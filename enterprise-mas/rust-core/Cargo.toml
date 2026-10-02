@@ -1,0 +1,170 @@
+# ============================================================================
+# enterprise-mas :: rust-core workspace root
+#
+# High-performance core responsible for orchestration, execution, security,
+# tenancy, policies, quota, eventing and persistence. No LLM/provider business
+# logic lives in this workspace (see README.md).
+#
+# Workspace members are added incrementally as each crate is implemented:
+#   [done] crates/common, crates/domain, crates/contracts, crates/orchestration
+#   [done] crates/execution, crates/policy, crates/security, crates/tenancy,
+#          crates/events
+#   [todo] crates/messaging,
+#          crates/persistence, crates/scheduling, crates/quota,
+#          crates/integrations, crates/observability, crates/application,
+#          crates/api, crates/worker, crates/scheduler-service, crates/cli
+# ============================================================================
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/common",
+    "crates/domain",
+    "crates/contracts",
+    "crates/orchestration",
+    "crates/execution",
+    "crates/policy",
+    "crates/security",
+    "crates/tenancy",
+    "crates/events",
+    "crates/messaging",
+    "crates/persistence",
+    "crates/scheduling",
+    "crates/quota",
+    "crates/integrations",
+    "crates/observability",
+    "crates/application",
+    "crates/api",
+    "crates/worker",
+    "crates/scheduler-service",
+    "crates/worker-service",
+    "crates/cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85.0"
+license = "Proprietary"
+publish = false
+homepage = "https://enterprise-mas.internal"
+repository = "https://enterprise-mas.internal/enterprise-mas"
+
+# --------------------------------------------------------------------------
+# Shared dependency versions. Every crate MUST reference these with
+# `dep.workspace = true` so the lockfile stays coherent.
+# --------------------------------------------------------------------------
+[workspace.dependencies]
+# --- internal crates ---
+mas-common = { path = "crates/common" }
+mas-domain = { path = "crates/domain" }
+mas-contracts = { path = "crates/contracts" }
+mas-orchestration = { path = "crates/orchestration" }
+mas-execution = { path = "crates/execution" }
+mas-policy = { path = "crates/policy" }
+mas-security = { path = "crates/security" }
+mas-tenancy = { path = "crates/tenancy" }
+mas-events = { path = "crates/events" }
+mas-messaging = { path = "crates/messaging" }
+mas-persistence = { path = "crates/persistence" }
+mas-scheduling = { path = "crates/scheduling" }
+mas-quota = { path = "crates/quota" }
+mas-integrations = { path = "crates/integrations" }
+mas-observability = { path = "crates/observability" }
+mas-application = { path = "crates/application" }
+mas-api = { path = "crates/api" }
+mas-worker = { path = "crates/worker" }
+mas-scheduler-service = { path = "crates/scheduler-service" }
+mas-worker-service = { path = "crates/worker-service" }
+mas-cli = { path = "crates/cli" }
+
+# --- async runtime / async interop ---
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+async-trait = "0.1"
+futures = "0.3"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+
+# --- hashing / encoding / crypto ---
+sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
+zeroize = "1.8"
+
+# --- randomization (retry jitter) ---
+rand = "0.9"
+
+# --- serialization ---
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# --- http/grpc servers (api crate) ---
+axum = { version = "0.8", default-features = false, features = ["json", "http1", "tokio", "query"] }
+tonic = { version = "0.13", default-features = false, features = ["server", "router", "codegen", "prost", "transport"] }
+tower = "0.5"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+toml = "0.8"
+
+# --- identity / time ---
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde", "alloc"] }
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio-rustls",
+    "postgres",
+    "uuid",
+    "chrono",
+    "json",
+] }
+
+# --- errors ---
+thiserror = "2"
+
+# --- telemetry primitives ---
+tracing = "0.1"
+
+# --- HTTP interop (status codes shared by common/api) ---
+http = "1"
+
+# --- encoding helpers ---
+base64 = "0.22"
+
+# --- url parsing / validation ---
+url = "2"
+
+# --- domain value objects ---
+semver = { version = "1", features = ["serde"] }
+cron = "0.12"
+
+# --------------------------------------------------------------------------
+# Workspace-wide lints. Every crate opts in with `[lints] workspace = true`.
+# --------------------------------------------------------------------------
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+# --------------------------------------------------------------------------
+# Build profiles.
+# --------------------------------------------------------------------------
+[profile.dev]
+incremental = true
+# Dependencies do not benefit from a fully unoptimized build; compiling them
+# with opt-level 1 keeps `cargo test` fast without hiding real behavior.
+[profile.dev.package."*"]
+opt-level = 1
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = false
+debug-assertions = false
+overflow-checks = false
+strip = "symbols"
+panic = "unwind"
+
+[profile.bench]
+inherits = "release"
+debug = true

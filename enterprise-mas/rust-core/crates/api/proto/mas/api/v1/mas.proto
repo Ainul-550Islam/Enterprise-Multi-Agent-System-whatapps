@@ -1,0 +1,177 @@
+// Multi-Agent System public gRPC API (v1).
+//
+// Semantics are IDENTICAL to the HTTP surface: the same use-cases, the same
+// validation errors, the same idempotency rules, the same existence hiding.
+// Scope travels as metadata: `x-tenant-id` + `x-organization-id` (uuid
+// strings); identity as `authorization: Bearer …`; correlation as
+// `x-correlation-id` (generated server-side when absent); execution
+// idempotency via `idempotency-key`.
+syntax = "proto3";
+package mas.api.v1;
+
+// ------------------------------ shared ------------------------------------
+message Empty {}
+
+message ExecutionReply {
+  string execution_id = 1;
+  string status = 2;
+  string tenant_id = 3;
+  optional string workflow_id = 4;
+  optional string agent_id = 5;
+  string root_execution_id = 6;
+  string correlation_id = 7;
+  bool cancellation_requested = 8;
+  bool replayed = 9;
+  string failure = 10;  // empty when no failure
+  string output_json = 11;  // empty when incomplete
+}
+
+// ------------------------------ tenancy ------------------------------------
+service TenancyApi {
+  rpc RegisterOrganization(RegisterOrganizationRequest) returns (OrganizationReply);
+  rpc ListOrganizations(Empty) returns (ListOrganizationsReply);
+  rpc RegisterTenant(RegisterTenantRequest) returns (TenantReply);
+  rpc ListTenants(Empty) returns (ListTenantsReply);
+  rpc RegisterProject(RegisterProjectRequest) returns (ProjectReply);
+  rpc InviteMembership(InviteMembershipRequest) returns (MembershipReply);
+}
+
+message RegisterOrganizationRequest {
+  string legal_name = 1;
+  string display_name = 2;
+  string slug = 3;
+}
+message OrganizationReply { string id = 1; string legal_name = 2; string display_name = 3; string slug = 4; }
+message ListOrganizationsReply { repeated OrganizationReply organizations = 1; }
+
+message RegisterTenantRequest {
+  string name = 1;
+  string slug = 2;
+  string environment = 3;  // development|staging|production
+  string isolation = 4;    // shared_rls|schema_per_tenant|dedicated_database
+}
+message TenantReply { string id = 1; string name = 2; string slug = 3; string environment = 4; string isolation = 5; }
+message ListTenantsReply { repeated TenantReply tenants = 1; }
+
+message RegisterProjectRequest { string name = 1; string slug = 2; }
+message ProjectReply { string id = 1; string name = 2; string slug = 3; }
+
+message InviteMembershipRequest { string user_id = 1; string role = 2; }
+message MembershipReply { string id = 1; string user_id = 2; string role = 3; string status = 4; }
+
+// ------------------------------ agents --------------------------------------
+service AgentApi {
+  rpc RegisterAgent(RegisterAgentRequest) returns (AgentReply);
+  rpc PublishAgentVersion(PublishAgentVersionRequest) returns (AgentVersionReply);
+  rpc GetAgent(GetAgentRequest) returns (AgentReply);
+  rpc ListAgents(ListAgentsRequest) returns (ListAgentsReply);
+}
+
+message RegisterAgentRequest {
+  string project_id = 1;
+  string name = 2;
+  string slug = 3;
+  string kind = 4;  // standard|supervisor|tool_user
+}
+message AgentReply {
+  string id = 1;
+  string project_id = 2;
+  string tenant_id = 3;
+  string name = 4;
+  string slug = 5;
+  string kind = 6;
+  string status = 7;
+  uint64 current_version = 8;  // 0 = none
+}
+message GetAgentRequest { string agent_id = 1; }
+message ListAgentsRequest { string project_id = 1; }
+message ListAgentsReply { repeated AgentReply agents = 1; }
+
+message PublishAgentVersionRequest {
+  string agent_id = 1;
+  string configuration_checksum = 2;  // 64 lowercase hex chars
+  string configuration_snapshot_json = 3;
+  string published_by = 4;  // user uuid
+}
+message AgentVersionReply { string id = 1; uint64 version_number = 2; string checksum = 3; }
+
+// ------------------------------ workflows ------------------------------------
+service WorkflowApi {
+  rpc CreateWorkflow(CreateWorkflowRequest) returns (WorkflowReply);
+  rpc UpdateWorkflowGraph(UpdateWorkflowGraphRequest) returns (UpdateWorkflowGraphReply);
+  rpc GetWorkflow(GetWorkflowRequest) returns (WorkflowReply);
+  rpc ListWorkflows(ListWorkflowsRequest) returns (ListWorkflowsReply);
+}
+
+message CreateWorkflowRequest { string project_id = 1; string name = 2; }
+message WorkflowReply { string id = 1; string project_id = 2; string name = 3; uint32 node_count = 4; uint64 graph_version = 5; }
+
+message WorkflowNodeMsg {
+  string node_key = 1;
+  string node_type = 2;
+  string name = 3;
+  string config_json = 4;  // serialized JSON object
+}
+message WorkflowEdgeMsg { string from_key = 1; string to_key = 2; }
+message UpdateWorkflowGraphRequest {
+  string workflow_id = 1;
+  repeated WorkflowNodeMsg nodes = 2;
+  repeated WorkflowEdgeMsg edges = 3;
+}
+message UpdateWorkflowGraphReply { string workflow_id = 1; repeated string topological_order = 2; }
+message GetWorkflowRequest { string workflow_id = 1; }
+message ListWorkflowsRequest { string project_id = 1; }
+message ListWorkflowsReply { repeated WorkflowReply workflows = 1; }
+
+// ------------------------------ executions -----------------------------------
+service ExecutionApi {
+  rpc SubmitExecution(SubmitExecutionRequest) returns (ExecutionReply);
+  rpc TransitionExecution(TransitionExecutionRequest) returns (ExecutionReply);
+  rpc GetExecution(GetExecutionRequest) returns (ExecutionReply);
+  rpc ListExecutions(Empty) returns (ListExecutionsReply);
+}
+
+message SubmitExecutionRequest {
+  string project_id = 1;
+  optional string workflow_id = 2;
+  optional string agent_id = 3;
+  string input_json = 4;
+  // `idempotency-key` metadata header is authoritative.
+}
+message TransitionExecutionRequest {
+  string execution_id = 1;
+  TransitionAction action = 2;
+}
+enum TransitionAction {
+  TRANSITION_ACTION_UNSPECIFIED = 0;
+  TRANSITION_ACTION_START = 1;
+  TRANSITION_ACTION_PAUSE = 2;
+  TRANSITION_ACTION_RESUME = 3;
+  TRANSITION_ACTION_CANCEL = 4;
+}
+message GetExecutionRequest { string execution_id = 1; }
+message ListExecutionsReply { repeated ExecutionReply executions = 1; }
+
+// ------------------------------ schedules ------------------------------------
+service ScheduleApi {
+  rpc RegisterSchedule(RegisterScheduleRequest) returns (ScheduleReply);
+  rpc SetScheduleState(SetScheduleStateRequest) returns (ScheduleReply);
+  rpc ListSchedules(Empty) returns (ListSchedulesReply);
+}
+
+message RegisterScheduleRequest {
+  optional string project_id = 1;
+  string name = 2;
+  string kind = 3;  // "interval" (only uniform-choice exposed)
+  uint64 every_seconds = 4;
+  string task_template_json = 5;
+}
+enum ScheduleStateAction {
+  SCHEDULE_STATE_ACTION_UNSPECIFIED = 0;
+  SCHEDULE_STATE_ACTION_PAUSE = 1;
+  SCHEDULE_STATE_ACTION_RESUME = 2;
+  SCHEDULE_STATE_ACTION_DISABLE = 3;
+}
+message SetScheduleStateRequest { string schedule_id = 1; ScheduleStateAction action = 2; }
+message ScheduleReply { string id = 1; string name = 2; string status = 3; }
+message ListSchedulesReply { repeated ScheduleReply schedules = 1; }

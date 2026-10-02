@@ -1,0 +1,29 @@
+# Execution: the runtime execution layer. Executor (execution claiming +
+# run), step/tool runners, the agent runtime bridge, result processing,
+# output validation, resource guard, sandbox policies and failure
+# classification. Node-executor adapters bind this crate into the
+# orchestration workflow runtime.
+[package]
+name = "mas-execution"
+description = "Execution layer: executor, step/tool runners, agent bridge, result processing, output validation, resource guard, sandbox, failure handling."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+mas-common.workspace = true
+mas-domain.workspace = true
+mas-orchestration.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+async-trait.workspace = true

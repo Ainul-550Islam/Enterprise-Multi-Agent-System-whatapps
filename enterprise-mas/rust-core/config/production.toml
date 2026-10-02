@@ -1,0 +1,60 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# PRODUCTION overlay (MAS_ENV=production). Merges over default.toml.
+#
+# ⚠️  GUARDRAILS — binaries refuse to boot when these hold:
+#   * database.url empty           → in-memory fallback is FORBIDDEN here
+#   * server.dev_tokens non-empty  → static tokens are a dev/test artifact
+#   * scheduler.api_bearer set     → production service auth comes from env
+#     MAS_SCHEDULER_API_TOKEN directly, never from a checked-in file
+#   * metrics listener public      → scraping endpoint must not be world-open
+#
+# Everything below is sized for a medium single-region deployment; tune per
+# SLO measurements (benches/ has the throughput floor):
+#   * api p99 submit+start               <  250 ms
+#   * scheduler tick drain (100 due)     <  1 s
+#   * worker settle latency (steady)     <  50 ms / msg
+# ─────────────────────────────────────────────────────────────────────────────
+environment = "production"
+
+[server]
+http_addr = "0.0.0.0:8080"
+grpc_addr = "0.0.0.0:50051"
+body_limit_kib = 256
+dev_tokens = ""
+
+[scheduler]
+# Behind an internal LB: only this host's loopback is too tight for probes,
+# but the completion route is internal-plane; protect with network policy.
+completion_addr = "0.0.0.0:8090"
+replica_id = "scheduler-prod-1"
+tick_interval_ms = 5000
+recover_on_start = true
+error_backoff_cap_ms = 60000
+# api_base_url comes from MAS_SCHEDULER_API_URL (service discovery insert).
+
+[worker]
+consumer_name = "tasks-prod"
+batch_size = 25
+ack_wait_ms = 30000
+poll_interval_ms = 100
+lease_ttl_ms = 45000
+max_in_flight = 64
+drain_timeout_ms = 60000
+worker_name = "worker-prod-1"
+retry_base_ms = 500
+retry_cap_ms = 30000
+retry_max_deliver = 10
+
+[database]
+# Empty here on purpose: production reads MAS_DATABASE_URL from env; the
+# guardrail above stops boot without it.
+url = ""
+max_connections = 32
+connect_timeout_ms = 5000
+
+[observability]
+log_format = "json"
+log_level = "info"
+# Scraped by the platform Prometheus; bind to pod IP via env in real deploys.
+metrics_addr = "0.0.0.0:9102"
+otlp_endpoint = ""

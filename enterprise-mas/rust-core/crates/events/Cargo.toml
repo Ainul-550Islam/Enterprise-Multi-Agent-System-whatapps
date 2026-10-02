@@ -1,0 +1,23 @@
+[package]
+name = "mas-events"
+description = "Domain event envelope, in-memory bus, transactional outbox with retry/dead-letter, and the publisher adapter"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+mas-common = { workspace = true }
+mas-domain = { workspace = true }
+mas-orchestration = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

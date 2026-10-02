@@ -1,0 +1,28 @@
+[package]
+name = "mas-application"
+description = "Use-case services composing domain and infrastructure ports; internal DTO mapping."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+mas-common = { workspace = true }
+mas-domain = { workspace = true }
+mas-contracts = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "root_topological_bench"
+path = "../../benches/topological_bench.rs"
+harness = false

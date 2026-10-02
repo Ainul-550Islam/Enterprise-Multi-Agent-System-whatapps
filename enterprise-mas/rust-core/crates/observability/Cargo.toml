@@ -1,0 +1,23 @@
+[package]
+name = "mas-observability"
+description = "JSON logging with redaction, metrics, trace/span plumbing, audit telemetry, health registry."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+mas-common = { workspace = true }
+mas-domain = { workspace = true }
+async-trait = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
+
+[lints]
+workspace = true

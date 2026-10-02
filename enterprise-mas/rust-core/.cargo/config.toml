@@ -1,0 +1,24 @@
+# Cargo-level configuration for reproducible compilation of rust-core.
+#
+# This file controls Cargo behavior only; build/target options that must be
+# per-binary live in each crate manifest.
+
+[build]
+# Keep all build artifacts inside the workspace for reproducible CI caching.
+target-dir = "target"
+# Use the system C toolchain (gcc) for linking and native dependencies.
+rustflags = []
+
+[net]
+# Sparse registry protocol: faster and CDN-cacheable.
+git-fetch-with-cli = false
+retry = 3
+offline = false
+
+[registries.crates-io]
+protocol = "sparse"
+
+[term]
+color = "auto"
+# --message-format short keeps CI logs parseable; humans can override locally.
+verbose = false

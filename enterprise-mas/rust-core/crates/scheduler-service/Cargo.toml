@@ -1,0 +1,44 @@
+[package]
+name = "mas-scheduler-service"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Scheduler tick driver process: interval-driven runtime, dispatch adapters, in-flight ledger, completion listener"
+license = "Proprietary"
+
+[lib]
+name = "mas_scheduler_service"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mas-scheduler"
+path = "src/main.rs"
+
+[dependencies]
+mas-common = { workspace = true }
+mas-domain = { workspace = true }
+mas-scheduling = { workspace = true }
+mas-worker = { workspace = true }
+mas-application = { workspace = true }
+mas-persistence = { workspace = true }
+mas-contracts = { workspace = true }
+sqlx = { workspace = true }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+
+axum = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true, features = ["net", "signal", "rt-multi-thread"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
+tower = { workspace = true }
+
+[features]
+testutils = []
+
+[lints]
+workspace = true

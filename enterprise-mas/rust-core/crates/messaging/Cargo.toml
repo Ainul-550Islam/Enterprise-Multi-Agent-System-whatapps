@@ -1,0 +1,30 @@
+[package]
+name = "mas-messaging"
+description = "Message transport layer: codecs, header propagation, connection lifecycle, broker port (NATS/JetStream-shaped), gRPC helpers, broker health."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+mas-common = { workspace = true }
+mas-contracts = { workspace = true }
+mas-events = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+async-nats = { version = "0.50.0", optional = true }
+futures-util = { workspace = true, optional = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
+
+[[bench]]
+name = "root_codec_bench"
+path = "../../benches/codec_bench.rs"
+harness = false
+
+[features]
+nats = ["dep:async-nats", "dep:futures-util"]

@@ -1,0 +1,22 @@
+{
+  "error": {
+    "code": "VALIDATION_FAILED",
+    "message": "node_type must be one of the allowed kinds",
+    "request_id": "550e8400-e29b-41d4-a716-446655440000",
+    "details": {
+      "issues": [
+        {
+          "field": "nodes[0].node_type",
+          "code": "invalid_enum_value",
+          "message": "unknown node type 'llm-yolo'"
+        }
+      ]
+    }
+  },
+  "meta": {
+    "request_id": "550e8400-e29b-41d4-a716-446655440000",
+    "correlation_id": "fxt-corr-2",
+    "api_version": "v1",
+    "responded_at": "2026-09-30T00:00:00.000Z"
+  }
+}

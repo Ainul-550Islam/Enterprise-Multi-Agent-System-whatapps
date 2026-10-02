@@ -1,0 +1,98 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# MAS runtime configuration — DEFAULT layer.
+#
+# Precedence (LATER WINS):
+#   1. config/default.toml            (this file — checked in, never secrets)
+#   2. config/{MAS_ENV}.toml          (development | test | production)
+#   3. environment variables          (names documented per key below)
+#   4. process CLI flags              (--flag, where the binary supports one)
+#
+# Rules:
+#   * No secrets in this file. Anything sensitive is EMPTY here and MUST be
+#     supplied by env (or the platform's secret manager → env).
+#   * Durations are plain integers with a unit suffix baked into the key name
+#     (`*_ms`); addresses are `host:port` strings.
+#   * Every key in this file is the schema: environment overlays override
+#     selectively (whole tables are replaced, file-level merge is deep).
+#   * Databases/queues are absent on purpose: binaries refuse to start without
+#     their dev flag until Postgres/NATS adapters land (fail closed, not silent).
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Which environment overlay gets merged on top of this file. Overridden by the
+# MAS_ENV environment variable (constants: development|test|production).
+environment = "development"
+
+# ── mas-api (HTTP + gRPC front end) ──────────────────────────────────────────
+[server]
+# Env: MAS_API_HTTP_ADDR
+http_addr = "0.0.0.0:8080"
+# Env: MAS_API_GRPC_ADDR
+grpc_addr = "0.0.0.0:50051"
+# Per-request body cap in KiB (mirrors the router's 256KiB default).
+body_limit_kib = 256
+# Static dev token table `token:subject:kind,...` — dev overlay ONLY; the
+# env var MAS_DEV_TOKENS wins and production must leave this empty.
+dev_tokens = ""
+
+# ── mas-scheduler (completion listener + tick driver) ───────────────────────
+[scheduler]
+# Completion listener bind. Env: MAS_SCHEDULER_ADDR
+completion_addr = "127.0.0.1:8090"
+# Replica identity (lease holder name). Env: MAS_SCHEDULER_REPLICA_ID
+replica_id = "scheduler-1"
+# Tick interval. Env: MAS_SCHEDULER_INTERVAL_MS
+tick_interval_ms = 1000
+# Startup recovery (reap dead leases + requeue overdue work).
+recover_on_start = true
+# Consecutive-tick-error backoff ceiling.
+error_backoff_cap_ms = 30000
+# Dispatch target: `http(s)://…` → HttpDispatcher; empty → dev loopback.
+# Env: MAS_SCHEDULER_API_URL
+api_base_url = ""
+# Service token for the schedule-run endpoint; NEVER set in files on
+# production (see production.toml). Env: MAS_SCHEDULER_API_TOKEN.
+api_bearer = ""
+
+# ── mas-worker (queue consumer) ─────────────────────────────────────────────
+[worker]
+# Durable consumer name. Env: MAS_WORKER_CONSUMER
+consumer_name = "tasks-main"
+# Subject filter for tasks. Env: MAS_WORKER_FILTER
+subject_filter = "mas.tasks.>"
+# Messages per fetch batch.
+batch_size = 10
+# Broker ack window: a message unacked within this returns for redelivery.
+ack_wait_ms = 30000
+# Poll cadence when the queue is idle. Env: MAS_WORKER_POLL_MS
+poll_interval_ms = 250
+# Task lease TTL (renewed at heartbeat rate ack_wait/2).
+lease_ttl_ms = 30000
+# In-flight handler concurrency cap.
+max_in_flight = 16
+# Graceful-shutdown drain budget before in-flight work is abandoned.
+drain_timeout_ms = 30000
+# Worker identity (lease holder name). Env: MAS_WORKER_NAME
+worker_name = "worker-1"
+# Retry policy: exponential backoff with full jitter.
+retry_base_ms = 250
+retry_cap_ms = 10000
+retry_max_deliver = 8
+
+# ── persistence (currently in-memory everywhere) ────────────────────────────
+[database]
+# Empty is *deliberate*: it selects in-memory stores which binaries refuse
+# outside `--dev-inmemory`. Env: MAS_DATABASE_URL
+url = ""
+max_connections = 10
+connect_timeout_ms = 5000
+
+# ── telemetry ───────────────────────────────────────────────────────────────
+[observability]
+# log output format: `json` | `pretty`. Env: MAS_LOG_FORMAT
+log_format = "json"
+# tracing filter directive. Env: MAS_LOG_LEVEL / RUST_LOG
+log_level = "info,mas=debug"
+# OTLP exporter endpoint (empty = no export). Env: MAS_OTLP_ENDPOINT
+otlp_endpoint = ""
+# Metrics listener (empty = disabled). Env: MAS_METRICS_ADDR
+metrics_addr = ""

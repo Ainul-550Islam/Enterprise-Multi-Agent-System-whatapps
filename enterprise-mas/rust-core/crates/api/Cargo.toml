@@ -1,0 +1,56 @@
+[package]
+name = "mas-api"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "HTTP + gRPC api processes: thin transports over mas-application use-cases"
+license = "Proprietary"
+
+[lib]
+name = "mas_api"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mas-api"
+path = "src/main.rs"
+
+[dependencies]
+mas-common = { workspace = true }
+mas-domain = { workspace = true }
+mas-contracts = { workspace = true }
+mas-application = { workspace = true }
+mas-observability = { workspace = true }
+mas-persistence = { workspace = true }
+mas-security = { workspace = true }
+mas-events = { workspace = true }
+chrono = { workspace = true }
+
+axum = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+tonic = { workspace = true }
+prost = { version = "0.13", features = ["prost-derive"] }
+tokio = { workspace = true, features = ["net", "signal", "rt-multi-thread"] }
+serde = { workspace = true }
+serde_json = "1"
+uuid = { workspace = true }
+http = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+
+[build-dependencies]
+tonic-build = { version = "0.13", default-features = false, features = ["prost", "transport"] }
+protoc-bin-vendored = "3"
+
+[dev-dependencies]
+mas-cli = { workspace = true }
+reqwest = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+tokio = { workspace = true, features = ["macros", "rt", "time", "net", "rt-multi-thread"] }
+http-body-util = "0.1"
+
+[features]
+default = ["testutils"]
+testutils = ["mas-cli/testutils"]
+
+[lints]
+workspace = true

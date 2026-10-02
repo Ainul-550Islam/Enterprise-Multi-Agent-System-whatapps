@@ -1,0 +1,26 @@
+# Shared foundation crate: serde, uuid, chrono/time, thiserror, tracing
+# primitives and validation helpers. Every other rust-core crate depends on
+# this one; it must never depend on siblings.
+[package]
+name = "mas-common"
+description = "Shared foundation: AppError, Result, typed IDs, timestamps, enums, pagination, validation, redaction, constants."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+http.workspace = true
+base64.workspace = true
+url.workspace = true
+toml.workspace = true

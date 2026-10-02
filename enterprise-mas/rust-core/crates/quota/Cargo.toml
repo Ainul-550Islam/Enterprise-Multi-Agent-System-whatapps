@@ -1,0 +1,17 @@
+[package]
+name = "mas-quota"
+description = "Quota engine: atomic counters, rate limiter, concurrency limiter, token meter, overage policy."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+mas-common = { workspace = true }
+mas-domain = { workspace = true }
+mas-orchestration = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "time"] }

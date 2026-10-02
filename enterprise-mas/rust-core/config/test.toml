@@ -1,0 +1,41 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# TEST overlay (MAS_ENV=test): *deterministic and fast* — short polls, short
+# timeouts, ephemeral ports where possible. CI and `cargo test` hosts source
+# this via scripts/check.sh. Merges over default.toml.
+# ─────────────────────────────────────────────────────────────────────────────
+environment = "test"
+
+[server]
+# Port would come from the runner; the value here is a documented stand-in
+# (tests bind 127.0.0.1:0 and override programmatically).
+http_addr = "127.0.0.1:0"
+grpc_addr = "127.0.0.1:0"
+dev_tokens = ""
+
+[scheduler]
+completion_addr = "127.0.0.1:0"
+replica_id = "scheduler-test"
+# Ticks fast enough for the loop assertions, slow enough to stay portable.
+tick_interval_ms = 25
+error_backoff_cap_ms = 500
+api_base_url = ""
+api_bearer = ""
+
+[worker]
+poll_interval_ms = 5
+ack_wait_ms = 200
+lease_ttl_ms = 150
+drain_timeout_ms = 3000
+retry_base_ms = 5
+retry_cap_ms = 40
+worker_name = "worker-test"
+
+[database]
+url = ""
+max_connections = 4
+connect_timeout_ms = 1000
+
+[observability]
+log_format = "json"
+log_level = "warn,mas=info"
+metrics_addr = ""
