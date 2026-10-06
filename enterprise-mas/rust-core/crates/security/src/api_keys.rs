@@ -8,15 +8,15 @@
 //! timing information about any stored hash.
 
 use crate::audit::{security_event, AuditSinkPort};
-use crate::principal::{PrincipalKind, SecurityPrincipal};
+use crate::principal::{PrincipalKind, SecurityPrincipal, TenantMembership};
 use crate::scopes::ScopeSet;
 use crate::secret_string::constant_time_eq;
 use mas_common::constants;
 use mas_common::error::AppError;
-use mas_common::ids::{ApiKeyId, TenantId, UserId};
+use mas_common::ids::{ApiKeyId, OrganizationId, TenantId, UserId};
 use mas_common::result::Result;
 use mas_common::timestamps::Timestamp;
-use mas_domain::{ApiKey, ApiKeyMetadataView, AuditActor};
+use mas_domain::{ApiKey, ApiKeyMetadataView, AuditActor, MembershipRole};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -64,6 +64,7 @@ impl StoredApiKey {
         ApiKeyMetadataView {
             id: self.metadata.id,
             tenant_id: self.metadata.tenant_id,
+            organization_id: self.metadata.organization_id,
             name: self.metadata.name.clone(),
             prefix: self.metadata.prefix.clone(),
             scopes: self.metadata.scopes.iter().cloned().collect(),
@@ -199,20 +200,47 @@ impl ApiKeyService {
             .collect()
     }
 
+    /// Clamps the role a bearer token may carry.
+    ///
+    /// `Owner` is deliberately unreachable by API key: it grants tenant
+    /// deletion and billing administration, and a bearer secret that can
+    /// delete a tenant is a blast radius the platform declines to issue.
+    /// Every other role is allowed and is recorded in the audit trail at mint
+    /// time.
+    const fn clamp_key_role(role: MembershipRole) -> MembershipRole {
+        match role {
+            MembershipRole::Owner => MembershipRole::Admin,
+            other => other,
+        }
+    }
+
     /// Issues a new key. The raw secret is returned once and never stored.
+    ///
+    /// `organization_id` and `role` are captured at mint time and are what
+    /// authenticate the bearer as afterwards — they are *not* read from the
+    /// caller at authentication time. `role` is additionally clamped: a key
+    /// can never be minted with more authority than `MembershipRole::Admin`,
+    /// because the platform's `Owner` role carries destructive,
+    /// non-delegable privileges (tenant deletion, billing) that must stay
+    /// with a human membership, never with a bearer token.
     pub async fn create(
         &self,
         tenant_id: TenantId,
+        organization_id: OrganizationId,
         user_id: Option<UserId>,
+        role: MembershipRole,
         name: impl Into<String>,
         scopes: ScopeSet,
         expires_at: Option<Timestamp>,
     ) -> Result<CreatedApiKey> {
+        let role = Self::clamp_key_role(role);
         let raw = Self::generate_raw();
         let prefix = Self::visible_prefix(&raw);
         let metadata = ApiKey::new(
             tenant_id,
+            organization_id,
             user_id,
+            role,
             name,
             prefix.clone(),
             scopes.iter().cloned().collect(),
@@ -313,15 +341,25 @@ impl ApiKeyService {
             tracing::warn!(%error, key = %metadata.id, "failed to record api key usage");
         }
         let scopes = ScopeSet::new(metadata.scopes.clone())?;
+        // The key row, not the caller, decides the tenant. An API key is
+        // bound to exactly one tenant at creation; authentication must carry
+        // that binding into the principal so nothing downstream can be
+        // talked into a different one.
         let principal = SecurityPrincipal::new(
             metadata
                 .user_id
                 .map(|u| u.to_string())
                 .unwrap_or_else(|| format!("api-key:{}", metadata.id)),
             PrincipalKind::ApiKey,
-            Some(metadata.tenant_id),
+            None,
             scopes,
-        );
+        )
+        .with_memberships(vec![TenantMembership {
+            organization_id: metadata.organization_id,
+            tenant_id: metadata.tenant_id,
+            role: metadata.role,
+        }])
+        .with_optional_expiry(metadata.expires_at);
         Ok(Ok(principal))
     }
 
@@ -342,6 +380,10 @@ impl ApiKeyService {
         }
         let raw = Self::generate_raw();
         let prefix = Self::visible_prefix(&raw);
+        // Rotation replaces the secret and nothing else: the id, the tenant
+        // binding, the organization binding and the role are all preserved,
+        // so rotation can never be used to move a key to another tenant or
+        // to widen its authority.
         stored.metadata.prefix = prefix;
         // Old key keeps working until the grace window closes (workers re-salt).
         let _grace_closes_at = Timestamp::now()
@@ -422,10 +464,13 @@ mod tests {
     async fn create_round_trip_and_validate() {
         let (service, store) = service().await;
         let tenant = TenantId::new();
+        let organization = OrganizationId::new();
         let created = service
             .create(
                 tenant,
+                organization,
                 Some(UserId::new()),
+                MembershipRole::Developer,
                 "ci-bot",
                 ScopeSet::new(["executions:read", "executions:*"]).expect("scopes"),
                 None,
@@ -466,10 +511,13 @@ mod tests {
     async fn rejects_have_stable_reasons() {
         let (service, _) = service().await;
         let tenant = TenantId::new();
+        let organization = OrganizationId::new();
         let created = service
             .create(
                 tenant,
+                organization,
                 None,
+                MembershipRole::ServiceAccount,
                 "svc",
                 ScopeSet::new(["a:b"]).expect("s"),
                 None,

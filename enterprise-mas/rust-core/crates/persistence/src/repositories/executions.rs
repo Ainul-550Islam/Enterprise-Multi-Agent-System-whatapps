@@ -1,3 +1,18 @@
+//! PURPOSE: The `executions` repository and its per-tenant idempotency
+//! lookup.
+//!
+//! Owning layer: `mas-persistence`.
+//!
+//! Production responsibility: resolve an idempotency key *within one tenant*
+//! and return the stored result for a replay — the lookup is the read half of
+//! the DB-enforced idempotency guarantee, and it must never cross tenants.
+//!
+//! It must NOT:
+//!   • look up a key without a tenant predicate;
+//!   • synthesise a result for a key that was never stored;
+//!   • be the enforcement point for idempotency — the unique index is; this
+//!     is only the lookup.
+
 //! `executions` repository + per-tenant idempotency ledger.
 //!
 //! Idempotency design (documented decision): the schema carries no dedicated
@@ -38,7 +53,12 @@ const EXECUTION_UPSERT: &str = "INSERT INTO executions (
         finished_at = EXCLUDED.finished_at,
         updated_at = EXCLUDED.updated_at";
 
-fn fetch_execution(pg_row: sqlx::postgres::PgRow) -> Result<ExecutionRow> {
+/// Maps one `executions` row.
+///
+/// Public for the same reason as [`super::tasks::fetch_task_row`]: the
+/// durable execution port selects this projection and must hydrate through
+/// one shared mapper.
+pub fn fetch_execution_row(pg_row: sqlx::postgres::PgRow) -> Result<ExecutionRow> {
     Ok(ExecutionRow {
         id: pg_row.try_get("id").map_err(map_sqlx)?,
         tenant_id: pg_row.try_get("tenant_id").map_err(map_sqlx)?,
@@ -68,9 +88,24 @@ pub struct ExecutionStore {
 
 impl ExecutionStore {
     /// Binds a store to a pool.
+    ///
+    /// The pool is not used to run statements: every query runs on the
+    /// request's transaction, which is the only place row-level security is
+    /// armed. It is retained for pool diagnostics and health probes, and
+    /// deliberately has no code path that executes a query through it.
     #[must_use]
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
+    }
+
+    /// Pool handle, for diagnostics only.
+    ///
+    /// Never use this to run a tenant-touching statement: it has no scope, and
+    /// under `FORCE ROW LEVEL SECURITY` that means it would return nothing.
+    /// It exists so pool statistics can be reported.
+    #[must_use]
+    pub const fn pool(&self) -> &PgPool {
+        &self.pool
     }
 
     /// Creates or rewrites an execution row (full upsert; transitions are
@@ -78,6 +113,10 @@ impl ExecutionStore {
     /// a faithful mirror).
     pub async fn save(&self, execution: &Execution) -> Result<()> {
         let row = ExecutionRow::from_domain(execution)?;
+        // Every tenant-owned table is FORCE RLS: this statement only sees rows
+        // inside the request's own scope, because the executor IS the
+        // request's transaction.
+        let mut scoped = crate::scoped_request::connection().await?;
         sqlx::query(EXECUTION_UPSERT)
             .bind(row.id)
             .bind(row.tenant_id)
@@ -96,7 +135,7 @@ impl ExecutionStore {
             .bind(row.finished_at)
             .bind(row.created_at)
             .bind(row.updated_at)
-            .execute(&self.pool)
+            .execute(scoped.connection().as_mut())
             .await
             .map_err(map_sqlx)?;
         Ok(())
@@ -104,14 +143,18 @@ impl ExecutionStore {
 
     /// Loads one execution by primary key.
     pub async fn get(&self, id: ExecutionId) -> Result<Option<Execution>> {
+        // Every tenant-owned table is FORCE RLS: this statement only sees rows
+        // inside the request's own scope, because the executor IS the
+        // request's transaction.
+        let mut scoped = crate::scoped_request::connection().await?;
         let row = sqlx::query(&format!(
             "SELECT {EXECUTION_COLUMNS} FROM executions WHERE id = $1"
         ))
         .bind(Uuid::from(id))
-        .fetch_optional(&self.pool)
+        .fetch_optional(scoped.connection().as_mut())
         .await
         .map_err(map_sqlx)?;
-        row.map(fetch_execution)
+        row.map(fetch_execution_row)
             .transpose()?
             .map(ExecutionRow::into_domain)
             .transpose()
@@ -119,16 +162,20 @@ impl ExecutionStore {
 
     /// Lists executions in a tenant, newest first.
     pub async fn list_for_tenant(&self, tenant: TenantId) -> Result<Vec<Execution>> {
+        // Every tenant-owned table is FORCE RLS: this statement only sees rows
+        // inside the request's own scope, because the executor IS the
+        // request's transaction.
+        let mut scoped = crate::scoped_request::connection().await?;
         let rows = sqlx::query(&format!(
             "SELECT {EXECUTION_COLUMNS} FROM executions
              WHERE tenant_id = $1 ORDER BY created_at DESC"
         ))
         .bind(Uuid::from(tenant))
-        .fetch_all(&self.pool)
+        .fetch_all(scoped.connection().as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.into_iter()
-            .map(fetch_execution)
+            .map(fetch_execution_row)
             .collect::<Result<Vec<_>>>()?
             .into_iter()
             .map(ExecutionRow::into_domain)
@@ -142,6 +189,10 @@ impl ExecutionStore {
         tenant: TenantId,
         key: &str,
     ) -> Result<Option<ExecutionId>> {
+        // Every tenant-owned table is FORCE RLS: this statement only sees rows
+        // inside the request's own scope, because the executor IS the
+        // request's transaction.
+        let mut scoped = crate::scoped_request::connection().await?;
         let hits: Vec<PgPoolRow> = sqlx::query(
             "SELECT id FROM executions
              WHERE tenant_id = $1
@@ -151,7 +202,7 @@ impl ExecutionStore {
         .bind(Uuid::from(tenant))
         .bind(SPEC_KEY)
         .bind(key)
-        .fetch_all(&self.pool)
+        .fetch_all(scoped.connection().as_mut())
         .await
         .map_err(map_sqlx)?;
         match hits.len() {
@@ -174,11 +225,15 @@ impl ExecutionStore {
         key: &str,
         execution: ExecutionId,
     ) -> Result<()> {
+        // Every tenant-owned table is FORCE RLS: this statement only sees rows
+        // inside the request's own scope, because the executor IS the
+        // request's transaction.
+        let mut scoped = crate::scoped_request::connection().await?;
         let result = sqlx::query(
             "UPDATE executions
              SET state = jsonb_set(
                     state,
-                    '{' || $2 || '}',
+                    ARRAY[$2]::text[],
                     coalesce(state -> $2, '{}'::jsonb) || jsonb_build_object('idempotency_key', $3),
                     true
                  )
@@ -188,7 +243,7 @@ impl ExecutionStore {
         .bind(SPEC_KEY)
         .bind(key)
         .bind(Uuid::from(execution))
-        .execute(&self.pool)
+        .execute(scoped.connection().as_mut())
         .await
         .map_err(map_sqlx)?;
         if result.rows_affected() != 1 {

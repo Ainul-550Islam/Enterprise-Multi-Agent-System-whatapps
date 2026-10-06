@@ -47,10 +47,19 @@
 pub mod dispatch;
 pub mod driver;
 pub mod durable;
+/// The real network client behind the SSRF guard. See the module's PURPOSE
+/// header: it is the only place in this process that opens a socket to a host
+/// named by configuration, and it pins the resolved address before doing so.
+pub mod egress;
+/// The scheduler's schedule store: a plane-scoped due-scan followed by
+/// tenant-scoped write-back. See the module's PURPOSE header.
+pub mod plane_store;
 pub mod server;
 
 pub use dispatch::{HttpDispatcher, InFlightLedger, LoopbackDispatcher};
 pub use driver::{DriverConfig, DriverStats, TickDriver};
+pub use egress::ReqwestEgress;
+pub use plane_store::{SchedulerPlaneStore, SCHEDULER_ACTOR};
 pub use server::{completion_router, health_router};
 
 /// Squashes a raw sqlx error into the platform taxonomy (DB errors at this

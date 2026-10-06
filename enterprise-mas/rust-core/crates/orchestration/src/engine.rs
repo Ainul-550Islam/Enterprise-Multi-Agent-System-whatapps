@@ -1,3 +1,18 @@
+//! PURPOSE: The orchestration engine: every lifecycle entry point of the
+//! platform funnels through here.
+//!
+//! Owning layer: `mas-orchestration`.
+//!
+//! Production responsibility: act as a coordination shell — every state
+//! transition goes through the domain aggregates, and every side effect
+//! (durable state, policy, quota, idempotency, dead letters, events) goes
+//! through a port, so the engine itself holds no hidden state.
+//!
+//! It must NOT:
+//!   • mutate an aggregate without going through its transition methods;
+//!   • perform I/O inline where a port exists;
+//!   • become a second home for business rules that belong in the domain.
+
 //! The orchestration engine: all lifecycle entry points of the platform.
 //!
 //! The engine is a **coordination shell**: every state transition goes
@@ -30,7 +45,7 @@ use mas_common::error::AppError;
 use mas_common::ids::{AgentId, ExecutionId, TaskId, TenantId, WorkflowId};
 use mas_common::result::Result;
 use mas_common::timestamps::Timestamp;
-use mas_domain::{Execution, QuotaDimension, Task, Workflow};
+use mas_domain::{Execution, QuotaDimension, Task, TransitionActor, TransitionFailure, Workflow};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -38,6 +53,43 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::warn;
+
+/// The actor recorded on transitions the engine performs on behalf of a
+/// runtime context.
+///
+/// Falls back to the engine's own service identity when the context carries no
+/// usable actor id: a transition with no actor at all is worse than one
+/// attributed to the platform, because an unattributed state change cannot be
+/// traced back to the request that caused it.
+fn runtime_actor(ctx: &RuntimeContext) -> TransitionActor {
+    let id: String = ctx.actor_id().chars().take(64).collect();
+    if id.is_empty() {
+        return engine_actor();
+    }
+    TransitionActor::system(id).unwrap_or_else(|_| engine_actor())
+}
+
+/// The engine's own identity, for transitions performed outside any runtime
+/// context (recovery sweeps, terminal finalization driven by the worker).
+fn engine_actor() -> TransitionActor {
+    TransitionActor::system("orchestration-engine").expect("literal actor id is valid")
+}
+
+/// Classifies an [`AppError`] into the transition failure the domain records.
+///
+/// The retry class comes from the error's own classification, so retry
+/// decisions downstream key off a field rather than off message matching.
+fn transition_failure(error: &AppError) -> TransitionFailure {
+    TransitionFailure::new(
+        error.error_code(),
+        error.public_message(),
+        error.is_retryable(),
+    )
+    .unwrap_or_else(|_| {
+        TransitionFailure::terminal("unclassified", "unclassified failure")
+            .expect("literal failure is valid")
+    })
+}
 
 // =============================================================================
 // Commands
@@ -508,8 +560,9 @@ impl OrchestrationEngine {
         task.deadline = command.deadline;
         task.execution_id = command.execution_id;
 
+        let actor = runtime_actor(ctx);
         self.ports.tasks.insert_task(&task).await?;
-        task.queue()?;
+        task.queue(&actor)?;
         self.ports.tasks.update_task(&task).await?;
 
         self.publish(
@@ -546,7 +599,11 @@ impl OrchestrationEngine {
     /// Cancels a non-terminal task.
     pub async fn cancel_task(&self, ctx: &RuntimeContext, task_id: TaskId) -> Result<Task> {
         let mut task = self.get_task(ctx, task_id).await?;
-        task.cancel()?;
+        let actor = runtime_actor(ctx);
+        match task.cancel(&actor)? {
+            mas_domain::CancellationOutcome::Cancelled(_)
+            | mas_domain::CancellationOutcome::AlreadyCancelled => {},
+        }
         self.ports.tasks.update_task(&task).await?;
         self.publish(
             "task.cancelled",
@@ -566,14 +623,15 @@ impl OrchestrationEngine {
         task_id: TaskId,
         error: &AppError,
     ) -> Result<RetryOutcome> {
+        let actor = runtime_actor(ctx);
         let mut task = self.get_task(ctx, task_id).await?;
         if task.status == TaskStatus::Running {
             // The worker reports the failed attempt; the engine owns the verdict.
-            task.fail(error.public_message())?;
+            task.fail(&actor, transition_failure(error))?;
         }
         match self.retry_policy.decision(task.attempt_count, error) {
             RetryDecision::Retry { delay } => {
-                task.retry()?;
+                task.retry(&actor, delay)?;
                 self.ports.tasks.update_task(&task).await?;
                 self.publish(
                     "task.retry_scheduled",
@@ -598,7 +656,7 @@ impl OrchestrationEngine {
                 } else {
                     "non_retryable_error"
                 };
-                self.dead_letter(&mut task, error, reason).await?;
+                self.dead_letter(&mut task, error, reason, &actor).await?;
                 Ok(RetryOutcome::DeadLettered {
                     task_id: task.id,
                     record_id: self
@@ -610,11 +668,19 @@ impl OrchestrationEngine {
         }
     }
 
-    async fn dead_letter(&self, task: &mut Task, error: &AppError, reason: &str) -> Result<()> {
+    async fn dead_letter(
+        &self,
+        task: &mut Task,
+        error: &AppError,
+        reason: &str,
+        actor: &TransitionActor,
+    ) -> Result<()> {
         // The task must be Failed to leave; workers fail their attempt first,
         // but tolerate a Running task that never got marked by failing it here.
         match task.status {
-            TaskStatus::Running => task.fail(error.public_message())?,
+            TaskStatus::Running => {
+                task.fail(actor, transition_failure(error))?;
+            },
             TaskStatus::Failed => {},
             other => {
                 return Err(AppError::conflict(format!(
@@ -633,7 +699,7 @@ impl OrchestrationEngine {
                 reason,
             )
             .await?;
-        task.dead_letter(reason)?;
+        task.dead_letter(actor, reason)?;
         self.ports.tasks.update_task(task).await?;
         self.publish(
             "task.dead_lettered",
@@ -652,15 +718,20 @@ impl OrchestrationEngine {
     /// Recovery-time decision for a task whose `Failed` state is already
     /// persisted (no reload, no re-fail). `Ok(true)` = requeued,
     /// `Ok(false)` = dead-lettered.
-    async fn retry_task_direct(&self, task: &mut Task, error: &AppError) -> Result<bool> {
+    async fn retry_task_direct(
+        &self,
+        task: &mut Task,
+        error: &AppError,
+        actor: &TransitionActor,
+    ) -> Result<bool> {
         match self.retry_policy.decision(task.attempt_count, error) {
-            RetryDecision::Retry { .. } => {
-                task.retry()?;
+            RetryDecision::Retry { delay } => {
+                task.retry(actor, delay)?;
                 self.ports.tasks.update_task(task).await?;
                 Ok(true)
             },
             RetryDecision::DoNotRetry | RetryDecision::Exhausted => {
-                self.dead_letter(task, error, "recovery_exhausted_attempts")
+                self.dead_letter(task, error, "recovery_exhausted_attempts", actor)
                     .await?;
                 Ok(false)
             },
@@ -854,11 +925,12 @@ impl OrchestrationEngine {
 
     /// Pending/Paused → Running, with a live cancellation token registered.
     pub async fn mark_execution_started(&self, execution_id: ExecutionId) -> Result<Execution> {
+        let actor = engine_actor();
         let mut execution = self.require_execution(execution_id).await?;
         if execution.status == ExecutionStatus::Paused {
-            execution.resume()?;
+            execution.resume(&actor)?;
         } else {
-            execution.start()?;
+            execution.start(&actor)?;
         }
         self.ports.executions.update_execution(&execution).await?;
         self.cancellers
@@ -882,7 +954,7 @@ impl OrchestrationEngine {
         execution_id: ExecutionId,
     ) -> Result<Execution> {
         let mut execution = self.require_execution_scoped(ctx, execution_id).await?;
-        execution.pause()?;
+        execution.pause(&runtime_actor(ctx))?;
         self.ports.executions.update_execution(&execution).await?;
         self.publish(
             "execution.paused",
@@ -901,7 +973,7 @@ impl OrchestrationEngine {
         execution_id: ExecutionId,
     ) -> Result<Execution> {
         let mut execution = self.require_execution_scoped(ctx, execution_id).await?;
-        execution.resume()?;
+        execution.resume(&runtime_actor(ctx))?;
         self.ports.executions.update_execution(&execution).await?;
         self.publish(
             "execution.resumed",
@@ -921,8 +993,9 @@ impl OrchestrationEngine {
         ctx: &RuntimeContext,
         execution_id: ExecutionId,
     ) -> Result<Execution> {
+        let actor = runtime_actor(ctx);
         let mut execution = self.require_execution_scoped(ctx, execution_id).await?;
-        execution.request_cancellation()?;
+        execution.request_cancellation(&actor)?;
         // Signal the in-process runtime, if this engine instance owns it.
         if let Some(token) = self
             .cancellers
@@ -938,7 +1011,10 @@ impl OrchestrationEngine {
             execution.status,
             ExecutionStatus::Pending | ExecutionStatus::Paused
         ) {
-            execution.cancel()?;
+            match execution.cancel(&actor)? {
+                mas_domain::CancellationOutcome::Cancelled(_)
+                | mas_domain::CancellationOutcome::AlreadyCancelled => {},
+            }
             self.release_terminal(&execution).await;
         }
         self.ports.executions.update_execution(&execution).await?;
@@ -963,7 +1039,7 @@ impl OrchestrationEngine {
         output: Option<Value>,
     ) -> Result<Execution> {
         let mut execution = self.require_execution(execution_id).await?;
-        execution.complete(output)?;
+        execution.complete(&engine_actor(), output)?;
         self.ports.executions.update_execution(&execution).await?;
         self.release_terminal(&execution).await;
         self.publish(
@@ -986,7 +1062,7 @@ impl OrchestrationEngine {
         error: &AppError,
     ) -> Result<Execution> {
         let mut execution = self.require_execution(execution_id).await?;
-        execution.fail(error.public_message())?;
+        execution.fail(&engine_actor(), transition_failure(error))?;
         self.ports.executions.update_execution(&execution).await?;
         self.release_terminal(&execution).await;
         self.publish(
@@ -1005,7 +1081,10 @@ impl OrchestrationEngine {
     /// Terminal transition: cancelled. Releases the permit.
     pub async fn finalize_cancellation(&self, execution_id: ExecutionId) -> Result<Execution> {
         let mut execution = self.require_execution(execution_id).await?;
-        execution.cancel()?;
+        match execution.cancel(&engine_actor())? {
+            mas_domain::CancellationOutcome::Cancelled(_)
+            | mas_domain::CancellationOutcome::AlreadyCancelled => {},
+        }
         self.ports.executions.update_execution(&execution).await?;
         self.release_terminal(&execution).await;
         self.publish(
@@ -1061,13 +1140,14 @@ impl OrchestrationEngine {
 
         let tasks = self.ports.tasks.list_active(None).await?;
         report.tasks_scanned = tasks.len() as u32;
+        let actor = engine_actor();
         for mut task in tasks {
             match task.status {
                 // Queued work just needs re-advertisement.
                 TaskStatus::Queued => report.tasks_requeued += 1,
                 // Pending never reached a queue: queue it now.
-                TaskStatus::Pending => match task.queue() {
-                    Ok(()) => match self.ports.tasks.update_task(&task).await {
+                TaskStatus::Pending => match task.queue(&actor) {
+                    Ok(_transition) => match self.ports.tasks.update_task(&task).await {
                         Ok(()) => report.tasks_requeued += 1,
                         Err(error) => report.errors.push(format!("task {}: {error}", task.id)),
                     },
@@ -1078,7 +1158,7 @@ impl OrchestrationEngine {
                 // infrastructure loss, not a logic bug.)
                 TaskStatus::Running => {
                     let synthetic = AppError::messaging("worker lost; attempt recovered");
-                    if let Err(error) = task.fail(synthetic.to_string()) {
+                    if let Err(error) = task.fail(&actor, transition_failure(&synthetic)) {
                         report.errors.push(format!("task {}: {error}", task.id));
                         continue;
                     }
@@ -1086,7 +1166,7 @@ impl OrchestrationEngine {
                         report.errors.push(format!("task {}: {error}", task.id));
                         continue;
                     }
-                    match self.retry_task_direct(&mut task, &synthetic).await {
+                    match self.retry_task_direct(&mut task, &synthetic, &actor).await {
                         Ok(true) => report.running_tasks_recovered += 1,
                         Ok(false) => report.tasks_dead_lettered += 1,
                         Err(error) => report.errors.push(format!("task {}: {error}", task.id)),
@@ -1571,7 +1651,15 @@ mod tests {
             }
             // Simulate the worker claiming the attempt.
             if task.status == TaskStatus::Queued {
-                task.start().expect("start");
+                task.start(
+                    &engine_actor(),
+                    "test-worker",
+                    Timestamp::now()
+                        .checked_add(std::time::Duration::from_secs(30))
+                        .expect("lease in the future"),
+                    mas_common::ids::TaskAttemptId::new(),
+                )
+                .expect("start");
                 engine.ports.tasks.update_task(&task).await.expect("update");
             }
             match engine
@@ -1629,7 +1717,15 @@ mod tests {
             )
             .await
             .expect("submit");
-        task.start().expect("start"); // pretend a worker owned it, then died
+        task.start(
+            &engine_actor(),
+            "test-worker",
+            Timestamp::now()
+                .checked_add(std::time::Duration::from_secs(30))
+                .expect("lease in the future"),
+            mas_common::ids::TaskAttemptId::new(),
+        )
+        .expect("start"); // pretend a worker owned it, then died
         engine.ports.tasks.update_task(&task).await.expect("update");
         drop(tasks); // recovery reads through the port only
 

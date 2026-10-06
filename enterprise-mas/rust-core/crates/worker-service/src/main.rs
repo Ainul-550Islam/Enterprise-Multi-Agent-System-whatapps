@@ -1,52 +1,51 @@
+// PURPOSE:
+// The production composition root for the worker process.
+//
+// There is exactly one bring-up path. It selects the broker and the durable
+// store, binds `execution.run` to `AgentRunHandler` over a connected,
+// health-probed gRPC bridge, and aborts the boot when bridge configuration is
+// missing or the bridge is unreachable. A worker that cannot reach the AI
+// orchestrator must not start: starting anyway would let it claim tasks and
+// then report failures for work it could never have performed.
+//
+// There is deliberately no `--dev-inmemory` lane and no echo handler. A second
+// bring-up path that answers tasks with canned output is a second execution
+// lifecycle, and the two cannot be told apart from the outside: both report
+// success. The queue plumbing is exercised by `mas-worker`'s own tests against
+// a real in-process broker, which is where that coverage belongs.
+
 //! `mas-worker` process bootstrap.
 //!
-//! Bring-up modes:
-//! * `--dev-inmemory` — in-process `InMemoryBroker` + in-memory leases +
-//!   in-memory task rows + an echo handler over a seeded demo task. Local
-//!   smoke run, killed by anything else (never production).
-//! * (default) — production: durable handler registry + lifecycle store in
-//!   PostgreSQL; the task **broker lane** selects at boot via `broker.kind`:
-//!   `pg` (default, SKIP-LOCKED claims over the outbox tables) or `nats`
-//!   (feature `nats`, JetStream stream + explicit-ack pull consumers over
-//!   `MAS_NATS_URL` / `broker.nats_url`). Consumer provisioning, health
-//!   probe, and fast-fail on missing config all happen before the loop
-//!   starts.
+//! Bring-up: durable handler registry + durable attempt coordination in
+//! PostgreSQL. The **broker lane** selects at boot via `broker.kind`:
+//! `pg` (default, SKIP-LOCKED claims over the durable task tables) or `nats`
+//! (feature `nats`, JetStream stream + explicit-ack pull consumers over
+//! `MAS_NATS_URL` / `broker.nats_url`).
 //!
-//! Environment: nothing required in dev mode; production needs
-//! `MAS_DATABASE_URL` (plus `MAS_NATS_URL` for the nats lane).
+//! Every claim, every attempt and every settlement goes through
+//! `DurableExecutionPort`, so the worker holds no authoritative state of its
+//! own: a restart re-derives everything from the database.
+//!
+//! Consumer provisioning, the AI bridge health probe, and fast-fail on missing
+//! configuration all happen before the loop starts.
+//!
+//! Environment: `MAS_DATABASE_URL`, the AI bridge settings (see
+//! `agent_execution`), plus `MAS_NATS_URL` for the nats lane.
+
+mod agent_execution;
 
 use std::sync::Arc;
 
-use mas_common::ids::{AgentId, OrganizationId, ProjectId, TenantId};
-use mas_domain::Task;
-use mas_messaging::broker::{BrokerPort, InMemoryBroker, PublishRequest};
-use mas_messaging::codec::{CodecConfig, JsonEventCodec};
-use mas_messaging::headers::HeaderSet;
-use mas_messaging::subjects::Subject;
-use mas_scheduling::lease::InMemoryLeaseStore;
+// `AgentBridge` is imported for its `health()` method, which the boot-time
+// readiness probe calls on the concrete bridge.
+use agent_execution::{AgentBridgeSettings, AgentRunHandler};
+use mas_execution::AgentBridge;
+use mas_messaging::broker::BrokerPort;
 use mas_worker::consumer::{ConsumerConfig, TaskConsumer};
 use mas_worker::handler::OperationDispatcher;
-use mas_worker::lifecycle::InMemoryTaskStore;
+use mas_worker::AttemptCoordinator;
 use mas_worker::ConsumerOutcome;
-
-/// Minimal handler for the bring-up run: echoes back its input.
-#[derive(Debug)]
-struct EchoHandler;
-
-#[async_trait::async_trait]
-impl mas_worker::TaskHandlerPort for EchoHandler {
-    async fn execute(
-        &self,
-        message: &mas_contracts::task::TaskQueueMessage,
-    ) -> mas_common::result::Result<serde_json::Value> {
-        eprintln!(
-            "demo task {} ran (operation {})
-",
-            message.task_id, message.operation
-        );
-        Ok(serde_json::json!({"echo": message.input.clone()}))
-    }
-}
+use mas_worker_service::run_slots::ControlPlaneRunSlots;
 
 #[tokio::main]
 async fn main() {
@@ -59,127 +58,33 @@ async fn main() {
     });
 }
 
+/// The single bring-up path.
+///
+/// Order matters and is deliberate:
+///
+/// 1. **Config** — every value the worker needs is resolved before anything is
+///    bound.
+/// 2. **Database** — the durable store is the only authority the worker has, so
+///    it is connected first.
+/// 3. **Broker lane** — selected and health-probed, so a worker never starts
+///    against a broker it cannot see.
+/// 4. **Durable attempt coordination** — claims, attempts and settlements all
+///    go through `DurableExecutionPort`; the worker keeps no authoritative
+///    state of its own, so a restart re-derives everything.
+/// 5. **AI bridge** — connected and health-probed. A missing or unreachable
+///    bridge aborts the boot rather than starting a worker that would claim
+///    tasks it cannot run.
+/// 6. **Consume** — `execution.run` dispatches through
+///    `AgentRunHandler` → canonical runtime → gRPC bridge → Python.
+///
+/// # Errors
+///
+/// Returns a human-readable boot failure. Every failure path names the knob
+/// that has to change, because a worker that refuses to start is only useful
+/// if the operator can tell why.
 async fn run() -> Result<(), String> {
-    let dev_inmemory = std::env::args().skip(1).any(|arg| arg == "--dev-inmemory");
-    if !dev_inmemory {
-        return run_production().await;
-    }
-
-    let layered = mas_common::config::load_layered().map_err(|e| format!("config: {e}"))?;
-    let merger = mas_common::config::Merger::new(&layered);
-    let worker_name = merger.string("MAS_WORKER_NAME", "worker.worker_name", "worker-1");
-    let poll_ms = merger
-        .u64("MAS_WORKER_POLL_MS", "worker.poll_interval_ms", 100)
-        .map_err(|e| format!("config: {e}"))?;
-    let consumer_name = merger.string("MAS_WORKER_CONSUMER", "worker.consumer_name", "tasks-main");
-
-    let broker_inner = InMemoryBroker::new();
-    broker_inner.set_available(true);
-    let broker = Arc::new(broker_inner);
-    let leases = Arc::new(InMemoryLeaseStore::new());
-    let lifecycle = Arc::new(InMemoryTaskStore::new());
-    let dispatcher =
-        OperationDispatcher::new().with_handler("execution.run", Arc::new(EchoHandler));
-
-    // Seed one demo task envelope (the publisher side of the contract).
-    let seed = demo_task();
-    let mut row = seed.clone();
-    row.queue().map_err(|e| format!("seed queue: {e}"))?;
-    lifecycle.seed(row);
-    let message = mas_contracts::task::TaskQueueMessage::staged(
-        seed.id,
-        seed.tenant_id,
-        seed.organization_id,
-        seed.project_id,
-        seed.operation.clone(),
-        seed.input.clone(),
-        seed.execution_id,
-        seed.agent_id,
-        seed.workflow_id,
-        seed.idempotency_key.clone(),
-        seed.priority,
-        1,
-        seed.max_attempts,
-        seed.deadline,
-        "dev-seed-1",
-    )
-    .map_err(|e| format!("seed message: {e}"))?;
-    let codec = JsonEventCodec::new(CodecConfig::default());
-    let frame = codec
-        .encode_value(&message)
-        .map_err(|e| format!("frame: {e}"))?;
-    broker
-        .publish(PublishRequest {
-            subject: Subject::parse("mas.tasks.execution.run")
-                .map_err(|e| format!("subject: {e}"))?,
-            headers: HeaderSet::default(),
-            payload: frame,
-            msg_id: Some("dev-seed-1".to_owned()),
-        })
-        .await
-        .map_err(|e| format!("publish: {e}"))?;
-
-    let consumer = TaskConsumer::new(
-        broker,
-        leases,
-        lifecycle,
-        Arc::new(dispatcher),
-        ConsumerConfig {
-            consumer_name,
-            poll_interval: std::time::Duration::from_millis(poll_ms),
-            worker_name,
-            ..ConsumerConfig::default()
-        },
-    );
-    let (handle, watch) = mas_worker::grace::channel();
-    tokio::spawn(mas_worker::grace::watch_signals(handle));
-
-    eprintln!("mas-worker dev loop: consuming mas.tasks.> (ctrl-c to drain)");
-    let outcome: ConsumerOutcome = consumer
-        .run(watch)
-        .await
-        .map_err(|e| format!("consumer: {e}"))?;
-    eprintln!(
-        "drained: acked={} naks={} terms={} completed={} failed={} abandoned={}",
-        outcome.acked,
-        outcome.naks,
-        outcome.terms,
-        outcome.completed,
-        outcome.failed,
-        outcome.abandoned,
-    );
-    let _ = run_demo_hint();
-    Ok(())
-}
-
-fn demo_task() -> Task {
-    Task::new(
-        TenantId::new(),
-        OrganizationId::new(),
-        ProjectId::new(),
-        Some(AgentId::new()),
-        None,
-        "execution.run",
-        serde_json::json!({"seed": true}),
-        mas_common::enums::TaskPriority::Normal,
-        "dev-task-1",
-        "mas-worker-demo",
-    )
-    .expect("demo task")
-}
-
-fn run_demo_hint() -> &'static str {
-    "demo ran against the in-memory broker; no state persists"
-}
-
-/// Production consumption: durable pg lane + durable lifecycle; handler
-/// registry driven from MAS_WORKER_HANDLERS ("execution.run" binds the
-/// echo handler ONLY for lab smoke — a production runtime binding phase
-/// replaces it; absent operations classify permanent → failed+republish).
-async fn run_production() -> Result<(), String> {
     use mas_persistence::pool::{Database, DatabaseUrl, PoolConfig};
-    use mas_persistence::repositories::tasks::TaskStore;
-    use mas_worker::lifecycle::TaskLifecyclePort;
+    use mas_persistence::repositories::PgDurableExecution;
 
     let layered = mas_common::config::load_layered().map_err(|e| format!("config: {e}"))?;
     let merger = mas_common::config::Merger::new(&layered);
@@ -188,28 +93,134 @@ async fn run_production() -> Result<(), String> {
         .u64("MAS_WORKER_POLL_MS", "worker.poll_interval_ms", 100)
         .map_err(|e| format!("config: {e}"))?;
     let consumer_name = merger.string("MAS_WORKER_CONSUMER", "worker.consumer_name", "tasks-main");
+    let max_in_flight = merger
+        .u64("MAS_WORKER_MAX_IN_FLIGHT", "worker.max_in_flight", 8)
+        .map_err(|e| format!("config: {e}"))?
+        .max(1) as usize;
+    let lease_ttl_ms = merger
+        .u64("MAS_WORKER_LEASE_TTL_MS", "worker.lease_ttl_ms", 15_000)
+        .map_err(|e| format!("config: {e}"))?
+        .max(1_000);
 
     let url = merger.string("MAS_DATABASE_URL", "database.url", "");
     if url.is_empty() {
-        return Err("mas-worker production requires database.url / MAS_DATABASE_URL".to_owned());
+        return Err(
+            "mas-worker requires database.url / MAS_DATABASE_URL: the durable \
+                    pipeline has no in-memory mode, because a claim this process cannot \
+                    lose on restart is not a claim"
+                .to_owned(),
+        );
     }
-    let url = DatabaseUrl::new(url).map_err(|e| format!("database url: {e}"))?;
-    let mut config =
-        PoolConfig::for_url(url, "mas-worker").map_err(|e| format!("database: {e}"))?;
-    config.max_connections = merger
+    // ── Worker plane pool ──────────────────────────────────────────────
+    //
+    // A worker claim is `SELECT … FROM tasks FOR UPDATE SKIP LOCKED`, and it
+    // scans every tenant's queue on purpose: the tenant authority is the row
+    // the lease is won on, which by definition is unknown until the query
+    // returns. That makes the worker one of the planes that cannot be
+    // expressed as an RLS policy, so it connects as `mas_worker` — a role
+    // whose BYPASSRLS is confined to the durable execution tables (migration
+    // 0017). It has no grant on credentials, api_keys or sessions, so a
+    // compromised worker cannot read tenant secrets.
+    //
+    // `MAS_DATABASE_URL` is still required: it is the pool the migration
+    // ledger is verified against and the pool any non-tenant work uses. There
+    // is no fallback from the worker plane to the runtime pool — under
+    // `mas_app` the claim would return zero rows and the worker would idle
+    // while looking healthy.
+    let runtime_url = DatabaseUrl::new(url).map_err(|e| format!("database url: {e}"))?;
+    let mut runtime_config =
+        PoolConfig::for_url(runtime_url, "mas-worker").map_err(|e| format!("database: {e}"))?;
+    runtime_config.max_connections = merger
         .u64("MAS_DATABASE_MAX_CONNS", "database.max_connections", 16)
         .map_err(|e| format!("config: {e}"))?
         .try_into()
         .unwrap_or(16);
-    let database = Database::connect(&config)
+    let runtime_database = Database::connect(&runtime_config)
         .await
         .map_err(|e| format!("database: {e}"))?;
-    let pool = database.pool().clone();
+    let pool = runtime_database.pool().clone();
 
-    let (broker, broker_lane) = select_broker(&merger, &pool).await?;
-    let lifecycle: Arc<dyn TaskLifecyclePort> = Arc::new(TaskStore::new(pool));
-    let leases: Arc<dyn mas_scheduling::lease::LeaseStorePort> =
-        Arc::new(InMemoryLeaseStore::new());
+    // Migrations must be current. A worker that claims tasks against a stale
+    // schema would fence and settle them against columns that no longer
+    // exist, which is a corruption and not an outage.
+    let runner = mas_persistence::migrations::MigrationRunner::new(pool.clone());
+    runner
+        .ensure_table()
+        .await
+        .map_err(|e| format!("migrations: {e}"))?;
+    runner
+        .verify()
+        .await
+        .map_err(|e| format!("migration ledger drift — apply scripts/migrate.sh up first: {e}"))?;
+
+    // The worker plane is a *different database role*, so it needs its own
+    // URL — the whole point is that the credential differs.
+    let worker_url = merger.string("MAS_DATABASE_WORKER_URL", "database.worker_url", "");
+    if worker_url.is_empty() {
+        return Err(
+            "mas-worker requires database.worker_url / MAS_DATABASE_WORKER_URL: the \
+             worker plane claims tasks across tenants and therefore runs as the \
+             mas_worker role (migrations/0017_plane_roles); falling back to the \
+             runtime role would make every claim return zero rows"
+                .to_owned(),
+        );
+    }
+    let worker_url =
+        DatabaseUrl::new(worker_url).map_err(|e| format!("worker database url: {e}"))?;
+    let mut worker_config = PoolConfig::for_url(worker_url, "mas-worker-plane")
+        .map_err(|e| format!("worker database: {e}"))?;
+    worker_config.max_connections = merger
+        .u64("MAS_DATABASE_MAX_CONNS", "database.max_connections", 16)
+        .map_err(|e| format!("config: {e}"))?
+        .try_into()
+        .unwrap_or(16);
+    let worker_database = Database::connect(&worker_config)
+        .await
+        .map_err(|e| format!("worker database: {e}"))?;
+    let worker_pool = worker_database.pool().clone();
+
+    let (broker, broker_lane) = select_broker(&merger, &worker_pool).await?;
+
+    // The durable execution port is the worker's only authority. Attempts are
+    // claimed, fenced and settled through it, so the worker holds nothing that
+    // a restart would lose.
+    // Claims, attempts and settlements all run on the worker plane. Once a
+    // lease is won, the row itself names the tenant, and the worker derives
+    // everything else from the database rather than from anything the broker
+    // told it.
+    let durable: Arc<dyn mas_application::durable::DurableExecutionPort> =
+        Arc::new(PgDurableExecution::new(worker_pool));
+    // ── The concurrency slot a run holds for its duration ──────────────
+    //
+    // Built over the *runtime* pool, not the worker-plane pool. The slot is a
+    // `quota_reservations` row and it is written inside the tenant's own
+    // row-level-security scope, which is only meaningful on a role that RLS
+    // applies to. `mas_worker` bypasses RLS — that is what lets it claim tasks
+    // across tenants — and pointing that role at the reservation table would
+    // let one worker release another tenant's slot.
+    //
+    // Without this gate, `max_in_flight` is the only concurrency limit in the
+    // system and it is a per-process constant: N workers would run N × 8 runs
+    // for a tenant whose plan allows four.
+    let control_plane = std::sync::Arc::new(
+        mas_persistence::repositories::control_plane::adapters::build_postgres_control_plane(
+            pool.clone(),
+        ),
+    );
+    let attempts = Arc::new(
+        AttemptCoordinator::new(
+            durable,
+            worker_name.clone(),
+            max_in_flight,
+            std::time::Duration::from_millis(lease_ttl_ms),
+        )
+        .map_err(|e| format!("attempt coordinator: {e}"))?
+        .with_run_slots(Arc::new(ControlPlaneRunSlots::new(
+            pool.clone(),
+            control_plane,
+            worker_name.clone(),
+        ))),
+    );
 
     let handlers_env = merger.string("MAS_WORKER_HANDLERS", "worker.handlers", "");
     let bound = handlers_env
@@ -217,24 +228,54 @@ async fn run_production() -> Result<(), String> {
         .map(str::trim)
         .filter(|h| !h.is_empty())
         .collect::<Vec<_>>();
+
+    // The AI bridge is resolved BEFORE the consumer starts, and a missing
+    // configuration aborts the boot. Binding an echo handler here instead would
+    // turn every execution into a silent no-op that reports success.
     let mut dispatcher = OperationDispatcher::new();
     if bound.contains(&"execution.run") {
-        dispatcher = dispatcher.with_handler("execution.run", Arc::new(EchoHandler));
+        let settings =
+            AgentBridgeSettings::from_merger(&merger).map_err(|e| format!("ai bridge: {e}"))?;
+        eprintln!(
+            "mas-worker: connecting ai bridge at {}",
+            settings.endpoint()
+        );
+        let bridge = settings
+            .connect()
+            .await
+            .map_err(|e| format!("ai bridge connect: {e}"))?;
+
+        match bridge.health().await {
+            Ok(()) => eprintln!("mas-worker: ai orchestrator healthy"),
+            Err(error) => {
+                return Err(format!(
+                    "ai orchestrator health probe failed: {error}. \
+                     refusing to start a worker whose AI runtime is unreachable"
+                ))
+            },
+        }
+
+        // The cancellation token the graceful-drain path owns: cancelling it
+        // stops in-flight AI work instead of abandoning it mid-run.
+        let cancellation = mas_orchestration::cancellation::CancellationToken::new();
+        dispatcher = dispatcher.with_handler(
+            "execution.run",
+            Arc::new(AgentRunHandler::new(Arc::new(bridge), cancellation)),
+        );
     }
     let ops: Vec<&str> = dispatcher.operations();
-    eprintln!(
-        "mas-worker production: handlers bound = {ops:?} (unknown ops ⇒ permanent-fail pipeline)"
-    );
+    eprintln!("mas-worker: handlers bound = {ops:?} (unknown ops ⇒ permanent-fail pipeline)");
 
     let consumer = TaskConsumer::new(
         broker,
-        leases,
-        lifecycle,
+        attempts,
         Arc::new(dispatcher),
         ConsumerConfig {
             consumer_name,
             poll_interval: std::time::Duration::from_millis(poll_ms),
             worker_name,
+            max_in_flight,
+            lease_ttl: std::time::Duration::from_millis(lease_ttl_ms),
             ..ConsumerConfig::default()
         },
     );
@@ -386,6 +427,102 @@ mod tests {
         assert!(
             err.contains("--features nats"),
             "message tells the operator what to rebuild with: {err}"
+        );
+    }
+
+    // -- production composition ---------------------------------------------
+    //
+    // These read this file and the manifest as data. The alternative --
+    // booting a worker against a real database to observe which handler it
+    // registered -- is not available in a unit test, and the property being
+    // guaranteed is structural anyway: which symbols the production path is
+    // allowed to name.
+
+    /// This file's own source, and the manifest that gates dev-only bridges.
+    const MAIN_SOURCE: &str = include_str!("main.rs");
+    const MANIFEST: &str = include_str!("../Cargo.toml");
+
+    /// The production composition root: from its start to the test module.
+    ///
+    /// Stopping at `mod tests` is not cosmetic. `include_str!` embeds this
+    /// whole file, tests included, and the tests below necessarily *name* the
+    /// symbols they forbid. Scanning to the end of the file would match the
+    /// assertions themselves and fail for no real reason.
+    fn production_source() -> &'static str {
+        let start = MAIN_SOURCE
+            .find("async fn run(")
+            .expect("run() is the one and only production composition root");
+        let end = MAIN_SOURCE
+            .find("\nmod tests")
+            .expect("the test module ends the file's production region");
+        &MAIN_SOURCE[start..end]
+    }
+
+    /// The `mas-execution` dependency line, with any comment removed.
+    ///
+    /// The manifest *discusses* `dev-bridges` in a comment explaining why it is
+    /// absent, so a naive `contains` matches the explanation rather than the
+    /// declaration. Only the dependency line itself is evidence.
+    fn execution_dependency_line() -> String {
+        MANIFEST
+            .lines()
+            .find(|line| line.trim_start().starts_with("mas-execution"))
+            .map(|line| line.split("//").next().unwrap_or("").to_owned())
+            .expect("the worker depends on mas-execution")
+    }
+
+    #[test]
+    fn echo_handler_never_reaches_the_production_path() {
+        // `EchoHandler` exists so the demo can prove queue plumbing works. If it
+        // is ever referenced from the production path, every execution becomes a
+        // no-op that reports success -- the single most dangerous outcome in
+        // this system, because it is indistinguishable from working.
+        let production = production_source();
+        assert!(
+            !production.contains("EchoHandler"),
+            "EchoHandler must stay confined to the demo path; \
+             a worker that echoes reports successes it never produced"
+        );
+    }
+
+    #[test]
+    fn the_production_path_never_names_the_in_memory_bridge() {
+        let production = production_source();
+        assert!(
+            !production.contains("InMemoryAgentBridge"),
+            "production must dispatch through the real gRPC bridge, \
+             not an in-memory stand-in"
+        );
+    }
+
+    #[test]
+    fn the_production_path_binds_the_grpc_bridge() {
+        // Positive counterpart to the two above: it is not enough that the
+        // forbidden symbols are absent, the real adapter must actually be wired
+        // in, or a future refactor could satisfy both by binding nothing.
+        let production = production_source();
+        assert!(
+            production.contains("AgentBridgeSettings"),
+            "the production path must resolve the bridge from settings"
+        );
+        assert!(
+            production.contains("settings\n            .connect()")
+                || production.contains("settings.connect()")
+                || production.contains(".connect()"),
+            "the production path must connect the bridge before consuming"
+        );
+    }
+
+    #[test]
+    fn the_worker_never_enables_the_dev_bridges_feature() {
+        // The strongest guarantee available: `InMemoryAgentBridge` only exists
+        // when `mas-execution/dev-bridges` is on. Keeping it out of this
+        // manifest makes an in-memory production bridge a compile error rather
+        // than a review-time question.
+        assert!(
+            !execution_dependency_line().contains("dev-bridges"),
+            "the worker must depend on mas-execution without dev-bridges; \
+             enabling it would make an in-memory bridge nameable in production"
         );
     }
 }

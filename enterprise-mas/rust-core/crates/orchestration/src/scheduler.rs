@@ -1,3 +1,18 @@
+//! PURPOSE: The runtime work scheduler: fair, priority-ordered selection of
+//! pending work.
+//!
+//! Owning layer: `mas-orchestration`.
+//!
+//! Production responsibility: order work by priority first and round-robin
+//! across tenants within a priority, so one tenant's backlog cannot starve
+//! everyone else.
+//!
+//! It must NOT:
+//!   • decide whether a task may run — selection is not permission, the
+//!     durable claim is;
+//!   • order by wall-clock arrival time, which is not reproducible in tests;
+//!   • let a single tenant hold the head of the queue indefinitely.
+
 //! Runtime work scheduler: fair, priority-ordered selection of pending work.
 //!
 //! Ordering contract (evaluated in order):
@@ -264,6 +279,13 @@ impl RuntimeScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mas_domain::TransitionActor;
+
+    /// The actor these tests attribute task transitions to.
+    fn test_actor() -> TransitionActor {
+        TransitionActor::system("test").expect("literal actor id is valid")
+    }
+
     use mas_common::enums::TaskPriority;
     use mas_common::ids::{OrganizationId, ProjectId};
     use mas_domain::Task;
@@ -364,7 +386,7 @@ mod tests {
         let scheduler = RuntimeScheduler::new();
         let tenant = TenantId::new();
         let mut task = stored_task(tenant, TaskPriority::High, "idem-1");
-        task.queue().expect("queued");
+        task.queue(&test_actor()).expect("queued");
         scheduler
             .enqueue(ScheduledWork::for_task(&task, None))
             .unwrap();

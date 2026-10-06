@@ -35,6 +35,25 @@ impl FeatureKey {
     pub const SANDBOXED_CODE: FeatureKey = FeatureKey(Cow::Borrowed("sandboxed_code"));
     pub const DEDICATED_ISOLATION: FeatureKey = FeatureKey(Cow::Borrowed("dedicated_isolation"));
     pub const PRIORITY_SUPPORT: FeatureKey = FeatureKey(Cow::Borrowed("priority_support"));
+    // The premium surface named by the commercial model. Every one of these is
+    // enforced server-side from the resolved entitlement; none is taken from a
+    // caller's claim about itself.
+    /// Access to the most capable (most expensive) models.
+    pub const ADVANCED_MODELS: FeatureKey = FeatureKey(Cow::Borrowed("advanced_models"));
+    /// Per-request token budgets above the standard ceiling.
+    pub const HIGH_TOKEN_BUDGET: FeatureKey = FeatureKey(Cow::Borrowed("high_token_budget"));
+    /// Multi-step workflow execution.
+    pub const WORKFLOWS: FeatureKey = FeatureKey(Cow::Borrowed("workflows"));
+    /// Scheduled / recurring execution.
+    pub const SCHEDULED_EXECUTION: FeatureKey = FeatureKey(Cow::Borrowed("scheduled_execution"));
+    /// Retrieval-augmented generation.
+    pub const RAG: FeatureKey = FeatureKey(Cow::Borrowed("rag"));
+    /// Tool invocation.
+    pub const TOOL_INVOCATION: FeatureKey = FeatureKey(Cow::Borrowed("tool_invocation"));
+    /// Long audit-retention windows.
+    pub const AUDIT_RETENTION: FeatureKey = FeatureKey(Cow::Borrowed("audit_retention"));
+    /// Concurrency above the standard ceiling.
+    pub const HIGH_CONCURRENCY: FeatureKey = FeatureKey(Cow::Borrowed("high_concurrency"));
 
     pub fn new(key: impl Into<Cow<'static, str>>) -> Result<Self> {
         let key = key.into();

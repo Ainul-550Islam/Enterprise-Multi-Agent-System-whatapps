@@ -1,3 +1,19 @@
+//! PURPOSE: The PostgreSQL persistence layer: every byte that crosses the SQL
+//! boundary.
+//!
+//! Owning layer: `mas-persistence`.
+//!
+//! Production responsibility: own the pool, the unit-of-work, the migration
+//! runner, row hydration and the repositories — and enforce, at the statement
+//! level, that no query touches a tenant-owned table without a tenant
+//! predicate (asserted by `tests/tenant_sql_contract.rs`).
+//!
+//! It must NOT:
+//!   • expose a repository method that filters by tenant in Rust instead of in
+//!     SQL;
+//!   • hold a connection across an await on non-database work;
+//!   • let a caller skip the unit-of-work and use the pool directly.
+
 //! # mas-persistence — PostgreSQL persistence layer
 //!
 //! Owns every byte that crosses the SQL boundary:
@@ -9,7 +25,7 @@
 //!   transaction per unit of work, named savepoints, explicit commit/rollback
 //!   (no implicit drops that silently commit).
 //! * [`migrations`] — the [`migrations::MigrationRunner`] plus the embedded
-//!   migration registry (`migrations/NNNN_name/up.sql`, 12 migrations). The
+//!   migration registry (`migrations/NNNN_name/up.sql`, 14 migrations). The
 //!   runner verifies applied versions and checksums, refuses incompatible
 //!   states (DB-ahead, gaps, checksum drift), and applies pending migrations
 //!   transactionally in strict order. RLS policies for every tenant-owned
@@ -30,10 +46,14 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod directory;
+pub mod durable;
 pub mod error;
 pub mod migrations;
 pub mod pool;
 pub mod repositories;
 pub mod rls;
 pub mod rows;
+pub mod scoped;
+pub mod scoped_request;
 pub mod transaction;

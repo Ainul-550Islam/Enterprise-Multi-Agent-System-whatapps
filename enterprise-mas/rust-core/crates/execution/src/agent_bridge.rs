@@ -1,3 +1,18 @@
+//! PURPOSE: The port to the Python agent runtime — the contract the Rust side
+//! uses to ask Python to run an agent.
+//!
+//! Owning layer: `mas-execution`.
+//!
+//! Production responsibility: define one request/response shape across the
+//! language boundary, carrying tenant identity, correlation identity, deadline
+//! and cancellation so a Python-side run is always attributable and stoppable.
+//! The production adapter speaks gRPC over the shared protobuf definitions.
+//!
+//! It must NOT:
+//!   • contain provider or LLM business logic — none lives in Rust;
+//!   • let the in-memory test adapter become a production fallback;
+//!   • drop the tenant or correlation identity on the way across.
+
 //! Agent runtime bridge: the port to the Python agent runtime.
 //!
 //! **No LLM/provider logic lives in Rust.** This module only defines the
@@ -11,7 +26,7 @@
 //! the runtime context.
 
 use mas_common::error::AppError;
-use mas_common::ids::AgentId;
+use mas_common::ids::{AgentId, ExecutionId, OrganizationId, ProjectId, TaskId, TenantId};
 use mas_common::result::Result;
 use mas_common::timestamps::Timestamp;
 use mas_orchestration::cancellation::CancellationToken;
@@ -20,8 +35,6 @@ use mas_orchestration::timeout::Deadline;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;
-use std::sync::Arc;
-use std::sync::Mutex;
 use std::time::Duration;
 
 /// Final status of an agent run.
@@ -72,6 +85,38 @@ pub struct AgentRunRequest {
     pub limits: mas_domain::ResourceLimits,
     /// Token allowance forwarded to the runtime (0 = unmetered).
     pub token_budget_max: u64,
+
+    // -- authoritative platform identity --------------------------------------
+    // The Python orchestrator must never derive tenancy from anything the AI
+    // runtime itself supplies. These are populated from the `RuntimeContext` by
+    // `from_context` and are optional only so that callers which legitimately
+    // lack a scope (unit fixtures, health probes) keep compiling. An adapter
+    // MUST refuse a request that is missing `tenant_id`: see
+    // `AgentRunRequest::require_authoritative_scope`.
+    /// Authoritative tenant (RLS scope on the platform side).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<TenantId>,
+    /// Authoritative organization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_id: Option<OrganizationId>,
+    /// Authoritative project.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<ProjectId>,
+    /// Owning execution, when the run was spawned by one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_id: Option<ExecutionId>,
+    /// Owning task, when the run was dispatched from the durable queue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<TaskId>,
+    /// Platform request id (distinct from the end-to-end correlation id).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    /// Caller-supplied deduplication key, propagated from the durable task so a
+    /// redelivered task cannot re-run paid AI work. `None` means "no
+    /// deduplication requested", which is legal for one-shot runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+
     /// Cancellation is *not* serialized; reconstructed by the adapter.
     #[serde(skip)]
     pub cancellation: CancellationToken,
@@ -89,6 +134,7 @@ impl AgentRunRequest {
         let deadline = context
             .deadline()
             .unwrap_or_else(|| Deadline::after(Duration::from_millis(limits.timeout_ms)));
+        let snapshot = context.snapshot();
         Ok(Self {
             agent_id,
             agent_version: None,
@@ -97,10 +143,49 @@ impl AgentRunRequest {
             deadline: deadline.expires_at(),
             limits,
             token_budget_max: budget.max_tokens(),
+            tenant_id: Some(snapshot.tenant_id),
+            organization_id: Some(snapshot.organization_id),
+            project_id: Some(snapshot.project_id),
+            execution_id: snapshot.execution_id,
+            task_id: None,
+            request_id: snapshot.request_id.map(|id| id.to_string()),
+            // A node attempt is one step of an execution, so it carries no
+            // idempotency key of its own; deduplication for dispatched work is
+            // set by the caller that owns the durable task.
+            idempotency_key: None,
             cancellation: context.cancellation().child(),
         })
     }
+
+    /// Refuses a request that lacks the authoritative tenant scope.
+    ///
+    /// Adapters that cross a trust boundary (the gRPC bridge to the Python
+    /// orchestrator) must call this before sending: the far side is required to
+    /// reject unscoped work, so sending it would only burn a round trip.
+    pub fn require_authoritative_scope(&self) -> Result<()> {
+        if self.tenant_id.is_none() {
+            return Err(AppError::validation(
+                "agent run request is missing the authoritative tenant scope",
+            ));
+        }
+        if self.organization_id.is_none() {
+            return Err(AppError::validation(
+                "agent run request is missing the authoritative organization scope",
+            ));
+        }
+        Ok(())
+    }
 }
+
+/// Wire code reported when a run is cancelled.
+///
+/// This is the Python orchestrator's published `ErrorCode` value for
+/// cancellation, not an ad-hoc literal: a cancellation is one physical
+/// condition, so it must carry one code regardless of which side noticed it
+/// first. Without this constant the gRPC bridge and the in-memory bridge could
+/// disagree, and a caller branching on the code would silently miss one of
+/// them.
+pub const CANCELLATION_CODE: &str = "cancellation_requested";
 
 /// The verdict of a run.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -137,10 +222,30 @@ pub trait AgentBridge: Send + Sync + fmt::Debug {
 // =============================================================================
 // In-memory implementation
 // =============================================================================
+//
+// PURPOSE:
+// Test/dev-only stand-in for the production gRPC bridge. It is compiled out of
+// release builds unless the `dev-bridges` feature is enabled explicitly, so the
+// production composition root *cannot* select it: an operator who wants it has
+// to name the feature, which is a deliberate act rather than a default.
+//
+// The gate is `any(test, feature = "dev-bridges")` rather than `test` alone so
+// integration tests and local bring-up binaries outside this crate can still
+// reach it when they opt in.
 
+// Used only by the gated in-memory bridge below, so they are imported here
+// rather than at the top of the module where they would be dead code in a
+// release build.
+#[cfg(any(test, feature = "dev-bridges"))]
+use std::sync::Arc;
+#[cfg(any(test, feature = "dev-bridges"))]
+use std::sync::Mutex;
+
+#[cfg(any(test, feature = "dev-bridges"))]
 type AgentHandler =
     Arc<dyn Fn(AgentRunRequest) -> std::result::Result<AgentRunVerdict, AppError> + Send + Sync>;
 
+#[cfg(any(test, feature = "dev-bridges"))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum AgentInjection {
     #[default]
@@ -151,6 +256,7 @@ enum AgentInjection {
     AlwaysTimeout,
 }
 
+#[cfg(any(test, feature = "dev-bridges"))]
 /// In-memory bridge for dev/tests: handler-driven canned responses, request
 /// recording and failure injection. Clone-free; share via `Arc`.
 pub struct InMemoryAgentBridge {
@@ -159,6 +265,7 @@ pub struct InMemoryAgentBridge {
     requests: Mutex<Vec<RecordedAgentRun>>,
 }
 
+#[cfg(any(test, feature = "dev-bridges"))]
 impl fmt::Debug for InMemoryAgentBridge {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("InMemoryAgentBridge")
@@ -174,6 +281,7 @@ impl fmt::Debug for InMemoryAgentBridge {
     }
 }
 
+#[cfg(any(test, feature = "dev-bridges"))]
 /// What the bridge saw (redacted input held for assertions).
 #[derive(Debug, Clone)]
 pub struct RecordedAgentRun {
@@ -182,12 +290,14 @@ pub struct RecordedAgentRun {
     pub at: Timestamp,
 }
 
+#[cfg(any(test, feature = "dev-bridges"))]
 impl Default for InMemoryAgentBridge {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(any(test, feature = "dev-bridges"))]
 impl InMemoryAgentBridge {
     #[must_use]
     pub fn new() -> Self {
@@ -234,6 +344,7 @@ impl InMemoryAgentBridge {
 }
 
 #[async_trait::async_trait]
+#[cfg(any(test, feature = "dev-bridges"))]
 impl AgentBridge for InMemoryAgentBridge {
     fn name(&self) -> &'static str {
         "in-memory-agent"
@@ -281,7 +392,7 @@ impl AgentBridge for InMemoryAgentBridge {
             biased;
             () = request.cancellation.cancelled() => {
                 Ok(AgentRunVerdict::Failed {
-                    code: "cancelled".to_owned(),
+                    code: CANCELLATION_CODE.to_owned(),
                     message: "agent run cancelled".to_owned(),
                     retryable: false,
                     usage: AgentUsage::default(),
@@ -366,7 +477,7 @@ mod tests {
         let verdict = bridge.run(request).await.expect("run");
         assert!(matches!(
             verdict,
-            AgentRunVerdict::Failed { code, .. } if code == "cancelled"
+            AgentRunVerdict::Failed { code, .. } if code == CANCELLATION_CODE
         ));
 
         bridge.fail_next(true);

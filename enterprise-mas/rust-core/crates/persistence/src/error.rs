@@ -28,6 +28,16 @@ pub fn map_sqlx(error: sqlx::Error) -> AppError {
     }
 }
 
+/// Whether `error` is a `unique_violation` (SQLSTATE 23505).
+///
+/// Exposed so a repository can tell "this already exists" apart from "the
+/// database is unhealthy" and give the caller a message it can act on,
+/// instead of a generic conflict that names a constraint.
+#[must_use]
+pub fn is_unique_violation(error: &sqlx::Error) -> bool {
+    matches!(error.as_database_error(), Some(db) if db.code().as_deref() == Some("23505"))
+}
+
 fn map_database(db: &dyn sqlx::error::DatabaseError) -> AppError {
     let code = db.code().map(|c| c.into_owned());
     match code.as_deref() {
@@ -55,6 +65,21 @@ fn map_database(db: &dyn sqlx::error::DatabaseError) -> AppError {
         ),
         // raise_exception (our append-only triggers, RLS guards)
         Some("P0001") => AppError::forbidden(sanitize_one_line(db.message())),
+        // insufficient_privilege. Two unrelated failures share this code: a
+        // role that was never granted the privilege it needs (a deployment
+        // defect, correctly a retryable-looking 500 because someone has to
+        // fix the grant), and a row a `FORCE ROW LEVEL SECURITY` policy
+        // refused (a scope violation). Only the message distinguishes them.
+        //
+        // The second case must not surface as a 500. A 500 tells the caller
+        // to retry, and a cross-tenant write will fail identically on every
+        // retry; worse, it reports a security boundary being enforced as
+        // though the server had broken. It is a 403 — deterministic,
+        // non-retryable, and worded so that it confirms nothing about the
+        // tenant the caller was not allowed to touch.
+        Some("42501") if mentions_row_level_security(db.message()) => {
+            AppError::forbidden("the tenant scope of this request does not permit this operation")
+        },
         // serialization_failure / deadlock_detected / lock_not_available:
         // retryable by definition of the SQLSTATE class 40xxx/55P03.
         Some("40001" | "40P01" | "55P03") => {
@@ -63,6 +88,15 @@ fn map_database(db: &dyn sqlx::error::DatabaseError) -> AppError {
         Some(other) => AppError::database(format!("database error (sqlstate {other})")),
         None => AppError::database("database error"),
     }
+}
+
+/// Whether a Postgres message is a row-level-security refusal.
+///
+/// Checked against the message rather than the SQLSTATE alone because
+/// `42501` also covers ordinary missing grants, which are a deployment
+/// defect and not a tenant-isolation event.
+fn mentions_row_level_security(message: &str) -> bool {
+    message.contains("row-level security")
 }
 
 /// Keeps one safe line of a vendor message (no newlines, capped length) so
@@ -110,6 +144,22 @@ mod tests {
     fn pool_timeouts_map_to_timeout() {
         let mapped = map_sqlx(sqlx::Error::PoolTimedOut);
         assert_eq!(mapped.error_code(), "TIMEOUT");
+    }
+
+    /// The discriminator that decides whether a `42501` is a tenant-isolation
+    /// event or a missing grant. It reads a vendor string, which is the
+    /// fragile part of the mapping, so it is the part that gets a test.
+    #[test]
+    fn only_row_level_security_refusals_read_as_scope_violations() {
+        assert!(mentions_row_level_security(
+            "new row violates row-level security policy for table \"subscriptions\""
+        ));
+        assert!(!mentions_row_level_security(
+            "permission denied for table subscriptions"
+        ));
+        assert!(!mentions_row_level_security(
+            "permission denied for schema public"
+        ));
     }
 
     #[test]

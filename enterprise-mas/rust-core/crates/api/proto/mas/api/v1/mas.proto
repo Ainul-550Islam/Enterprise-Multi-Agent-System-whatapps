@@ -1,3 +1,18 @@
+// PURPOSE:
+// The canonical wire contract between Rust and Python.
+//
+// Declares `AgentBridgeApi`, the only surface Rust uses to ask Python to run
+// an agent, together with every message that crosses it: the request carrying
+// request/execution/task/tenant/org/project identity, the authenticated
+// service identity, a correlation id, an absolute deadline, an idempotency
+// key, the agent reference and version, the input, runtime state and tool
+// context; and the reply carrying the result, a structured failure with a
+// machine-readable code, safe provider metadata, usage, cost, the finish
+// state, correlation/request identity and retry classification.
+//
+// Both languages generate from THIS file. Editing it is a breaking change on
+// both sides, and it is the only place the contract is defined.
+
 // Multi-Agent System public gRPC API (v1).
 //
 // Semantics are IDENTICAL to the HTTP surface: the same use-cases, the same
@@ -175,3 +190,151 @@ enum ScheduleStateAction {
 message SetScheduleStateRequest { string schedule_id = 1; ScheduleStateAction action = 2; }
 message ScheduleReply { string id = 1; string name = 2; string status = 3; }
 message ListSchedulesReply { repeated ScheduleReply schedules = 1; }
+
+// --------------------- AI orchestrator bridge -------------------------------
+//
+// Rust -> Python AI Orchestrator. Rust remains the caller and the sole
+// authority on execution state; the orchestrator may not transition execution
+// state on its own and may not write Rust-owned tables.
+//
+// This service exists because the Python orchestrator owns AI execution
+// (agent behaviour, planning, model providers, tools, memory, RAG,
+// guardrails), while Rust owns platform execution state. The messages below
+// are a 1:1 projection of the Rust domain types:
+//
+//   AgentRunRequest   <- mas_execution::agent_bridge::AgentRunRequest
+//   ResourceLimitsMsg <- mas_domain::ResourceLimits
+//   AgentRunReply     <- mas_execution::agent_bridge::AgentRunVerdict
+//   AgentUsageMsg     <- mas_execution::agent_bridge::AgentUsage
+//
+// Timestamps are RFC-3339 strings with millisecond precision
+// (`Timestamp::to_rfc3339_millis`), matching the Rust serde representation so
+// no lossy conversion is introduced at the boundary.
+service AgentBridgeApi {
+  // Runs an agent once. Retries belong to the caller's policy.
+  rpc RunAgent(AgentRunRequest) returns (AgentRunReply);
+  // Readiness of the AI runtime behind the bridge.
+  rpc Health(Empty) returns (BridgeHealthReply);
+}
+
+// Resource envelope the AI runtime must respect (mirrors `ResourceLimits`).
+message ResourceLimitsMsg {
+  // Wall-clock timeout for the whole run, milliseconds.
+  uint64 timeout_ms = 1;
+  // Maximum number of execution steps.
+  uint32 max_steps = 2;
+  // Maximum concurrently running tasks spawned by this run.
+  uint32 max_parallel_tasks = 3;
+  // Maximum tool invocations.
+  uint32 max_tool_calls = 4;
+  // Maximum input/output payload size in bytes.
+  uint64 max_payload_bytes = 5;
+  // Maximum retries of any single step.
+  uint32 max_retries = 6;
+}
+
+message AgentRunRequest {
+  // ---- AI routing ---------------------------------------------------------
+  string agent_id = 1;
+  // Pinned agent version; empty means "current published version".
+  optional string agent_version = 2;
+  // JSON-encoded run input (already redacted upstream by Rust).
+  string input_json = 3;
+
+  // ---- identity / correlation (authoritative, supplied by Rust) ----------
+  string correlation_id = 4;
+  string request_id = 5;
+  string execution_id = 6;
+  string task_id = 7;
+  string tenant_id = 8;
+  string organization_id = 9;
+  optional string project_id = 10;
+  // Wire protocol version claimed by the caller; mismatched majors are
+  // rejected before any AI work is performed.
+  string protocol_version = 11;
+
+  // ---- bounds -------------------------------------------------------------
+  // Absolute wall-clock deadline, RFC-3339 with milliseconds.
+  string deadline_rfc3339 = 12;
+  ResourceLimitsMsg limits = 13;
+  // Token allowance forwarded to the runtime (0 = unmetered).
+  uint64 token_budget_max = 14;
+
+  // ---- idempotency --------------------------------------------------------
+  // Caller-supplied deduplication key. Rust derives it from the task's own
+  // idempotency key, so a redelivered task cannot re-run paid AI work. Empty
+  // means "no deduplication requested" and is legal for one-shot runs.
+  optional string idempotency_key = 15;
+
+  // ---- authenticated caller identity --------------------------------------
+  // The authenticated internal service identity Rust resolved before making
+  // this call. It travels in the *body* rather than only in metadata so the
+  // orchestrator can authorize against a value Rust signed off on; the
+  // `authorization` bearer header carries the same principal as proof of
+  // possession and is cross-checked against this field.
+  ServiceIdentityMsg identity = 16;
+}
+
+// Authenticated internal service identity (mirrors
+// `mas_security::principal::ServicePrincipal`). Never contains a credential:
+// the secret stays in the `authorization` header and is redacted everywhere.
+message ServiceIdentityMsg {
+  // Stable subject name, e.g. "rust-core".
+  string subject = 1;
+  // Issuer that vouched for the subject, e.g. "platform-mtls".
+  string issuer = 2;
+  // Scopes the subject holds, e.g. "execute_agent".
+  repeated string scopes = 3;
+}
+
+// Agent self-reported consumption. Mirrors `AgentUsage`.
+message AgentUsageMsg {
+  uint64 tokens_input = 1;
+  uint64 tokens_output = 2;
+  uint32 tool_calls = 3;
+  uint32 steps = 4;
+  // Wall-clock active time reported by the agent, milliseconds.
+  uint64 active_time_ms = 5;
+}
+
+message AgentSucceeded {
+  // JSON-encoded output.
+  string output_json = 1;
+  AgentUsageMsg usage = 2;
+  // Which model actually served the run, after routing and failover, as
+  // "provider/model". Safe to log: it names a configured endpoint, never a
+  // credential. Absent when the runtime did not record it.
+  optional string model_key = 3;
+  // Why the run stopped: "completed", "step_limit", "tool_call_limit",
+  // "deadline", "cancelled", "budget_exhausted". Distinct from success: a run
+  // can stop early with usable output.
+  string finish_reason = 4;
+}
+
+message AgentFailed {
+  // Stable machine-readable failure code (e.g. "model_timeout").
+  string code = 1;
+  // Safe message; never contains credentials or raw provider errors.
+  string message = 2;
+  // Whether the caller's retry policy may retry this run.
+  bool retryable = 3;
+  AgentUsageMsg usage = 4;
+  // Correlation id of the work that failed, so a Rust log line can be joined
+  // to the AI failure without a second lookup.
+  string correlation_id = 5;
+  // Platform request id of the call that failed.
+  string request_id = 6;
+}
+
+message AgentRunReply {
+  oneof verdict {
+    AgentSucceeded succeeded = 1;
+    AgentFailed failed = 2;
+  }
+}
+
+message BridgeHealthReply {
+  bool healthy = 1;
+  // Human-readable detail; must never contain secret material.
+  string detail = 2;
+}

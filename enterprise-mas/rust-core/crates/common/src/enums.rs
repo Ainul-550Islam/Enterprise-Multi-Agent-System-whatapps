@@ -1,3 +1,18 @@
+//! PURPOSE: The shared state enums whose string values are the platform's wire
+//! contract.
+//!
+//! Owning layer: `mas-common` (the base layer).
+//!
+//! Production responsibility: one definition of every status, priority and
+//! class, with a stable `snake_case` representation shared by database rows,
+//! events, API payloads and metrics labels. Renaming a shipped variant is a
+//! breaking change to all four.
+//!
+//! It must NOT:
+//!   • rename or renumber a variant once shipped;
+//!   • carry domain behaviour — these are vocabulary, not logic;
+//!   • gain an `Other`/`Unknown` catch-all that lets a real state go unnamed.
+
 //! Shared state enums used across crates.
 //!
 //! Every enum has a *stable* wire representation: `snake_case` strings via
@@ -226,8 +241,19 @@ impl TaskPriority {
 
 string_enum! {
     /// Lifecycle of one execution (a complete workflow/agent run).
+    ///
+    /// `Queued` is the durable-execution state between intake and a worker
+    /// claiming the execution's task: the execution row exists and is
+    /// committed, but no runner owns it yet. It exists so a submission that
+    /// is durable but not yet claimed is distinguishable from one that was
+    /// never dispatched — the difference matters for restart recovery and for
+    /// "is this execution stuck?" telemetry.
+    ///
+    /// `Completed` is the canonical *succeeded* outcome; the pipeline's
+    /// "succeeded" wording and this variant are the same state.
     ExecutionStatus {
         Pending => "pending",
+        Queued => "queued",
         Running => "running",
         Paused => "paused",
         Completed => "completed",
@@ -240,6 +266,12 @@ impl ExecutionStatus {
     #[must_use]
     pub const fn is_terminal(&self) -> bool {
         matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+    }
+
+    /// `true` once the execution has been made visible to the dispatcher.
+    #[must_use]
+    pub const fn is_dispatchable(&self) -> bool {
+        matches!(self, Self::Pending | Self::Queued)
     }
 }
 

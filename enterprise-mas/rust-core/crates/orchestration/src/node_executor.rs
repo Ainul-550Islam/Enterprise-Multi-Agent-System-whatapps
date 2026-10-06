@@ -1,3 +1,17 @@
+//! PURPOSE: The plugin surface of the workflow runtime: one executor per node
+//! type.
+//!
+//! Owning layer: `mas-orchestration`.
+//!
+//! Production responsibility: keep node execution uniform — an executor sees
+//! exactly one node at a time through a shared context, and returns a
+//! classified outcome the runtime can act on without knowing the node kind.
+//!
+//! It must NOT:
+//!   • mutate the graph or schedule other nodes (the runtime drives the DAG);
+//!   • hold state between nodes;
+//!   • return an unclassified failure.
+
 //! Node execution: the plugin surface of the workflow runtime.
 //!
 //! A [`NodeExecutor`] knows how to execute one or more [`WorkflowNodeType`]s
@@ -11,7 +25,7 @@
 
 use crate::runtime_context::RuntimeContext;
 use mas_common::error::AppError;
-use mas_common::ids::{ExecutionId, ExecutionStepId};
+use mas_common::ids::{ExecutionId, ExecutionStepId, TaskId};
 use mas_common::result::Result;
 use mas_domain::{WorkflowNode, WorkflowNodeType};
 use serde::{Deserialize, Serialize};
@@ -136,6 +150,18 @@ pub struct NodeExecutionInput<'a> {
     pub context: &'a RuntimeContext,
     /// 1-based attempt number (first attempt = 1).
     pub attempt: u32,
+    /// The durable task this dispatch belongs to, when it was dispatched from
+    /// the durable queue.
+    ///
+    /// `None` for in-process graph runs that were never a queue message. It is
+    /// propagated to the agent bridge so the orchestrator can attribute the run
+    /// to the task that owns it.
+    pub task_id: Option<TaskId>,
+    /// The durable task's idempotency key, when dispatched from the queue.
+    ///
+    /// This is what stops a redelivered task from re-running paid AI work: the
+    /// orchestrator deduplicates on it rather than on anything the payload says.
+    pub idempotency_key: Option<&'a str>,
 }
 
 /// Executes one node type (or several shared shapes).
@@ -157,6 +183,10 @@ pub trait NodeExecutor: Send + Sync + fmt::Debug {
 }
 
 /// Registry of node executors, keyed by the node types they handle.
+///
+/// `Clone` because a worker-side executor needs its own
+/// dispatch table: cloning shares the `Arc`s, so registering an executor on one
+/// clone does not affect the others.
 #[derive(Clone, Default)]
 pub struct NodeExecutorRegistry {
     executors: Vec<Arc<dyn NodeExecutor>>,
@@ -322,6 +352,8 @@ mod tests {
                 input: serde_json::json!({"ping": true}),
                 context: &context,
                 attempt: 1,
+                task_id: None,
+                idempotency_key: None,
             })
             .await
             .expect("execute");
@@ -337,6 +369,8 @@ mod tests {
                 input: Value::Null,
                 context: &context,
                 attempt: 1,
+                task_id: None,
+                idempotency_key: None,
             })
             .await
             .is_err());

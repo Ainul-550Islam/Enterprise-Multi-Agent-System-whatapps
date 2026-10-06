@@ -346,7 +346,15 @@ pub async fn invite_membership(
         .map_err(|e| crate::response::ApiError::new(e, &ctx))
 }
 
-fn scoped(ctx: &RequestContext) -> std::result::Result<&RequestContext, crate::response::ApiError> {
+/// Asserts that a scope was **resolved** for this request.
+///
+/// `require_scope` only ever returns a scope the middleware produced from the
+/// principal's identity, so this is the guard that makes a tenant-owned route
+/// unreachable without authentication and resolution. It is not a check that a
+/// header was present — that was the old behaviour, and it granted a scope to
+/// anyone who could spell one.
+fn scoped(ctx: &RequestContext) -> std::result::Result<(), crate::response::ApiError> {
     ctx.require_scope()
+        .map(|_| ())
         .map_err(|e| crate::response::ApiError::new(e, ctx))
 }

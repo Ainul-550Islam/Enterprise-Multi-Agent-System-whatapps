@@ -1,3 +1,19 @@
+//! PURPOSE: The canonical execution runtime: claims one execution and drives
+//! it end-to-end through the workflow runtime to the agent bridge.
+//!
+//! Owning layer: `mas-execution`.
+//!
+//! Production responsibility: be the single place an execution actually runs.
+//! Per run it claims the work, hydrates the run scope (resources, deadline,
+//! cancellation), delegates nodes to the registered executors, and produces a
+//! classified outcome with the usage actually observed.
+//!
+//! It must NOT:
+//!   • maintain its own execution state machine — the durable one in
+//!     `mas-application::durable` is authoritative;
+//!   • invent usage numbers; usage is what the runtime observed;
+//!   • swallow a classified failure into a generic internal error.
+
 //! Executor: claims one execution and runs it end-to-end.
 //!
 //! The [`Executor`] is the unit a worker process owns. Per run it:
@@ -13,15 +29,19 @@
 //! This crate deliberately contains no scheduling loop; the worker binary
 //! pulls work from the dispatcher and calls [`Executor::run_execution`].
 
-use crate::node_adapters::{RunScope, SharedScopes};
+use crate::agent_bridge::AgentBridge;
+use crate::node_adapters::{AdapterWiring, AgentNodeExecutor, RunScope, SharedScopes};
 use crate::resource_guard::{GuardSnapshot, ResourceGuard};
 use crate::step_runner::StepRunner;
 use mas_common::error::AppError;
-use mas_common::ids::ExecutionId;
+use mas_common::ids::{AgentId, ExecutionId, ExecutionStepId, TaskId};
 use mas_common::result::Result;
-use mas_domain::{ExecutionStep, ResourceLimits, TokenBudget, WorkflowGraph};
+use mas_domain::{
+    ExecutionStep, ResourceLimits, TokenBudget, WorkflowGraph, WorkflowNode, WorkflowNodeType,
+};
 use mas_orchestration::engine::OrchestrationEngine;
 use mas_orchestration::locks::DistributedLock;
+use mas_orchestration::node_executor::{NodeExecutionInput, NodeExecutorRegistry, NodeOutcome};
 use mas_orchestration::runtime_context::RuntimeContext;
 use mas_orchestration::workflow_runtime::{RuntimeRunResult, WorkflowRuntime};
 use serde::{Deserialize, Serialize};
@@ -78,6 +98,51 @@ pub struct RunOutcome {
     pub steps: Vec<ExecutionStep>,
 }
 
+/// Outcome of one single-agent execution (see [`Executor::run_agent_node`]).
+///
+/// Carries the same three things a graph run does — the verdict, the resource
+/// consumption and the step rows — because a one-node run is not a different
+/// kind of work; it is the same work with a smaller graph.
+#[derive(Debug, Clone)]
+pub struct AgentRunOutcome {
+    pub execution_id: ExecutionId,
+    /// `Ok(output)` on success; `Err(failure)` when the node recorded a
+    /// classified failure. A failure is never reported as success, and a
+    /// cancellation is never folded into either.
+    pub result: std::result::Result<serde_json::Value, AgentNodeFailure>,
+    pub guard: GuardSnapshot,
+    pub steps: Vec<ExecutionStep>,
+    /// Usage the bridge reported, when it reported any.
+    pub usage: Option<mas_domain::ResourceUsageSummary>,
+}
+
+/// The durable identity of an agent run that was dispatched from the queue.
+///
+/// This is the task row's authoritative identity, carried to the agent bridge
+/// so the orchestrator can attribute the run to the task that owns it and
+/// deduplicate a redelivery instead of re-running paid work. Graph runs that
+/// were never a queue message pass `None`.
+#[derive(Debug, Clone, Copy)]
+pub struct DurableRunIdentity<'a> {
+    /// The durable task that owns this run.
+    pub task_id: TaskId,
+    /// The task's idempotency key: the deduplication handle for the run.
+    pub idempotency_key: &'a str,
+}
+
+/// A classified agent-node failure returned by [`Executor::run_agent_node`].
+///
+/// The failure a node produced, in the pipeline's vocabulary.
+#[derive(Debug, Clone)]
+pub struct AgentNodeFailure {
+    /// Stable machine code (`tool_unavailable`, `rate_limited`, …).
+    pub code: String,
+    /// Safe, already-redacted message.
+    pub message: String,
+    /// Whether another attempt makes sense.
+    pub retryable: bool,
+}
+
 impl RunOutcome {
     #[must_use]
     pub const fn succeeded(&self) -> bool {
@@ -87,8 +152,18 @@ impl RunOutcome {
 
 /// The worker-side driver.
 pub struct Executor {
-    engine: Arc<OrchestrationEngine>,
-    runtime: Arc<WorkflowRuntime>,
+    /// The orchestration engine. Present for graph runs, absent for
+    /// single-agent runs — a worker that owns no workflow catalog must not be
+    /// forced to own an engine to run one agent node.
+    engine: Option<Arc<OrchestrationEngine>>,
+    /// The workflow runtime. Present for graph runs only.
+    runtime: Option<Arc<WorkflowRuntime>>,
+    /// The node executors this executor may dispatch to.
+    ///
+    /// This is the canonical dispatch table: agent nodes always reach the
+    /// [`AgentBridge`] through it, and never by a caller invoking the bridge
+    /// directly.
+    registry: NodeExecutorRegistry,
     scopes: SharedScopes,
     config: ExecutorConfig,
     steps: Option<Arc<dyn StepStorePort>>,
@@ -101,19 +176,51 @@ impl fmt::Debug for Executor {
             .field("config", &self.config)
             .field("has_step_store", &self.steps.is_some())
             .field("has_locks", &self.locks.is_some())
+            .field("graph_capable", &self.runtime.is_some())
             .finish_non_exhaustive()
     }
 }
 
 impl Executor {
+    /// Builds the **graph** executor: full workflow runs over an engine.
     pub fn new(
         engine: Arc<OrchestrationEngine>,
         runtime: Arc<WorkflowRuntime>,
         scopes: SharedScopes,
     ) -> Self {
         Self {
-            engine,
-            runtime,
+            engine: Some(Arc::clone(&engine)),
+            runtime: Some(Arc::clone(&runtime)),
+            registry: runtime.executors().clone(),
+            scopes,
+            config: ExecutorConfig::default(),
+            steps: None,
+            locks: None,
+        }
+    }
+
+    /// Builds the **single-agent** executor the durable worker uses.
+    ///
+    /// Agent nodes dispatch through the canonical
+    /// [`AgentNodeExecutor`], which is the only
+    /// component that talks to the [`AgentBridge`]. The tool, approval and
+    /// delay adapters are deliberately *not* registered: a worker that runs
+    /// one agent has no tool catalog and no approval store, and registering
+    /// adapters it cannot back would advertise a capability it does not have.
+    ///
+    /// The bridge is required, and it is the caller's real bridge: there is no
+    /// in-memory fallback here, so a worker built this way cannot report a
+    /// success it did not produce.
+    #[must_use]
+    pub fn for_agent_runs(bridge: Arc<dyn AgentBridge>, scopes: SharedScopes) -> Self {
+        let registry = NodeExecutorRegistry::new().with_executor(Arc::new(AgentNodeExecutor::new(
+            bridge,
+            AdapterWiring::new(scopes.clone()),
+        )));
+        Self {
+            engine: None,
+            runtime: None,
+            registry,
             scopes,
             config: ExecutorConfig::default(),
             steps: None,
@@ -205,7 +312,12 @@ impl Executor {
         self.scopes.register(Arc::clone(&scope))?;
 
         // 3. Run (errors are infrastructure-level; outcomes are verdicts).
-        let run_result = self.runtime.run(execution_id, graph, context).await;
+        let runtime = self.runtime.as_ref().ok_or_else(|| {
+            AppError::conflict(
+                "this executor cannot run a workflow graph; build it with Executor::new",
+            )
+        })?;
+        let run_result = runtime.run(execution_id, graph, context).await;
 
         // 4. Release scope & collect state.
         let released = self.scopes.release(execution_id).unwrap_or(scope);
@@ -243,16 +355,186 @@ impl Executor {
 
 impl Executor {
     /// Engine access for worker-side lifecycle calls.
-    #[must_use]
-    pub fn engine(&self) -> &Arc<OrchestrationEngine> {
-        &self.engine
+    ///
+    /// Only available on the graph executor; a single-agent executor has no
+    /// engine because it must not become a second authority over execution
+    /// state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this executor was built with
+    /// [`Executor::for_agent_runs`].
+    pub fn engine(&self) -> Result<&Arc<OrchestrationEngine>> {
+        self.engine.as_ref().ok_or_else(|| {
+            AppError::conflict(
+                "this executor runs single agent nodes and owns no orchestration engine; \
+                 lifecycle authority belongs to the durable execution pipeline",
+            )
+        })
     }
+
+    /// Runs a **single agent** execution through the canonical node-executor
+    /// path.
+    ///
+    /// This is the entry point the durable worker uses for an execution that
+    /// is one agent run rather than a workflow graph. It exists so that the
+    /// worker has no reason — and no way — to call the [`AgentBridge`] itself:
+    ///
+    /// ```text
+    ///   worker → Executor::run_agent_node → NodeExecutorRegistry
+    ///          → AgentNodeExecutor → AgentBridge → Python orchestrator
+    /// ```
+    ///
+    /// which is exactly the route a one-node graph would take through
+    /// [`WorkflowRuntime`]. The difference is only that the graph is implied
+    /// rather than loaded, because the worker does not own — and must not own
+    /// — a workflow catalog: giving it one would make it a second authority
+    /// over execution state, which is the thing this pipeline exists to
+    /// prevent.
+    ///
+    /// What this method deliberately does **not** do is move execution status.
+    /// Status belongs to the durable pipeline (`DurableExecutionPort`); this
+    /// method runs the work and reports what happened. That separation is why
+    /// it is safe to call from a worker that holds a lease.
+    ///
+    /// # Errors
+    ///
+    /// Infrastructure breakdown only: no executor registered for `agent`
+    /// nodes, or the run scope could not be registered. A failed or cancelled
+    /// *run* is not an error — it comes back in
+    /// [`AgentRunOutcome::result`].
+    pub async fn run_agent_node(
+        &self,
+        execution_id: ExecutionId,
+        agent_id: AgentId,
+        input: serde_json::Value,
+        context: &RuntimeContext,
+        durable: Option<DurableRunIdentity<'_>>,
+    ) -> Result<AgentRunOutcome> {
+        if self.config.step_guard_charge_per_step == 0 {
+            return Err(AppError::invalid_field(
+                "step_guard_charge_per_step",
+                "out_of_range",
+                "step guard charge multiplier must be \u{2265} 1",
+            ));
+        }
+
+        // ── 1. Hydrate the run scope (guard + step ledger). ───────────────
+        // Identical to the graph path: the resource guard and the step book
+        // are what make a run chargeable and reconstructable, and a run that
+        // bypasses them is invisible to both budget and audit.
+        let budget = match self.config.token_budget_max {
+            Some(max) => Some(TokenBudget::new(max)?),
+            None => None,
+        };
+        let guard = ResourceGuard::new(Some(self.config.default_limits), budget)?;
+        let step_limits = self
+            .config
+            .default_limits
+            .expand_steps_by(self.config.step_guard_charge_per_step);
+        let step_runner =
+            StepRunner::new(execution_id, ResourceGuard::new(Some(step_limits), None)?);
+        let scope = Arc::new(RunScope::new(guard, step_runner));
+        self.scopes.register(Arc::clone(&scope))?;
+
+        // ── 2. The node an equivalent one-node graph would carry. ─────────
+        let mut config = serde_json::Map::new();
+        config.insert(
+            "agent_ref".to_owned(),
+            serde_json::Value::String(agent_id.to_string()),
+        );
+        let node =
+            WorkflowNode::new("agent", WorkflowNodeType::Agent, "agent run")?.with_config(config);
+        node.validate()?;
+
+        let outcome = self
+            .registry
+            .execute(NodeExecutionInput {
+                execution_id,
+                step_id: ExecutionStepId::new(),
+                node: &node,
+                input,
+                context,
+                attempt: 1,
+                task_id: durable.map(|identity| identity.task_id),
+                idempotency_key: durable.map(|identity| identity.idempotency_key),
+            })
+            .await;
+
+        // ── 3. Release the scope and collect what the run consumed. ───────
+        let released = self.scopes.release(execution_id).unwrap_or(scope);
+        let guard_snapshot = released.guard.lock().await.snapshot();
+        let steps = released
+            .steps
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .steps();
+
+        let result = match outcome? {
+            NodeOutcome::Completed { output } => Ok(output),
+            NodeOutcome::Failed { failure } => Err(AgentNodeFailure {
+                code: failure.code,
+                message: failure.message,
+                retryable: failure.retryable,
+            }),
+            NodeOutcome::Deferred { reason, .. } => Err(AgentNodeFailure {
+                code: "deferred".to_owned(),
+                message: reason,
+                // A deferral is the runtime asking to be woken later, which is
+                // the definition of "worth another attempt".
+                retryable: true,
+            }),
+            NodeOutcome::WaitingApproval { approval_ref } => Err(AgentNodeFailure {
+                code: "waiting_approval".to_owned(),
+                message: format!("run blocked on approval {approval_ref}"),
+                retryable: false,
+            }),
+            NodeOutcome::Skipped { reason } => Err(AgentNodeFailure {
+                code: "skipped".to_owned(),
+                message: reason,
+                retryable: false,
+            }),
+        };
+
+        Ok(AgentRunOutcome {
+            execution_id,
+            result,
+            guard: guard_snapshot,
+            usage: usage_from_guard(&guard_snapshot),
+            steps,
+        })
+    }
+}
+
+/// Projects the run's **guard snapshot** into a usage summary.
+///
+/// Usage is read from the resource guard, not from a number the handler
+/// computed on the way past. The guard is what the node adapters actually
+/// charged against, so it is the only measurement that cannot disagree with
+/// the budget that was enforced.
+///
+/// Returns `None` when the run consumed nothing: an all-zero record is noise,
+/// and the durable pipeline must never meter a success that measured nothing.
+fn usage_from_guard(guard: &GuardSnapshot) -> Option<mas_domain::ResourceUsageSummary> {
+    if guard.tokens_consumed == 0 && guard.tool_calls_used == 0 && guard.steps_used == 0 {
+        return None;
+    }
+    Some(mas_domain::ResourceUsageSummary {
+        steps_executed: guard.steps_used,
+        tool_calls: guard.tool_calls_used,
+        // The guard charges a single token pool; the input/output split is not
+        // observable at this layer, so the whole charge is reported as input
+        // rather than invented on either side.
+        tokens_input: guard.tokens_consumed,
+        tokens_output: 0,
+        active_time_ms: guard.elapsed_ms,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent_bridge::InMemoryAgentBridge;
+    use crate::agent_bridge::{AgentRunVerdict, AgentUsage, InMemoryAgentBridge};
     use crate::node_adapters::standard_registry;
     use crate::sandbox::{EgressPolicy, SandboxPolicy};
     use crate::tool_runner::{InMemoryToolBridge, ToolCatalogPort, ToolRunner};
@@ -649,5 +931,253 @@ mod tests {
             .await
             .expect("contended")
             .is_none());
+    }
+
+    // -- canonical single-agent path ---------------------------------------
+
+    fn agent_context(tenant: TenantId, org: OrganizationId, project: ProjectId) -> RuntimeContext {
+        RuntimeContext::new(tenant, org, project, "mas-worker", Environment::Development)
+            .expect("ctx")
+    }
+
+    #[tokio::test]
+    async fn agent_runs_reach_the_bridge_through_the_node_registry() {
+        let tenant = TenantId::new();
+        let org = OrganizationId::new();
+        let project = ProjectId::new();
+
+        // The bridge is the *only* thing that can produce an output here: the
+        // handler below is what an AgentNodeExecutor calls, and nothing else in
+        // the path can manufacture `answer`.
+        let bridge = Arc::new(InMemoryAgentBridge::new().with_handler(|_request| {
+            Ok(AgentRunVerdict::Succeeded {
+                output: serde_json::json!({"answer": 42}),
+                usage: AgentUsage {
+                    tokens_input: 11,
+                    tokens_output: 7,
+                    tool_calls: 1,
+                    steps: 1,
+                    active_time_ms: 3,
+                },
+            })
+        }));
+
+        let executor = Executor::for_agent_runs(bridge, SharedScopes::new());
+
+        // A single-agent executor owns no orchestration engine: giving it one
+        // would make the worker a second authority over execution state.
+        assert!(
+            executor.engine().is_err(),
+            "the single-agent executor must not expose an engine"
+        );
+
+        let outcome = executor
+            .run_agent_node(
+                ExecutionId::new(),
+                AgentId::new(),
+                serde_json::json!({"prompt": "hello"}),
+                &agent_context(tenant, org, project),
+                None,
+            )
+            .await
+            .expect("run");
+
+        // The output came back through the registry, not from a direct call.
+        let output = outcome.result.expect("succeeded");
+        assert_eq!(output["answer"], serde_json::json!(42));
+        assert!(
+            outcome.guard.steps_used >= 1,
+            "the run was charged against the resource guard"
+        );
+        assert!(
+            outcome.guard.tokens_consumed >= 18,
+            "token usage the bridge reported was charged: {:?}",
+            outcome.guard
+        );
+        assert!(outcome.usage.is_some(), "usage is reported from the guard");
+        assert!(
+            !outcome.steps.is_empty(),
+            "the step ledger recorded the run"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_agent_run_is_a_classified_failure_not_a_success() {
+        let tenant = TenantId::new();
+        let org = OrganizationId::new();
+        let project = ProjectId::new();
+
+        let bridge = Arc::new(InMemoryAgentBridge::new().with_handler(|_request| {
+            Ok(AgentRunVerdict::Failed {
+                code: "rate_limited".to_owned(),
+                message: "provider rate limited the run".to_owned(),
+                retryable: true,
+                usage: AgentUsage::default(),
+            })
+        }));
+
+        let executor = Executor::for_agent_runs(bridge, SharedScopes::new());
+        let outcome = executor
+            .run_agent_node(
+                ExecutionId::new(),
+                AgentId::new(),
+                serde_json::json!({}),
+                &agent_context(tenant, org, project),
+                None,
+            )
+            .await
+            .expect("run");
+
+        let failure = outcome
+            .result
+            .expect_err("a failed verdict must not become a success");
+        assert_eq!(failure.code, "rate_limited");
+        assert!(failure.retryable, "a transient verdict stays retryable");
+        // The guard still charged the step attempt — it really did run — but
+        // no model consumption was recorded. Refusing to meter a failed run is
+        // the settlement layer's job (`TaskOutcome::Failed` produces no usage
+        // observations), and it is asserted there.
+        assert_eq!(
+            outcome.usage.map(|usage| usage.tokens_input).unwrap_or(0),
+            0,
+            "a failed run reports no token consumption"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bridge_error_is_reported_not_swallowed() {
+        let tenant = TenantId::new();
+        let org = OrganizationId::new();
+        let project = ProjectId::new();
+
+        let bridge = Arc::new(
+            InMemoryAgentBridge::new().with_handler(|_request| Err(AppError::unauthorized("nope"))),
+        );
+
+        let executor = Executor::for_agent_runs(bridge, SharedScopes::new());
+        let outcome = executor
+            .run_agent_node(
+                ExecutionId::new(),
+                AgentId::new(),
+                serde_json::json!({}),
+                &agent_context(tenant, org, project),
+                None,
+            )
+            .await
+            .expect("run");
+
+        let failure = outcome.result.expect_err("an auth failure is terminal");
+        assert!(
+            !failure.retryable,
+            "an authorization denial is never retryable"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_agent_node_releases_its_scope_so_a_second_run_may_start() {
+        let tenant = TenantId::new();
+        let org = OrganizationId::new();
+        let project = ProjectId::new();
+
+        let bridge = Arc::new(InMemoryAgentBridge::new().with_handler(|_request| {
+            Ok(AgentRunVerdict::Succeeded {
+                output: serde_json::json!({"ok": true}),
+                usage: AgentUsage::default(),
+            })
+        }));
+        let scopes = SharedScopes::new();
+        let executor = Executor::for_agent_runs(bridge, scopes.clone());
+
+        let first = ExecutionId::new();
+        executor
+            .run_agent_node(
+                first,
+                AgentId::new(),
+                serde_json::json!({}),
+                &agent_context(tenant, org, project),
+                None,
+            )
+            .await
+            .expect("first run");
+        assert!(
+            scopes.get(first).is_none(),
+            "the scope is released at the end of the run"
+        );
+
+        // A second run reuses the same process without leaking a scope.
+        executor
+            .run_agent_node(
+                ExecutionId::new(),
+                AgentId::new(),
+                serde_json::json!({}),
+                &agent_context(tenant, org, project),
+                None,
+            )
+            .await
+            .expect("second run");
+    }
+
+    #[tokio::test]
+    async fn the_task_id_and_idempotency_key_reach_the_bridge() {
+        let tenant = TenantId::new();
+        let org = OrganizationId::new();
+        let project = ProjectId::new();
+        let task_id = TaskId::new();
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        let bridge = Arc::new(InMemoryAgentBridge::new().with_handler(move |request| {
+            recorder
+                .lock()
+                .expect("recorder")
+                .push((request.task_id, request.idempotency_key.clone()));
+            Ok(AgentRunVerdict::Succeeded {
+                output: serde_json::json!({"ok": true}),
+                usage: AgentUsage::default(),
+            })
+        }));
+
+        let executor = Executor::for_agent_runs(bridge, SharedScopes::new());
+        executor
+            .run_agent_node(
+                ExecutionId::new(),
+                AgentId::new(),
+                serde_json::json!({}),
+                &agent_context(tenant, org, project),
+                Some(DurableRunIdentity {
+                    task_id,
+                    idempotency_key: "idem-durable-1",
+                }),
+            )
+            .await
+            .expect("run");
+
+        let seen = seen.lock().expect("recorder");
+        assert_eq!(seen.len(), 1, "the bridge was called exactly once");
+        assert_eq!(
+            seen[0],
+            (Some(task_id), Some("idem-durable-1".to_owned())),
+            "the orchestrator receives the task's durable identity, so a \
+             redelivered task cannot re-run paid work"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_single_agent_executor_refuses_to_run_a_graph() {
+        let tenant = TenantId::new();
+        let org = OrganizationId::new();
+        let project = ProjectId::new();
+        let bridge = Arc::new(InMemoryAgentBridge::new());
+        let executor = Executor::for_agent_runs(bridge, SharedScopes::new());
+
+        let error = executor
+            .run_execution(
+                ExecutionId::new(),
+                &mas_domain::WorkflowGraph::default(),
+                &agent_context(tenant, org, project),
+            )
+            .await
+            .expect_err("a single-agent executor cannot drive a graph");
+        assert!(matches!(error, AppError::Conflict(_)), "{error:?}");
     }
 }

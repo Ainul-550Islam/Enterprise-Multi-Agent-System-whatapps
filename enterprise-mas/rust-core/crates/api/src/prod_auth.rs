@@ -1,3 +1,23 @@
+//! PURPOSE: Production API-key verification — the credential-to-principal
+//! boundary.
+//!
+//! Owning layer: `mas-api` (the process edge).
+//!
+//! Production responsibility: look a presented API key up by its hash,
+//! check expiry and revocation, and build the principal — carrying the
+//! tenant and organization the KEY is bound to, not the ones the caller
+//! asked for.
+//!
+//! Security boundary: before this module was corrected the caller's
+//! `x-tenant-id` header silently overrode the key's own tenant, so any key
+//! could act in any tenant. Verification now carries the key's binding, and
+//! the request's headers are only ever hints resolved against it.
+//!
+//! It must NOT:
+//!   • take the tenant or organization from the request;
+//!   • accept an expired, revoked, or unknown key;
+//!   • return a reason that distinguishes "unknown key" from "revoked key".
+
 //! Production bearer verification: database-backed API keys.
 //!
 //! Flow per request (the only raw-secret-bearing code path in the API):
@@ -7,7 +27,16 @@
 //! 3. SHA-256 the raw token and compare digests in constant time — never
 //!    length-related loops, never logs with secret material.
 //! 4. Lifecycle guards (active, unexpired), stamp `last_used_at`
-//!    fire-and-forget, produce `Principal{ ApiKey, subject = key id }`.
+//!    fire-and-forget, and produce a **tenant-bound** principal.
+//!
+//! # What changed and why
+//!
+//! The previous version returned `Principal { subject: <key id>, kind: ApiKey }`
+//! and threw away `ApiKeyRow.tenant_id`. The caller's `x-tenant-id` header then
+//! decided the scope, which meant a valid key minted in tenant A could be
+//! presented with `x-tenant-id: B`. Verification now carries the key's own
+//! tenant and organization into the principal, so the binding survives
+//! authentication (spec Phase 8: keys are tenant-bound).
 //!
 //! No caches: keys are revocable and revocation must take effect at the
 //! next request (the same property that makes `last_used_at` meaningful).
@@ -15,10 +44,12 @@
 use async_trait::async_trait;
 use mas_persistence::repositories::api_keys::ApiKeyStore;
 
-use crate::auth::{Principal, PrincipalKind, TokenVerifierPort};
+use crate::auth::TokenVerifierPort;
 use mas_common::constants::{API_KEY_PREFIX, API_KEY_VISIBLE_PREFIX_LEN};
 use mas_common::error::AppError;
+use mas_common::ids::UserId;
 use mas_common::result::Result;
+use mas_security::{PrincipalKind, ScopeSet, SecurityPrincipal, TenantMembership};
 
 const UNAUTHENTICATED: &str = "unauthenticated";
 
@@ -67,11 +98,22 @@ impl PostgresApiKeyVerifier {
                 .chars()
                 .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
     }
+
+    /// Lifts the row's scopes into a `ScopeSet`.
+    ///
+    /// A row whose scopes cannot be parsed is a minting or migration bug, and
+    /// the safe reading of it is "no scopes" rather than "all scopes".
+    fn scopes_from(row: &mas_persistence::repositories::api_keys::ApiKeyRow) -> ScopeSet {
+        serde_json::from_value::<Vec<String>>(row.scopes.clone())
+            .ok()
+            .and_then(|scopes| ScopeSet::new(scopes).ok())
+            .unwrap_or_else(ScopeSet::denied)
+    }
 }
 
 #[async_trait]
 impl TokenVerifierPort for PostgresApiKeyVerifier {
-    async fn verify(&self, token: &str) -> Result<Principal> {
+    async fn verify(&self, token: &str) -> Result<SecurityPrincipal> {
         // All failure paths share ONE error body: no oracle refinement.
         let unauthenticated = || AppError::unauthorized(UNAUTHENTICATED);
 
@@ -100,10 +142,39 @@ impl TokenVerifierPort for PostgresApiKeyVerifier {
         }
         // Telemetry best-effort: never let the marker write block authN.
         let _ = self.store.touch_last_used(row.id).await;
-        Ok(Principal {
-            subject: row.id.to_string(),
-            kind: PrincipalKind::ApiKey,
-        })
+
+        // The key row decides the tenant. This is the whole point of the
+        // change: a bearer secret is bound to the tenant that minted it, and
+        // no header on the request can move it.
+        let tenant_id = mas_common::ids::TenantId::from_uuid(row.tenant_id);
+        let organization_id = mas_common::ids::OrganizationId::from_uuid(row.organization_id);
+
+        let mut principal = SecurityPrincipal::new(
+            format!("api-key:{}", row.id),
+            PrincipalKind::ApiKey,
+            Some(tenant_id),
+            Self::scopes_from(&row),
+        )
+        .with_organization(organization_id)
+        .with_role(row.role);
+
+        // The key's own binding is a credential grant, expressed in the same
+        // shape the resolver uses for memberships so one code path answers
+        // "what role here" for every kind of principal.
+        principal
+            .memberships
+            .push(TenantMembership::new(organization_id, tenant_id, row.role));
+
+        if let Some(user_id) = row.user_id {
+            // A key minted by a user is still a key: the actor is the key, and
+            // the creating user is recorded for audit only. It never widens
+            // the key's authority.
+            principal
+                .roles
+                .push(format!("created_by:{}", UserId::from_uuid(user_id)));
+        }
+
+        Ok(principal)
     }
 }
 
@@ -153,5 +224,29 @@ mod tests {
             API_KEY_PREFIX.len() + API_KEY_VISIBLE_PREFIX_LEN
         );
         assert!(token.starts_with(&prefix));
+    }
+
+    /// A key row whose scopes are unusable must not become a wildcard.
+    #[test]
+    fn unparseable_scopes_degrade_to_no_scopes() {
+        let row = mas_persistence::repositories::api_keys::ApiKeyRow {
+            id: uuid::Uuid::now_v7(),
+            tenant_id: uuid::Uuid::now_v7(),
+            organization_id: uuid::Uuid::now_v7(),
+            role: mas_domain::MembershipRole::ServiceAccount,
+            user_id: None,
+            name: "svc".to_owned(),
+            prefix: "mas_deadbeef".to_owned(),
+            secret_hash: "a".repeat(64),
+            scopes: serde_json::json!("not-an-array"),
+            status: "active".to_owned(),
+            expires_at: None,
+            last_used_at: None,
+        };
+        let scopes = PostgresApiKeyVerifier::scopes_from(&row);
+        assert!(
+            !scopes.permits("executions:read"),
+            "a malformed scope blob must not grant anything"
+        );
     }
 }

@@ -1,3 +1,19 @@
+# PURPOSE: The `rust-core` workspace manifest — the single place every crate's
+# identity, dependency and lint profile is declared.
+#
+# Owning layer: workspace root.
+#
+# Production responsibility: one resolver, one lint set, one version for every
+# internal crate, so a dependency cannot silently drift between `api`, `worker`
+# and `scheduler-service`. The pinned toolchain and the `-D warnings` profile
+# are what make "it compiled on my machine" meaningless here.
+#
+# It must NOT:
+#   • carry per-crate version numbers or unpinned git dependencies;
+#   • add a dependency to a lower layer that would invert the dependency rule
+#     (domain → common → contracts, never the reverse);
+#   • relax the shared lint profile for one crate to silence a warning.
+
 # ============================================================================
 # enterprise-mas :: rust-core workspace root
 #
@@ -39,6 +55,7 @@ members = [
     "crates/scheduler-service",
     "crates/worker-service",
     "crates/cli",
+    "crates/ai-bridge",
 ]
 
 [workspace.package]
@@ -77,6 +94,7 @@ mas-worker = { path = "crates/worker" }
 mas-scheduler-service = { path = "crates/scheduler-service" }
 mas-worker-service = { path = "crates/worker-service" }
 mas-cli = { path = "crates/cli" }
+mas-ai-bridge = { path = "crates/ai-bridge" }
 
 # --- async runtime / async interop ---
 tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }

@@ -1,3 +1,26 @@
+//! PURPOSE: The deterministic scheduler runtime: which due schedules a tick
+//! fires, in what order, and how a failed run is retried.
+//!
+//! Owning layer: `mas-scheduling` (domain logic; no clock, no I/O of its own).
+//!
+//! Production responsibility: turn "these schedules are due" into an ordered,
+//! fair, overlap-safe list of runs, and report every branch in a
+//! `TickReport`. Time is a parameter, never read from a clock, so every
+//! branch is unit-testable.
+//!
+//! Security boundary: the runtime decides *when* work fires, never *whose*
+//! work it is. Tenancy arrives in `DueWork` from the store's due-scan, and the
+//! runtime passes it through untouched — it has no mechanism and no license to
+//! infer, default, or substitute a tenant. Fairness interleaving keys on
+//! tenant so a large tenant cannot starve a small one, which is an
+//! availability property and not an isolation one: isolation is enforced by
+//! row-level security in the store, below the runtime.
+//!
+//! It must NOT:
+//!   • read a clock — `now` is always a parameter;
+//!   • touch a database, a broker or a socket: those are ports;
+//!   • swallow a per-schedule failure into a whole-tick failure.
+
 //! The deterministic scheduler runtime: scan → lease → queue → dispatch,
 //! plus crash recovery.
 //!
@@ -52,6 +75,31 @@ pub trait DispatchPort: Send + Sync + std::fmt::Debug {
 
     /// Marks a schedule's run finished (success or failure — overlap bookkeeping).
     async fn mark_finished(&self, schedule: ScheduleId) -> Result<()>;
+}
+
+/// Delegation so a shared dispatcher can be handed to [`SchedulerRuntime`].
+///
+/// The scheduler process picks its dispatcher at boot — durable submission or
+/// an internal HTTP call — so the concrete type is only known at runtime and
+/// arrives behind an `Arc`. Without this impl every caller would need a
+/// hand-written forwarding wrapper, and each wrapper would be one more place
+/// for a future method to be silently forgotten.
+#[async_trait::async_trait]
+impl<T> DispatchPort for std::sync::Arc<T>
+where
+    T: DispatchPort + ?Sized,
+{
+    async fn dispatch(&self, work: &DueWork) -> Result<DispatchAck> {
+        (**self).dispatch(work).await
+    }
+
+    async fn is_running(&self, schedule: ScheduleId) -> Result<bool> {
+        (**self).is_running(schedule).await
+    }
+
+    async fn mark_finished(&self, schedule: ScheduleId) -> Result<()> {
+        (**self).mark_finished(schedule).await
+    }
 }
 
 /// Runtime configuration.

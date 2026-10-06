@@ -1,3 +1,17 @@
+//! PURPOSE: The PostgreSQL implementation of the transactional outbox store.
+//!
+//! Owning layer: `mas-persistence`.
+//!
+//! Production responsibility: let callers enqueue *inside their own
+//! unit-of-work*, so the state change and the event commit atomically, and
+//! give the relay an ownership-fenced claim that survives any number of relay
+//! replicas racing over the same backlog.
+//!
+//! It must NOT:
+//!   • commit an event independently of the state change it describes;
+//!   • let a worker settle a row it no longer owns (`claimed_by` fence);
+//!   • drop a dead-lettered row.
+
 //! PostgreSQL implementation of the transactional outbox port.
 //!
 //! Callers insert outbox rows **inside their own unit-of-work** via
@@ -105,6 +119,8 @@ fn row_from_sqlx(row: &sqlx::postgres::PgRow) -> Result<OutboxRow> {
         last_error: row.try_get("last_error").map_err(map_sqlx)?,
         enqueued_at: row.try_get("enqueued_at").map_err(map_sqlx)?,
         published_at: row.try_get("published_at").map_err(map_sqlx)?,
+        claimed_by: row.try_get("claimed_by").map_err(map_sqlx)?,
+        claimed_at: row.try_get("claimed_at").map_err(map_sqlx)?,
     })
 }
 
@@ -122,7 +138,7 @@ impl OutboxStorePort for PostgresOutboxStore {
         let rows = sqlx::query(
             "SELECT event_id, envelope, tenant_id, event_type, aggregate_type,
                     aggregate_id, status, attempts, next_attempt_at, last_error,
-                    enqueued_at, published_at
+                    enqueued_at, published_at, claimed_by, claimed_at
              FROM outbox_events
              WHERE status IN ('pending', 'failed')
                AND next_attempt_at <= now()
@@ -139,19 +155,95 @@ impl OutboxStorePort for PostgresOutboxStore {
             .collect()
     }
 
-    async fn mark_published(&self, event_id: EventId) -> Result<()> {
+    async fn claim_due(
+        &self,
+        limit: usize,
+        worker: &str,
+        lease: std::time::Duration,
+    ) -> Result<Vec<OutboxRecord>> {
+        let limit = i64::try_from(limit.clamp(1, 10_000)).unwrap_or(10_000);
+        let lease_secs = i64::try_from(lease.as_secs().max(1)).unwrap_or(i64::MAX);
+
+        // One statement on purpose. The sub-select takes row locks with SKIP
+        // LOCKED (so replicas never block each other) and the outer UPDATE
+        // stamps ownership in the same atomic step — there is no window in
+        // which two relays hold the same row.
+        //
+        // A row is claimable when it is unclaimed, or when the claimant's
+        // lease has expired (`claimed_at` older than the lease). The second
+        // case is what recovers from a relay that died mid-publish.
+        let rows = sqlx::query(
+            "UPDATE outbox_events AS o
+             SET claimed_by = $1, claimed_at = now()
+             FROM (
+                 SELECT event_id
+                 FROM outbox_events
+                 WHERE status IN ('pending', 'failed')
+                   AND next_attempt_at <= now()
+                   AND (
+                        claimed_by IS NULL
+                     OR claimed_by = $1
+                     OR claimed_at < now() - ($3 || ' seconds')::interval
+                   )
+                 ORDER BY next_attempt_at ASC, enqueued_at ASC
+                 LIMIT $2
+                 FOR UPDATE SKIP LOCKED
+             ) AS due
+             WHERE o.event_id = due.event_id
+             RETURNING o.event_id, o.envelope, o.tenant_id, o.event_type,
+                       o.aggregate_type, o.aggregate_id, o.status, o.attempts,
+                       o.next_attempt_at, o.last_error, o.enqueued_at,
+                       o.published_at, o.claimed_by, o.claimed_at",
+        )
+        .bind(worker)
+        .bind(limit)
+        .bind(lease_secs)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+
+        rows.iter()
+            .map(|row| row_from_sqlx(row).and_then(OutboxRow::into_record))
+            .collect()
+    }
+
+    async fn release_claim(&self, event_id: EventId, worker: &str) -> Result<()> {
         let result = sqlx::query(
             "UPDATE outbox_events
-             SET status = 'published', published_at = now(), last_error = NULL
-             WHERE event_id = $1 AND status IN ('pending', 'failed')",
+             SET claimed_by = NULL, claimed_at = NULL
+             WHERE event_id = $1 AND claimed_by = $2",
         )
         .bind(event_id.into_uuid())
+        .bind(worker)
         .execute(&self.pool)
         .await
         .map_err(map_sqlx)?;
         if result.rows_affected() == 0 {
             return Err(AppError::conflict(format!(
-                "outbox event {event_id} is not pending/failed; not marking published"
+                "outbox event {event_id} is not claimed by {worker}"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn mark_published(&self, event_id: EventId, worker: &str) -> Result<()> {
+        let result = sqlx::query(
+            "UPDATE outbox_events
+             SET status = 'published', published_at = now(), last_error = NULL,
+                 claimed_by = NULL, claimed_at = NULL
+             WHERE event_id = $1
+               AND status IN ('pending', 'failed')
+               AND claimed_by = $2",
+        )
+        .bind(event_id.into_uuid())
+        .bind(worker)
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        if result.rows_affected() == 0 {
+            return Err(AppError::conflict(format!(
+                "outbox event {event_id} is not owned by {worker} in a publishable state; \
+                 refusing a stale settlement"
             )));
         }
         Ok(())
@@ -160,6 +252,7 @@ impl OutboxStorePort for PostgresOutboxStore {
     async fn mark_failed(
         &self,
         event_id: EventId,
+        worker: &str,
         error: &str,
         next_attempt_at: Timestamp,
     ) -> Result<()> {
@@ -167,10 +260,14 @@ impl OutboxStorePort for PostgresOutboxStore {
         let result = sqlx::query(
             "UPDATE outbox_events
              SET status = 'failed', attempts = attempts + 1,
-                 last_error = $2, next_attempt_at = $3
-             WHERE event_id = $1 AND status IN ('pending', 'failed')",
+                 last_error = $3, next_attempt_at = $4,
+                 claimed_by = NULL, claimed_at = NULL
+             WHERE event_id = $1
+               AND status IN ('pending', 'failed')
+               AND claimed_by = $2",
         )
         .bind(event_id.into_uuid())
+        .bind(worker)
         .bind(trimmed)
         .bind(next_attempt_at.into_datetime())
         .execute(&self.pool)
@@ -178,25 +275,31 @@ impl OutboxStorePort for PostgresOutboxStore {
         .map_err(map_sqlx)?;
         if result.rows_affected() == 0 {
             return Err(AppError::conflict(format!(
-                "outbox event {event_id} is not pending/failed; not marking failed"
+                "outbox event {event_id} is not owned by {worker} in a retryable state; \
+                 refusing a stale settlement"
             )));
         }
         Ok(())
     }
 
-    async fn mark_dead_lettered(&self, event_id: EventId) -> Result<()> {
+    async fn mark_dead_lettered(&self, event_id: EventId, worker: &str) -> Result<()> {
         let result = sqlx::query(
             "UPDATE outbox_events
-             SET status = 'dead_lettered'
-             WHERE event_id = $1 AND status = 'failed'",
+             SET status = 'dead_lettered',
+                 claimed_by = NULL, claimed_at = NULL
+             WHERE event_id = $1
+               AND status IN ('pending', 'failed')
+               AND claimed_by = $2",
         )
         .bind(event_id.into_uuid())
+        .bind(worker)
         .execute(&self.pool)
         .await
         .map_err(map_sqlx)?;
         if result.rows_affected() == 0 {
             return Err(AppError::conflict(format!(
-                "outbox event {event_id} is not failed; not dead-lettering"
+                "outbox event {event_id} is not owned by {worker} in a dead-letterable state; \
+                 refusing a stale settlement"
             )));
         }
         Ok(())

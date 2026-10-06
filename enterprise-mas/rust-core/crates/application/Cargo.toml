@@ -1,3 +1,17 @@
+# PURPOSE: The `mas-application` crate manifest.
+#
+# Owning layer: `mas-application`.
+#
+# Production responsibility: declare the use-case layer's dependencies,
+# including `mas-observability` for the named pipeline metrics and the safe
+# structured-log surface, and `mas-events` for the canonical event builder.
+#
+# It must NOT:
+#   • depend on a process crate (`mas-api`, `mas-worker`,
+#     `mas-scheduler-service`) — the dependency points the other way;
+#   • depend on `mas-persistence`; persistence implements this crate's ports;
+#   • take a concrete infrastructure dependency where a port will do.
+
 [package]
 name = "mas-application"
 description = "Use-case services composing domain and infrastructure ports; internal DTO mapping."
@@ -10,10 +24,29 @@ publish = false
 mas-common = { workspace = true }
 mas-domain = { workspace = true }
 mas-contracts = { workspace = true }
+# mas-events is pulled in because the durable submission units of work write
+# their domain events into the transactional outbox *inside the same
+# transaction* as the state change. mas-events depends only on
+# common/domain/orchestration, so this adds no dependency cycle.
+mas-events = { workspace = true }
+# mas-observability is pulled in for the named pipeline metrics: the durable
+# pipeline's counters must be declared once, in the crate every emitting layer
+# already depends on.
+mas-observability = { workspace = true }
+# The control-plane gate composes the canonical policy engine and quota
+# engine in a fixed order. It depends on them; it does not reimplement them.
+mas-policy = { workspace = true }
+mas-quota = { workspace = true }
+# Entitlement resolution lives in mas-tenancy; the gate composes it.
+mas-tenancy = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

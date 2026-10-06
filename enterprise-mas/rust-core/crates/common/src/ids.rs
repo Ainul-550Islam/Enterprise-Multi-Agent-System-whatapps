@@ -251,3 +251,15 @@ define_id!(/// Identifies an authenticated `Session`.
 SessionId);
 define_id!(/// Identifies an event in the eventing infrastructure.
 EventId);
+define_id!(/// Identifies a commercial `Plan` (a durable, data-defined tier).
+PlanId);
+define_id!(/// Identifies a negotiated entitlement or quota override.
+OverrideId);
+define_id!(/// Identifies one held quota reservation (an in-flight spend).
+ReservationId);
+define_id!(/// Identifies a `Subscription` row.
+SubscriptionId);
+define_id!(/// Identifies one append-only `SubscriptionEvent` (lifecycle history).
+SubscriptionEventId);
+define_id!(/// Identifies a receipt for one provider billing-webhook event.
+BillingReceiptId);

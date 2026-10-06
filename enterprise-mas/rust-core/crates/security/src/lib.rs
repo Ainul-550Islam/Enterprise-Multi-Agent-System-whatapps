@@ -1,3 +1,23 @@
+//! PURPOSE: The one security crate — principal, scope, authorization,
+//! authentication failures, API keys, secrets, audit and internal-service
+//! authentication.
+//!
+//! Owning layer: shared; every crate depends on this one for identity and
+//! authorization decisions.
+//!
+//! Production responsibility: hold the single `SecurityPrincipal` type, the
+//! single `AuthorizationService`, the single `AuthoritativeScope`, the single
+//! stable failure taxonomy, and the single internal-service HMAC scheme.
+//!
+//! Security boundary: this crate is pure decision logic. It performs no I/O
+//! and reaches no database, so a decision made here is deterministic,
+//! testable, and cannot be widened by a caller who controls storage.
+//!
+//! It must NOT:
+//!   • grow a second principal, authorization, or internal-auth type;
+//!   • perform I/O — the directory and the repository live elsewhere;
+//!   • expose a raw secret through `Debug`, `Display`, or an error message.
+
 //! Security crate: authentication material, secret access control, and the
 //! audit trail every security decision must leave behind.
 //!
@@ -24,7 +44,11 @@
 
 pub mod api_keys;
 pub mod audit;
+pub mod auth_failure;
+pub mod authorization;
+pub mod internal_service;
 pub mod principal;
+pub mod scope;
 pub mod scopes;
 pub mod secret_gate;
 pub mod secret_string;
@@ -34,7 +58,16 @@ pub use api_keys::{
     ApiKeyService, ApiKeyStorePort, CreatedApiKey, InMemoryApiKeyStore, StoredApiKey,
 };
 pub use audit::{AuditSinkPort, NoopAuditSink, RecordingAuditSink};
-pub use principal::{PrincipalKind, SecurityPrincipal};
+pub use auth_failure::{AuthFailure, AuthFailureCode, AuthFailureKind};
+pub use authorization::{
+    Action, AuthorizationDecision, AuthorizationRequest, AuthorizationService,
+    AuthorizationServicePort, DenyByDefault, ResourceKind,
+};
+pub use internal_service::{
+    sign, verify, InternalServiceIdentity, SERVICE_HEADER, SIGNATURE_HEADER,
+};
+pub use principal::{PrincipalKind, SecurityPrincipal, TenantMembership};
+pub use scope::{machine_plane_scope, AuthoritativeScope};
 pub use scopes::ScopeSet;
 pub use secret_gate::{InMemorySecretResolver, SecretGate, SecretResolverPort};
 pub use secret_string::{constant_time_eq, SecretString};

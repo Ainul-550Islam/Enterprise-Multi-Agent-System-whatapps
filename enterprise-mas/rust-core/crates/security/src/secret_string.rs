@@ -1,3 +1,20 @@
+//! PURPOSE: [`SecretString`] — the only legitimate home for raw secret bytes.
+//!
+//! Owning layer: `mas-security`.
+//!
+//! Production responsibility: hold secret material so that `Debug` and
+//! `Display` never reveal it, so reading the bytes requires spelling
+//! `expose()`, and so the memory is zeroized on drop.
+//!
+//! Security boundary: a secret that can be printed ends up in a log line, an
+//! error body, or a crash dump. This type removes the accident; `expose()`
+//! makes every legitimate read visible in review.
+//!
+//! It must NOT:
+//!   • implement `Debug`/`Display` in terms of the content;
+//!   • be serialized by an untagged derive that would write it to disk;
+//!   • be compared with `==` — constant-time comparison is `constant_time_eq`.
+
 //! [`SecretString`]: in-memory secret material with redacted output and
 //! zeroization on drop.
 //!

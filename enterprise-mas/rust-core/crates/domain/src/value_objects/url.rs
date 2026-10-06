@@ -18,13 +18,59 @@ use url::{Host, Url};
 ///
 /// This is a first-line guard; the integration HTTP client enforces the full
 /// egress policy (DNS resolution checks, redirect re-validation, allowlists).
+///
+/// # Internal endpoints
+///
+/// Loopback and RFC1918 destinations are refused by [`Self::parse`], and that
+/// is right for anything a tenant can influence. Platform services, however,
+/// legitimately call each other over the cluster network, and an operator
+/// needs to be able to configure `MAS_API_URL=http://mas-api:8080`.
+///
+/// [`Self::parse_internal_endpoint`] exists for exactly that case and carries
+/// a flag the egress layer reads. The exception is therefore *visible at the
+/// point of use*: a URL that skips the private-address check says so about
+/// itself, and the egress policy still has to opt in before such a URL may be
+/// contacted.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
-pub struct SafeUrl(Url);
+pub struct SafeUrl {
+    url: Url,
+    /// Whether this URL was parsed as an operator-declared internal endpoint.
+    /// `false` for everything else, and never settable from a tenant-supplied
+    /// value.
+    internal_endpoint: bool,
+}
 
 impl SafeUrl {
-    /// Parses and validates a URL.
+    /// Parses and validates a URL, refusing private and loopback hosts.
+    ///
+    /// This is the correct parse for anything a tenant can influence.
     pub fn parse(raw: &str) -> Result<Self> {
+        Self::parse_with(raw, false)
+    }
+
+    /// Parses a URL for an **operator-declared internal service endpoint**.
+    ///
+    /// Identical to [`Self::parse`] except that loopback and private hosts are
+    /// accepted. Use it only for destinations that come from process
+    /// configuration and that the egress policy has explicitly allow-listed —
+    /// never for a URL derived from tenant data, a webhook endpoint, a
+    /// connector config, or anything a request can reach.
+    ///
+    /// The returned URL reports [`Self::is_internal_endpoint`], and the egress
+    /// policy refuses to contact it unless it was built with
+    /// internal endpoints enabled.
+    pub fn parse_internal_endpoint(raw: &str) -> Result<Self> {
+        Self::parse_with(raw, true)
+    }
+
+    /// Whether this URL was parsed as an internal endpoint.
+    #[must_use]
+    pub const fn is_internal_endpoint(&self) -> bool {
+        self.internal_endpoint
+    }
+
+    fn parse_with(raw: &str, internal_endpoint: bool) -> Result<Self> {
         let trimmed = raw.trim();
         let url = Url::parse(trimmed).map_err(|err| {
             AppError::invalid_field("url", "invalid_url", format!("not a valid URL: {err}"))
@@ -52,6 +98,16 @@ impl SafeUrl {
         let host = url.host().ok_or_else(|| {
             AppError::invalid_field("url", "missing_host", "URL must contain an explicit host")
         })?;
+
+        if internal_endpoint {
+            // The scheme, credential and host-presence checks above still
+            // applied. Only the private/loopback refusal is lifted, and only
+            // for the address the operator named.
+            return Ok(Self {
+                url,
+                internal_endpoint: true,
+            });
+        }
 
         match host {
             Host::Domain(domain) => {
@@ -88,7 +144,10 @@ impl SafeUrl {
             },
         }
 
-        Ok(Self(url))
+        Ok(Self {
+            url,
+            internal_endpoint: false,
+        })
     }
 
     fn ipv4_is_forbidden(ip: Ipv4Addr) -> bool {
@@ -110,37 +169,37 @@ impl SafeUrl {
     /// The validated URL as a string.
     #[must_use]
     pub fn as_str(&self) -> &str {
-        self.0.as_str()
+        self.url.as_str()
     }
 
     /// The host portion (always present after validation).
     #[must_use]
     pub fn host_str(&self) -> &str {
-        self.0.host_str().unwrap_or("")
+        self.url.host_str().unwrap_or("")
     }
 
     /// `http` or `https`.
     #[must_use]
     pub fn scheme(&self) -> &str {
-        self.0.scheme()
+        self.url.scheme()
     }
 
     /// Whether TLS is used.
     #[must_use]
     pub fn is_tls(&self) -> bool {
-        self.0.scheme() == "https"
+        self.url.scheme() == "https"
     }
 
     /// Access the parsed URL (read-only).
     #[must_use]
     pub const fn as_url(&self) -> &Url {
-        &self.0
+        &self.url
     }
 }
 
 impl fmt::Display for SafeUrl {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.0.as_str())
+        f.write_str(self.url.as_str())
     }
 }
 
@@ -162,6 +221,6 @@ impl TryFrom<String> for SafeUrl {
 
 impl From<SafeUrl> for String {
     fn from(url: SafeUrl) -> Self {
-        url.0.into()
+        url.url.into()
     }
 }

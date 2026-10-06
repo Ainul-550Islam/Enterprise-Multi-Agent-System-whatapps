@@ -1,3 +1,16 @@
+//! PURPOSE: Task dispatch: from a stored, queued task to a transport hop.
+//!
+//! Owning layer: `mas-orchestration`.
+//!
+//! Production responsibility: enforce the dispatch invariants — a task is
+//! dispatched only once per attempt, carries its tenant and correlation
+//! identity, and a transport failure is reported rather than absorbed.
+//!
+//! It must NOT:
+//!   • be the authority on whether work may run (that is the durable claim);
+//!   • dispatch a task whose tenant identity is not on the message;
+//!   • retry forever without surfacing the failure to the durable layer.
+
 //! Task dispatch: from a stored, queued [`Task`] to a transport hop.
 //!
 //! [`DispatchTransport`] is the outbound port (NATS/queue adapter implements
@@ -298,7 +311,21 @@ impl DispatchTransport for InMemoryDispatchTransport {
 mod tests {
     use super::*;
     use mas_common::enums::TaskPriority;
-    use mas_common::ids::{AgentId, OrganizationId, ProjectId, TenantId};
+    use mas_common::ids::{AgentId, OrganizationId, ProjectId, TaskAttemptId, TenantId};
+    use mas_common::timestamps::Timestamp;
+    use mas_domain::TransitionActor;
+
+    /// The actor these tests attribute task transitions to.
+    fn test_actor() -> TransitionActor {
+        TransitionActor::system("test").expect("literal actor id is valid")
+    }
+
+    /// The ownership window a test claim installs.
+    fn test_lease() -> Timestamp {
+        Timestamp::now()
+            .checked_add(std::time::Duration::from_secs(30))
+            .expect("lease in the future")
+    }
 
     fn queued_task(key: &str) -> Task {
         let mut task = Task::new(
@@ -314,7 +341,7 @@ mod tests {
             "tester",
         )
         .expect("task");
-        task.queue().expect("queue");
+        task.queue(&test_actor()).expect("queue");
         task
     }
 
@@ -331,7 +358,14 @@ mod tests {
 
         // A running task cannot be dispatched.
         let mut running = queued_task("idem-2");
-        running.start().expect("start");
+        running
+            .start(
+                &test_actor(),
+                "test-worker",
+                test_lease(),
+                TaskAttemptId::new(),
+            )
+            .expect("start");
         let error = dispatcher.dispatch(&running).await.unwrap_err();
         assert_eq!(error.error_code(), "CONFLICT");
     }
@@ -364,7 +398,13 @@ mod tests {
         let dispatcher = BasicTaskDispatcher::new(transport.clone());
         let ok = queued_task("ok-1");
         let mut bad = queued_task("bad-1");
-        bad.start().expect("start"); // not queued anymore
+        bad.start(
+            &test_actor(),
+            "test-worker",
+            test_lease(),
+            TaskAttemptId::new(),
+        )
+        .expect("start"); // not queued anymore
 
         let results = dispatcher.dispatch_batch(&[ok, bad]).await;
         assert_eq!(results.len(), 2);

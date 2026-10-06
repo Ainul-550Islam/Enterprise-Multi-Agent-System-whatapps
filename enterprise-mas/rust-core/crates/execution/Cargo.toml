@@ -1,3 +1,10 @@
+# PURPOSE:
+# Declares the execution crate and its optional `dev-bridges` feature.
+#
+# `dev-bridges` is what makes the in-memory bridge test-only: it is off by
+# default, so a production build of the worker cannot construct or reach an
+# in-memory bridge even by accident.
+
 # Execution: the runtime execution layer. Executor (execution claiming +
 # run), step/tool runners, the agent runtime bridge, result processing,
 # output validation, resource guard, sandbox policies and failure
@@ -11,6 +18,13 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
+
+[features]
+# Opt-in escape hatch for the in-memory agent bridge. Enabled by tests and by
+# local bring-up tooling only; production binaries must NOT depend on it, so
+# that `InMemoryAgentBridge` cannot be selected outside a test/dev context.
+default = []
+dev-bridges = []
 
 [lints]
 workspace = true

@@ -34,9 +34,10 @@ mod tests;
 // ---------------------------------------------------------------------------
 pub use error::{AppError, ValidationIssue};
 pub use ids::{
-    AgentId, AgentVersionId, ApiKeyId, AuditEventId, ConnectorId, CredentialId, EventId,
-    ExecutionId, ExecutionStepId, MembershipId, OrganizationId, PolicyId, ProjectId, QuotaId,
-    ScheduleId, SecretReferenceId, SessionId, TaskAttemptId, TaskId, TenantId, ToolId, TypedId,
+    AgentId, AgentVersionId, ApiKeyId, AuditEventId, BillingReceiptId, ConnectorId, CredentialId,
+    EventId, ExecutionId, ExecutionStepId, MembershipId, OrganizationId, OverrideId, PlanId,
+    PolicyId, ProjectId, QuotaId, ReservationId, ScheduleId, SecretReferenceId, SessionId,
+    SubscriptionEventId, SubscriptionId, TaskAttemptId, TaskId, TenantId, ToolId, TypedId,
     UsageRecordId, UserId, WebhookId, WorkflowId, WorkflowNodeId, WorkflowVersionId,
 };
 pub use pagination::{

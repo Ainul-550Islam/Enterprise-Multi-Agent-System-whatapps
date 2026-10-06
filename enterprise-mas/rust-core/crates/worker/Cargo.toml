@@ -1,3 +1,18 @@
+# PURPOSE: The `mas-worker` crate manifest.
+#
+# Owning layer: `mas-worker`.
+#
+# Production responsibility: declare the consumer plane's dependencies,
+# including `mas-application` for the durable execution port — the worker must
+# settle through the same atomic units the submission path uses, so it cannot
+# grow a second lifecycle. `mas-application` depends only on common/domain/
+# contracts/events, so this adds no dependency cycle.
+#
+# It must NOT:
+#   • depend on `mas-execution`'s in-memory test doubles in a non-dev target;
+#   • add a dependency that inverts the layer order;
+#   • enable a feature that substitutes an in-memory production path.
+
 [package]
 name = "mas-worker"
 version = "0.1.0"
@@ -14,6 +29,11 @@ path = "src/lib.rs"
 mas-common = { workspace = true }
 mas-domain = { workspace = true }
 mas-contracts = { workspace = true }
+# mas-application is pulled in for the durable execution port: the worker must
+# settle through the same atomic units the submission path uses, so it cannot
+# grow a second lifecycle. mas-application depends only on common/domain/
+# contracts/events, so this adds no dependency cycle.
+mas-application = { workspace = true }
 mas-messaging = { workspace = true }
 mas-scheduling = { workspace = true }
 
@@ -26,7 +46,6 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
-mas-application = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "time"] }
 
 [features]

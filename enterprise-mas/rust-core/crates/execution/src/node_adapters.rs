@@ -1,3 +1,19 @@
+//! PURPOSE: Bind the execution runners into the orchestration node registry so
+//! a workflow graph is runnable end-to-end.
+//!
+//! Owning layer: `mas-execution` (adapting into `mas-orchestration`).
+//!
+//! Production responsibility: every adapter obeys the run's deadline and
+//! cancellation, charges the shared run-scope resource guard, and records step
+//! state durably — so a workflow step is accountable whether it succeeds,
+//! fails or is cancelled mid-flight.
+//!
+//! It must NOT:
+//!   • bypass the resource guard, which is what stops one step from consuming
+//!     the whole run's budget;
+//!   • ignore a cancellation signal because the node is "nearly done";
+//!   • let an unregistered node type fall through to a no-op success.
+
 //! Node-executor adapters: bind mas-execution runners into the orchestration
 //! `NodeExecutorRegistry`, making workflows runnable end-to-end.
 //!
@@ -257,13 +273,20 @@ impl NodeExecutor for AgentNodeExecutor {
                 )
             });
 
-        let request = AgentRunRequest::from_context(
+        let mut request = AgentRunRequest::from_context(
             input.context,
             agent_id,
             input.input.clone(),
             limits,
             &budget,
         )?;
+
+        // Durable identity, when the run was dispatched from the queue. These
+        // three are the task row's authoritative columns, so the orchestrator
+        // attributes the run to the task that owns it and can deduplicate a
+        // redelivery instead of re-running paid work.
+        request.task_id = input.task_id;
+        request.idempotency_key = input.idempotency_key.map(ToOwned::to_owned);
 
         let verdict = match self.bridge.run(request).await {
             Ok(verdict) => verdict,
@@ -706,6 +729,8 @@ mod tests {
                 input: serde_json::json!({"q": "?"}),
                 context: &context,
                 attempt: 1,
+                task_id: None,
+                idempotency_key: None,
             })
             .await
             .expect("execute");
@@ -764,6 +789,8 @@ mod tests {
                 input: Value::Null,
                 context: &context,
                 attempt: 1,
+                task_id: None,
+                idempotency_key: None,
             })
             .await
             .expect("execute");
@@ -784,6 +811,8 @@ mod tests {
                 input: Value::Null,
                 context: &context,
                 attempt: 1,
+                task_id: None,
+                idempotency_key: None,
             })
             .await
             .expect("adapter maps runner Err to a failed outcome");
@@ -818,6 +847,8 @@ mod tests {
                 input: Value::Null,
                 context: &context,
                 attempt: 1,
+                task_id: None,
+                idempotency_key: None,
             })
             .await
             .expect("delay");
@@ -843,6 +874,8 @@ mod tests {
                 input: Value::Null,
                 context: &context,
                 attempt: 1,
+                task_id: None,
+                idempotency_key: None,
             })
             .await
             .expect("approval");

@@ -1,3 +1,18 @@
+//! PURPOSE: The `workflows` repository.
+//!
+//! Owning layer: `mas-persistence`.
+//!
+//! Production responsibility: persist and hydrate workflow aggregates, with
+//! every statement on the request's scoped transaction when one exists.
+//!
+//! Security boundary: workflows are tenant-owned rows under
+//! `FORCE ROW LEVEL SECURITY`; a cross-tenant read returns nothing rather
+//! than returning and being filtered.
+//!
+//! It must NOT:
+//!   • open an unscoped transaction for a tenant-touching query;
+//!   • interpolate caller input into SQL.
+
 //! `workflows` repository (spec-JSONB style; graph travels inside the spec).
 //!
 //! The domain `Workflow` owns no slug as a field (name-only) but the schema
@@ -79,15 +94,34 @@ pub struct WorkflowStore {
 
 impl WorkflowStore {
     /// Binds a store to a pool.
+    ///
+    /// The pool is not used to run statements: every query runs on the
+    /// request's transaction, which is the only place row-level security is
+    /// armed. It is retained for pool diagnostics and health probes, and
+    /// deliberately has no code path that executes a query through it.
     #[must_use]
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
+    }
+
+    /// Pool handle, for diagnostics only.
+    ///
+    /// Never use this to run a tenant-touching statement: it has no scope, and
+    /// under `FORCE ROW LEVEL SECURITY` that means it would return nothing.
+    /// It exists so pool statistics can be reported.
+    #[must_use]
+    pub const fn pool(&self) -> &PgPool {
+        &self.pool
     }
 
     /// Creates or rewrites a workflow row (graph rides inside `spec`).
     pub async fn save(&self, workflow: &Workflow) -> Result<()> {
         let slug = slugify(&workflow.name);
         let row = WorkflowRow::from_domain(workflow, &slug)?;
+        // Every tenant-owned table is FORCE RLS: this statement only sees rows
+        // inside the request's own scope, because the executor IS the
+        // request's transaction.
+        let mut scoped = crate::scoped_request::connection().await?;
         let result = sqlx::query(WORKFLOW_UPSERT)
             .bind(row.id)
             .bind(row.tenant_id)
@@ -99,7 +133,7 @@ impl WorkflowStore {
             .bind(&row.spec)
             .bind(row.created_at)
             .bind(row.updated_at)
-            .execute(&self.pool)
+            .execute(scoped.connection().as_mut())
             .await
             .map_err(|error| match error {
                 sqlx::Error::Database(db) if db.is_unique_violation() => AppError::conflict(
@@ -119,11 +153,15 @@ impl WorkflowStore {
 
     /// Loads one workflow by primary key.
     pub async fn get(&self, id: WorkflowId) -> Result<Option<Workflow>> {
+        // Every tenant-owned table is FORCE RLS: this statement only sees rows
+        // inside the request's own scope, because the executor IS the
+        // request's transaction.
+        let mut scoped = crate::scoped_request::connection().await?;
         let row = sqlx::query(&format!(
             "SELECT {WORKFLOW_COLUMNS} FROM workflows WHERE id = $1"
         ))
         .bind(Uuid::from(id))
-        .fetch_optional(&self.pool)
+        .fetch_optional(scoped.connection().as_mut())
         .await
         .map_err(map_sqlx)?;
         row.map(fetch_workflow)
@@ -134,12 +172,16 @@ impl WorkflowStore {
 
     /// Lists workflows attached to a project.
     pub async fn list_for_project(&self, project: ProjectId) -> Result<Vec<Workflow>> {
+        // Every tenant-owned table is FORCE RLS: this statement only sees rows
+        // inside the request's own scope, because the executor IS the
+        // request's transaction.
+        let mut scoped = crate::scoped_request::connection().await?;
         let rows = sqlx::query(&format!(
             "SELECT {WORKFLOW_COLUMNS} FROM workflows
              WHERE project_id = $1 ORDER BY name"
         ))
         .bind(Uuid::from(project))
-        .fetch_all(&self.pool)
+        .fetch_all(scoped.connection().as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.into_iter()
@@ -152,12 +194,16 @@ impl WorkflowStore {
 
     /// Lists workflows in a tenant (name order for stable CLI output).
     pub async fn list_for_tenant(&self, tenant: TenantId) -> Result<Vec<Workflow>> {
+        // Every tenant-owned table is FORCE RLS: this statement only sees rows
+        // inside the request's own scope, because the executor IS the
+        // request's transaction.
+        let mut scoped = crate::scoped_request::connection().await?;
         let rows = sqlx::query(&format!(
             "SELECT {WORKFLOW_COLUMNS} FROM workflows
              WHERE tenant_id = $1 ORDER BY name"
         ))
         .bind(Uuid::from(tenant))
-        .fetch_all(&self.pool)
+        .fetch_all(scoped.connection().as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.into_iter()

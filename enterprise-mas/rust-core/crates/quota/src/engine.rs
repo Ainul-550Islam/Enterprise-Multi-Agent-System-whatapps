@@ -24,7 +24,7 @@ use mas_common::result::Result;
 use mas_common::timestamps::Timestamp;
 use mas_domain::quota::{EnforcementMode, Quota, QuotaDimension, QuotaPeriod};
 
-use crate::counter::{CounterKey, CounterStorePort};
+use crate::counter::{CounterKey, CounterStorePort, ReservationAttempt};
 
 /// Where quota definitions come from (Postgres in production; the
 /// [`InMemoryQuotaRegistry`] in tests/dev).
@@ -35,6 +35,19 @@ pub trait QuotaRegistryPort: Send + Sync + std::fmt::Debug {
 
     /// Registers/replaces a quota definition (admin paths + test seeds).
     async fn upsert(&self, quota: &Quota) -> Result<()>;
+}
+
+/// Forwards every operation through an `Arc` (same reason as the counter
+/// store's forwarding impl: one shared store, `dyn`-friendly services).
+#[async_trait::async_trait]
+impl<T: QuotaRegistryPort + ?Sized> QuotaRegistryPort for std::sync::Arc<T> {
+    async fn find(&self, tenant: TenantId, dimension: QuotaDimension) -> Result<Option<Quota>> {
+        (**self).find(tenant, dimension).await
+    }
+
+    async fn upsert(&self, quota: &Quota) -> Result<()> {
+        (**self).upsert(quota).await
+    }
 }
 
 /// In-memory quota registry.
@@ -137,6 +150,19 @@ impl<S: CounterStorePort, R: QuotaRegistryPort> QuotaEngine<S, R> {
         self.registry.upsert(quota).await
     }
 
+    /// The registry behind the engine.
+    ///
+    /// Exposed for one question: *is a ceiling configured for this
+    /// dimension at all?* A caller that cannot ask it has to either hold a
+    /// reservation for every tenant — rows and counter churn for a limit
+    /// nobody set — or enforce a limit nobody asked for. Both are wrong, and
+    /// neither is visible from the engine's other methods, which deliberately
+    /// answer "allowed" when no definition exists.
+    #[must_use]
+    pub fn registry(&self) -> &R {
+        &self.registry
+    }
+
     /// Checks and consumes `amount` for one tenant/dimension at `now`.
     ///
     /// Missing quota definition = **unlimited** (consumption is recorded for
@@ -173,44 +199,92 @@ impl<S: CounterStorePort, R: QuotaRegistryPort> QuotaEngine<S, R> {
 
         let window = window_seconds(quota.period);
         let key = CounterKey::for_time(tenant, dimension, window, now);
-        let consumed = self.counters.increment(key, amount).await?;
-        let over_limit = consumed > quota.limit;
-        let overage_units = consumed.saturating_sub(quota.limit);
         let reset_at = window.and_then(|w| key.window_end(w));
         let retry_after = reset_at.and_then(|end| end.duration_since(now));
 
+        // One round trip decides and consumes. The previous shape —
+        // `increment`, compare, then `decrement` on rejection — was two round
+        // trips with a read-modify-write between them, so two replicas could
+        // each observe "still under the limit" and both commit. It also left
+        // the counter inflated for the duration of the gap, and permanently
+        // inflated if the compensating decrement never ran.
+        let attempt: ReservationAttempt =
+            self.counters.try_reserve(key, amount, quota.limit).await?;
+        let over_limit = !attempt.allowed;
+
         match (quota.enforcement, over_limit) {
             (EnforcementMode::Enforce, true) => {
-                // Roll the just-added amount back: Enforce-mode consumption
-                // is atomic check-and-reserve, never "count and reject".
-                let _ = self.counters.decrement(key, amount).await?;
+                // `Enforce` rejected the reservation, so the store wrote
+                // nothing: `attempt.value` is the *projected* total, not the
+                // stored one. Reporting what the counter actually holds keeps
+                // the arithmetic a caller sees consistent with `usage()`.
+                let held = attempt.value.saturating_sub(amount);
                 Ok(ConsumptionDecision {
                     allowed: false,
                     enforcement: quota.enforcement,
-                    consumed: consumed - amount,
+                    consumed: held,
                     limit: quota.limit,
-                    remaining: quota.limit.saturating_sub(consumed - amount),
+                    remaining: quota.limit.saturating_sub(held),
                     over_limit: true,
                     overage_units: 0,
                     reset_at,
                     retry_after,
                 })
             },
-            (mode, over) => Ok(ConsumptionDecision {
+            // `WarnOnly` and `AllowWithOverage` must consume even past the
+            // ceiling — that is what distinguishes them from `Enforce` — so
+            // they cannot use the guarded primitive. They take the plain
+            // increment, and the overage they produce is deliberate.
+            (EnforcementMode::WarnOnly, _) | (EnforcementMode::AllowWithOverage, _)
+                if over_limit =>
+            {
+                let consumed = self.counters.increment(key, amount).await?;
+                Ok(ConsumptionDecision {
+                    allowed: true,
+                    enforcement: quota.enforcement,
+                    consumed,
+                    limit: quota.limit,
+                    remaining: 0,
+                    over_limit: true,
+                    overage_units: if quota.enforcement == EnforcementMode::AllowWithOverage {
+                        consumed.saturating_sub(quota.limit)
+                    } else {
+                        0
+                    },
+                    reset_at,
+                    retry_after: None,
+                })
+            },
+            (mode, _) => Ok(ConsumptionDecision {
                 allowed: true,
                 enforcement: mode,
-                consumed,
+                consumed: attempt.value,
                 limit: quota.limit,
-                remaining: quota.limit.saturating_sub(consumed),
-                over_limit: over,
-                overage_units: if mode == EnforcementMode::AllowWithOverage {
-                    overage_units
-                } else {
-                    0
-                },
+                remaining: attempt.remaining(),
+                over_limit: false,
+                overage_units: 0,
                 reset_at,
                 retry_after: None,
             }),
+        }
+    }
+
+    /// The counter window a dimension is metered over, when configured.
+    ///
+    /// Callers that name a bucket directly — the reservation path does, so a
+    /// settlement can find the same window the charge landed in — need this.
+    /// `None` means the gauge bucket (0), used by dimensions that never reset.
+    pub async fn window_seconds_for(
+        &self,
+        tenant: TenantId,
+        dimension: QuotaDimension,
+    ) -> Option<u64> {
+        match self.registry.find(tenant, dimension).await {
+            Ok(Some(quota)) => window_seconds(quota.period),
+            // No definition ⇒ the engine meters on an hourly window; callers
+            // must use the same default or they will address a different
+            // bucket than the one that was charged.
+            _ => Some(3_600),
         }
     }
 
@@ -310,14 +384,22 @@ where
             .consume(tenant_id, dimension, amount, &now)
             .await?;
         if !decision.allowed {
-            let mut error = AppError::rate_limited(format!(
-                "{dimension} quota exceeded for tenant {tenant_id} ({}/{})",
-                decision.consumed, decision.limit
+            // QUOTA_EXCEEDED, not RATE_LIMITED. They are different facts:
+            // rate limiting is transient back-pressure, quota exhaustion is
+            // an entitlement statement about the tenant's plan. Mapping both
+            // to `RATE_LIMITED` made every quota denial retryable, so a worker
+            // would spend its whole attempt budget re-submitting work that
+            // could not succeed until the billing period rolled over.
+            return Err(AppError::quota_exceeded(
+                dimension.as_str(),
+                decision.consumed,
+                decision.limit,
+                decision.retry_after,
+                format!(
+                    "{dimension} quota exceeded for tenant {tenant_id} ({}/{})",
+                    decision.consumed, decision.limit
+                ),
             ));
-            if let Some(retry) = decision.retry_after {
-                error = error.with_context(format!("retry_after_seconds={}", retry.as_secs()));
-            }
-            return Err(error);
         }
         Ok(())
     }
@@ -466,7 +548,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bridge_maps_decisions_to_rate_limited_and_releases() {
+    async fn bridge_maps_denials_to_quota_exceeded_and_releases() {
         let (engine, tenant) = engine_pair();
         let registry_store = engine
             .registry
@@ -489,7 +571,22 @@ mod tests {
             .check_and_reserve(tenant, QuotaDimension::Executions, 1)
             .await
             .expect_err("second reserve over limit");
-        assert_eq!(err.error_code(), "RATE_LIMITED");
+        // The whole point of the dedicated variant: a quota denial is its own
+        // class, is not retryable, and carries the arithmetic.
+        assert_eq!(err.error_code(), "QUOTA_EXCEEDED");
+        assert!(!err.is_retryable(), "a quota denial must not be retried");
+        assert!(
+            matches!(
+                &err,
+                AppError::QuotaExceeded {
+                    dimension,
+                    consumed: 1,
+                    limit: 1,
+                    ..
+                } if dimension == "executions"
+            ),
+            "the denial names the dimension and the arithmetic, got {err:?}"
+        );
 
         bridge
             .release(tenant, QuotaDimension::Executions, 1)

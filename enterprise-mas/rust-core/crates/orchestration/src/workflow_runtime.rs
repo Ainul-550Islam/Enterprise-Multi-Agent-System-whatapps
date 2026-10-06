@@ -1,3 +1,17 @@
+//! PURPOSE: The workflow runtime: drives one validated graph for one
+//! execution.
+//!
+//! Owning layer: `mas-orchestration`.
+//!
+//! Production responsibility: be the last mile of orchestration — walk the
+//! DAG in topological order, respect deadlines, cancellation and retries, and
+//! produce a terminal outcome with the steps that actually ran.
+//!
+//! It must NOT:
+//!   • persist state itself (settlement is the durable port's job);
+//!   • continue past a cancelled run because a node is "nearly done";
+//!   • report success when a node on the critical path failed.
+
 //! The workflow runtime: drives a [`WorkflowGraph`] for one execution.
 //!
 //! The runtime is the *last mile* of orchestration. Given an execution row, a
@@ -702,6 +716,8 @@ async fn run_node_attempt(
                         input: Value::Object(context.data().clone()),
                         context,
                         attempt,
+                        task_id: None,
+                        idempotency_key: None,
                     })
                     .await
             })

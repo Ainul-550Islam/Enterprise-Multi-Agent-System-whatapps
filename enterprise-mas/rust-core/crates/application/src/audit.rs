@@ -17,6 +17,19 @@ pub trait AuditSinkPort: std::fmt::Debug + Send + Sync {
     async fn record(&self, event: &AuditEvent) -> Result<()>;
 }
 
+/// Forwards every event through an `Arc`.
+///
+/// Several services and the control-plane handlers share one sink so a
+/// request's audit trail is a single sequence. Without this forwarding impl,
+/// a struct wanting to hold `Arc<dyn AuditSinkPort>` has to be generic over
+/// the concrete sink type instead.
+#[async_trait::async_trait]
+impl<T: AuditSinkPort + ?Sized> AuditSinkPort for std::sync::Arc<T> {
+    async fn record(&self, event: &AuditEvent) -> Result<()> {
+        (**self).record(event).await
+    }
+}
+
 /// Builds and records an audit event for one completed mutation. Actor,
 /// scope and correlation id come from the service context.
 pub async fn record_mutation(
@@ -84,13 +97,6 @@ impl AuditSinkPort for InMemoryAuditSink {
             .unwrap_or_else(|e| e.into_inner())
             .push(event.clone());
         Ok(())
-    }
-}
-
-#[async_trait]
-impl AuditSinkPort for std::sync::Arc<InMemoryAuditSink> {
-    async fn record(&self, event: &AuditEvent) -> Result<()> {
-        AuditSinkPort::record(self.as_ref(), event).await
     }
 }
 

@@ -1,3 +1,19 @@
+// PURPOSE: Cross-crate full-stack integration: a real HTTP server carrying
+// `mas-api`'s production router, driven by the real `mas-cli` typed client,
+// with no mocks on either side.
+//
+// Owning layer: workspace integration tests (compiled into `mas-api`'s
+// `root_integration` target).
+//
+// Production responsibility: prove the wire contract holds end to end —
+// scope headers, envelope shape, execution submit and replay, and list/get
+// transitions — across the same code a client actually calls.
+//
+// It must NOT:
+//   • substitute an in-memory handler for the production router;
+//   • assert on incidental ordering that is not part of the contract;
+//   • be skipped or weakened to keep a refactor green.
+
 // Cross-crate full-stack integration: a REAL HTTP server (axum bound to a
 // loopback port) carrying `mas-api`'s production router and in-memory
 // application services, driven by the REAL `mas-cli` typed client — no
@@ -55,6 +71,13 @@ async fn seed_scope(state: &AppState) -> FixtureScope {
         .await
         .expect("tenant");
     let tenant_scoped = system.clone().with_scope(tenant.id, organization.id);
+    // A newly registered tenant is `provisioning`, and the tenancy resolver
+    // refuses to resolve a non-operational tenant. Activate it before use.
+    state
+        .tenancy
+        .activate_tenant(&tenant_scoped, tenant.id)
+        .await
+        .expect("activate");
     let project = state
         .tenancy
         .register_project(&tenant_scoped, "Core", "core-root-it")
@@ -161,7 +184,15 @@ async fn full_stack_through_real_http_and_real_cli_client() {
             .await,
     );
     let execution_id = submitted["id"].as_str().expect("execution id").to_owned();
-    assert_eq!(submitted["status"], "pending");
+    // `queued`, not `pending`: submission is one atomic transaction that
+    // writes the execution, its task and the task's first attempt together.
+    // By the time the caller can observe the execution, its work is already
+    // enqueued — reporting `pending` would describe a state that no longer
+    // exists and that no reader can act on.
+    assert_eq!(
+        submitted["status"], "queued",
+        "an execution whose task is enqueued is queued: {submitted}"
+    );
 
     let replay = client
         .post::<_, serde_json::Value>(

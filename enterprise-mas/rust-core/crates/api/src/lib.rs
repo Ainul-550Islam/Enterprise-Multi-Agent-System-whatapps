@@ -31,13 +31,16 @@ pub mod auth;
 pub mod context;
 pub mod grpc;
 pub mod handlers;
+pub mod inmemory_directory;
 pub mod middleware;
 pub mod prod_auth;
 pub mod response;
 pub mod router;
+pub mod scope_resolution;
 pub mod server;
 pub mod state;
 
-pub use auth::{Principal, TokenVerifierPort};
+pub use auth::{PrincipalKind, TokenVerifierPort};
 pub use context::RequestContext;
+pub use scope_resolution::{RequestScopeResolver, ResolvedRequest, ScopeClaims};
 pub use state::AppState;

@@ -1,3 +1,19 @@
+//! PURPOSE: Result processing and the failure taxonomy: the last gate before
+//! anything a runner produced is persisted or published.
+//!
+//! Owning layer: `mas-execution`.
+//!
+//! Production responsibility: never trust raw runner output. Truncate
+//! oversized payloads, redact secrets and PII, and map every error to one
+//! stable `FailureClass` — one taxonomy that retry, dead-lettering, metrics
+//! and the API all read from.
+//!
+//! It must NOT:
+//!   • persist or emit an unredacted payload;
+//!   • classify a failure by string-matching a message instead of the variant;
+//!   • let an unclassified error default to "retryable", which would loop
+//!     forever on a request that can never succeed.
+
 //! Result processing + failure taxonomy.
 //!
 //! Raw runner output is never trusted as-is: [`ResultProcessor`] truncates
@@ -89,10 +105,30 @@ pub fn classify_failure(error: &AppError) -> FailureClass {
         AppError::Cancelled(_) => FailureClass::Cancelled,
         AppError::Timeout(_) => FailureClass::Timeout,
         AppError::RateLimited(_) => FailureClass::ResourceExhausted,
+        // Quota exhaustion *is* resource exhaustion, and it is named
+        // separately so a dashboard can tell "the platform is busy" (retry)
+        // from "this tenant has spent its allowance" (do not retry, and
+        // consider a plan conversation).
+        AppError::QuotaExceeded { .. } => FailureClass::ResourceExhausted,
         AppError::ExternalService { .. } | AppError::Messaging(_) => FailureClass::Upstream,
-        AppError::Forbidden(_) | AppError::Unauthorized(_) => FailureClass::PolicyDenied,
+        AppError::Forbidden(_) | AppError::Unauthorized(_) | AppError::PolicyDenied { .. } => {
+            FailureClass::PolicyDenied
+        },
+        // An entitlement refusal is not a policy denial: nothing was
+        // evaluated and no rule fired — the plan simply does not include the
+        // feature. It is a billing fact and lands in its own bucket.
+        AppError::EntitlementRequired { .. } => FailureClass::NonRetryable,
         AppError::Validation { .. } => FailureClass::NonRetryable,
         AppError::Serialization(_) => FailureClass::PayloadRejected,
+        // An external runtime's own verdict is honoured rather than
+        // re-derived: it produced the failure, so it classified it.
+        AppError::ExternalFailure { retryable, .. } => {
+            if *retryable {
+                FailureClass::Upstream
+            } else {
+                FailureClass::PayloadRejected
+            }
+        },
         AppError::Database(_) | AppError::Internal(_) | AppError::NotFound { .. } => {
             FailureClass::Platform
         },

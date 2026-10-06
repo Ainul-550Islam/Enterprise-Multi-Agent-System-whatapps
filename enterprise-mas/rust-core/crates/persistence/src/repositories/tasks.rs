@@ -1,3 +1,17 @@
+//! PURPOSE: The `tasks` repository — the worker's durability plane.
+//!
+//! Owning layer: `mas-persistence`.
+//!
+//! Production responsibility: implement the settlement protocol on the row
+//! itself: atomic claim (`FOR UPDATE SKIP LOCKED`), lease and ownership
+//! columns, and version-guarded transitions so a stale worker's write is
+//! rejected rather than applied.
+//!
+//! It must NOT:
+//!   • update a task without the version fence;
+//!   • clear ownership without recording a terminal outcome;
+//!   • let a task be claimed by two workers at once.
+
 //! `tasks` repository — the worker's durability plane.
 //!
 //! The consumer's settlement protocol lives on the `tasks` row itself:
@@ -20,14 +34,15 @@ use crate::rows::TaskRow;
 /// Full projected columns for task queries.
 pub const TASK_COLUMNS: &str = "id, tenant_id, organization_id, project_id, execution_id, \
      idempotency_key, kind, status, priority, payload, result, not_before, deadline_at, \
-     correlation_id, created_at, updated_at";
+     correlation_id, created_by, created_at, updated_at";
 
 const TASK_UPSERT: &str = "INSERT INTO tasks (
         id, tenant_id, organization_id, project_id, execution_id, idempotency_key,
         kind, status, priority, payload, result, not_before, deadline_at,
-        correlation_id, created_at, updated_at
-    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+        correlation_id, created_by, created_at, updated_at
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
     ON CONFLICT (id) DO UPDATE SET
+        created_by = EXCLUDED.created_by,
         status = EXCLUDED.status,
         payload = EXCLUDED.payload,
         result = EXCLUDED.result,
@@ -35,7 +50,13 @@ const TASK_UPSERT: &str = "INSERT INTO tasks (
         deadline_at = EXCLUDED.deadline_at,
         updated_at = EXCLUDED.updated_at";
 
-fn fetch_task(pg_row: sqlx::postgres::PgRow) -> Result<TaskRow> {
+/// Maps one `tasks` row.
+///
+/// Public because the durable execution port selects the same projection
+/// (plus migration 0014's fence columns) and must hydrate through the same
+/// mapper — a second mapper would be a second source of truth for what a
+/// task row means.
+pub fn fetch_task_row(pg_row: sqlx::postgres::PgRow) -> Result<TaskRow> {
     Ok(TaskRow {
         id: pg_row.try_get("id").map_err(map_sqlx)?,
         tenant_id: pg_row.try_get("tenant_id").map_err(map_sqlx)?,
@@ -51,6 +72,7 @@ fn fetch_task(pg_row: sqlx::postgres::PgRow) -> Result<TaskRow> {
         not_before: pg_row.try_get("not_before").map_err(map_sqlx)?,
         deadline_at: pg_row.try_get("deadline_at").map_err(map_sqlx)?,
         correlation_id: pg_row.try_get("correlation_id").map_err(map_sqlx)?,
+        created_by: pg_row.try_get("created_by").map_err(map_sqlx)?,
         created_at: pg_row.try_get("created_at").map_err(map_sqlx)?,
         updated_at: pg_row.try_get("updated_at").map_err(map_sqlx)?,
     })
@@ -82,7 +104,7 @@ impl TaskStore {
             .fetch_optional(&self.pool)
             .await
             .map_err(map_sqlx)?;
-        row.map(fetch_task)
+        row.map(fetch_task_row)
             .transpose()?
             .map(TaskRow::into_domain)
             .transpose()
@@ -108,6 +130,7 @@ impl TaskStore {
             .bind(row.not_before)
             .bind(row.deadline_at)
             .bind(&row.correlation_id)
+            .bind(&row.created_by)
             .bind(row.created_at)
             .bind(row.updated_at)
             .execute(&self.pool)
@@ -142,8 +165,22 @@ mod tests {
 
     #[test]
     fn upsert_arity_matches_projection() {
-        assert_eq!(TASK_UPSERT.matches('$').count(), 16);
-        assert_eq!(TASK_COLUMNS.split(',').count(), 16);
+        // The INSERT placeholder count and the SELECT projection must stay in
+        // lockstep; a new materialized column has to be added to both.
+        assert_eq!(
+            TASK_UPSERT.matches('$').count(),
+            TASK_COLUMNS.split(',').count(),
+            "upsert placeholders must match the projected column count"
+        );
+    }
+
+    #[test]
+    fn created_by_is_materialized_on_both_directions() {
+        // `domain::Task::created_by` is required, so hydration must always find
+        // it. Rows written by the durable broker rely on the column default.
+        assert!(TASK_COLUMNS.contains("created_by"));
+        assert!(TASK_UPSERT.contains("created_by"));
+        assert!(TaskRow::MATERIALIZED.contains(&"created_by"));
     }
 
     #[test]

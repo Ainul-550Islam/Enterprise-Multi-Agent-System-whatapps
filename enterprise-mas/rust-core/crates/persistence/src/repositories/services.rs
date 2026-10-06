@@ -182,6 +182,10 @@ impl OrganizationStorePort for PgServices {
         // status sync (status transitions are the only legal later state
         // mutation without a full overwrite tax).
         let row = OrganizationRow::from_domain(organization)?;
+        // Every tenant-owned table is FORCE RLS: this statement only sees rows
+        // inside the request's own scope, because the executor IS the
+        // request's transaction.
+        let mut scoped = crate::scoped_request::connection().await?;
         sqlx::query(&format!(
             "INSERT INTO organizations ({ORG_COLUMNS})
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
@@ -199,39 +203,51 @@ impl OrganizationStorePort for PgServices {
         .bind(&row.settings)
         .bind(row.created_at)
         .bind(row.updated_at)
-        .execute(&self.pool)
+        .execute(scoped.connection().as_mut())
         .await
         .map_err(map_unique("organizations", "slug"))?;
         Ok(())
     }
 
     async fn get(&self, id: OrganizationId) -> Result<Option<Organization>> {
+        // Every tenant-owned table is FORCE RLS: this statement only sees rows
+        // inside the request's own scope, because the executor IS the
+        // request's transaction.
+        let mut scoped = crate::scoped_request::connection().await?;
         let row = sqlx::query(&format!(
             "SELECT {ORG_COLUMNS} FROM organizations WHERE id = $1"
         ))
         .bind(Uuid::from(id))
-        .fetch_optional(&self.pool)
+        .fetch_optional(scoped.connection().as_mut())
         .await
         .map_err(map_sqlx)?;
         row.as_ref().map(org_from).transpose()
     }
 
     async fn get_by_slug(&self, slug: &str) -> Result<Option<Organization>> {
+        // Every tenant-owned table is FORCE RLS: this statement only sees rows
+        // inside the request's own scope, because the executor IS the
+        // request's transaction.
+        let mut scoped = crate::scoped_request::connection().await?;
         let row = sqlx::query(&format!(
             "SELECT {ORG_COLUMNS} FROM organizations WHERE slug = $1"
         ))
         .bind(slug)
-        .fetch_optional(&self.pool)
+        .fetch_optional(scoped.connection().as_mut())
         .await
         .map_err(map_sqlx)?;
         row.as_ref().map(org_from).transpose()
     }
 
     async fn list(&self) -> Result<Vec<Organization>> {
+        // Every tenant-owned table is FORCE RLS: this statement only sees rows
+        // inside the request's own scope, because the executor IS the
+        // request's transaction.
+        let mut scoped = crate::scoped_request::connection().await?;
         let rows = sqlx::query(&format!(
             "SELECT {ORG_COLUMNS} FROM organizations ORDER BY legal_name"
         ))
-        .fetch_all(&self.pool)
+        .fetch_all(scoped.connection().as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(org_from).collect()
@@ -242,6 +258,10 @@ impl OrganizationStorePort for PgServices {
 impl TenantStorePort for PgServices {
     async fn save(&self, tenant: &Tenant) -> Result<()> {
         let row = TenantRow::from_domain(tenant)?;
+        // Every tenant-owned table is FORCE RLS: this statement only sees rows
+        // inside the request's own scope, because the executor IS the
+        // request's transaction.
+        let mut scoped = crate::scoped_request::connection().await?;
         sqlx::query(
             "INSERT INTO tenants (
                 id, organization_id, name, slug, status, environment,
@@ -266,18 +286,22 @@ impl TenantStorePort for PgServices {
         .bind(&row.settings)
         .bind(row.created_at)
         .bind(row.updated_at)
-        .execute(&self.pool)
+        .execute(scoped.connection().as_mut())
         .await
         .map_err(map_unique("tenants", "slug"))?;
         Ok(())
     }
 
     async fn get(&self, id: TenantId) -> Result<Option<Tenant>> {
+        // Every tenant-owned table is FORCE RLS: this statement only sees rows
+        // inside the request's own scope, because the executor IS the
+        // request's transaction.
+        let mut scoped = crate::scoped_request::connection().await?;
         let row = sqlx::query(&format!(
             "SELECT {TENANT_COLUMNS} FROM tenants WHERE id = $1"
         ))
         .bind(Uuid::from(id))
-        .fetch_optional(&self.pool)
+        .fetch_optional(scoped.connection().as_mut())
         .await
         .map_err(map_sqlx)?;
         row.as_ref().map(tenant_from).transpose()
@@ -288,25 +312,33 @@ impl TenantStorePort for PgServices {
         organization: OrganizationId,
         slug: &str,
     ) -> Result<Option<Tenant>> {
+        // Every tenant-owned table is FORCE RLS: this statement only sees rows
+        // inside the request's own scope, because the executor IS the
+        // request's transaction.
+        let mut scoped = crate::scoped_request::connection().await?;
         let row = sqlx::query(&format!(
             "SELECT {TENANT_COLUMNS} FROM tenants
              WHERE organization_id = $1 AND slug = $2"
         ))
         .bind(Uuid::from(organization))
         .bind(slug)
-        .fetch_optional(&self.pool)
+        .fetch_optional(scoped.connection().as_mut())
         .await
         .map_err(map_sqlx)?;
         row.as_ref().map(tenant_from).transpose()
     }
 
     async fn list(&self, organization: OrganizationId) -> Result<Vec<Tenant>> {
+        // Every tenant-owned table is FORCE RLS: this statement only sees rows
+        // inside the request's own scope, because the executor IS the
+        // request's transaction.
+        let mut scoped = crate::scoped_request::connection().await?;
         let rows = sqlx::query(&format!(
             "SELECT {TENANT_COLUMNS} FROM tenants
              WHERE organization_id = $1 ORDER BY name"
         ))
         .bind(Uuid::from(organization))
-        .fetch_all(&self.pool)
+        .fetch_all(scoped.connection().as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(tenant_from).collect()
@@ -317,6 +349,10 @@ impl TenantStorePort for PgServices {
 impl ProjectStorePort for PgServices {
     async fn save(&self, project: &Project) -> Result<()> {
         let row = ProjectRow::from_domain(project)?;
+        // Every tenant-owned table is FORCE RLS: this statement only sees rows
+        // inside the request's own scope, because the executor IS the
+        // request's transaction.
+        let mut scoped = crate::scoped_request::connection().await?;
         sqlx::query(
             "INSERT INTO projects (
                 id, tenant_id, organization_id, name, slug, description,
@@ -340,30 +376,38 @@ impl ProjectStorePort for PgServices {
         .bind(&row.config)
         .bind(row.created_at)
         .bind(row.updated_at)
-        .execute(&self.pool)
+        .execute(scoped.connection().as_mut())
         .await
         .map_err(map_unique("projects", "slug"))?;
         Ok(())
     }
 
     async fn get(&self, id: ProjectId) -> Result<Option<Project>> {
+        // Every tenant-owned table is FORCE RLS: this statement only sees rows
+        // inside the request's own scope, because the executor IS the
+        // request's transaction.
+        let mut scoped = crate::scoped_request::connection().await?;
         let row = sqlx::query(&format!(
             "SELECT {PROJECT_COLUMNS} FROM projects WHERE id = $1"
         ))
         .bind(Uuid::from(id))
-        .fetch_optional(&self.pool)
+        .fetch_optional(scoped.connection().as_mut())
         .await
         .map_err(map_sqlx)?;
         row.as_ref().map(project_from).transpose()
     }
 
     async fn list(&self, tenant: TenantId) -> Result<Vec<Project>> {
+        // Every tenant-owned table is FORCE RLS: this statement only sees rows
+        // inside the request's own scope, because the executor IS the
+        // request's transaction.
+        let mut scoped = crate::scoped_request::connection().await?;
         let rows = sqlx::query(&format!(
             "SELECT {PROJECT_COLUMNS} FROM projects
              WHERE tenant_id = $1 ORDER BY name"
         ))
         .bind(Uuid::from(tenant))
-        .fetch_all(&self.pool)
+        .fetch_all(scoped.connection().as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(project_from).collect()
@@ -374,6 +418,10 @@ impl ProjectStorePort for PgServices {
 impl UserStorePort for PgServices {
     async fn save(&self, user: &User) -> Result<()> {
         let row = UserRow::from_domain(user)?;
+        // Every tenant-owned table is FORCE RLS: this statement only sees rows
+        // inside the request's own scope, because the executor IS the
+        // request's transaction.
+        let mut scoped = crate::scoped_request::connection().await?;
         sqlx::query(
             "INSERT INTO users (
                 id, email, display_name, status, external_subject,
@@ -395,27 +443,35 @@ impl UserStorePort for PgServices {
         .bind(row.last_login_at)
         .bind(row.created_at)
         .bind(row.updated_at)
-        .execute(&self.pool)
+        .execute(scoped.connection().as_mut())
         .await
         .map_err(map_unique("users", "email"))?;
         Ok(())
     }
 
     async fn get(&self, id: UserId) -> Result<Option<User>> {
+        // Every tenant-owned table is FORCE RLS: this statement only sees rows
+        // inside the request's own scope, because the executor IS the
+        // request's transaction.
+        let mut scoped = crate::scoped_request::connection().await?;
         let row = sqlx::query(&format!("SELECT {USER_COLUMNS} FROM users WHERE id = $1"))
             .bind(Uuid::from(id))
-            .fetch_optional(&self.pool)
+            .fetch_optional(scoped.connection().as_mut())
             .await
             .map_err(map_sqlx)?;
         row.as_ref().map(user_from).transpose()
     }
 
     async fn get_by_email(&self, email: &str) -> Result<Option<User>> {
+        // Every tenant-owned table is FORCE RLS: this statement only sees rows
+        // inside the request's own scope, because the executor IS the
+        // request's transaction.
+        let mut scoped = crate::scoped_request::connection().await?;
         let row = sqlx::query(&format!(
             "SELECT {USER_COLUMNS} FROM users WHERE email = $1"
         ))
         .bind(email.to_ascii_lowercase())
-        .fetch_optional(&self.pool)
+        .fetch_optional(scoped.connection().as_mut())
         .await
         .map_err(map_sqlx)?;
         row.as_ref().map(user_from).transpose()
@@ -426,6 +482,10 @@ impl UserStorePort for PgServices {
 impl MembershipStorePort for PgServices {
     async fn save(&self, membership: &Membership) -> Result<()> {
         let row = MembershipRow::from_domain(membership)?;
+        // Every tenant-owned table is FORCE RLS: this statement only sees rows
+        // inside the request's own scope, because the executor IS the
+        // request's transaction.
+        let mut scoped = crate::scoped_request::connection().await?;
         sqlx::query(
             "INSERT INTO memberships (
                 id, user_id, organization_id, tenant_id, roles, status,
@@ -448,42 +508,54 @@ impl MembershipStorePort for PgServices {
         .bind(row.joined_at)
         .bind(row.created_at)
         .bind(row.updated_at)
-        .execute(&self.pool)
+        .execute(scoped.connection().as_mut())
         .await
         .map_err(map_unique("memberships", "user→tenant binding"))?;
         Ok(())
     }
 
     async fn get(&self, id: MembershipId) -> Result<Option<Membership>> {
+        // Every tenant-owned table is FORCE RLS: this statement only sees rows
+        // inside the request's own scope, because the executor IS the
+        // request's transaction.
+        let mut scoped = crate::scoped_request::connection().await?;
         let row = sqlx::query(&format!(
             "SELECT {MEMBERSHIP_COLUMNS} FROM memberships WHERE id = $1"
         ))
         .bind(Uuid::from(id))
-        .fetch_optional(&self.pool)
+        .fetch_optional(scoped.connection().as_mut())
         .await
         .map_err(map_sqlx)?;
         row.as_ref().map(membership_from).transpose()
     }
 
     async fn for_user(&self, user: UserId) -> Result<Vec<Membership>> {
+        // Every tenant-owned table is FORCE RLS: this statement only sees rows
+        // inside the request's own scope, because the executor IS the
+        // request's transaction.
+        let mut scoped = crate::scoped_request::connection().await?;
         let rows = sqlx::query(&format!(
             "SELECT {MEMBERSHIP_COLUMNS} FROM memberships
              WHERE user_id = $1 ORDER BY created_at"
         ))
         .bind(Uuid::from(user))
-        .fetch_all(&self.pool)
+        .fetch_all(scoped.connection().as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(membership_from).collect()
     }
 
     async fn for_tenant(&self, tenant: TenantId) -> Result<Vec<Membership>> {
+        // Every tenant-owned table is FORCE RLS: this statement only sees rows
+        // inside the request's own scope, because the executor IS the
+        // request's transaction.
+        let mut scoped = crate::scoped_request::connection().await?;
         let rows = sqlx::query(&format!(
             "SELECT {MEMBERSHIP_COLUMNS} FROM memberships
              WHERE tenant_id = $1 ORDER BY created_at"
         ))
         .bind(Uuid::from(tenant))
-        .fetch_all(&self.pool)
+        .fetch_all(scoped.connection().as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(membership_from).collect()

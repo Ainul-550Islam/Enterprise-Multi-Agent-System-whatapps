@@ -1,3 +1,22 @@
+//! PURPOSE: The `agents` + `agent_versions` repositories.
+//!
+//! Owning layer: `mas-persistence`.
+//!
+//! Production responsibility: persist and hydrate agent aggregates. Every
+//! statement runs on the request's scoped transaction when one exists, which
+//! is what arms row-level security; the pool is retained only for
+//! diagnostics.
+//!
+//! Security boundary: these queries execute under `FORCE ROW LEVEL SECURITY`.
+//! A row another tenant owns is invisible here, not filtered afterwards — the
+//! database refuses to return it.
+//!
+//! It must NOT:
+//!   • acquire a fresh connection to "get around" the request transaction;
+//!   • build SQL from caller-supplied table or column names (the generic
+//!     document helpers use a closed whitelist for exactly this reason);
+//!   • assume a returned row belongs to the caller — it belongs to the scope.
+
 //! `agents` + `agent_versions` repositories (spec-JSONB style).
 //!
 //! Doctrine (shared with the other production repositories):
@@ -98,14 +117,33 @@ pub struct AgentStore {
 
 impl AgentStore {
     /// Binds a store to a pool.
+    ///
+    /// The pool is not used to run statements: every query runs on the
+    /// request's transaction, which is the only place row-level security is
+    /// armed. It is retained for pool diagnostics and health probes, and
+    /// deliberately has no code path that executes a query through it.
     #[must_use]
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
 
+    /// Pool handle, for diagnostics only.
+    ///
+    /// Never use this to run a tenant-touching statement: it has no scope, and
+    /// under `FORCE ROW LEVEL SECURITY` that means it would return nothing.
+    /// It exists so pool statistics can be reported.
+    #[must_use]
+    pub const fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
     /// Creates or rewrites an agent row.
     pub async fn save(&self, agent: &Agent) -> Result<()> {
         let row = AgentRow::from_domain(agent)?;
+        // Every tenant-owned table is FORCE RLS: this statement only sees rows
+        // inside the request's own scope, because the executor IS the
+        // request's transaction.
+        let mut scoped = crate::scoped_request::connection().await?;
         let result = sqlx::query(AGENT_UPSERT)
             .bind(row.id)
             .bind(row.tenant_id)
@@ -116,7 +154,7 @@ impl AgentStore {
             .bind(&row.spec)
             .bind(row.created_at)
             .bind(row.updated_at)
-            .execute(&self.pool)
+            .execute(scoped.connection().as_mut())
             .await
             .map_err(|error| map_write_conflict(&error, "agents", &row.slug))?;
         if result.rows_affected() != 1 {
@@ -131,9 +169,13 @@ impl AgentStore {
 
     /// Loads one agent by primary key (service role; services assert scope).
     pub async fn get(&self, id: AgentId) -> Result<Option<Agent>> {
+        // Every tenant-owned table is FORCE RLS: this statement only sees rows
+        // inside the request's own scope, because the executor IS the
+        // request's transaction.
+        let mut scoped = crate::scoped_request::connection().await?;
         let row = sqlx::query(&format!("SELECT {AGENT_COLUMNS} FROM agents WHERE id = $1"))
             .bind(Uuid::from(id))
-            .fetch_optional(&self.pool)
+            .fetch_optional(scoped.connection().as_mut())
             .await
             .map_err(map_sqlx)?;
         row.map(fetch_agent)
@@ -144,12 +186,16 @@ impl AgentStore {
 
     /// Loads by (tenant, slug) — the public-key lookup for runs/CLI.
     pub async fn get_by_slug(&self, tenant: TenantId, slug: &str) -> Result<Option<Agent>> {
+        // Every tenant-owned table is FORCE RLS: this statement only sees rows
+        // inside the request's own scope, because the executor IS the
+        // request's transaction.
+        let mut scoped = crate::scoped_request::connection().await?;
         let row = sqlx::query(&format!(
             "SELECT {AGENT_COLUMNS} FROM agents WHERE tenant_id = $1 AND slug = $2"
         ))
         .bind(Uuid::from(tenant))
         .bind(slug)
-        .fetch_optional(&self.pool)
+        .fetch_optional(scoped.connection().as_mut())
         .await
         .map_err(map_sqlx)?;
         row.map(fetch_agent)
@@ -162,13 +208,17 @@ impl AgentStore {
     /// spec-carried field on the agent aggregate — the schema owns no
     /// dedicated column).
     pub async fn list_for_project(&self, project: ProjectId) -> Result<Vec<Agent>> {
+        // Every tenant-owned table is FORCE RLS: this statement only sees rows
+        // inside the request's own scope, because the executor IS the
+        // request's transaction.
+        let mut scoped = crate::scoped_request::connection().await?;
         let rows = sqlx::query(&format!(
             "SELECT {AGENT_COLUMNS} FROM agents
              WHERE spec ->> 'project_id' = $1
              ORDER BY name"
         ))
         .bind(Uuid::from(project).to_string())
-        .fetch_all(&self.pool)
+        .fetch_all(scoped.connection().as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.into_iter()
@@ -181,11 +231,15 @@ impl AgentStore {
 
     /// Lists tenant-scoped agents (scheduler/usage paths).
     pub async fn list_for_tenant(&self, tenant: TenantId) -> Result<Vec<Agent>> {
+        // Every tenant-owned table is FORCE RLS: this statement only sees rows
+        // inside the request's own scope, because the executor IS the
+        // request's transaction.
+        let mut scoped = crate::scoped_request::connection().await?;
         let rows = sqlx::query(&format!(
             "SELECT {AGENT_COLUMNS} FROM agents WHERE tenant_id = $1 ORDER BY name"
         ))
         .bind(Uuid::from(tenant))
-        .fetch_all(&self.pool)
+        .fetch_all(scoped.connection().as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.into_iter()
@@ -205,9 +259,24 @@ pub struct AgentVersionStore {
 
 impl AgentVersionStore {
     /// Binds a store to a pool.
+    ///
+    /// The pool is not used to run statements: every query runs on the
+    /// request's transaction, which is the only place row-level security is
+    /// armed. It is retained for pool diagnostics and health probes, and
+    /// deliberately has no code path that executes a query through it.
     #[must_use]
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
+    }
+
+    /// Pool handle, for diagnostics only.
+    ///
+    /// Never use this to run a tenant-touching statement: it has no scope, and
+    /// under `FORCE ROW LEVEL SECURITY` that means it would return nothing.
+    /// It exists so pool statistics can be reported.
+    #[must_use]
+    pub const fn pool(&self) -> &PgPool {
+        &self.pool
     }
 
     /// Appends an immutable version; refuses to overwrite a snapshot (the
@@ -216,6 +285,10 @@ impl AgentVersionStore {
     pub async fn save(&self, version: &AgentVersion, tenant: TenantId) -> Result<()> {
         let mut row = AgentVersionRow::from_domain(version)?;
         row.tenant_id = Uuid::from(tenant);
+        // Every tenant-owned table is FORCE RLS: this statement only sees rows
+        // inside the request's own scope, because the executor IS the
+        // request's transaction.
+        let mut scoped = crate::scoped_request::connection().await?;
         let result = sqlx::query(AGENT_VERSION_INSERT)
             .bind(row.id)
             .bind(row.agent_id)
@@ -224,7 +297,7 @@ impl AgentVersionStore {
             .bind(&row.deployment)
             .bind(&row.spec)
             .bind(row.created_at)
-            .execute(&self.pool)
+            .execute(scoped.connection().as_mut())
             .await
             .map_err(map_sqlx)?;
         if result.rows_affected() == 0 {
@@ -241,11 +314,15 @@ impl AgentVersionStore {
 
     /// Loads one version by primary key.
     pub async fn get(&self, id: AgentVersionId) -> Result<Option<AgentVersion>> {
+        // Every tenant-owned table is FORCE RLS: this statement only sees rows
+        // inside the request's own scope, because the executor IS the
+        // request's transaction.
+        let mut scoped = crate::scoped_request::connection().await?;
         let row = sqlx::query(&format!(
             "SELECT {AGENT_VERSION_COLUMNS} FROM agent_versions WHERE id = $1"
         ))
         .bind(Uuid::from(id))
-        .fetch_optional(&self.pool)
+        .fetch_optional(scoped.connection().as_mut())
         .await
         .map_err(map_sqlx)?;
         row.map(fetch_agent_version)
@@ -256,12 +333,16 @@ impl AgentVersionStore {
 
     /// Lists every version of an agent, newest first.
     pub async fn list_for_agent(&self, agent: AgentId) -> Result<Vec<AgentVersion>> {
+        // Every tenant-owned table is FORCE RLS: this statement only sees rows
+        // inside the request's own scope, because the executor IS the
+        // request's transaction.
+        let mut scoped = crate::scoped_request::connection().await?;
         let rows = sqlx::query(&format!(
             "SELECT {AGENT_VERSION_COLUMNS} FROM agent_versions
              WHERE agent_id = $1 ORDER BY version DESC"
         ))
         .bind(Uuid::from(agent))
-        .fetch_all(&self.pool)
+        .fetch_all(scoped.connection().as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.into_iter()

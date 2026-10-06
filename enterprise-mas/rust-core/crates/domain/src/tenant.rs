@@ -81,6 +81,47 @@ impl Tenant {
         self.organization_id
     }
 
+    /// Rebuilds a tenant exactly as the database has it.
+    ///
+    /// This is a **hydration** constructor for the persistence layer, not a
+    /// way to create a tenant: it takes the id, the owning organization and
+    /// the timestamps as given facts. It exists because `organization_id` is
+    /// private — the owning organization is fixed at creation and must not be
+    /// movable in memory — and a repository reading a row still has to produce
+    /// a `Tenant` with the owner the row names.
+    ///
+    /// Security boundary: it must only ever be called with values read from a
+    /// row. Passing caller-supplied ids here would construct a tenant whose
+    /// ownership is whatever the caller claimed, which is precisely the
+    /// cross-organization confusion [`Self::assert_belongs_to`] exists to
+    /// catch — so the caller is expected to assert coherence immediately
+    /// afterwards.
+    pub fn reconstitute(
+        id: TenantId,
+        organization_id: OrganizationId,
+        name: String,
+        slug: Slug,
+        status: TenantStatus,
+        environment: Environment,
+        isolation: IsolationMode,
+        settings: serde_json::Map<String, serde_json::Value>,
+        created_at: Timestamp,
+        updated_at: Timestamp,
+    ) -> Self {
+        Self {
+            id,
+            organization_id,
+            name,
+            slug,
+            status,
+            environment,
+            isolation,
+            settings,
+            created_at,
+            updated_at,
+        }
+    }
+
     /// Defense-in-depth: asserts this tenant belongs to `organization_id`.
     /// Call at trust boundaries when both were supplied independently
     /// (prevents cross-organization tenant ownership confusion).

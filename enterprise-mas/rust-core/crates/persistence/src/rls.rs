@@ -1,3 +1,23 @@
+//! PURPOSE: The row-level-security context — the GUC statements that arm
+//! PostgreSQL's policies inside a transaction.
+//!
+//! Owning layer: `mas-persistence`.
+//!
+//! Production responsibility: produce the exact `set_config(..., true)`
+//! statements (`SET LOCAL`, never `SET`) for a resolved tenant and
+//! organization, and refuse to produce any statement for an unscoped context.
+//!
+//! Security boundary: this is the last layer of defence below the repository.
+//! Because the setting is transaction-local, a connection returning to the
+//! pool carries nothing forward, so Phase 12's pooled-connection leak cannot
+//! occur through it.
+//!
+//! It must NOT:
+//!   • emit a session-level `SET`;
+//!   • produce statements for an empty or partial scope;
+//!   • be bypassed for convenience — repositories reach it only through
+//!     `scoped_request`.
+
 //! Row-Level Security session context.
 //!
 //! The SQL policies (in the migration set) read three GUCs:

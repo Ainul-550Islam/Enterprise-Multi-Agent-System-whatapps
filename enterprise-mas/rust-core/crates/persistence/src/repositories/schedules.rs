@@ -1,3 +1,38 @@
+//! PURPOSE: The `schedules` + `schedule_runs` repositories.
+//!
+//! Owning layer: `mas-persistence`.
+//!
+//! Production responsibility: persist schedules and the record of each run.
+//! Every statement runs on the request's scoped transaction when one exists.
+//!
+//! Security boundary: the schedule row is the authority for which tenant a
+//! fired run belongs to. The internal run endpoint resolves the schedule
+//! under the resolved scope and compares the schedule's own `tenant_id`
+//! against it, so a caller cannot name a tenant and borrow another tenant's
+//! schedule.
+//!
+//! Two planes reach this store, and they reach different halves of it:
+//!
+//!   * the **request plane** uses the `&self` methods, which borrow the
+//!     request's scoped transaction, so every row it sees is inside
+//!     `app.current_tenant`;
+//!   * the **scheduler plane** uses the `*_in` methods with an explicit
+//!     connection. Its cross-tenant due-scan runs on the `mas_scheduler`
+//!     connection (BYPASSRLS, SELECT on `schedules` only); everything after
+//!     the scan runs on `mas_app` inside a scoped transaction for the tenant
+//!     the due row named.
+//!
+//! The split is the point: one cross-tenant SELECT on one table is a far
+//! smaller exemption than an entire tick loop running RLS-free.
+//!
+//! It must NOT:
+//!   • look a schedule up outside a scope on the request plane;
+//!   • expose the task template as caller-controllable — it comes from the
+//!     stored row;
+//!   • take a second scoped connection while one is already held. The
+//!     request transaction sits behind a non-reentrant mutex, so nesting
+//!     `connection()` calls inside one method is a deadlock, not a slowdown.
+
 //! `schedules` + `schedule_runs` repositories.
 //!
 //! The application's `ScheduleStorePort` (CRUD surface) and the scheduler's
@@ -16,7 +51,7 @@ use mas_common::ids::{ScheduleId, TenantId};
 use mas_common::result::Result;
 use mas_common::timestamps::Timestamp;
 use mas_domain::schedule::Schedule;
-use sqlx::{PgPool, Row};
+use sqlx::{PgConnection, PgPool, Row};
 use uuid::Uuid;
 
 use crate::error::map_sqlx;
@@ -81,14 +116,52 @@ pub struct ScheduleStore {
 
 impl ScheduleStore {
     /// Binds a store to a pool.
+    ///
+    /// The pool is not used to run statements: every query runs on the
+    /// request's transaction, which is the only place row-level security is
+    /// armed. It is retained for pool diagnostics and health probes, and
+    /// deliberately has no code path that executes a query through it.
     #[must_use]
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
 
-    /// Creates or rewrites a schedule row. The organization link resolves
-    /// via the tenant FK inside the statement (see module docs).
-    pub async fn save(&self, schedule: &Schedule) -> Result<()> {
+    /// Pool handle, for diagnostics only.
+    ///
+    /// Never use this to run a tenant-touching statement: it has no scope, and
+    /// under `FORCE ROW LEVEL SECURITY` that means it would return nothing.
+    /// It exists so pool statistics can be reported.
+    #[must_use]
+    pub const fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
+    // ── Connection-taking primitives ────────────────────────────────────
+    //
+    // Every statement the store can run exists once, here, taking an explicit
+    // connection. Two callers reach them:
+    //
+    //   * the request path, through the `&self` methods below, which borrow
+    //     the request's scoped transaction;
+    //   * the scheduler plane, through `SchedulerPlaneStore` in
+    //     `mas-scheduler-service`, which borrows the plane's own connection
+    //     for the cross-tenant due-scan and a scoped transaction for
+    //     everything after it.
+    //
+    // Neither caller can widen the other's reach, and there is no third
+    // implementation of this SQL to drift out of step.
+
+    /// Creates or rewrites a schedule row on `connection`.
+    ///
+    /// The organization link resolves via the tenant FK inside the statement
+    /// (see module docs), so a tenant that does not exist is rejected by the
+    /// database rather than guessed at in Rust.
+    ///
+    /// # Errors
+    /// `conflict` when the tenant already holds a schedule of this name;
+    /// `validation` when the tenant id is unknown (the `INSERT … SELECT`
+    /// matched no row); the mapped sqlx error otherwise.
+    pub async fn save_in(connection: &mut PgConnection, schedule: &Schedule) -> Result<()> {
         let row = ScheduleRow::from_domain(schedule, Uuid::nil())?;
         let result = sqlx::query(SAVE_SQL)
             .bind(row.id)
@@ -102,7 +175,7 @@ impl ScheduleStore {
             .bind(row.last_run_at)
             .bind(row.created_at)
             .bind(row.updated_at)
-            .execute(&self.pool)
+            .execute(&mut *connection)
             .await
             .map_err(|error| match error {
                 sqlx::Error::Database(db) if db.is_unique_violation() => {
@@ -121,13 +194,16 @@ impl ScheduleStore {
         Ok(())
     }
 
-    /// Loads one schedule by primary key.
-    pub async fn get(&self, id: ScheduleId) -> Result<Option<Schedule>> {
+    /// Loads one schedule by primary key on `connection`.
+    ///
+    /// # Errors
+    /// The mapped sqlx error.
+    pub async fn get_in(connection: &mut PgConnection, id: ScheduleId) -> Result<Option<Schedule>> {
         let row = sqlx::query(&format!(
             "SELECT {SCHEDULE_COLUMNS} FROM schedules WHERE id = $1"
         ))
         .bind(Uuid::from(id))
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *connection)
         .await
         .map_err(map_sqlx)?;
         row.map(fetch_schedule)
@@ -136,13 +212,16 @@ impl ScheduleStore {
             .transpose()
     }
 
-    /// Lists schedules in a tenant (name order).
-    pub async fn list(&self, tenant: TenantId) -> Result<Vec<Schedule>> {
+    /// Lists schedules in a tenant (name order) on `connection`.
+    ///
+    /// # Errors
+    /// The mapped sqlx error.
+    pub async fn list_in(connection: &mut PgConnection, tenant: TenantId) -> Result<Vec<Schedule>> {
         let rows = sqlx::query(&format!(
             "SELECT {SCHEDULE_COLUMNS} FROM schedules WHERE tenant_id = $1 ORDER BY name"
         ))
         .bind(Uuid::from(tenant))
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *connection)
         .await
         .map_err(map_sqlx)?;
         rows.into_iter()
@@ -153,16 +232,29 @@ impl ScheduleStore {
             .collect()
     }
 
-    /// Due-scan with the documented semantics (active rows whose next plan
-    /// is at or before `now`, oldest first, bounded).
-    pub async fn list_due(&self, now: &Timestamp, limit: usize) -> Result<Vec<Schedule>> {
+    /// Due-scan with the documented semantics on `connection`: active rows
+    /// whose next plan is at or before `now`, oldest first, bounded.
+    ///
+    /// This is the platform's one legitimate cross-tenant read. It is only
+    /// ever called on the scheduler plane's connection (`mas_scheduler`),
+    /// whose BYPASSRLS is granted for SELECT on `schedules` and nothing else.
+    /// Called on `mas_app` without a scope it returns zero rows rather than
+    /// every tenant's schedules, which is the correct failure direction.
+    ///
+    /// # Errors
+    /// The mapped sqlx error.
+    pub async fn list_due_in(
+        connection: &mut PgConnection,
+        now: &Timestamp,
+        limit: usize,
+    ) -> Result<Vec<Schedule>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
         let rows = sqlx::query(LIST_DUE_SQL)
             .bind(now.into_datetime())
             .bind(i64::try_from(limit).unwrap_or(i64::MAX))
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *connection)
             .await
             .map_err(map_sqlx)?;
         rows.into_iter()
@@ -173,16 +265,29 @@ impl ScheduleStore {
             .collect()
     }
 
-    /// Journals a planned tick. `false` = the unique constraint reports
-    /// another replica already recorded it (duplicate-fire guard).
-    pub async fn record_run(&self, schedule_id: ScheduleId, planned_at: Timestamp) -> Result<bool> {
+    /// Journals a planned tick on `connection`.
+    ///
+    /// `false` = the unique constraint reports another replica already
+    /// recorded it (duplicate-fire guard).
+    ///
+    /// # Errors
+    /// `not_found` when the schedule does not exist inside the scope the
+    /// connection carries — which, under RLS, is also what a schedule owned
+    /// by another tenant looks like. The two are deliberately
+    /// indistinguishable to the caller: the caller is not entitled to know
+    /// that another tenant's schedule exists.
+    pub async fn record_run_in(
+        connection: &mut PgConnection,
+        schedule_id: ScheduleId,
+        planned_at: Timestamp,
+    ) -> Result<bool> {
         let result = sqlx::query(RECORD_RUN_SQL)
             .bind(Uuid::now_v7())
             // schedule_runs carries tenant too; deriving it via a subselect
             // keeps replica loops pure (no extra read round-trip).
             .bind(Uuid::from(schedule_id))
             .bind(planned_at.into_datetime())
-            .execute(&self.pool)
+            .execute(&mut *connection)
             .await;
         match result {
             Ok(done) => {
@@ -191,10 +296,18 @@ impl ScheduleStore {
                 }
                 // Zero rows is ambiguous: duplicate tick vs unknown schedule.
                 // Resolve it honestly — replicas depend on the distinction.
+                //
+                // The disambiguating read reuses the connection already in
+                // hand. Taking a second scoped connection here deadlocks: the
+                // request's transaction sits behind a non-reentrant mutex and
+                // this branch is reached while that guard is still alive. The
+                // hang was invisible until the suite ran against real
+                // PostgreSQL, and it sits on the duplicate-tick path — the
+                // path every second replica takes on every tick.
                 let exists: bool =
                     sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM schedules WHERE id = $1)")
                         .bind(Uuid::from(schedule_id))
-                        .fetch_one(&self.pool)
+                        .fetch_one(&mut *connection)
                         .await
                         .map_err(map_sqlx)?;
                 if exists {
@@ -205,6 +318,61 @@ impl ScheduleStore {
             },
             Err(err) => Err(map_sqlx(err)),
         }
+    }
+
+    // ── Request-scoped surface ──────────────────────────────────────────
+
+    /// Creates or rewrites a schedule row.
+    ///
+    /// Every tenant-owned table is FORCE RLS: this statement only sees rows
+    /// inside the request's own scope, because the executor IS the request's
+    /// transaction.
+    ///
+    /// # Errors
+    /// See [`Self::save_in`].
+    pub async fn save(&self, schedule: &Schedule) -> Result<()> {
+        let mut scoped = crate::scoped_request::connection().await?;
+        Self::save_in(scoped.connection().as_mut(), schedule).await
+    }
+
+    /// Loads one schedule by primary key.
+    ///
+    /// # Errors
+    /// See [`Self::get_in`].
+    pub async fn get(&self, id: ScheduleId) -> Result<Option<Schedule>> {
+        let mut scoped = crate::scoped_request::connection().await?;
+        Self::get_in(scoped.connection().as_mut(), id).await
+    }
+
+    /// Lists schedules in a tenant (name order).
+    ///
+    /// # Errors
+    /// See [`Self::list_in`].
+    pub async fn list(&self, tenant: TenantId) -> Result<Vec<Schedule>> {
+        let mut scoped = crate::scoped_request::connection().await?;
+        Self::list_in(scoped.connection().as_mut(), tenant).await
+    }
+
+    /// Due-scan inside the request's scope.
+    ///
+    /// This is *not* the scheduler's due-scan: a request sees only its own
+    /// tenant's schedules. The scheduler's cross-tenant scan goes through
+    /// [`Self::list_due_in`] on the plane connection.
+    ///
+    /// # Errors
+    /// See [`Self::list_due_in`].
+    pub async fn list_due(&self, now: &Timestamp, limit: usize) -> Result<Vec<Schedule>> {
+        let mut scoped = crate::scoped_request::connection().await?;
+        Self::list_due_in(scoped.connection().as_mut(), now, limit).await
+    }
+
+    /// Journals a planned tick.
+    ///
+    /// # Errors
+    /// See [`Self::record_run_in`].
+    pub async fn record_run(&self, schedule_id: ScheduleId, planned_at: Timestamp) -> Result<bool> {
+        let mut scoped = crate::scoped_request::connection().await?;
+        Self::record_run_in(scoped.connection().as_mut(), schedule_id, planned_at).await
     }
 }
 

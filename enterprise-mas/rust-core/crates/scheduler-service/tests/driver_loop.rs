@@ -1,3 +1,20 @@
+//! PURPOSE: End-to-end driver-loop test:due work → dispatch → completion.
+//!
+//! Owning layer: integration tests for `mas-scheduler-service`.
+//!
+//! Production responsibility: exercise the real listener, the real
+//! dispatcher and the real SSRF policy on a loopback socket, so the wiring —
+//! not a mock — is what gets tested.
+//!
+//! Security boundary: the test proves the completion route refuses unsigned
+//! notices and that reaching a loopback endpoint still requires an explicit
+//! egress policy exemption. It signs its own requests with a test secret, so
+//! the authenticated path and the unauthenticated path are both covered.
+//!
+//! It must NOT:
+//!   • disable the SSRF guard to make the test pass;
+//!   • use a production credential as the test secret.
+
 //! End-to-end: wall-clock driver + deterministic runtime over the real
 //! in-memory store/leases, plus request-level coverage of the HTTP
 //! dispatch adapter and completion listener.
@@ -237,6 +254,9 @@ async fn failing_store_backs_off_and_recovers_on_repair() {
 #[tokio::test]
 async fn http_dispatcher_round_trip_with_completion_listener() {
     // ── Fake API downstream: accepts runs, returns an execution id ──
+    /// The shared secret the scheduler authenticates internal callers with.
+    const SECRET: &str = "driver-loop-internal-secret";
+
     let execution_id = ExecutionId::new();
     let api = axum::Router::new().route(
         "/v1/internal/schedule-runs",
@@ -252,8 +272,23 @@ async fn http_dispatcher_round_trip_with_completion_listener() {
 
     // ── Scheduler side: dispatcher + completion listener on the loopback ──
     let ledger = InFlightLedger::default();
-    let dispatcher = HttpDispatcher::new(ledger.clone(), &format!("http://{api_addr}"), None)
-        .expect("dispatcher");
+    // The fake API is on loopback, so the dispatcher is configured with an
+    // internal-endpoint policy naming it explicitly. Reaching it still goes
+    // through the SSRF guard; only the "must be publicly routable" rule is
+    // relaxed, for this host alone.
+    let host = api_addr.ip().to_string();
+    let policy = mas_integrations::http_guard::EgressPolicy::for_internal_endpoints(
+        [host.as_str()],
+        Some([api_addr.port()].into_iter().collect()),
+    );
+    let dispatcher = HttpDispatcher::new(
+        ledger.clone(),
+        &format!("http://{api_addr}"),
+        None,
+        "mas-scheduler",
+        policy,
+    )
+    .expect("dispatcher");
     let work = DueWork {
         schedule_id: ScheduleId::new(),
         tenant_id: TenantId::new(),
@@ -275,8 +310,15 @@ async fn http_dispatcher_round_trip_with_completion_listener() {
         .expect("bind");
     let completion_addr = completion_listener.local_addr().expect("addr");
     let ledger_for_listener = ledger.clone();
+    let auth = mas_scheduler_service::server::InternalAuth::new(Some(
+        mas_security::SecretString::new(SECRET.to_owned()),
+    ));
     tokio::spawn(async move {
-        axum::serve(completion_listener, completion_router(ledger_for_listener)).await
+        axum::serve(
+            completion_listener,
+            completion_router(ledger_for_listener, auth),
+        )
+        .await
     });
 
     let notice = CompletionNotice {
@@ -284,9 +326,19 @@ async fn http_dispatcher_round_trip_with_completion_listener() {
         execution_id,
         outcome: "succeeded".to_owned(),
     };
+    let body = serde_json::to_vec(&notice).expect("notice");
+    let signature = mas_security::internal_service::sign(
+        SECRET.as_bytes(),
+        "mas-api",
+        &Timestamp::now(),
+        &body,
+    );
     let response = reqwest::Client::new()
         .post(format!("http://{completion_addr}/v1/scheduler/completions"))
-        .json(&notice)
+        .header("content-type", "application/json")
+        .header("x-mas-internal-signature", signature)
+        .header("x-mas-internal-service", "mas-api")
+        .body(body)
         .send()
         .await
         .expect("posted completion");

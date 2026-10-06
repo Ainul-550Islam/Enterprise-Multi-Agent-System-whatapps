@@ -1,3 +1,24 @@
+//! PURPOSE: The gRPC surface of the api process.
+//!
+//! Owning layer: `mas-api` (the process edge).
+//!
+//! Production responsibility: serve the same application services over gRPC
+//! as the HTTP surface serves over HTTP, with the same principal, the same
+//! scope resolution, and the same authorization decisions.
+//!
+//! Security boundary: every routed call runs inside
+//! `scoped_call`, which wraps the work in the request's RLS-armed
+//! transaction when a scope exists. A route that has no scope — organization
+//! registration, which necessarily happens before a tenant exists — runs
+//! unscoped by design, and that set is deliberately small and auditable.
+//!
+//! It must NOT:
+//!   • read a tenant or organization id from gRPC metadata and treat it as
+//!     authoritative — metadata is a hint, resolved exactly as headers are on
+//!     the HTTP path;
+//!   • reach the pool directly; the scoped transaction is the only path;
+//!   • let a service method bypass authorization by being reached here.
+
 //! Tonic gRPC services for `mas.api.v1` — exact semantic mirror of the
 //! HTTP handlers (same context construction, same use-cases, same error
 //! surface). Metadata keys equal the HTTP header names.
@@ -9,7 +30,10 @@ use mas_common::result::Result as MasResult;
 use tonic::{Code, Request, Response, Status};
 
 use crate::auth::{bearer_token, TokenVerifierPort};
-use crate::context::{RequestContext, CORRELATION_HEADER, ORGANIZATION_HEADER, TENANT_HEADER};
+use crate::context::{
+    RequestContext, CORRELATION_HEADER, ORGANIZATION_HEADER, PROJECT_HEADER, TENANT_HEADER,
+};
+use crate::scope_resolution::ScopeClaims;
 use crate::state::AppState;
 
 pub mod gen {
@@ -34,6 +58,9 @@ fn to_status(err: AppError) -> Status {
         AppError::Forbidden(_) => Code::PermissionDenied,
         AppError::Conflict(_) => Code::AlreadyExists,
         AppError::RateLimited(_) => Code::ResourceExhausted,
+        AppError::QuotaExceeded { .. } => Code::ResourceExhausted,
+        AppError::PolicyDenied { .. } => Code::PermissionDenied,
+        AppError::EntitlementRequired { .. } => Code::FailedPrecondition,
         AppError::Timeout(_) => Code::DeadlineExceeded,
         AppError::Cancelled(_) => Code::Cancelled,
         AppError::ExternalService { .. } => Code::Unavailable,
@@ -50,6 +77,38 @@ fn parse_id<T: mas_common::ids::TypedId>(field: &'static str, raw: &str) -> Resu
         .map_err(|_| Status::new(Code::InvalidArgument, format!("{field}: not a valid uuid")))
 }
 
+/// Runs one service call inside the request's scoped transaction.
+///
+/// The future is created outside and polled inside, which is enough: a tokio
+/// task-local is read at poll time, so the repository calls the service makes
+/// see the transaction this opens. On PostgreSQL that transaction is what
+/// arms row-level security, exactly as it is on the HTTP path.
+///
+/// A route that has no scope (organization registration, which happens before
+/// a tenant exists) simply runs unscoped.
+///
+/// The `Status` error is large; the alternative (boxing it) would force every
+/// one of the thirteen call sites to unwrap, which is a readability cost with
+/// no safety benefit. The lint is about avoiding needless copies on hot
+/// paths; a gRPC status is constructed once, on failure.
+#[allow(clippy::result_large_err)]
+async fn scoped_call<T>(
+    state: &AppState,
+    ctx: &RequestContext,
+    work: impl std::future::Future<Output = MasResult<T>>,
+) -> Result<T, Status> {
+    let Some(pool) = &state.runtime_pool else {
+        return work.await.map_err(to_status);
+    };
+    let scope = match ctx.require_scope() {
+        Ok(scope) => scope.clone(),
+        Err(_) => return work.await.map_err(to_status),
+    };
+    mas_persistence::scoped_request::with_authoritative_scope(pool, scope, || work)
+        .await
+        .map_err(to_status)
+}
+
 /// Builds a verified [`RequestContext`] from grpc metadata (auth + scope +
 /// correlation), exactly mirroring the HTTP middleware.
 #[allow(clippy::result_large_err)] // tonic idiom: Status is the transport error
@@ -64,38 +123,63 @@ async fn context_from(
     let principal = verify(state.verifier.as_ref(), &token)
         .await
         .map_err(to_status)?;
-    let tenant =
-        RequestContext::parse_scope_header(TENANT_HEADER, meta_str(metadata, TENANT_HEADER))
-            .map_err(to_status)?
-            .map(TenantId::from_uuid);
-    let organization = RequestContext::parse_scope_header(
-        ORGANIZATION_HEADER,
-        meta_str(metadata, ORGANIZATION_HEADER),
-    )
-    .map_err(to_status)?
-    .map(OrganizationId::from_uuid);
-    Ok(RequestContext {
-        principal,
-        tenant_id: tenant,
-        organization_id: organization,
-        request_id: uuid::Uuid::now_v7(),
-        correlation_id: RequestContext::correlation_or_generated(meta_str(
-            metadata,
-            CORRELATION_HEADER,
-        )),
-    })
+
+    // The metadata keys are claims, exactly as the HTTP headers are. They
+    // select among tenants the principal can already reach; they never grant
+    // one.
+    let claims = ScopeClaims {
+        tenant: RequestContext::parse_scope_header(
+            TENANT_HEADER,
+            meta_str(metadata, TENANT_HEADER),
+        )
+        .map_err(to_status)?
+        .map(TenantId::from_uuid),
+        organization: RequestContext::parse_scope_header(
+            ORGANIZATION_HEADER,
+            meta_str(metadata, ORGANIZATION_HEADER),
+        )
+        .map_err(to_status)?
+        .map(OrganizationId::from_uuid),
+        project: RequestContext::parse_scope_header(
+            PROJECT_HEADER,
+            meta_str(metadata, PROJECT_HEADER),
+        )
+        .map_err(to_status)?
+        .map(ProjectId::from_uuid),
+    };
+    let correlation_id =
+        RequestContext::correlation_or_generated(meta_str(metadata, CORRELATION_HEADER));
+
+    let context = RequestContext::with_claims(claims, correlation_id);
+
+    // Scope comes from identity. A gRPC caller has no more authority over it
+    // than an HTTP one.
+    let resolver = state.scope_resolver.as_ref().ok_or_else(|| {
+        Status::new(
+            Code::Internal,
+            "no tenancy directory is configured; refusing to resolve request scope",
+        )
+    })?;
+    let resolved = resolver
+        .resolve(&principal, claims)
+        .await
+        .map_err(to_status)?;
+
+    Ok(context.with_resolved(resolved.principal, resolved.scope))
 }
 
 async fn verify(
     verifier: &dyn TokenVerifierPort,
     token: &str,
-) -> MasResult<crate::auth::Principal> {
+) -> MasResult<mas_security::SecurityPrincipal> {
     verifier.verify(token).await
 }
 
 #[allow(clippy::result_large_err)]
 fn scoped(ctx: &RequestContext) -> Result<ServiceContext, Status> {
-    let ctx = ctx.require_scope().map_err(to_status)?;
+    // `require_scope` only ever hands out a scope the resolver produced, so
+    // this fails closed for any route reached without resolution.
+    let _ = ctx.require_scope().map_err(to_status)?;
     ctx.service_context().map_err(to_status)
 }
 
@@ -314,12 +398,14 @@ impl gen::tenancy_api_server::TenancyApi for GrpcServices {
         let ctx = context_from(&self.state, request.metadata()).await?;
         let service_ctx = scoped(&ctx)?;
         let msg = request.into_inner();
-        let project = self
-            .state
-            .tenancy
-            .register_project(&service_ctx, &msg.name, &msg.slug)
-            .await
-            .map_err(to_status)?;
+        let project = scoped_call(
+            &self.state,
+            &ctx,
+            self.state
+                .tenancy
+                .register_project(&service_ctx, &msg.name, &msg.slug),
+        )
+        .await?;
         Ok(Response::new(gen::ProjectReply {
             id: project.id.to_string(),
             name: project.name.clone(),
@@ -344,12 +430,14 @@ impl gen::tenancy_api_server::TenancyApi for GrpcServices {
                 "role: owner | admin | developer | operator | viewer | service_account",
             )
         })?;
-        let membership = self
-            .state
-            .tenancy
-            .invite_membership(&service_ctx, user_id, role)
-            .await
-            .map_err(to_status)?;
+        let membership = scoped_call(
+            &self.state,
+            &ctx,
+            self.state
+                .tenancy
+                .invite_membership(&service_ctx, user_id, role),
+        )
+        .await?;
         Ok(Response::new(gen::MembershipReply {
             id: membership.id.to_string(),
             user_id: membership.user_id.to_string(),
@@ -386,12 +474,14 @@ impl gen::agent_api_server::AgentApi for GrpcServices {
                 "kind: standard | supervisor | tool_user",
             )
         })?;
-        let agent = self
-            .state
-            .agents
-            .register(&service_ctx, project_id, &msg.name, &msg.slug, kind)
-            .await
-            .map_err(to_status)?;
+        let agent = scoped_call(
+            &self.state,
+            &ctx,
+            self.state
+                .agents
+                .register(&service_ctx, project_id, &msg.name, &msg.slug, kind),
+        )
+        .await?;
         Ok(Response::new(agent_reply(&agent)))
     }
 
@@ -437,12 +527,12 @@ impl gen::agent_api_server::AgentApi for GrpcServices {
         let ctx = context_from(&self.state, request.metadata()).await?;
         let service_ctx = scoped(&ctx)?;
         let agent_id: AgentId = parse_id("agent_id", &request.into_inner().agent_id)?;
-        let agent = self
-            .state
-            .agents
-            .get(&service_ctx, agent_id)
-            .await
-            .map_err(to_status)?;
+        let agent = scoped_call(
+            &self.state,
+            &ctx,
+            self.state.agents.get(&service_ctx, agent_id),
+        )
+        .await?;
         Ok(Response::new(agent_reply(&agent)))
     }
 
@@ -453,12 +543,12 @@ impl gen::agent_api_server::AgentApi for GrpcServices {
         let ctx = context_from(&self.state, request.metadata()).await?;
         let service_ctx = scoped(&ctx)?;
         let project_id: ProjectId = parse_id("project_id", &request.into_inner().project_id)?;
-        let agents = self
-            .state
-            .agents
-            .list(&service_ctx, project_id)
-            .await
-            .map_err(to_status)?;
+        let agents = scoped_call(
+            &self.state,
+            &ctx,
+            self.state.agents.list(&service_ctx, project_id),
+        )
+        .await?;
         Ok(Response::new(gen::ListAgentsReply {
             agents: agents.iter().map(agent_reply).collect(),
         }))
@@ -478,12 +568,14 @@ impl gen::workflow_api_server::WorkflowApi for GrpcServices {
         let service_ctx = scoped(&ctx)?;
         let msg = request.into_inner();
         let project_id: ProjectId = parse_id("project_id", &msg.project_id)?;
-        let workflow = self
-            .state
-            .workflows
-            .create(&service_ctx, project_id, &msg.name)
-            .await
-            .map_err(to_status)?;
+        let workflow = scoped_call(
+            &self.state,
+            &ctx,
+            self.state
+                .workflows
+                .create(&service_ctx, project_id, &msg.name),
+        )
+        .await?;
         Ok(Response::new(gen::WorkflowReply {
             id: workflow.id.to_string(),
             project_id: workflow.project_id.to_string(),
@@ -527,12 +619,14 @@ impl gen::workflow_api_server::WorkflowApi for GrpcServices {
                 mas_domain::WorkflowEdge::new(&edge.from_key, &edge.to_key).map_err(to_status)?,
             );
         }
-        let order = self
-            .state
-            .workflows
-            .update_graph(&service_ctx, workflow_id, nodes, edges)
-            .await
-            .map_err(to_status)?;
+        let order = scoped_call(
+            &self.state,
+            &ctx,
+            self.state
+                .workflows
+                .update_graph(&service_ctx, workflow_id, nodes, edges),
+        )
+        .await?;
         Ok(Response::new(gen::UpdateWorkflowGraphReply {
             workflow_id: workflow_id.to_string(),
             topological_order: order,
@@ -546,12 +640,12 @@ impl gen::workflow_api_server::WorkflowApi for GrpcServices {
         let ctx = context_from(&self.state, request.metadata()).await?;
         let service_ctx = scoped(&ctx)?;
         let workflow_id: WorkflowId = parse_id("workflow_id", &request.into_inner().workflow_id)?;
-        let workflow = self
-            .state
-            .workflows
-            .get(&service_ctx, workflow_id)
-            .await
-            .map_err(to_status)?;
+        let workflow = scoped_call(
+            &self.state,
+            &ctx,
+            self.state.workflows.get(&service_ctx, workflow_id),
+        )
+        .await?;
         Ok(Response::new(gen::WorkflowReply {
             id: workflow.id.to_string(),
             project_id: workflow.project_id.to_string(),
@@ -568,12 +662,12 @@ impl gen::workflow_api_server::WorkflowApi for GrpcServices {
         let ctx = context_from(&self.state, request.metadata()).await?;
         let service_ctx = scoped(&ctx)?;
         let project_id: ProjectId = parse_id("project_id", &request.into_inner().project_id)?;
-        let workflows = self
-            .state
-            .workflows
-            .list(&service_ctx, project_id)
-            .await
-            .map_err(to_status)?;
+        let workflows = scoped_call(
+            &self.state,
+            &ctx,
+            self.state.workflows.list(&service_ctx, project_id),
+        )
+        .await?;
         Ok(Response::new(gen::ListWorkflowsReply {
             workflows: workflows
                 .iter()
@@ -687,12 +781,12 @@ impl gen::execution_api_server::ExecutionApi for GrpcServices {
         let service_ctx = scoped(&ctx)?;
         let execution_id: mas_common::ids::ExecutionId =
             parse_id("execution_id", &request.into_inner().execution_id)?;
-        let execution = self
-            .state
-            .executions
-            .get(&service_ctx, execution_id)
-            .await
-            .map_err(to_status)?;
+        let execution = scoped_call(
+            &self.state,
+            &ctx,
+            self.state.executions.get(&service_ctx, execution_id),
+        )
+        .await?;
         Ok(Response::new(execution_reply(&execution, false)))
     }
 
@@ -702,12 +796,8 @@ impl gen::execution_api_server::ExecutionApi for GrpcServices {
     ) -> Result<Response<gen::ListExecutionsReply>, Status> {
         let ctx = context_from(&self.state, request.metadata()).await?;
         let service_ctx = scoped(&ctx)?;
-        let executions = self
-            .state
-            .executions
-            .list(&service_ctx)
-            .await
-            .map_err(to_status)?;
+        let executions =
+            scoped_call(&self.state, &ctx, self.state.executions.list(&service_ctx)).await?;
         Ok(Response::new(gen::ListExecutionsReply {
             executions: executions
                 .iter()
@@ -748,12 +838,14 @@ impl gen::schedule_api_server::ScheduleApi for GrpcServices {
             serde_json::from_str(&msg.task_template_json).map_err(|_| {
                 Status::new(Code::InvalidArgument, "task_template_json: not valid JSON")
             })?;
-        let schedule = self
-            .state
-            .schedules
-            .register(&service_ctx, project_id, &msg.name, kind, template)
-            .await
-            .map_err(to_status)?;
+        let schedule = scoped_call(
+            &self.state,
+            &ctx,
+            self.state
+                .schedules
+                .register(&service_ctx, project_id, &msg.name, kind, template),
+        )
+        .await?;
         Ok(Response::new(gen::ScheduleReply {
             id: schedule.id.to_string(),
             name: schedule.name.clone(),
@@ -799,12 +891,8 @@ impl gen::schedule_api_server::ScheduleApi for GrpcServices {
     ) -> Result<Response<gen::ListSchedulesReply>, Status> {
         let ctx = context_from(&self.state, request.metadata()).await?;
         let service_ctx = scoped(&ctx)?;
-        let schedules = self
-            .state
-            .schedules
-            .list(&service_ctx)
-            .await
-            .map_err(to_status)?;
+        let schedules =
+            scoped_call(&self.state, &ctx, self.state.schedules.list(&service_ctx)).await?;
         Ok(Response::new(gen::ListSchedulesReply {
             schedules: schedules
                 .iter()
@@ -865,6 +953,13 @@ mod tests {
             .await
             .expect("tenant");
         let tenant_scoped = system.clone().with_scope(tenant.id, organization.id);
+        // Provisioned tenants are not operational and the resolver refuses
+        // them, so the seed activates the tenant before use.
+        state
+            .tenancy
+            .activate_tenant(&tenant_scoped, tenant.id)
+            .await
+            .expect("activate");
         let project = state
             .tenancy
             .register_project(&tenant_scoped, "Core", "core-grpc")

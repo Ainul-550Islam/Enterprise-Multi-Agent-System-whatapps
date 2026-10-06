@@ -1,3 +1,13 @@
+// PURPOSE:
+// Public surface of the execution runtime.
+//
+// Re-exports the `AgentBridge` port that every agent-execution adapter
+// implements, together with the request/verdict types an adapter carries and
+// the scope helpers that make a tenant-less run unrepresentable.
+//
+// The in-memory test bridge lives here but is compiled only under the
+// `dev-bridges` feature, so a release build cannot reach it.
+
 //! # mas-execution
 //!
 //! The execution layer: everything between a *dispatched* task/execution and
@@ -34,8 +44,10 @@ pub mod sandbox;
 pub mod step_runner;
 pub mod tool_runner;
 
+#[cfg(any(test, feature = "dev-bridges"))]
+pub use agent_bridge::InMemoryAgentBridge;
 pub use agent_bridge::{
-    AgentBridge, AgentRunRequest, AgentRunStatus, AgentRunVerdict, AgentUsage, InMemoryAgentBridge,
+    AgentBridge, AgentRunRequest, AgentRunStatus, AgentRunVerdict, AgentUsage, CANCELLATION_CODE,
 };
 pub use executor::{Executor, ExecutorConfig, RunOutcome, StepStorePort};
 pub use mas_orchestration::checkpoint::NodeExecutionState;

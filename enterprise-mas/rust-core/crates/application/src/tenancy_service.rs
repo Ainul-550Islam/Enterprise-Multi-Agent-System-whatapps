@@ -9,16 +9,19 @@
 
 use mas_common::enums::Environment;
 use mas_common::error::AppError;
-use mas_common::ids::UserId;
+use mas_common::ids::{TenantId, UserId};
 use mas_common::result::Result;
 use mas_domain::value_objects::{Email, Slug};
 use mas_domain::{IsolationMode, Membership, MembershipRole, Organization, Project, Tenant, User};
 
 use crate::audit::{self, AuditSinkPort};
 use crate::context::ServiceContext;
+use crate::control_plane::DEFAULT_PLAN_CODE;
 use crate::stores::{
     MembershipStorePort, OrganizationStorePort, ProjectStorePort, TenantStorePort, UserStorePort,
 };
+use mas_domain::subscription::{Subscription, SubscriptionState};
+use mas_tenancy::entitlements::EntitlementStorePort;
 
 /// Use-cases over the tenancy hierarchy and identity aggregates.
 #[derive(Debug)]
@@ -29,6 +32,15 @@ pub struct TenancyService {
     users: Box<dyn UserStorePort>,
     memberships: Box<dyn MembershipStorePort>,
     audit: Box<dyn AuditSinkPort>,
+    /// Subscriptions, so activating a tenant can give it one.
+    ///
+    /// A tenant with no subscription cannot run anything: the control plane
+    /// fails closed, which is correct. But a tenant that can never run
+    /// anything is not a product, so activation — the transition that makes a
+    /// tenant operational — creates the subscription. Doing it anywhere else
+    /// would leave a window in which the tenant exists and cannot be used,
+    /// with no single place that closes it.
+    subscriptions: Box<dyn EntitlementStorePort>,
 }
 
 impl TenancyService {
@@ -40,6 +52,7 @@ impl TenancyService {
         users: Box<dyn UserStorePort>,
         memberships: Box<dyn MembershipStorePort>,
         audit: Box<dyn AuditSinkPort>,
+        subscriptions: Box<dyn EntitlementStorePort>,
     ) -> Self {
         Self {
             organizations,
@@ -48,6 +61,7 @@ impl TenancyService {
             users,
             memberships,
             audit,
+            subscriptions,
         }
     }
 
@@ -122,6 +136,64 @@ impl TenancyService {
             ctx,
             self.audit.as_ref(),
             "tenant.register",
+            "tenant",
+            Some(tenant.id.to_string()),
+            mas_domain::AuditOutcome::Success,
+        )
+        .await?;
+        Ok(tenant)
+    }
+
+    /// Moves a tenant from `provisioning` to `active`.
+    ///
+    /// Without this there is no path from registration to operational: a
+    /// tenant stays `provisioning` forever, and every resolution refuses it.
+    /// That is a safe default but an unusable product, so the transition is a
+    /// first-class, audited operation rather than a direct store write.
+    ///
+    /// The tenant must belong to the context's organization. A tenant id from
+    /// another organization reads as "does not exist", never as "forbidden",
+    /// so this cannot be used to probe for tenants across the platform.
+    pub async fn activate_tenant(
+        &self,
+        ctx: &ServiceContext,
+        tenant_id: TenantId,
+    ) -> Result<Tenant> {
+        let organization_id = ctx.require_organization()?;
+        let mut tenant = self
+            .tenants
+            .get(tenant_id)
+            .await?
+            .filter(|tenant| tenant.organization_id() == organization_id)
+            .ok_or_else(|| AppError::not_found("tenant", tenant_id.to_string()))?;
+        tenant.activate()?;
+        self.tenants.save(&tenant).await?;
+
+        // An operational tenant needs a subscription, or the gate refuses
+        // every execution it ever attempts. Created only if absent, so
+        // reactivating a tenant never resets a plan someone bought.
+        if self
+            .subscriptions
+            .get_subscription(tenant_id)
+            .await?
+            .is_none()
+        {
+            let subscription = Subscription::new(
+                tenant_id,
+                DEFAULT_PLAN_CODE,
+                SubscriptionState::Active,
+                None,
+                None,
+            )?;
+            self.subscriptions
+                .upsert_subscription(&subscription)
+                .await?;
+        }
+
+        audit::record_mutation(
+            ctx,
+            self.audit.as_ref(),
+            "tenant.activate",
             "tenant",
             Some(tenant.id.to_string()),
             mas_domain::AuditOutcome::Success,
@@ -273,6 +345,7 @@ mod tests {
             Box::new(store.clone()),
             Box::new(store),
             Box::new(audit.clone()),
+            Box::new(crate::control_plane::build_in_memory_control_plane().entitlement_store()),
         );
         Fixture { service, audit }
     }

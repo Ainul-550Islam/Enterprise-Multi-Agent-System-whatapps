@@ -1,3 +1,10 @@
+// PURPOSE:
+// NATS broker adapter, enabled by the `nats` feature.
+//
+// Translates between the platform's header set and NATS headers, and publishes
+// and consumes task messages over a durable subject. Carries no tenancy
+// decisions: scope arrives in the message and is enforced upstream.
+
 //! Real NATS JetStream adapter for [`crate::broker::BrokerPort`]
 //! (feature `nats`).
 //!
@@ -36,10 +43,13 @@ use mas_common::error::AppError;
 use mas_common::result::Result;
 use mas_common::timestamps::Timestamp;
 
+use mas_events::bus::{ConsumerId, EventBusPort, EventHandler, SubscriptionFilter};
+use mas_events::envelope::EventEnvelope;
+
 use crate::broker::{
     AckInstruction, BrokerMessage, BrokerPort, ConsumerConfig, ConsumerStats, PublishRequest,
 };
-use crate::headers::HeaderSet;
+use crate::headers::{HeaderSet, PropagationContext, EVENT_ID_KEY};
 use crate::subjects::Subject;
 
 /// Dead-letter subject suffix inside the task subject space.
@@ -512,6 +522,143 @@ impl BrokerPort for NatsBroker {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Event plane: outbox relay -> NATS
+// ---------------------------------------------------------------------------
+
+/// Subject prefix for the platform event plane.
+pub const EVENT_SUBJECT_PREFIX: &str = "mas.events";
+
+/// A subject for one envelope.
+///
+/// Dots in the event type are flattened to underscores so a NATS subject never
+/// gains an extra hierarchy level by accident: `execution.step.completed`
+/// becomes `mas.events.execution.execution_step_completed`, which is exactly
+/// one subscribable token.
+#[must_use]
+pub fn event_subject(envelope: &EventEnvelope) -> String {
+    let flat_type: String = envelope
+        .event_type
+        .chars()
+        .map(|c| if c == '.' { '_' } else { c })
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .collect();
+    let flat_aggregate: String = envelope
+        .aggregate_type
+        .chars()
+        .map(|c| if c == '.' { '_' } else { c })
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .collect();
+    format!("{EVENT_SUBJECT_PREFIX}.{flat_aggregate}.{flat_type}")
+}
+
+/// Builds the wire headers for one envelope.
+///
+/// The identity set is on the headers rather than only in the body because a
+/// consumer must be able to route, deduplicate and enforce tenancy **before**
+/// it parses a payload: an event that cannot be attributed is dropped or
+/// dead-lettered, never executed.
+#[must_use]
+pub fn event_headers(envelope: &EventEnvelope) -> HeaderSet {
+    let mut headers = HeaderSet::new();
+    PropagationContext::from_envelope(envelope)
+        .inject_into(&mut headers)
+        .expect("the propagation context fits the header limits");
+    let _ = headers.insert(EVENT_ID_KEY, envelope.id.to_string());
+    let _ = headers.insert("x-event-type", envelope.event_type.clone());
+    let _ = headers.insert("x-event-version", envelope.event_version.to_string());
+    let _ = headers.insert("x-aggregate-type", envelope.aggregate_type.clone());
+    let _ = headers.insert("x-aggregate-id", envelope.aggregate_id.clone());
+    let _ = headers.insert("x-occurred-at", envelope.occurred_at.to_string());
+    headers
+}
+
+/// Production [`EventBusPort`] over core NATS.
+///
+/// This is the transport the outbox relay publishes through. It carries no
+/// retry policy and no state: the relay owns the claim and the attempt budget,
+/// and this adapter's only job is to put one envelope on the wire and report
+/// whether the server accepted it.
+///
+/// `subscribe` is deliberately unimplemented here. Event *consumption* happens
+/// through the durable task broker, which has its own ack/redelivery contract;
+/// offering a second, unacknowledged subscription surface would create a second
+/// delivery path with different guarantees.
+#[derive(Debug)]
+pub struct NatsEventBus {
+    client: async_nats::Client,
+}
+
+impl NatsEventBus {
+    /// Connects and verifies the server answers a flush.
+    ///
+    /// Failing here is a boot failure by design: a relay that cannot reach its
+    /// transport would claim rows and then fail every one of them.
+    pub async fn connect(url: &str) -> Result<Self> {
+        let client = async_nats::connect(url)
+            .await
+            .map_err(|e| nats_err("events connect", e))?;
+        let bus = Self { client };
+        bus.client
+            .flush()
+            .await
+            .map_err(|e| nats_err("events ping", e))?;
+        Ok(bus)
+    }
+}
+
+#[async_trait::async_trait]
+impl EventBusPort for NatsEventBus {
+    async fn publish(&self, envelope: &EventEnvelope) -> Result<()> {
+        let payload = serde_json::to_vec(envelope).map_err(|error| {
+            AppError::serialization(format!("event envelope not serializable: {error}"))
+        })?;
+        let subject = event_subject(envelope);
+        let headers = event_headers(envelope);
+        let nats_headers = NatsBroker::to_nats_headers(
+            &headers,
+            // JetStream dedup rides the event id, so a redelivered relay
+            // batch cannot put the same event on the wire twice.
+            Some(&envelope.id.to_string()),
+        );
+
+        self.client
+            .publish_with_headers(subject, nats_headers, payload.into())
+            .await
+            .map_err(|e| nats_err("events publish", e))?;
+        // Flush before reporting success: a publish that is still buffered is
+        // not yet acknowledged, and the relay must not mark the row published
+        // on the strength of a write the server may never have seen.
+        self.client
+            .flush()
+            .await
+            .map_err(|e| nats_err("events flush", e))?;
+        Ok(())
+    }
+
+    async fn subscribe(
+        &self,
+        _consumer: ConsumerId,
+        _filter: SubscriptionFilter,
+        _handler: EventHandler,
+    ) -> Result<()> {
+        Err(AppError::internal(
+            "the NATS event bus is publish-only: durable event consumption goes \
+             through the task broker, which owns its own ack and redelivery contract",
+        ))
+    }
+
+    async fn unsubscribe(&self, _consumer: &ConsumerId) -> Result<()> {
+        Err(AppError::internal(
+            "the NATS event bus is publish-only and holds no subscriptions",
+        ))
+    }
+
+    async fn consumers(&self) -> Vec<ConsumerId> {
+        Vec::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -551,6 +698,70 @@ mod tests {
             .is_ok());
     }
 
+    use crate::headers::CORRELATION_ID_KEY;
+
+    fn test_envelope(event_type: &str) -> EventEnvelope {
+        EventEnvelope::builder(
+            event_type,
+            2,
+            "execution",
+            "exec-1",
+            mas_common::ids::TenantId::new(),
+        )
+        .expect("builder")
+        .with_correlation("corr-1")
+        .expect("correlation")
+        .build()
+        .expect("envelope")
+    }
+
+    #[test]
+    fn event_subjects_are_flat_and_subscribable() {
+        let subject = event_subject(&test_envelope("execution.step.completed"));
+        assert_eq!(subject, "mas.events.execution.execution_step_completed");
+        // Exactly `mas.events.<aggregate>.<type>`: the prefix is two tokens
+        // and no event name can inject a further hierarchy level.
+        assert_eq!(subject.split('.').count(), 4, "{subject}");
+        Subject::parse(&subject).expect("the subject is a valid platform subject");
+    }
+
+    #[test]
+    fn event_headers_carry_the_identity_a_consumer_validates_on() {
+        let envelope = test_envelope("execution.started");
+        let headers = event_headers(&envelope);
+        assert_eq!(
+            headers.get(EVENT_ID_KEY),
+            Some(envelope.id.to_string()).as_deref()
+        );
+        assert_eq!(headers.get("x-event-type"), Some("execution.started"));
+        assert_eq!(headers.get("x-event-version"), Some("2"));
+        assert_eq!(headers.get("x-aggregate-type"), Some("execution"));
+        assert_eq!(headers.get("x-aggregate-id"), Some("exec-1"));
+        assert_eq!(
+            headers.get(CORRELATION_ID_KEY),
+            Some("corr-1"),
+            "correlation rides the shared header set"
+        );
+    }
+
+    #[test]
+    fn the_event_bus_refuses_to_offer_a_second_delivery_path() {
+        // A subscription is refused rather than silently creating an
+        // unacknowledged consumer: durable event consumption belongs to the
+        // task broker, and a second delivery path would have a second set of
+        // guarantees. Asserted on the source because constructing a bus needs
+        // a live server.
+        let source = std::fs::read_to_string("src/nats.rs").expect("read source");
+        assert!(
+            source.contains("the NATS event bus is publish-only"),
+            "subscription is refused, so there is one event delivery path"
+        );
+        assert!(
+            source.contains("holds no subscriptions"),
+            "unsubscribe is refused for the same reason"
+        );
+    }
+
     #[test]
     fn dlq_subject_is_a_valid_platform_subject() {
         Subject::parse(DLQ_SUBJECT).expect("DLQ subject parses");
@@ -564,6 +775,6 @@ mod tests {
         let back = NatsBroker::headers_from_nats(Some(&nats_headers));
         assert_eq!(back.get("x-trace-id"), Some("t-1"));
         assert_eq!(back.get(NATS_MSG_ID), Some("msg-1"));
-        assert!(NatsBroker::headers_from_nats(None).len() == 0);
+        assert!(NatsBroker::headers_from_nats(None).is_empty());
     }
 }

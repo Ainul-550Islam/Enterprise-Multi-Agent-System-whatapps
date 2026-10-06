@@ -35,6 +35,10 @@ pub struct ResolutionOutcome {
 }
 
 /// Turns request-time identity + ids into a verified context.
+///
+/// Cheaply clonable: both halves are `Arc<dyn …>`, so a process-wide resolver
+/// can be shared with request handlers without re-opening a directory.
+#[derive(Clone)]
 pub struct TenantResolver {
     directory: Arc<dyn TenantDirectoryPort>,
     memberships: Arc<dyn MembershipDirectoryPort>,
@@ -93,7 +97,10 @@ impl TenantResolver {
             if !p.is_usable() {
                 return Err(AppError::unauthorized("credential is expired"));
             }
-            if p.tenant_id.is_some() && !p.tenant_matches(tenant_id) {
+            // A principal bound elsewhere must not learn that this tenant
+            // exists. Both shapes of binding are checked: the credential's own
+            // tenant, and every membership it holds.
+            if !p.can_reach_tenant(tenant_id) {
                 return Err(Self::tenant_missing()); // hide cross-tenant existence
             }
         }
@@ -172,8 +179,37 @@ impl TenantResolver {
             // break-glass by design.
             return Ok(MembershipView::empty());
         }
+        // A credential-bound principal (API key, service identity) carries its
+        // own proven grant. It never reaches the membership table — its
+        // authority came from the credential row at authentication time — so
+        // seeding from it here is what lets a key act at all.
+        let mut effective_roles: BTreeSet<MembershipRole> = BTreeSet::new();
+        let mut organization_memberships: Vec<Membership> = Vec::new();
+        let mut tenant_memberships: Vec<Membership> = Vec::new();
+        // Only a credential-bound principal may contribute its own grant. A
+        // membership-bound principal (a human user) contributes nothing here:
+        // its roles come from the directory below, and believing a grant
+        // carried on the principal would let a stale or forged grant outrank
+        // a suspended membership.
+        if principal.is_credential_bound() {
+            if let Some(role) = principal.role_in(tenant.id, organization.id) {
+                effective_roles.insert(role);
+            }
+        }
+
+        // A membership-bound human principal additionally contributes every
+        // active grant the directory holds.
         let Ok(user_id) = UserId::from_str(&principal.actor_id) else {
-            return Ok(MembershipView::empty()); // non-user key without user binding
+            let highest_role = effective_roles
+                .iter()
+                .copied()
+                .max_by_key(MembershipRole::rank);
+            return Ok(MembershipView {
+                organization_memberships,
+                tenant_memberships,
+                effective_roles,
+                highest_role,
+            });
         };
         let rows = self.memberships.memberships_for_user(user_id).await?;
         let mut org_rows = Vec::new();
@@ -191,17 +227,18 @@ impl TenantResolver {
                 Some(_) => {}, // another tenant: not in this context
             }
         }
-        let mut effective_roles = BTreeSet::new();
         for row in org_rows.iter().chain(tenant_rows.iter()) {
             effective_roles.extend(row.roles.iter().copied());
         }
+        organization_memberships = org_rows;
+        tenant_memberships = tenant_rows;
         let highest_role = effective_roles
             .iter()
             .copied()
             .max_by_key(MembershipRole::rank);
         Ok(MembershipView {
-            organization_memberships: org_rows,
-            tenant_memberships: tenant_rows,
+            organization_memberships,
+            tenant_memberships,
             effective_roles,
             highest_role,
         })
@@ -283,13 +320,22 @@ mod tests {
         }
     }
 
-    fn user_principal(user: UserId, tenant: TenantId) -> SecurityPrincipal {
+    fn user_principal(
+        user: UserId,
+        tenant: TenantId,
+        organization: mas_common::ids::OrganizationId,
+    ) -> SecurityPrincipal {
         SecurityPrincipal::new(
             user.to_string(),
             mas_security::PrincipalKind::User,
-            Some(tenant),
+            None,
             ScopeSet::denied(),
         )
+        .with_memberships(vec![mas_security::TenantMembership {
+            organization_id: organization,
+            tenant_id: tenant,
+            role: MembershipRole::Developer,
+        }])
     }
 
     #[tokio::test]
@@ -300,7 +346,7 @@ mod tests {
         let outcome = world
             .resolver
             .resolve(
-                Some(&user_principal(dev, world.tenant.id)),
+                Some(&user_principal(dev, world.tenant.id, world.organization.id)),
                 world.tenant.id,
                 Some(world.project.id),
             )
@@ -313,7 +359,7 @@ mod tests {
         let err = world
             .resolver
             .resolve(
-                Some(&user_principal(dev, TenantId::new())),
+                Some(&user_principal(dev, TenantId::new(), world.organization.id)),
                 world.tenant.id,
                 None,
             )
@@ -333,7 +379,11 @@ mod tests {
         let outcome = world
             .resolver
             .resolve(
-                Some(&user_principal(viewer, world.tenant.id)),
+                Some(&user_principal(
+                    viewer,
+                    world.tenant.id,
+                    world.organization.id,
+                )),
                 world.tenant.id,
                 None,
             )

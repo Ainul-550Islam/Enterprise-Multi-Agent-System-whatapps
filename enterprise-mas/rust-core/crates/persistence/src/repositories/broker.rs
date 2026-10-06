@@ -1,3 +1,19 @@
+//! PURPOSE: `PgTaskBroker` — the durability-first broker for PostgreSQL-only
+//! deployments.
+//!
+//! Owning layer: `mas-persistence`.
+//!
+//! Production responsibility: make rows the truth. `fetch` claims queued task
+//! rows atomically (`FOR UPDATE SKIP LOCKED`) and `ack`/`nack` are row
+//! transitions, so a crashed consumer's work is recovered by the database
+//! rather than by broker metadata.
+//!
+//! It must NOT:
+//!   • derive attempt counts from delivery metadata (they come from
+//!     `task_attempts`);
+//!   • delete a message row on completion — the row is the audit trail;
+//!   • hand the same task to two workers.
+
 //! `PgTaskBroker` — the durability-first broker for Pg-only deployments.
 //!
 //! Doctrine (recorded in `docs/production-wiring.md` §3):
@@ -33,6 +49,7 @@ use mas_messaging::broker::{
 };
 use mas_messaging::headers::HeaderSet;
 use mas_messaging::subjects::Subject;
+use serde_json::json;
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
@@ -55,7 +72,9 @@ const CLAIM_SQL: &str = "WITH claimable AS (
     UPDATE tasks t
     SET status = 'running', not_before = now() + make_interval(secs => $2), updated_at = now()
     FROM claimable WHERE t.id = claimable.id
-    RETURNING t.id, t.payload, t.created_at, t.correlation_id";
+    RETURNING t.id, t.tenant_id, t.organization_id, t.project_id, t.execution_id,
+              t.idempotency_key, t.kind, t.priority, t.deadline_at,
+              t.payload, t.created_at, t.correlation_id";
 
 /// Return overdue claims to the queue (lease-expired 'running' rows).
 const REAP_SQL: &str = "UPDATE tasks SET status = 'queued', not_before = now(), updated_at = now()
@@ -113,9 +132,16 @@ impl PgTaskBroker {
     /// Binds a broker to a pool.
     #[must_use]
     pub fn new(pool: PgPool) -> Self {
+        // `InMemoryBroker` starts UNAVAILABLE by design (see its chaos knob).
+        // The event lane here is a real delegation target for non-durable
+        // subjects, `fetch` remainders, `ack`, `dead_letters`, `ping` and
+        // `consumer_stats` — so it must be switched on or every one of those
+        // calls fails with "broker is currently unavailable".
+        let events = InMemoryBroker::new();
+        events.set_available(true);
         Self {
             pool,
-            events: InMemoryBroker::new(),
+            events,
             flight: FlightLedger::default(),
             ack_window_seconds: DEFAULT_ACK_WINDOW.as_secs() as i64,
         }
@@ -153,6 +179,77 @@ impl PgTaskBroker {
             let created_at: chrono::DateTime<chrono::Utc> =
                 row.try_get("created_at").map_err(map_sqlx)?;
             let correlation_id: String = row.try_get("correlation_id").map_err(map_sqlx)?;
+            // `publish` decomposed the staged `TaskQueueMessage` into dedicated
+            // columns (identity, routing, correlation) plus a payload jsonb
+            // holding `input` and the `_mas_spec` envelope. Consumers decode
+            // with the standard codec, so the frame MUST be re-assembled into
+            // the full message here — returning the raw payload made every
+            // durable frame undecodable (and therefore dead-lettered).
+            let tenant_id: Uuid = row.try_get("tenant_id").map_err(map_sqlx)?;
+            let organization_id: Uuid = row.try_get("organization_id").map_err(map_sqlx)?;
+            let project_id: Uuid = row.try_get("project_id").map_err(map_sqlx)?;
+            let execution_id: Option<Uuid> = row.try_get("execution_id").map_err(map_sqlx)?;
+            let idempotency_key: String = row.try_get("idempotency_key").map_err(map_sqlx)?;
+            let priority: String = row.try_get("priority").map_err(map_sqlx)?;
+            let deadline_at: Option<chrono::DateTime<chrono::Utc>> =
+                row.try_get("deadline_at").map_err(map_sqlx)?;
+
+            let spec = payload.get(crate::rows::SPEC_KEY).cloned();
+            let get = |key: &str| {
+                spec.as_ref()
+                    .and_then(|s| s.get(key))
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null)
+            };
+            let operation = get("operation")
+                .as_str()
+                .map(str::to_owned)
+                .or_else(|| row.try_get::<String, _>("kind").ok())
+                .unwrap_or_else(|| "execution.run".to_owned());
+            let enqueued_at = get("queued_at")
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| Timestamp::from_datetime(created_at).to_rfc3339_millis());
+
+            let mut frame = serde_json::Map::new();
+            frame.insert("task_id".to_owned(), json!(id));
+            frame.insert("tenant_id".to_owned(), json!(tenant_id));
+            frame.insert("organization_id".to_owned(), json!(organization_id));
+            frame.insert("project_id".to_owned(), json!(project_id));
+            frame.insert("operation".to_owned(), json!(operation));
+            frame.insert(
+                "input".to_owned(),
+                payload.get("input").cloned().unwrap_or(json!({})),
+            );
+            if let Some(execution) = execution_id {
+                frame.insert("execution_id".to_owned(), json!(execution));
+            }
+            if let Some(agent) = get("agent_id").as_str() {
+                frame.insert("agent_id".to_owned(), json!(agent));
+            }
+            if let Some(workflow) = get("workflow_id").as_str() {
+                frame.insert("workflow_id".to_owned(), json!(workflow));
+            }
+            frame.insert("idempotency_key".to_owned(), json!(idempotency_key));
+            frame.insert("priority".to_owned(), json!(priority));
+            frame.insert(
+                "attempt_count".to_owned(),
+                json!(get("attempt_count").as_u64().unwrap_or(0)),
+            );
+            frame.insert(
+                "max_attempts".to_owned(),
+                json!(get("max_attempts").as_u64().unwrap_or(1)),
+            );
+            if let Some(deadline) = deadline_at {
+                frame.insert(
+                    "deadline".to_owned(),
+                    json!(Timestamp::from_datetime(deadline).to_rfc3339_millis()),
+                );
+            }
+            frame.insert("correlation_id".to_owned(), json!(&correlation_id));
+            frame.insert("enqueued_at".to_owned(), json!(enqueued_at));
+            let payload = serde_json::Value::Object(frame);
+
             let sequence = sequence_of(id);
             self.flight.record(sequence, id);
             let mut headers = HeaderSet::new();
@@ -163,12 +260,7 @@ impl PgTaskBroker {
                 .insert("x-task-id", id.to_string())
                 .map_err(|err| AppError::validation(err.to_string()))?;
             // The durable lane's subject is the operation as the frame
-            // originally carried it (derived on publish).
-            let operation = payload
-                .get(crate::rows::SPEC_KEY)
-                .and_then(|spec| spec.get("operation"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("execution.run");
+            // originally carried it (derived on publish / `kind` column).
             let subject = Subject::parse(&format!("mas.tasks.{operation}"))
                 .unwrap_or_else(|_| Subject::parse("mas.tasks.unknown").expect("static"));
             messages.push(BrokerMessage {
@@ -268,15 +360,11 @@ impl BrokerPort for PgTaskBroker {
     }
 
     async fn ensure_consumer(&self, config: ConsumerConfig) -> Result<()> {
-        // Durable consumers are configless (claim/reap is global); the event
-        // lane creates its normal durable consumer.
-        let durable = config.filter.matches(
-            &Subject::parse("mas.tasks.x")
-                .map_err(|e| AppError::validation(format!("subject: {e}")))?,
-        );
-        if !durable {
-            self.events.ensure_consumer(config).await?;
-        }
+        // The durable lane is configless (claim/reap is global), but `fetch`,
+        // `ack`, `consumer_stats` and `dead_letters` all fan out to the event
+        // lane too — so the consumer MUST exist there as well, or every one of
+        // those calls fails with "broker consumer not found".
+        self.events.ensure_consumer(config).await?;
         Ok(())
     }
 

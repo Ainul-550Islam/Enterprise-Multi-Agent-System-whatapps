@@ -1,3 +1,18 @@
+//! PURPOSE: The task-row lifecycle port: keeping domain `Task` rows in
+//! lockstep with broker settlement.
+//!
+//! Owning layer: `mas-worker`.
+//!
+//! Production responsibility: route every row change through the domain's own
+//! transition rules, so an illegal state is impossible here by construction
+//! rather than by a check someone must remember to write.
+//!
+//! It must NOT:
+//!   • set a status field directly;
+//!   • become the authority for the pipeline's canonical machine — the durable
+//!     port is;
+//!   • let a lifecycle failure block broker settlement silently.
+
 //! Task-row lifecycle port: the consumer keeps the domain `Task` rows in
 //! lockstep with broker settlement. Row updates go through the domain's own
 //! transition rules, so illegal states are impossible here by construction.
@@ -86,7 +101,9 @@ mod tests {
         let seed = task();
         // Seed the queue-path sequence: new() ⇒ Pending; queue() ⇒ Queued.
         let mut seeded = seed.clone();
-        seeded.queue().expect("queue");
+        seeded
+            .queue(&mas_domain::TransitionActor::system("worker-test").expect("actor"))
+            .expect("queue");
         store.seed(seeded.clone());
         let loaded = TaskLifecyclePort::load(&store, seeded.id)
             .await

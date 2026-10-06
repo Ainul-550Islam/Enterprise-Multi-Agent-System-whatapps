@@ -1,3 +1,18 @@
+//! PURPOSE: The task-consumer plane: the consumer, the attempt coordinator,
+//! the capacity gate, the failure classifier and the failure/recovery matrix.
+//!
+//! Owning layer: `mas-worker`.
+//!
+//! Production responsibility: own everything between the broker and the
+//! canonical runtime — claiming, leasing, capacity, retry classification and
+//! settlement — while implementing no execution state machine of its own.
+//!
+//! It must NOT:
+//!   • contain a handler that fakes work (no `EchoHandler`, no in-memory
+//!     agent bridge on the production path);
+//!   • reach the agent runtime except through the canonical executor;
+//!   • claim more work than its remaining capacity.
+
 //! # mas-worker
 //!
 //! The **task consumer** plane: everything between "a task message sits on
@@ -41,12 +56,22 @@
 //! Heartbeats while a task runs: `LeaseStorePort::renew` +
 //! `AckInstruction::InProgress` at half of `ack_wait`.
 
+pub mod attempts;
 pub mod backoff;
+pub mod capacity;
+pub mod classify;
 pub mod consumer;
+#[cfg(test)]
+mod failure_matrix;
 pub mod grace;
 pub mod handler;
 pub mod lifecycle;
+pub mod run_slot;
 
+pub use attempts::{AttemptCoordinator, ClaimOneOutcome};
+pub use capacity::CapacityGate;
+pub use classify::{classify, ClassifiedFailure, FailureClass};
 pub use consumer::{ConsumerConfig, ConsumerOutcome, TaskConsumer};
 pub use handler::{OperationDispatcher, TaskHandlerPort};
 pub use lifecycle::{InMemoryTaskStore, TaskLifecyclePort};
+pub use run_slot::{NoRunSlots, RunSlot, RunSlotPort};

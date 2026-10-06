@@ -1,3 +1,24 @@
+//! PURPOSE: The one HTTP route table for the api process.
+//!
+//! Owning layer: `mas-api` (the process edge).
+//!
+//! Production responsibility: define which paths exist, and — more
+//! importantly — which authentication envelope each of them sits behind:
+//! public (health), protected (bearer API key + resolved scope), and internal
+//! (body-bound service HMAC, tenant resolved from server-side truth).
+//!
+//! Security boundary: a route registered on the wrong sub-router is a hole,
+//! not a bug. The internal routes deliberately do NOT sit behind
+//! `authenticated_layer`, because that layer's tenant comes from the API key
+//! and a platform service has none; they authenticate with the internal
+//! signature instead and resolve tenancy from the row they name.
+//!
+//! It must NOT:
+//!   • add a route without deciding which of the three envelopes protects it;
+//!   • put an internal route behind the API-key layer, or a tenant route
+//!     behind the internal layer;
+//!   • leave a route outside the request-context layer.
+
 //! HTTP route table. Layer order (outside → in, per request):
 //! `request_context_layer` → `authenticated_layer` (protected routes only)
 //! → handler. Health routes stay public; the fallback answers v1-style 404s
@@ -8,7 +29,8 @@ use axum::routing::{get, post, put};
 use axum::Router;
 
 use crate::handlers::{
-    agents, executions, health, schedules, tenancy, workflows, Ctx, MAX_BODY_BYTES,
+    agents, control_plane, executions, health, internal, schedules, tenancy, workflows, Ctx,
+    MAX_BODY_BYTES,
 };
 use crate::middleware::{authenticated_layer, request_context_layer};
 use crate::response::ApiError;
@@ -49,12 +71,60 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/schedules/{schedule_id}/pause", post(schedules::pause))
         .route("/v1/schedules/{schedule_id}/resume", post(schedules::resume))
         .route("/v1/schedules/{schedule_id}/disable", post(schedules::disable))
+        // ---- control plane (billing, entitlements, usage) -----------
+        // Tenant-scoped: the tenant comes from the authenticated scope, never
+        // from the path or the body, so no caller can read another tenant's
+        // plan, usage or billing state by guessing an id.
+        .route("/v1/billing/subscription", get(control_plane::get_subscription))
+        .route("/v1/billing/entitlements", get(control_plane::list_entitlements))
+        .route("/v1/billing/usage-totals", get(control_plane::usage_totals))
+        .route("/v1/billing/receipts", get(control_plane::list_receipts))
+        .route("/v1/billing/receipts/{provider}/{event_id}", get(control_plane::get_receipt))
+        .route("/v1/usage", get(control_plane::list_usage))
+        // ---- control-plane administration -------------------------
+        // `platform:admin` only. These change what a tenant may do and what
+        // it is billed; every one of them is audited, and every one of them
+        // refuses rather than degrading when the caller is not authorised.
+        .route("/v1/admin/plans", post(control_plane::create_plan))
+        .route(
+            "/v1/admin/plans/{code}/features",
+            put(control_plane::grant_plan_feature),
+        )
+        .route(
+            "/v1/admin/tenants/{tenant_id}/subscription",
+            post(control_plane::create_subscription),
+        )
+        .route(
+            "/v1/admin/tenants/{tenant_id}/subscription/transitions",
+            post(control_plane::transition_subscription),
+        )
+        .route(
+            "/v1/admin/tenants/{tenant_id}/overrides/features",
+            post(control_plane::grant_feature_override),
+        )
+        .route(
+            "/v1/admin/tenants/{tenant_id}/overrides/quotas",
+            post(control_plane::grant_quota_override),
+        )
+        .route(
+            "/v1/admin/tenants/{tenant_id}/overrides/features/{feature}/end",
+            post(control_plane::end_feature_override),
+        )
         .route_layer(axum::middleware::from_fn_with_state(state.clone(), authenticated_layer))
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES));
+
+    // ---- internal (service-to-service) -----------------------------
+    // Deliberately NOT behind `authenticated_layer`: those routes take a
+    // tenant API key, and a platform service has none. These take the
+    // internal HMAC instead and resolve the tenant from server-side truth.
+    let internal = Router::new()
+        .route("/v1/internal/schedule-runs", post(internal::schedule_runs))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES));
 
     Router::new()
         .merge(public)
         .merge(protected)
+        .merge(internal)
         .fallback(not_found)
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -112,6 +182,15 @@ mod tests {
             )
             .await
             .expect("tenant");
+        let org_scoped_activate = system.clone().with_scope(tenant.id, organization.id);
+        // A tenant is provisioned, not operational, until activated. The
+        // resolver refuses a non-operational tenant, so the happy path has to
+        // activate it.
+        state
+            .tenancy
+            .activate_tenant(&org_scoped_activate, tenant.id)
+            .await
+            .expect("activate");
         let tenant_scoped = system.clone().with_scope(tenant.id, organization.id);
         let project = state
             .tenancy
@@ -387,7 +466,10 @@ mod tests {
             .expect("response");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
-        // Scope headers are mandatory on tenant routes.
+        // Scope headers are mandatory on tenant routes when the principal has
+        // no tenant binding of its own. It is a malformed request (400), not
+        // an authorization failure (403): nothing was denied, because nothing
+        // was ever asked for.
         let no_scope = request(Method::GET, "/v1/executions", None);
         let response = seeded
             .router
@@ -395,8 +477,8 @@ mod tests {
             .oneshot(no_scope)
             .await
             .expect("response");
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = json_body(response).await;
-        assert_eq!(body["error"]["code"], "FORBIDDEN");
+        assert_eq!(body["error"]["code"], "VALIDATION_FAILED");
     }
 }

@@ -1,3 +1,23 @@
+//! PURPOSE: The SSRF egress guard — the policy every production outbound
+//! HTTP call goes through.
+//!
+//! Owning layer: `mas-integrations`.
+//!
+//! Production responsibility: decide whether a destination is reachable at
+//! all: reject link-local, loopback, and metadata addresses unless a caller
+//! names them explicitly as internal endpoints.
+//!
+//! Security boundary: without this, any feature that fetches a URL becomes a
+//! request forgery into the cluster. Reaching a private range is a decision
+//! somebody makes on purpose, in code, for a named host.
+//!
+//! It must NOT:
+//!   • allow a redirect to re-target an approved request into a private
+//!     range;
+//!   • be optional for production callers — `HttpDispatcher` holds one and
+//!     every dispatch goes through it;
+//!   • resolve a hostname more than once (DNS rebinding).
+
 //! Hardened egress: the SSRF enforcement layer promised by `SafeUrl`.
 //!
 //! `SafeUrl` performs first-line validation at parse time (scheme, no
@@ -53,6 +73,19 @@ pub struct EgressPolicy {
     pub hostname_allowlist: Option<BTreeSet<String>>,
     pub max_redirects: u8,
     pub max_body_bytes: usize,
+    /// Whether URLs parsed as operator-declared internal endpoints
+    /// (`SafeUrl::parse_internal_endpoint`) may be contacted.
+    ///
+    /// Default `false`. When `true`, [`Self::hostname_allowlist`] is
+    /// **mandatory**: the exception is granted to a named destination, not to
+    /// "anything private".
+    ///
+    /// This exists because platform services legitimately call each other over
+    /// the cluster network. It is not a way to reach a tenant-supplied
+    /// private address — a URL from tenant data is never parsed as an internal
+    /// endpoint, and the flag on the `SafeUrl` is what distinguishes the two.
+    #[serde(default)]
+    pub allow_internal_endpoints: bool,
 }
 
 impl Default for EgressPolicy {
@@ -64,6 +97,38 @@ impl Default for EgressPolicy {
             hostname_allowlist: None,
             max_redirects: DEFAULT_MAX_REDIRECTS,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+            allow_internal_endpoints: false,
+        }
+    }
+}
+
+impl EgressPolicy {
+    /// A policy for one operator-declared internal service endpoint.
+    ///
+    /// `hosts` names the exact hosts the platform may reach over the cluster
+    /// network — `mas-api`, `127.0.0.1`, a Kubernetes service DNS name. Plain
+    /// HTTP is permitted for them because cluster traffic is commonly not TLS
+    /// terminated, and every other restriction (redirect re-validation, body
+    /// caps, redirect limits) stays in force.
+    ///
+    /// The allowlist is required: an internal-endpoint policy with no
+    /// allowlist would be an open permit to reach any private address, which
+    /// is the exact vulnerability the guard exists to prevent.
+    #[must_use]
+    pub fn for_internal_endpoints<I, S>(hosts: I, allowed_ports: Option<BTreeSet<u16>>) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let hosts: BTreeSet<String> = hosts.into_iter().map(Into::into).collect();
+        Self {
+            https_only: false,
+            permitted_plain_http_hosts: hosts.clone(),
+            allowed_ports,
+            hostname_allowlist: Some(hosts),
+            max_redirects: DEFAULT_MAX_REDIRECTS,
+            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+            allow_internal_endpoints: true,
         }
     }
 }
@@ -74,6 +139,26 @@ impl EgressPolicy {
     /// `SafeUrl` guarantees parse-level safety; this layer applies the
     /// operator policy on scheme, port and hostname.
     pub fn check_destination(&self, url: &SafeUrl) -> Result<()> {
+        // An internal endpoint is permitted only when the policy opted in, and
+        // then only if it also passes the hostname allowlist below. A URL that
+        // merely *claims* to be internal cannot get through a policy that never
+        // enabled them.
+        if url.is_internal_endpoint() {
+            if !self.allow_internal_endpoints {
+                return Err(AppError::invalid_field(
+                    "url",
+                    "internal_endpoint_forbidden",
+                    "this egress policy does not permit internal endpoints",
+                ));
+            }
+            if self.hostname_allowlist.is_none() {
+                return Err(AppError::internal(
+                    "internal endpoints are enabled without a hostname allowlist; \
+                     refusing to contact anything",
+                ));
+            }
+        }
+
         let parsed = Url::parse(url.as_str()).map_err(|err| {
             AppError::internal(format!("validated SafeUrl failed re-parse: {err}"))
         })?;
@@ -152,6 +237,38 @@ impl EgressPolicy {
     /// the whole request is refused — a hostile DNS record must not smuggle
     /// a private address past us among good ones.
     pub fn pin_resolution(&self, resolved: &[IpAddr]) -> Result<IpAddr> {
+        self.pin_resolution_public(resolved)
+    }
+
+    /// Resolution gate for a destination that may legitimately be private.
+    ///
+    /// `internal_endpoint` comes from the URL and is honoured only when the
+    /// policy allows internal endpoints at all. For an internal endpoint the
+    /// requirement relaxes from "publicly routable" to "not a link-local or
+    /// metadata address": reaching `10.0.0.5` is the point, but reaching
+    /// `169.254.169.254` never is, not even from inside the cluster.
+    pub fn pin_resolution_for(
+        &self,
+        resolved: &[IpAddr],
+        internal_endpoint: bool,
+    ) -> Result<IpAddr> {
+        if internal_endpoint && self.allow_internal_endpoints {
+            for addr in resolved {
+                if is_metadata_or_link_local(addr) {
+                    return Err(AppError::invalid_field(
+                        "url",
+                        "forbidden_host",
+                        format!("destination resolves to metadata/link-local address {addr}"),
+                    ));
+                }
+            }
+            return Ok(resolved[0]);
+        }
+        self.pin_resolution_public(resolved)
+    }
+
+    /// The public-only resolution gate.
+    fn pin_resolution_public(&self, resolved: &[IpAddr]) -> Result<IpAddr> {
         if resolved.is_empty() {
             return Err(AppError::external_service(
                 "http-egress",
@@ -168,6 +285,25 @@ impl EgressPolicy {
             }
         }
         Ok(resolved[0])
+    }
+}
+
+/// Whether an address is a link-local or cloud-metadata address.
+///
+/// Never reachable, not even from an operator-declared internal endpoint:
+/// `169.254.0.0/16` is the metadata service on every major cloud, and a
+/// platform service calling its own API has no business being able to read
+/// instance credentials.
+#[must_use]
+pub fn is_metadata_or_link_local(addr: &IpAddr) -> bool {
+    match addr {
+        IpAddr::V4(ip) => ip.is_link_local() || ip.is_unspecified() || ip.is_broadcast(),
+        IpAddr::V6(ip) => {
+            if let Some(mapped) = ip.to_ipv4_mapped() {
+                return mapped.is_link_local() || mapped.is_unspecified() || mapped.is_broadcast();
+            }
+            ip.is_unspecified() || (ip.segments()[0] & 0xffc0) == 0xfe80
+        },
     }
 }
 

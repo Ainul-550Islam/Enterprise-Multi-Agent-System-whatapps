@@ -1386,6 +1386,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
 
 [[package]]
+name = "mas-ai-bridge"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "hex",
+ "mas-common",
+ "mas-domain",
+ "mas-execution",
+ "mas-orchestration",
+ "mas-security",
+ "prost",
+ "protoc-bin-vendored",
+ "serde_json",
+ "tokio",
+ "tonic",
+ "tonic-build",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "mas-api"
 version = "0.1.0"
 dependencies = [
@@ -1403,11 +1425,13 @@ dependencies = [
  "mas-observability",
  "mas-persistence",
  "mas-security",
+ "mas-tenancy",
  "prost",
  "protoc-bin-vendored",
  "reqwest",
  "serde",
  "serde_json",
+ "sqlx",
  "tokio",
  "tonic",
  "tonic-build",
@@ -1421,14 +1445,23 @@ name = "mas-application"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "criterion",
+ "hex",
  "mas-common",
  "mas-contracts",
  "mas-domain",
+ "mas-events",
+ "mas-observability",
+ "mas-policy",
+ "mas-quota",
+ "mas-tenancy",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -1600,13 +1633,18 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "futures",
  "mas-application",
  "mas-common",
  "mas-contracts",
  "mas-domain",
  "mas-events",
  "mas-messaging",
+ "mas-policy",
+ "mas-quota",
  "mas-scheduling",
+ "mas-security",
+ "mas-tenancy",
  "mas-worker",
  "serde",
  "serde_json",
@@ -1655,8 +1693,12 @@ dependencies = [
  "mas-common",
  "mas-contracts",
  "mas-domain",
+ "mas-events",
+ "mas-integrations",
+ "mas-messaging",
  "mas-persistence",
  "mas-scheduling",
+ "mas-security",
  "mas-worker",
  "reqwest",
  "serde",
@@ -1665,6 +1707,7 @@ dependencies = [
  "tokio",
  "tower",
  "tracing",
+ "url",
  "uuid",
 ]
 
@@ -1697,6 +1740,7 @@ dependencies = [
  "sha2",
  "tokio",
  "tracing",
+ "uuid",
  "zeroize",
 ]
 
@@ -1738,16 +1782,26 @@ name = "mas-worker-service"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "mas-ai-bridge",
+ "mas-application",
  "mas-common",
  "mas-contracts",
  "mas-domain",
+ "mas-execution",
  "mas-messaging",
+ "mas-orchestration",
  "mas-persistence",
+ "mas-quota",
  "mas-scheduling",
+ "mas-security",
  "mas-worker",
  "serde_json",
+ "sha2",
  "sqlx",
  "tokio",
+ "toml",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

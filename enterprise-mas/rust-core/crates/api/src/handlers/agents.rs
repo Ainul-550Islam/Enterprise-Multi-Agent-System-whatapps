@@ -72,16 +72,23 @@ pub async fn publish_version(
     scoped(&ctx)?;
     let published_by = match body.published_by {
         Some(user) => user,
-        None => mas_common::ids::UserId::parse_str(&ctx.principal.subject).map_err(|_| {
-            crate::response::ApiError::new(
-                mas_common::error::AppError::invalid_field(
-                    "published_by",
-                    "invalid",
-                    "provide an explicit user id (subject is not a uuid)",
-                ),
-                &ctx,
-            )
-        })?,
+        None => {
+            let subject = ctx
+                .principal
+                .as_ref()
+                .map(|principal| principal.actor_id.clone())
+                .unwrap_or_default();
+            mas_common::ids::UserId::parse_str(&subject).map_err(|_| {
+                crate::response::ApiError::new(
+                    mas_common::error::AppError::invalid_field(
+                        "published_by",
+                        "invalid",
+                        "provide an explicit user id (subject is not a uuid)",
+                    ),
+                    &ctx,
+                )
+            })
+        }?,
     };
     let service_ctx = ctx
         .service_context()

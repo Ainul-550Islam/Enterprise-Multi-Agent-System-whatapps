@@ -1,3 +1,18 @@
+# PURPOSE: The `mas-persistence` crate manifest.
+#
+# Owning layer: `mas-persistence`.
+#
+# Production responsibility: declare the SQL layer's dependencies, including
+# `mas-application` — this crate *implements* the durable execution port the
+# application layer defines, so the canonical pipeline has one definition and
+# one production implementation.
+#
+# It must NOT:
+#   • depend on `mas-api` or `mas-worker`;
+#   • enable a fallback that swaps PostgreSQL for an in-memory store;
+#   • pin a `sqlx` feature set that disables the compile-time query checking
+#     used by the repositories.
+
 [package]
 name = "mas-persistence"
 description = "PostgreSQL persistence: pool, transactions, migration runner, RLS context, row models, repositories."
@@ -12,9 +27,17 @@ mas-application = { workspace = true }
 mas-contracts = { workspace = true }
 mas-domain = { workspace = true }
 mas-events = { workspace = true }
+mas-security = { workspace = true }
+mas-tenancy = { workspace = true }
 mas-messaging = { workspace = true }
 mas-scheduling = { workspace = true }
 mas-worker = { workspace = true }
+# The control-plane repositories implement the policy and quota ports over
+# Postgres. Both crates are leaf-ish (common/domain/orchestration only), so
+# this edge is acyclic and lets the Postgres adapters live with every other
+# Postgres adapter instead of introducing a new crate.
+mas-policy = { workspace = true }
+mas-quota = { workspace = true }
 sqlx = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -22,7 +45,10 @@ async-trait = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
 
 [dev-dependencies]
+mas-tenancy = { workspace = true }
+futures = "0.3"
 sha2 = "0.10"
-tokio = { workspace = true, features = ["macros", "rt", "time"] }
+tokio = { workspace = true, features = ["macros", "rt", "time", "sync"] }

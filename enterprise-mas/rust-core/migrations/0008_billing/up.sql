@@ -1,3 +1,17 @@
+-- PURPOSE: Migration 0008 — subscriptions, entitlements, quotas and usage
+-- records.
+--
+-- Owning layer: database schema.
+--
+-- Production responsibility: give usage and quota a durable home with tenant
+-- foreign keys and the indexes the metering queries need, so a usage record is
+-- attributable to a tenant and cannot be double-counted.
+--
+-- It must NOT:
+--   • drop or rewrite an existing table (this migration is additive);
+--   • create a usage table without a tenant foreign key;
+--   • be edited after it has been applied anywhere.
+
 -- 0008_billing: subscriptions, entitlements, quotas, usage records.
 
 CREATE TABLE subscriptions (
@@ -48,11 +62,11 @@ CREATE TABLE quotas (
     scope       text NOT NULL, -- e.g. tenant / project / agent
     resource    text NOT NULL, -- e.g. executions.minute, tokens.day
     max_value   bigint NOT NULL CHECK (max_value >= 0),
-    window      text NOT NULL CHECK (window IN ('second', 'minute', 'hour', 'day', 'month', 'lifetime')),
+    "window"    text NOT NULL CHECK ("window" IN ('second', 'minute', 'hour', 'day', 'month', 'lifetime')),
     spec        jsonb NOT NULL DEFAULT '{}'::jsonb,
     created_at  timestamptz NOT NULL DEFAULT now(),
     updated_at  timestamptz NOT NULL DEFAULT now(),
-    UNIQUE (tenant_id, scope, resource, window)
+    UNIQUE (tenant_id, scope, resource, "window")
 );
 CREATE TRIGGER quotas_updated_at BEFORE UPDATE ON quotas
     FOR EACH ROW EXECUTE FUNCTION mas_set_updated_at();

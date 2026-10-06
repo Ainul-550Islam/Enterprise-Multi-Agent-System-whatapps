@@ -1,3 +1,10 @@
+# PURPOSE:
+# Declares the worker service binary and its dependencies.
+#
+# Depends on `mas-ai-bridge` with default features only, which is what keeps
+# the in-memory bridge out of a release build, and on `mas-execution` for the
+# `AgentBridge` port the handler is written against.
+
 [package]
 name = "mas-worker-service"
 version = "0.1.0"
@@ -13,7 +20,12 @@ path = "src/main.rs"
 # collision with the lib target).
 doc = false
 
+[lib]
+name = "mas_worker_service"
+path = "src/lib.rs"
+
 [dependencies]
+mas-application = { workspace = true }
 mas-common = { workspace = true }
 mas-contracts = { workspace = true }
 mas-domain = { workspace = true }
@@ -21,10 +33,26 @@ mas-messaging = { workspace = true }
 mas-persistence = { workspace = true }
 mas-worker = { workspace = true }
 mas-scheduling = { workspace = true }
+# The worker drives real AI execution. `mas-execution` is deliberately pulled in
+# WITHOUT the `dev-bridges` feature: an in-memory agent bridge is never
+# linkable into this binary, so production cannot select it by accident.
+mas-execution = { workspace = true }
+mas-orchestration = { workspace = true }
+mas-ai-bridge = { workspace = true }
+mas-security = { workspace = true }
 sqlx = { workspace = true }
 async-trait = { workspace = true }
 serde_json = { workspace = true }
+tracing = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
+
+[dev-dependencies]
+toml = { workspace = true }
+uuid = { workspace = true }
+sha2 = "0.10"
+serde_json = { workspace = true }
+mas-quota = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "sync"] }
 
 [features]
 nats = ["mas-messaging/nats"]

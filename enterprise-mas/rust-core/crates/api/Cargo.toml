@@ -1,3 +1,22 @@
+# PURPOSE: The `mas-api` crate manifest — the tenant-facing HTTP + gRPC
+# process.
+#
+# Owning layer: the process edge.
+#
+# Production responsibility: declare the dependency set this process is
+# allowed to reach. Notably it depends on `mas-security` (the one
+# authorization and internal-service-authentication crate) and on `sqlx`
+# (the runtime pool it opens one RLS-armed transaction per request from).
+#
+# Security boundary: a dependency added here is reachable by request
+# handlers. Anything that can bypass authorization belongs in a plane crate
+# with its own role, not here.
+#
+# It must NOT:
+#   • depend on a plane crate directly (worker/outbox/audit) — those are
+#     separate processes with separate database roles;
+#   • enable a dev/test convenience dependency in the default feature set.
+
 [package]
 name = "mas-api"
 version = "0.1.0"
@@ -22,6 +41,8 @@ mas-application = { workspace = true }
 mas-observability = { workspace = true }
 mas-persistence = { workspace = true }
 mas-security = { workspace = true }
+sqlx = { workspace = true }
+mas-tenancy = { workspace = true }
 mas-events = { workspace = true }
 chrono = { workspace = true }
 

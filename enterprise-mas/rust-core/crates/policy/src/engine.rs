@@ -265,6 +265,32 @@ impl PolicyEngine {
         let mut transform_layers: Vec<(i32, Map<String, Value>)> = Vec::new();
         let mut rate_specs: Vec<(i32, RuleRef, CompiledRule)> = Vec::new();
 
+        // An empty policy set is not a denial.
+        //
+        // This distinction matters once policy sits in the path of every
+        // request. A policy is an *additional* restriction layered on top of
+        // the authorization the tenant already carries (tenancy, entitlement,
+        // quota): it exists to say "not this", not to be the only thing that
+        // can ever say "yes". When no policy applies to a scope there is
+        // nothing forbidding the action, and an implicit deny here would
+        // silently turn every unconfigured tenant into a tenant that cannot
+        // execute — which presents as an outage, not as a security control.
+        //
+        // The secure default is unchanged wherever a policy *does*
+        // participate: `default_effect: deny` still denies, and a policy set
+        // that matches nothing still denies.
+        if policies.is_empty() {
+            return Ok(Vote {
+                decision: PolicyDecision::Allow,
+                reason: Some(
+                    "no policy applies to this scope; the entitlement decision stands".to_owned(),
+                ),
+                matched: Vec::new(),
+                transform: Map::new(),
+                bucket_touched: false,
+            });
+        }
+
         for policy in policies {
             let matching: Vec<&CompiledRule> = match policy.combining {
                 Combining::FirstApplicable => policy

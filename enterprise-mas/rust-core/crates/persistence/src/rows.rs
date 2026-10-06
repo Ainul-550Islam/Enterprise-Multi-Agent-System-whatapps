@@ -1,3 +1,17 @@
+//! PURPOSE: Row models and the column ↔ domain hydration bridge.
+//!
+//! Owning layer: `mas-persistence`.
+//!
+//! Production responsibility: keep materialized columns strongly typed in SQL
+//! (ids as UUID, statuses as text, timestamps as `timestamptz`) and rebuild
+//! the domain aggregate from them, so a schema drift fails loudly at the
+//! boundary instead of silently producing a default.
+//!
+//! It must NOT:
+//!   • let a hydration failure default to a plausible-looking value;
+//!   • duplicate column lists across repositories (they are shared constants);
+//!   • carry secrets — rows are what get logged and exported.
+
 //! Row models and the column ↔ domain hydration bridge.
 //!
 //! Domain aggregates are serde-shaped (enums as strings, ids as UUID strings,
@@ -518,6 +532,10 @@ pub struct OutboxRow {
     pub enqueued_at: DateTime<Utc>,
     /// Publish time (NULL until published).
     pub published_at: Option<DateTime<Utc>>,
+    /// Relay that currently owns the row (NULL when unclaimed).
+    pub claimed_by: Option<String>,
+    /// When the current claim was taken (NULL when unclaimed).
+    pub claimed_at: Option<DateTime<Utc>>,
 }
 
 impl OutboxRow {
@@ -545,6 +563,8 @@ impl OutboxRow {
             last_error: self.last_error,
             enqueued_at: Timestamp::from_datetime(self.enqueued_at),
             published_at: self.published_at.map(Timestamp::from_datetime),
+            claimed_by: self.claimed_by,
+            claimed_at: self.claimed_at.map(Timestamp::from_datetime),
         })
     }
 
@@ -566,6 +586,10 @@ impl OutboxRow {
             last_error: record.last_error.clone(),
             enqueued_at: record.enqueued_at.into_datetime(),
             published_at: record.published_at.map(Timestamp::into_datetime),
+            // A record being enqueued is by definition unclaimed: ownership
+            // only exists once a relay has taken the row.
+            claimed_by: None,
+            claimed_at: None,
         })
     }
 }
@@ -1278,6 +1302,7 @@ pub struct ScheduleRow {
 impl ScheduleRow {
     const MATERIALIZED: &'static [&'static str] = &[
         "id",
+        "tenant_id",
         "organization_id",
         "name",
         "status",
@@ -1323,8 +1348,13 @@ impl ScheduleRow {
     /// Extracts the row from the domain aggregate (organization is NOT a
     /// domain field — the repository passes it through explicitly).
     pub fn from_domain(schedule: &Schedule, organization: Uuid) -> Result<Self> {
-        let (map, spec) = split_spec(&dehydrate("schedules", schedule)?, Self::MATERIALIZED)?;
-        let mut target = map
+        let full = dehydrate("schedules", schedule)?;
+        let (map, spec) = split_spec(&full, Self::MATERIALIZED)?;
+        // `task_template` and `kind` are domain fields but NOT materialized
+        // columns: they belong to the `target` / `rule` jsonb columns, so they
+        // must be read from the full aggregate — reading them from `map` (the
+        // materialized projection) silently dropped `task_template`.
+        let mut target = full
             .get("task_template")
             .map(|t| json!({ "task_template": t.clone() }))
             .and_then(|v| v.as_object().cloned())
@@ -1336,11 +1366,7 @@ impl ScheduleRow {
         if !spec_rest.is_empty() {
             target.insert(Self::TARGET_SPEC_KEY.to_owned(), Value::Object(spec_rest));
         }
-        let rule = match map
-            .get("kind")
-            .cloned()
-            .or_else(|| dehydrate("schedules", schedule).ok()?.get("kind").cloned())
-        {
+        let rule = match full.get("kind").cloned() {
             Some(kind) => json!({ "kind": kind }),
             None => json!({}),
         };
@@ -1396,6 +1422,10 @@ pub struct TaskRow {
     pub deadline_at: Option<DateTime<Utc>>,
     /// Correlation key.
     pub correlation_id: String,
+    /// Who created the task. Materialized: `domain::Task::created_by` is a
+    /// required field, so hydration must always be able to read it. Rows
+    /// written by the durable broker carry the platform principal default.
+    pub created_by: String,
     /// Creation time.
     pub created_at: DateTime<Utc>,
     /// Last update time.
@@ -1403,7 +1433,9 @@ pub struct TaskRow {
 }
 
 impl TaskRow {
-    const MATERIALIZED: &'static [&'static str] = &[
+    /// Materialized columns for `tasks`. Exposed so the repository test can
+    /// assert that a required domain field is actually materialized.
+    pub const MATERIALIZED: &'static [&'static str] = &[
         "id",
         "tenant_id",
         "organization_id",
@@ -1414,6 +1446,7 @@ impl TaskRow {
         "status",
         "priority",
         "deadline",
+        "created_by",
         "created_at",
         "updated_at",
     ];
@@ -1445,6 +1478,10 @@ impl TaskRow {
         if let Some(deadline) = self.deadline_at {
             spec.insert("deadline".to_owned(), ts_json(deadline));
         }
+        // Round-trip the retry backoff: without it a requeued task is
+        // claimable the instant it is written.
+        spec.insert("not_before".to_owned(), ts_json(self.not_before));
+        spec.insert("created_by".to_owned(), json!(self.created_by));
         spec.insert("created_at".to_owned(), ts_json(self.created_at));
         spec.insert("updated_at".to_owned(), ts_json(self.updated_at));
         hydrate("tasks", Value::Object(spec))
@@ -1456,7 +1493,17 @@ impl TaskRow {
         let mut spec = spec_value.as_object().cloned().unwrap_or_default();
         spec.remove("input");
         spec.remove("result");
-        spec.remove("not_before");
+        // `not_before` is materialized onto the column, NOT dropped: it is the
+        // retry backoff, and dropping it made every retry immediately
+        // claimable again (a retry storm instead of a backoff).
+        let not_before = match spec.remove("not_before") {
+            Some(Value::String(raw)) => Timestamp::parse_rfc3339(&raw)
+                .map(Timestamp::into_datetime)
+                .map_err(|_| {
+                    AppError::database("invalid timestamp 'not_before' for table tasks")
+                })?,
+            _ => Timestamp::epoch().into_datetime(),
+        };
         let mut payload = map
             .get("input")
             .map(|i| json!({ "input": i.clone() }))
@@ -1477,12 +1524,18 @@ impl TaskRow {
             priority: take_string(&map, "tasks", "priority")?,
             payload: Value::Object(payload),
             result: map.get("result").cloned().filter(|v| !v.is_null()),
-            not_before: Timestamp::epoch().into_datetime(),
+            not_before,
             deadline_at: take_opt_ts(&map, "tasks", "deadline")?,
             correlation_id: map
                 .get("correlation_id")
                 .and_then(Value::as_str)
                 .unwrap_or("00000000-0000-0000-0000-000000000000")
+                .to_owned(),
+            created_by: map
+                .get("created_by")
+                .and_then(Value::as_str)
+                .filter(|raw| !raw.is_empty())
+                .unwrap_or("system")
                 .to_owned(),
             created_at: take_ts(&map, "tasks", "created_at")?,
             updated_at: take_ts(&map, "tasks", "updated_at")?,

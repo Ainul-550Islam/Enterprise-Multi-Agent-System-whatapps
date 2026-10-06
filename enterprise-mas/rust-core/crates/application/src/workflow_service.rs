@@ -213,6 +213,7 @@ mod tests {
             Box::new(store.clone()),
             Box::new(store.clone()),
             Box::new(audit.clone()),
+            Box::new(crate::control_plane::build_in_memory_control_plane().entitlement_store()),
         );
         let service =
             WorkflowService::new(Box::new(store.clone()), Box::new(store), Box::new(audit));

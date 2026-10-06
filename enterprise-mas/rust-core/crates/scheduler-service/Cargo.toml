@@ -1,3 +1,16 @@
+# PURPOSE: The `mas-scheduler-service` crate manifest.
+#
+# Owning layer: `mas-scheduler-service` (the process edge).
+#
+# Production responsibility: declare the scheduler process's dependencies,
+# including `mas-application` for the canonical submission pipeline and
+# `mas-events` for the outbox relay the process hosts.
+#
+# It must NOT:
+#   • add the in-memory dev lane's dependencies to the default feature set;
+#   • depend on `mas-api`;
+#   • enable a feature that lets the process start without a durable store.
+
 [package]
 name = "mas-scheduler-service"
 version = "0.1.0"
@@ -17,11 +30,15 @@ path = "src/main.rs"
 [dependencies]
 mas-common = { workspace = true }
 mas-domain = { workspace = true }
+mas-integrations = { workspace = true }
+mas-security = { workspace = true }
 mas-scheduling = { workspace = true }
 mas-worker = { workspace = true }
 mas-application = { workspace = true }
 mas-persistence = { workspace = true }
 mas-contracts = { workspace = true }
+mas-events = { workspace = true }
+mas-messaging = { workspace = true }
 sqlx = { workspace = true }
 async-trait = { workspace = true }
 serde_json = { workspace = true }
@@ -29,6 +46,7 @@ uuid = { workspace = true }
 
 axum = { workspace = true }
 reqwest = { workspace = true }
+url = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true, features = ["net", "signal", "rt-multi-thread"] }
 tracing = { workspace = true }
@@ -38,6 +56,11 @@ tokio = { workspace = true, features = ["macros", "rt", "time"] }
 tower = { workspace = true }
 
 [features]
+# The outbox relay publishes over NATS, so the event plane is on by default.
+# Building without it disables the relay rather than silently falling back to
+# an in-process bus that would publish events nowhere.
+default = ["nats"]
+nats = ["mas-messaging/nats"]
 testutils = []
 
 [lints]

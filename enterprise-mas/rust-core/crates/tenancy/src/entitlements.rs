@@ -25,6 +25,30 @@ pub trait EntitlementStorePort: Send + Sync + fmt::Debug {
     async fn upsert_entitlement(&self, entitlement: &Entitlement) -> Result<()>;
 }
 
+/// Forwards every operation through an [`Arc`].
+///
+/// Tenant provisioning and the control-plane gate hold the *same* store, and
+/// both want to own it. Without this forwarding impl one of them has to be
+/// generic over the concrete type instead.
+#[async_trait::async_trait]
+impl<T: EntitlementStorePort + ?Sized> EntitlementStorePort for std::sync::Arc<T> {
+    async fn get_subscription(&self, tenant_id: TenantId) -> Result<Option<Subscription>> {
+        (**self).get_subscription(tenant_id).await
+    }
+
+    async fn upsert_subscription(&self, subscription: &Subscription) -> Result<()> {
+        (**self).upsert_subscription(subscription).await
+    }
+
+    async fn list_entitlements(&self, tenant_id: TenantId) -> Result<Vec<Entitlement>> {
+        (**self).list_entitlements(tenant_id).await
+    }
+
+    async fn upsert_entitlement(&self, entitlement: &Entitlement) -> Result<()> {
+        (**self).upsert_entitlement(entitlement).await
+    }
+}
+
 /// Plan-matrix source: plan_code → the features it buys + generic caps.
 #[async_trait::async_trait]
 pub trait PlanMatrixPort: Send + Sync + fmt::Debug {
@@ -161,6 +185,18 @@ pub struct EntitlementService {
 impl EntitlementService {
     pub fn new(store: Arc<dyn EntitlementStorePort>, plans: Arc<dyn PlanMatrixPort>) -> Self {
         Self { store, plans }
+    }
+
+    /// The store this service reads through.
+    ///
+    /// Exposed so tenant provisioning can write the subscription the gate then
+    /// reads. They must be the same store: two instances would mean a tenant
+    /// could be activated and still be refused every execution, which is the
+    /// kind of failure that looks like a bug in the gate but is really two
+    /// halves of one system not talking to each other.
+    #[must_use]
+    pub fn store(&self) -> Arc<dyn EntitlementStorePort> {
+        Arc::clone(&self.store)
     }
 
     /// Builds the effective profile for a tenant (None → no plan at all).

@@ -1,3 +1,24 @@
+//! PURPOSE: The stable response envelope and the conversion from internal
+//! errors to the public error contract.
+//!
+//! Owning layer: `mas-api` (the process edge).
+//!
+//! Production responsibility: every success and every failure leaves the
+//! process in exactly one shape — `data` + `error` + `meta` — so a client
+//! branches on a code, never on a message, and so no internal detail crosses
+//! the wire by accident.
+//!
+//! Security boundary: this is the last place a secret, a stack trace, or a
+//! foreign tenant's identifier could escape. `stable_error` publishes only
+//! `AppError::error_code()` and `AppError::public_message()`; everything else
+//! stays in logs and spans.
+//!
+//! It must NOT:
+//!   • render an internal error message, a SQL detail, or a credential;
+//!   • return different envelope shapes from different handlers;
+//!   • disclose whether a tenant exists — an unreachable tenant is a
+//!     `RESOURCE_NOT_FOUND`, never a `FORBIDDEN`.
+
 //! Uniform response shapes: every route answers `ApiEnvelope<T>` — data on
 //! success, `StableApiError` on failure, `EnvelopeMeta` (request id +
 //! correlation echo) on both.
@@ -40,6 +61,16 @@ pub fn ok<T: serde::Serialize>(ctx: &RequestContext, data: T) -> ApiResponse<T> 
 pub fn created<T: serde::Serialize>(ctx: &RequestContext, data: T) -> ApiResponse<T> {
     ApiResponse {
         status: StatusCode::CREATED,
+        correlation_id: String::new(),
+        ..ok(ctx, data)
+    }
+}
+
+/// Accepted-envelope (`202 Accepted`) for asynchronous intake routes such as
+/// the internal run endpoint, where the work is queued rather than completed.
+pub fn accepted<T: serde::Serialize>(ctx: &RequestContext, data: T) -> ApiResponse<T> {
+    ApiResponse {
+        status: StatusCode::ACCEPTED,
         correlation_id: String::new(),
         ..ok(ctx, data)
     }
@@ -159,16 +190,19 @@ impl<T> IntoApiResult<T> for std::result::Result<T, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::{Principal, PrincipalKind};
+    use mas_security::{PrincipalKind, ScopeSet, SecurityPrincipal};
 
     fn ctx() -> RequestContext {
         RequestContext {
-            principal: Principal {
-                subject: "jane".to_owned(),
-                kind: PrincipalKind::User,
-            },
-            tenant_id: None,
-            organization_id: None,
+            principal: Some(SecurityPrincipal::new(
+                "jane",
+                PrincipalKind::User,
+                None,
+                ScopeSet::denied(),
+            )),
+            scope: None,
+            claimed_tenant: None,
+            claimed_organization: None,
             request_id: uuid::Uuid::now_v7(),
             correlation_id: "corr-42".to_owned(),
         }

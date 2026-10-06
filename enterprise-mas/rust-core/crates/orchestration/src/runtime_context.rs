@@ -1,3 +1,17 @@
+//! PURPOSE: The immutable-per-request execution context threaded through the
+//! whole pipeline.
+//!
+//! Owning layer: `mas-orchestration`.
+//!
+//! Production responsibility: make identity non-forgeable — tenant,
+//! organization and actor are set once at the boundary and never mutated, so
+//! no node downstream can widen its own scope.
+//!
+//! It must NOT:
+//!   • expose a mutable setter for identity fields;
+//!   • carry a credential or raw payload — identity and correlation only;
+//!   • be reconstructed mid-run from data the request supplied.
+
 //! The immutable-per-request execution context threaded through the whole
 //! pipeline (API → engine → runtime → node → tool/agent invocation).
 //!
@@ -223,6 +237,18 @@ impl RuntimeContext {
     #[must_use]
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.deadline = Some(Deadline::after(timeout));
+        self
+    }
+    /// Links an external cancellation token into this context.
+    ///
+    /// The worker's shutdown path owns a token, and a run dispatched from the
+    /// durable queue must be cancelled when the worker drains rather than
+    /// abandoned mid-flight. The context's own token is replaced by the one
+    /// given, so calling [`CancellationToken::cancel`] on the caller's token
+    /// stops this run without disturbing unrelated runs.
+    #[must_use]
+    pub fn with_cancellation(mut self, token: CancellationToken) -> Self {
+        self.cancellation = token;
         self
     }
 

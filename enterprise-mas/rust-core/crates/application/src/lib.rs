@@ -1,3 +1,19 @@
+//! PURPOSE: The use-case layer: the services `api`, `worker` and
+//! `scheduler-service` are thin processes around, plus the canonical durable
+//! execution pipeline's ports and its in-memory reference implementation.
+//!
+//! Owning layer: `mas-application`.
+//!
+//! Production responsibility: own every use case and every *canonical* state
+//! machine, so the same business rule cannot be implemented twice in two
+//! processes. Dependencies arrive as ports; nothing here binds HTTP, gRPC, SQL
+//! or a broker.
+//!
+//! It must NOT:
+//!   • depend on `mas-api`, `mas-worker` or any other process crate;
+//!   • grow a second execution lifecycle — `durable` is the only one;
+//!   • let a service take a concrete store when a port will do.
+
 //! # mas-application
 //!
 //! The use-case layer. `api`, `worker` and `scheduler-service` are thin
@@ -25,9 +41,20 @@
 pub mod agent_service;
 pub mod audit;
 pub mod context;
+pub mod control_plane;
 pub mod dto;
+/// The durable execution pipeline's atomic port, its canonical event builder,
+/// the request fingerprint, and the in-memory reference implementation.
+pub mod durable;
+pub mod durable_events;
+pub mod durable_memory;
 pub mod execution_service;
+pub mod fingerprint;
+pub mod pipeline_log;
+pub mod pipeline_metrics;
 pub mod schedule_service;
 pub mod stores;
 pub mod tenancy_service;
+#[cfg(test)]
+mod tenant_isolation;
 pub mod workflow_service;

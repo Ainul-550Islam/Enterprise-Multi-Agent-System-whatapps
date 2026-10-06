@@ -1,3 +1,20 @@
+//! PURPOSE: The secret-manager abstraction — where a secret comes from.
+//!
+//! Owning layer: `mas-security`.
+//!
+//! Production responsibility: resolve secret *references* (environment,
+//! file, or external manager) into values, so no caller hard-codes credential
+//! material and no configuration file carries one.
+//!
+//! Security boundary: the abstraction exists so that "where secrets live" is
+//! one decision, made once, and so an unresolvable reference fails loudly
+//! rather than degrading to an empty string that an HMAC would accept.
+//!
+//! It must NOT:
+//!   • return an empty secret as success;
+//!   • log or cache the resolved value in anything with a `Debug` impl;
+//!   • accept a secret from a command-line argument.
+
 //! The secret-resolution gate: domain `SecretReference` → material, with
 //! lifecycle enforcement, optional TTL caching and mandatory auditing of
 //! every resolution attempt (success AND failure — never the material).

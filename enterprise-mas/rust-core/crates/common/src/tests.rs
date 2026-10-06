@@ -67,6 +67,12 @@ fn ids_roundtrip_display_fromstr_serde() {
     check!(ApiKeyId);
     check!(SessionId);
     check!(EventId);
+    check!(PlanId);
+    check!(OverrideId);
+    check!(ReservationId);
+    check!(SubscriptionId);
+    check!(SubscriptionEventId);
+    check!(BillingReceiptId);
 }
 
 #[test]
