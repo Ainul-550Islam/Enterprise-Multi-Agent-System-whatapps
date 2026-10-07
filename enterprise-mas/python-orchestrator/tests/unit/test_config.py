@@ -29,6 +29,7 @@ from mas_orchestrator.config.settings import (
     ProviderSettings,
     RagSettings,
     RustCoreSettings,
+    ServiceSettings,
     Settings,
     ToolSettings,
     load_settings,
@@ -108,6 +109,29 @@ def test_mtls_accepts_a_complete_keypair_reference() -> None:
         client_key_secret_ref="key-ref",
     )
     assert settings.transport.uses_tls
+
+
+def test_inbound_grpc_tls_requires_server_certificate_and_key() -> None:
+    with pytest.raises(ValidationError, match="grpc_certificate_chain_path"):
+        ServiceSettings(grpc_transport_security=TransportSecurity.TLS)
+
+
+def test_inbound_grpc_mtls_requires_a_client_ca_bundle() -> None:
+    with pytest.raises(ValidationError, match="grpc_client_ca_bundle_path"):
+        ServiceSettings(
+            grpc_transport_security=TransportSecurity.MTLS,
+            grpc_certificate_chain_path="/run/secrets/server.crt",
+            grpc_private_key_path="/run/secrets/server.key",
+        )
+
+
+def test_inbound_grpc_tls_accepts_server_identity() -> None:
+    settings = ServiceSettings(
+        grpc_transport_security=TransportSecurity.TLS,
+        grpc_certificate_chain_path="/run/secrets/server.crt",
+        grpc_private_key_path="/run/secrets/server.key",
+    )
+    assert settings.grpc_transport_security.uses_tls
 
 
 def test_negative_pricing_rejected() -> None:
@@ -469,16 +493,33 @@ def test_production_ready_also_valid_in_staging() -> None:
     assert validate_settings(settings) == ()
 
 
-def test_non_loopback_bind_is_flagged_in_production() -> None:
-    settings = Settings.model_validate(
-        {
-            "environment": "production",
-            "service": {"bind_host": "0.0.0.0", "service_token_secret_ref": "tok"},
-            "rust_core": {"bearer_token_secret_ref": "tok"},
-        }
+def test_plaintext_inbound_grpc_is_rejected_in_production() -> None:
+    settings = production_ready_settings(Environment.PRODUCTION)
+    insecure_service = settings.service.model_copy(
+        update={"grpc_transport_security": TransportSecurity.INSECURE}
     )
-    fields = {v.field for v in validate_settings(settings)}
-    assert "service.bind_host" in fields
+    unsafe = settings.model_copy(update={"service": insecure_service})
+
+    fields = {violation.field for violation in validate_settings(unsafe)}
+
+    assert "service.grpc_transport_security" in fields
+
+
+def test_remote_bridge_bind_requires_private_network_opt_in() -> None:
+    settings = production_ready_settings(Environment.PRODUCTION)
+    remote_service = settings.service.model_copy(update={"bind_host": "0.0.0.0"})
+    unsafe = settings.model_copy(update={"service": remote_service})
+
+    fields = {violation.field for violation in validate_settings(unsafe)}
+
+    assert "service.allow_remote_bridge_clients" in fields
+
+    explicitly_allowed_service = remote_service.model_copy(
+        update={"allow_remote_bridge_clients": True}
+    )
+    allowed = settings.model_copy(update={"service": explicitly_allowed_service})
+
+    assert validate_settings(allowed) == ()
 
 
 def test_guardrail_failure_mode_semantics() -> None:

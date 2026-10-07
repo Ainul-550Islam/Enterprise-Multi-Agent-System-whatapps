@@ -161,6 +161,52 @@ pub static MIGRATIONS: &[Migration] = &[
         "worker_metering_grant",
         "../../../migrations/0022_worker_metering_grant/up.sql"
     ),
+    migration!(
+        23,
+        "agent_dashboard_columns",
+        "../../../migrations/0023_agent_dashboard_columns/up.sql"
+    ),
+    migration!(
+        24,
+        "workflow_versions",
+        "../../../migrations/0024_workflow_versions/up.sql"
+    ),
+    migration!(
+        25,
+        "rollback_records",
+        "../../../migrations/0025_rollback_records/up.sql"
+    ),
+    migration!(
+        26,
+        "analytics_rollups",
+        "../../../migrations/0026_analytics_rollups/up.sql"
+    ),
+    migration!(27, "approvals", "../../../migrations/0027_approvals/up.sql"),
+    migration!(
+        28,
+        "rag_pgvector_plane",
+        "../../../migrations/0028_rag_pgvector_plane/up.sql"
+    ),
+    migration!(
+        29,
+        "data_hub_state",
+        "../../../migrations/0029_data_hub_state/up.sql"
+    ),
+    migration!(
+        30,
+        "execution_step_domain_parity",
+        "../../../migrations/0030_execution_step_domain_parity/up.sql"
+    ),
+    migration!(
+        31,
+        "worker_execution_step_insert",
+        "../../../migrations/0031_worker_execution_step_insert/up.sql"
+    ),
+    migration!(
+        32,
+        "api_key_prefix_lookup",
+        "../../../migrations/0032_api_key_prefix_lookup/up.sql"
+    ),
 ];
 
 /// A migration already recorded in the database.
@@ -494,11 +540,11 @@ mod tests {
     #[test]
     fn registry_is_contiguous_and_ordered() {
         validate_registry().expect("registry must be valid");
-        assert_eq!(MIGRATIONS.len(), 22);
+        assert_eq!(MIGRATIONS.len(), 32);
         assert_eq!(MIGRATIONS.first().map(|m| m.name), Some("extensions"));
         assert_eq!(
             MIGRATIONS.last().map(|m| m.name),
-            Some("worker_metering_grant")
+            Some("api_key_prefix_lookup")
         );
         // Versions are 1-based and strictly ascending: the runner applies them
         // in registry order and refuses gaps.

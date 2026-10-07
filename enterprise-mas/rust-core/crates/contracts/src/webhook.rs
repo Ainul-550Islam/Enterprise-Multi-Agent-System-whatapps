@@ -1,0 +1,121 @@
+//! Outbound webhook endpoint and delivery DTOs.
+
+use mas_common::ids::{EventId, SecretReferenceId, WebhookId};
+use mas_common::result::Result;
+use mas_common::timestamps::Timestamp;
+use mas_common::validation;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
+
+/// Register a webhook endpoint using a secret-manager reference only.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterWebhookRequest {
+    /// Absolute endpoint URL; the application reapplies `SafeUrl` SSRF checks.
+    pub url: String,
+    /// Event names delivered to this endpoint.
+    pub subscribed_events: Vec<String>,
+    /// Reference to an externally stored HMAC signing secret.
+    pub secret_reference_id: SecretReferenceId,
+    /// Optional display description.
+    pub description: Option<String>,
+}
+
+impl RegisterWebhookRequest {
+    /// Validates the URL envelope and event subscription bounds.
+    ///
+    /// The application service must additionally parse the URL with the
+    /// domain `SafeUrl` type, which performs the authoritative SSRF checks.
+    pub fn validate(&self) -> Result<()> {
+        validation::validate_length("url", &self.url, 1, 2048)?;
+        if !(self.url.starts_with("https://") || self.url.starts_with("http://"))
+            || self.url.split_once("://").is_none_or(|(_, authority)| {
+                authority
+                    .split('/')
+                    .next()
+                    .is_none_or(|host| host.is_empty() || host.contains('@'))
+            })
+        {
+            return Err(mas_common::error::AppError::invalid_field(
+                "url",
+                "invalid_url",
+                "webhook URL must be absolute and must not contain credentials",
+            ));
+        }
+        if self.subscribed_events.is_empty() || self.subscribed_events.len() > 128 {
+            return Err(mas_common::error::AppError::invalid_field(
+                "subscribed_events",
+                "out_of_range",
+                "a webhook must subscribe to between 1 and 128 events",
+            ));
+        }
+        let distinct: BTreeSet<&str> = self.subscribed_events.iter().map(String::as_str).collect();
+        if distinct.len() != self.subscribed_events.len() {
+            return Err(mas_common::error::AppError::invalid_field(
+                "subscribed_events",
+                "duplicate",
+                "event subscriptions must be unique",
+            ));
+        }
+        for event in &self.subscribed_events {
+            validation::validate_length("event", event, 1, 128)?;
+            if !event
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || ".:_-*".contains(character))
+            {
+                return Err(mas_common::error::AppError::invalid_field(
+                    "subscribed_events",
+                    "invalid_format",
+                    format!("invalid webhook event name '{event}'"),
+                ));
+            }
+        }
+        if let Some(description) = &self.description {
+            validation::validate_length("description", description, 0, 512)?;
+        }
+        Ok(())
+    }
+}
+
+/// Safe endpoint metadata; the signing secret is never represented.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebhookDto {
+    /// Endpoint id.
+    pub id: WebhookId,
+    /// Destination URL.
+    pub url: String,
+    /// Subscriptions.
+    pub subscribed_events: Vec<String>,
+    /// Whether delivery is enabled.
+    pub enabled: bool,
+    /// Secret reference is intentionally not returned.
+    pub has_signing_secret: bool,
+    /// Consecutive failure count.
+    pub consecutive_failures: u32,
+    /// Creation time.
+    pub created_at: Timestamp,
+    /// Last update time.
+    pub updated_at: Timestamp,
+}
+
+/// Delivery history row; contains a digest, not the signed payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebhookDeliveryDto {
+    /// Delivery identifier.
+    pub id: uuid::Uuid,
+    /// Destination endpoint.
+    pub endpoint_id: WebhookId,
+    /// Emitted event.
+    pub event_id: EventId,
+    /// Delivery status.
+    pub state: String,
+    /// Attempts so far.
+    pub attempt_count: u32,
+    /// Last HTTP status, if any.
+    pub last_status_code: Option<u16>,
+    /// Retry time when scheduled.
+    pub next_attempt_at: Option<Timestamp>,
+    /// SHA-256 payload digest.
+    pub payload_hash: String,
+    /// Sanitized error summary.
+    pub last_error: Option<String>,
+}

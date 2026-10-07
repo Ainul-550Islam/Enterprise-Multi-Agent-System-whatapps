@@ -38,10 +38,15 @@
 //!   versioned `contracts` wire shapes; the API never serializes domain
 //!   aggregates directly.
 
+pub mod agent_runtime_catalog;
 pub mod agent_service;
+pub mod analytics_service;
+pub mod api_key_service;
+pub mod approval_service;
 pub mod audit;
 pub mod context;
 pub mod control_plane;
+pub mod data_hub_service;
 pub mod dto;
 /// The durable execution pipeline's atomic port, its canonical event builder,
 /// the request fingerprint, and the in-memory reference implementation.
@@ -52,7 +57,9 @@ pub mod execution_service;
 pub mod fingerprint;
 pub mod pipeline_log;
 pub mod pipeline_metrics;
+pub mod rollback_service;
 pub mod schedule_service;
+pub mod search_service;
 pub mod stores;
 pub mod tenancy_service;
 #[cfg(test)]

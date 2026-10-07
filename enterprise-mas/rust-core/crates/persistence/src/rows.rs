@@ -30,7 +30,10 @@ use std::str::FromStr;
 use chrono::{DateTime, Utc};
 use mas_common::enums::EventStatus;
 use mas_common::error::AppError;
-use mas_common::ids::{EventId, OrganizationId, ProjectId, TenantId};
+use mas_common::ids::{
+    EventId, OrganizationId, ProjectId, RollbackRecordId, TenantId, UserId, WorkflowId,
+    WorkflowVersionId,
+};
 use mas_common::result::Result;
 use mas_common::timestamps::Timestamp;
 use mas_domain::membership::Membership;
@@ -38,6 +41,9 @@ use mas_domain::organization::Organization;
 use mas_domain::project::{Project, ProjectConfig};
 use mas_domain::tenant::{IsolationMode, Tenant};
 use mas_domain::user::User;
+use mas_domain::{
+    DataSource, Document, ExecutionStep, RollbackRecord, RollbackResourceKind, WorkflowVersion,
+};
 use mas_events::outbox::OutboxRecord;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -75,6 +81,20 @@ fn take_string(map: &Map<String, Value>, table: &'static str, key: &'static str)
 }
 
 /// Extracts a required UUID column.
+fn take_opt_string(
+    map: &Map<String, Value>,
+    table: &'static str,
+    key: &'static str,
+) -> Result<Option<String>> {
+    match map.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        _ => Err(AppError::database(format!(
+            "invalid nullable string column '{key}' for table {table}"
+        ))),
+    }
+}
+
 fn take_uuid(map: &Map<String, Value>, table: &'static str, key: &'static str) -> Result<Uuid> {
     let raw = take_string(map, table, key)?;
     Uuid::parse_str(&raw).map_err(|_| {
@@ -687,6 +707,112 @@ impl AuditRow {
     }
 }
 
+/// Row model for a tenant-scoped execution timeline step.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExecutionStepRow {
+    /// Step primary key.
+    pub id: Uuid,
+    /// RLS scope.
+    pub tenant_id: Uuid,
+    /// Parent execution.
+    pub execution_id: Uuid,
+    /// Workflow node key, when present.
+    pub node_key: Option<String>,
+    /// Zero-based position in the timeline.
+    pub ordinal: i32,
+    /// Stable lifecycle token.
+    pub status: String,
+    /// One-based execution attempt.
+    pub attempt: i32,
+    /// Safe step metadata and external references.
+    pub detail: Value,
+    /// Start time.
+    pub started_at: Option<DateTime<Utc>>,
+    /// Finish time.
+    pub finished_at: Option<DateTime<Utc>>,
+    /// Creation time.
+    pub created_at: DateTime<Utc>,
+    /// Last update time.
+    pub updated_at: DateTime<Utc>,
+}
+
+impl ExecutionStepRow {
+    /// Hydrates the domain step from fixed columns and the safe detail object.
+    pub fn into_domain(self) -> Result<ExecutionStep> {
+        let ordinal = u64::try_from(self.ordinal)
+            .map_err(|_| AppError::database("execution_steps.ordinal is negative"))?;
+        let attempt = u32::try_from(self.attempt)
+            .map_err(|_| AppError::database("execution_steps.attempt is not positive"))?;
+        let detail = self
+            .detail
+            .as_object()
+            .ok_or_else(|| AppError::database("execution_steps.detail must be a JSON object"))?;
+        let step_type = detail
+            .get("step_type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| AppError::database("execution_steps.detail.step_type is missing"))?;
+        let optional = |key: &str| detail.get(key).filter(|value| !value.is_null()).cloned();
+        hydrate(
+            "execution_steps",
+            json!({
+                "id": self.id,
+                "execution_id": self.execution_id,
+                "node_key": self.node_key,
+                "step_type": step_type,
+                "sequence": ordinal,
+                "attempt": attempt,
+                "status": self.status,
+                "input_ref": optional("input_ref"),
+                "output_ref": optional("output_ref"),
+                "error": optional("error"),
+                "tool_id": optional("tool_id"),
+                "agent_id": optional("agent_id"),
+                "started_at": self.started_at.map(ts_json),
+                "finished_at": self.finished_at.map(ts_json),
+                "created_at": ts_json(self.created_at),
+                "updated_at": ts_json(self.updated_at),
+            }),
+        )
+    }
+
+    /// Extracts the step and its tenant from the trusted execution row.
+    pub fn from_domain(step: &ExecutionStep, tenant_id: TenantId) -> Result<Self> {
+        if tenant_id.is_nil() || step.execution_id.is_nil() || step.id.is_nil() {
+            return Err(AppError::invalid_field(
+                "execution_step",
+                "required",
+                "tenant, execution and step identifiers must be concrete",
+            ));
+        }
+        let ordinal = i32::try_from(step.sequence)
+            .map_err(|_| AppError::invalid_field("sequence", "out_of_range", "too large"))?;
+        let attempt = i32::try_from(step.attempt)
+            .map_err(|_| AppError::invalid_field("attempt", "out_of_range", "too large"))?;
+        let detail = json!({
+            "step_type": step.step_type,
+            "input_ref": step.input_ref,
+            "output_ref": step.output_ref,
+            "error": step.error,
+            "tool_id": step.tool_id,
+            "agent_id": step.agent_id,
+        });
+        Ok(Self {
+            id: Uuid::from(step.id),
+            tenant_id: Uuid::from(tenant_id),
+            execution_id: Uuid::from(step.execution_id),
+            node_key: step.node_key.clone(),
+            ordinal,
+            status: step.status.to_string(),
+            attempt,
+            detail,
+            started_at: step.started_at.map(Timestamp::into_datetime),
+            finished_at: step.finished_at.map(Timestamp::into_datetime),
+            created_at: step.created_at.into_datetime(),
+            updated_at: step.updated_at.into_datetime(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -811,6 +937,142 @@ mod tests {
     }
 
     #[test]
+    fn data_source_row_roundtrips_with_sync_metadata() {
+        let tenant_id = TenantId::new();
+        let project_id = ProjectId::new();
+        let created_by = UserId::new();
+        let mut source = DataSource::register(
+            tenant_id,
+            project_id,
+            "Knowledge base",
+            mas_domain::data_source::DataSourceKind::Upload,
+            json!({"max_bytes": 1048576}),
+            None,
+            created_by,
+        )
+        .expect("source");
+        source.activate().expect("activate");
+        source.begin_sync().expect("begin sync");
+        source
+            .complete_sync(Some("cursor-safe-1".to_owned()), Timestamp::now())
+            .expect("complete sync");
+        // PostgreSQL timestamptz persists microseconds; this row adapter uses
+        // the shared millisecond wire precision. Fix timestamps to millisecond
+        // values so this test compares the exact persisted representation.
+        let persisted_at =
+            Timestamp::parse_rfc3339("2026-09-30T00:00:00.000Z").expect("fixed timestamp");
+        source.created_at = persisted_at;
+        source.updated_at = persisted_at;
+        source.last_synced_at = Some(persisted_at);
+
+        let row = DataSourceRow::from_domain(&source).expect("row");
+        assert_eq!(row.tenant_id, tenant_id.into_uuid());
+        assert_eq!(row.project_id, project_id.into_uuid());
+        assert_eq!(row.sync_cursor.as_deref(), Some("cursor-safe-1"));
+        let restored = row.into_domain().expect("restored source");
+        assert_eq!(
+            dehydrate("data_sources", &restored).expect("restored json"),
+            dehydrate("data_sources", &source).expect("source json")
+        );
+    }
+
+    #[test]
+    fn document_row_roundtrips_ready_metadata_without_chunk_data() {
+        let tenant_id = TenantId::new();
+        let project_id = ProjectId::new();
+        let source_id = mas_common::ids::DataSourceId::new();
+        let created_by = UserId::new();
+        let mut document = Document::new(
+            tenant_id,
+            project_id,
+            source_id,
+            "Runbook",
+            "text/plain",
+            4,
+            "a".repeat(64),
+            created_by,
+            json!({"roles": ["operator"]}),
+            Map::new(),
+        )
+        .expect("document");
+        document.begin_processing().expect("begin processing");
+        document.mark_ready(2).expect("ready");
+        let persisted_at =
+            Timestamp::parse_rfc3339("2026-09-30T00:00:00.000Z").expect("fixed timestamp");
+        document.created_at = persisted_at;
+        document.updated_at = persisted_at;
+
+        let row = DocumentRow::from_domain(&document).expect("row");
+        assert_eq!(row.size_bytes, 4);
+        assert_eq!(row.chunk_count, 2);
+        assert_eq!(row.access_policy, json!({"roles": ["operator"]}));
+        let restored = row.into_domain().expect("restored document");
+        assert_eq!(
+            dehydrate("documents", &restored).expect("restored json"),
+            dehydrate("documents", &document).expect("document json")
+        );
+    }
+
+    #[test]
+    fn workflow_version_row_roundtrips_and_preserves_checksum() {
+        use mas_domain::{WorkflowEdge, WorkflowGraph, WorkflowNode, WorkflowNodeType};
+
+        let tenant_id = TenantId::new();
+        let workflow_id = WorkflowId::new();
+        let graph = WorkflowGraph::new(
+            vec![
+                WorkflowNode::new("start", WorkflowNodeType::Start, "Start").expect("start node"),
+                WorkflowNode::new("end", WorkflowNodeType::End, "End").expect("end node"),
+            ],
+            vec![WorkflowEdge::new("start", "end").expect("edge")],
+        );
+        let version = WorkflowVersion::publish(
+            tenant_id,
+            workflow_id,
+            1,
+            graph,
+            vec!["start".to_owned(), "end".to_owned()],
+            Some(UserId::new()),
+            None,
+        )
+        .expect("version");
+
+        let row = WorkflowVersionRow::from_domain(&version).expect("row");
+        assert_eq!(row.version, 1);
+        assert_eq!(row.checksum, version.checksum());
+        let restored = row.into_domain().expect("restored version");
+        assert_eq!(restored.checksum(), version.checksum());
+        assert_eq!(restored.topo_order(), version.topo_order());
+        assert_eq!(restored.graph(), version.graph());
+    }
+
+    #[test]
+    fn rollback_record_row_roundtrips_append_only_audit_fields() {
+        let record = RollbackRecord::new(
+            TenantId::new(),
+            RollbackResourceKind::Workflow,
+            Uuid::now_v7(),
+            2,
+            3,
+            AuditActor::system(),
+            "Restore reviewed workflow snapshot",
+            "rollback-request-3",
+        )
+        .expect("record");
+
+        let row = RollbackRecordRow::from_domain(&record).expect("row");
+        assert_eq!(row.from_version, 2);
+        assert_eq!(row.to_version, 3);
+        assert_eq!(row.idempotency_key, "rollback-request-3");
+        let restored = row.into_domain().expect("restored record");
+        assert_eq!(restored.id, record.id);
+        assert_eq!(restored.resource_kind, record.resource_kind);
+        assert_eq!(restored.actor, record.actor);
+        assert_eq!(restored.reason, record.reason);
+        assert_eq!(restored.created_at, record.created_at);
+    }
+
+    #[test]
     fn id_columns_roundtrip_through_rows() {
         let row = OrganizationRow {
             id: Uuid::now_v7(),
@@ -885,6 +1147,32 @@ fn take_opt_uuid(
     }
 }
 
+/// Extracts an optional signed 32-bit column value from an aggregate object.
+fn take_opt_i32(
+    map: &Map<String, Value>,
+    table: &'static str,
+    key: &'static str,
+) -> Result<Option<i32>> {
+    match map.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(value)) => value
+            .as_i64()
+            .and_then(|number| i32::try_from(number).ok())
+            .map(Some)
+            .ok_or_else(|| AppError::database(format!("invalid i32 '{key}' for table {table}"))),
+        _ => Err(AppError::database(format!(
+            "invalid optional i32 '{key}' for table {table}"
+        ))),
+    }
+}
+
+/// Extracts a required u64 column.
+fn take_u64(map: &Map<String, Value>, table: &'static str, key: &'static str) -> Result<u64> {
+    map.get(key)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| AppError::database(format!("missing/invalid u64 '{key}' for table {table}")))
+}
+
 /// Extracts a required u32 column.
 fn take_u32(map: &Map<String, Value>, table: &'static str, key: &'static str) -> Result<u32> {
     map.get(key)
@@ -919,6 +1207,10 @@ pub struct AgentRow {
     pub slug: String,
     /// Status string (see `[AgentStatus]`).
     pub status: String,
+    /// User-configured time-saving baseline; absent means unknown.
+    pub baseline_minutes_per_task: Option<i32>,
+    /// Ownership class (`user` or `system`).
+    pub origin: String,
     /// Spec payload (aggregate minus materialized columns).
     pub spec: Value,
     /// Creation time.
@@ -935,6 +1227,8 @@ impl AgentRow {
         "name",
         "slug",
         "status",
+        "baseline_minutes_per_task",
+        "origin",
         "created_at",
         "updated_at",
     ];
@@ -950,6 +1244,8 @@ impl AgentRow {
                 "name": self.name,
                 "slug": self.slug,
                 "status": self.status,
+                "baseline_minutes_per_task": self.baseline_minutes_per_task,
+                "origin": self.origin,
                 "created_at": ts_json(self.created_at),
                 "updated_at": ts_json(self.updated_at),
             })
@@ -971,6 +1267,8 @@ impl AgentRow {
             name: take_string(&map, "agents", "name")?,
             slug: take_string(&map, "agents", "slug")?,
             status: take_string(&map, "agents", "status")?,
+            baseline_minutes_per_task: take_opt_i32(&map, "agents", "baseline_minutes_per_task")?,
+            origin: take_string(&map, "agents", "origin")?,
             spec,
             created_at: take_ts(&map, "agents", "created_at")?,
             updated_at: take_ts(&map, "agents", "updated_at")?,
@@ -1040,6 +1338,336 @@ impl AgentVersionRow {
             spec,
             created_at: take_opt_ts(&map, "agent_versions", "published_at")?
                 .unwrap_or_else(|| Timestamp::epoch().into_datetime()),
+        })
+    }
+}
+
+/// Row model for Rust-owned `data_sources` metadata.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DataSourceRow {
+    /// Source primary key.
+    pub id: Uuid,
+    /// Row-level-security tenant.
+    pub tenant_id: Uuid,
+    /// Owning project.
+    pub project_id: Uuid,
+    /// User-visible source name.
+    pub name: String,
+    /// Stable source adapter kind.
+    pub kind: String,
+    /// Source lifecycle status.
+    pub status: String,
+    /// Non-secret adapter configuration.
+    pub config: Value,
+    /// Optional credential metadata link.
+    pub credential_id: Option<Uuid>,
+    /// User that created the source.
+    pub created_by: Uuid,
+    /// Opaque adapter synchronization cursor.
+    pub sync_cursor: Option<String>,
+    /// Last successful synchronization time.
+    pub last_synced_at: Option<DateTime<Utc>>,
+    /// Stable error code for the latest failed synchronization.
+    pub last_failure_code: Option<String>,
+    /// Row creation timestamp.
+    pub created_at: DateTime<Utc>,
+    /// Last row update timestamp.
+    pub updated_at: DateTime<Utc>,
+}
+
+impl DataSourceRow {
+    /// Hydrates the aggregate and reruns source/config invariants.
+    pub fn into_domain(self) -> Result<DataSource> {
+        let source: DataSource = hydrate(
+            "data_sources",
+            json!({
+                "id": self.id,
+                "tenant_id": self.tenant_id,
+                "project_id": self.project_id,
+                "name": self.name,
+                "kind": self.kind,
+                "status": self.status,
+                "config": self.config,
+                "credential_id": self.credential_id,
+                "created_by": self.created_by,
+                "sync_cursor": self.sync_cursor,
+                "last_synced_at": self.last_synced_at.map(ts_json),
+                "last_failure_code": self.last_failure_code,
+                "created_at": ts_json(self.created_at),
+                "updated_at": ts_json(self.updated_at),
+            }),
+        )?;
+        source.validate()?;
+        Ok(source)
+    }
+
+    /// Extracts all persisted DataSource fields.
+    pub fn from_domain(source: &DataSource) -> Result<Self> {
+        source.validate()?;
+        let value = dehydrate("data_sources", source)?;
+        let map = object(&value)?;
+        Ok(Self {
+            id: take_uuid(map, "data_sources", "id")?,
+            tenant_id: take_uuid(map, "data_sources", "tenant_id")?,
+            project_id: take_uuid(map, "data_sources", "project_id")?,
+            name: take_string(map, "data_sources", "name")?,
+            kind: take_string(map, "data_sources", "kind")?,
+            status: take_string(map, "data_sources", "status")?,
+            config: map.get("config").cloned().unwrap_or(Value::Null),
+            credential_id: take_opt_uuid(map, "data_sources", "credential_id")?,
+            created_by: take_uuid(map, "data_sources", "created_by")?,
+            sync_cursor: take_opt_string(map, "data_sources", "sync_cursor")?,
+            last_synced_at: take_opt_ts(map, "data_sources", "last_synced_at")?,
+            last_failure_code: take_opt_string(map, "data_sources", "last_failure_code")?,
+            created_at: take_ts(map, "data_sources", "created_at")?,
+            updated_at: take_ts(map, "data_sources", "updated_at")?,
+        })
+    }
+}
+
+/// Row model for Rust-owned `documents` metadata.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DocumentRow {
+    /// Document primary key.
+    pub id: Uuid,
+    /// Row-level-security tenant.
+    pub tenant_id: Uuid,
+    /// Owning project.
+    pub project_id: Uuid,
+    /// Owning Rust-managed source.
+    pub source_id: Uuid,
+    /// Display title.
+    pub title: String,
+    /// Validated MIME type.
+    pub mime_type: String,
+    /// Exact document content size in bytes.
+    pub size_bytes: i64,
+    /// Lowercase SHA-256 content digest.
+    pub content_sha256: String,
+    /// Ingestion lifecycle status.
+    pub status: String,
+    /// Number of chunks reported by the RAG plane.
+    pub chunk_count: i32,
+    /// Stable failure code for the latest failed ingestion.
+    pub failure_code: Option<String>,
+    /// Role/principal filters applied to retrieval.
+    pub access_policy: Value,
+    /// Non-secret caller-supplied metadata.
+    pub metadata: Value,
+    /// User that created the document metadata.
+    pub created_by: Uuid,
+    /// Row creation timestamp.
+    pub created_at: DateTime<Utc>,
+    /// Last row update timestamp.
+    pub updated_at: DateTime<Utc>,
+}
+
+impl DocumentRow {
+    /// Hydrates the aggregate and reruns metadata invariants.
+    pub fn into_domain(self) -> Result<Document> {
+        let size_bytes = u64::try_from(self.size_bytes)
+            .map_err(|_| AppError::database("documents.size_bytes is negative"))?;
+        let chunk_count = u32::try_from(self.chunk_count)
+            .map_err(|_| AppError::database("documents.chunk_count is negative or out of range"))?;
+        let metadata = self
+            .metadata
+            .as_object()
+            .cloned()
+            .ok_or_else(|| AppError::database("documents.metadata is not an object"))?;
+        let document: Document = hydrate(
+            "documents",
+            json!({
+                "id": self.id,
+                "tenant_id": self.tenant_id,
+                "project_id": self.project_id,
+                "source_id": self.source_id,
+                "title": self.title,
+                "mime_type": self.mime_type,
+                "size_bytes": size_bytes,
+                "content_sha256": self.content_sha256,
+                "status": self.status,
+                "chunk_count": chunk_count,
+                "failure_code": self.failure_code,
+                "access_policy": self.access_policy,
+                "metadata": metadata,
+                "created_by": self.created_by,
+                "created_at": ts_json(self.created_at),
+                "updated_at": ts_json(self.updated_at),
+            }),
+        )?;
+        document.validate()?;
+        Ok(document)
+    }
+
+    /// Extracts all persisted Document fields.
+    pub fn from_domain(document: &Document) -> Result<Self> {
+        document.validate()?;
+        let value = dehydrate("documents", document)?;
+        let map = object(&value)?;
+        let size_bytes = take_u64(map, "documents", "size_bytes")?;
+        let chunk_count = take_u32(map, "documents", "chunk_count")?;
+        let metadata = map
+            .get("metadata")
+            .and_then(Value::as_object)
+            .cloned()
+            .map(Value::Object)
+            .ok_or_else(|| AppError::database("documents.metadata is not an object"))?;
+        Ok(Self {
+            id: take_uuid(map, "documents", "id")?,
+            tenant_id: take_uuid(map, "documents", "tenant_id")?,
+            project_id: take_uuid(map, "documents", "project_id")?,
+            source_id: take_uuid(map, "documents", "source_id")?,
+            title: take_string(map, "documents", "title")?,
+            mime_type: take_string(map, "documents", "mime_type")?,
+            size_bytes: i64::try_from(size_bytes)
+                .map_err(|_| AppError::database("documents.size_bytes exceeds SQL range"))?,
+            content_sha256: take_string(map, "documents", "content_sha256")?,
+            status: take_string(map, "documents", "status")?,
+            chunk_count: i32::try_from(chunk_count)
+                .map_err(|_| AppError::database("documents.chunk_count exceeds SQL range"))?,
+            failure_code: take_opt_string(map, "documents", "failure_code")?,
+            access_policy: map
+                .get("access_policy")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
+            metadata,
+            created_by: take_uuid(map, "documents", "created_by")?,
+            created_at: take_ts(map, "documents", "created_at")?,
+            updated_at: take_ts(map, "documents", "updated_at")?,
+        })
+    }
+}
+
+/// Row model for the immutable `workflow_versions` snapshot table.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkflowVersionRow {
+    /// Snapshot primary key.
+    pub id: Uuid,
+    /// Row-level-security tenant.
+    pub tenant_id: Uuid,
+    /// Owning workflow.
+    pub workflow_id: Uuid,
+    /// Monotonic per-workflow version number.
+    pub version: i32,
+    /// Immutable validated graph snapshot.
+    pub graph: Value,
+    /// Deterministic topological node order.
+    pub topo_order: Vec<String>,
+    /// Lowercase SHA-256 digest of graph and order.
+    pub checksum: String,
+    /// Earlier version this new snapshot rolls back to, if any.
+    pub rollback_of: Option<Uuid>,
+    /// Publishing user, absent for a system publication.
+    pub created_by: Option<Uuid>,
+    /// Snapshot creation timestamp.
+    pub created_at: DateTime<Utc>,
+}
+
+impl WorkflowVersionRow {
+    /// Hydrates the immutable snapshot and checks its checksum.
+    pub fn into_domain(self) -> Result<WorkflowVersion> {
+        let version = u64::try_from(self.version)
+            .map_err(|_| AppError::database("workflow_versions.version must be positive"))?;
+        let graph = hydrate("workflow_versions", self.graph)?;
+        WorkflowVersion::rehydrate(
+            WorkflowVersionId::from_uuid(self.id),
+            TenantId::from_uuid(self.tenant_id),
+            WorkflowId::from_uuid(self.workflow_id),
+            version,
+            graph,
+            self.topo_order,
+            self.checksum,
+            self.created_by.map(UserId::from_uuid),
+            Timestamp::from_datetime(self.created_at),
+            self.rollback_of.map(WorkflowVersionId::from_uuid),
+        )
+    }
+
+    /// Extracts the immutable snapshot from the aggregate.
+    pub fn from_domain(version: &WorkflowVersion) -> Result<Self> {
+        let graph = serde_json::to_value(version.graph())
+            .map_err(|error| AppError::serialization(format!("workflow version graph: {error}")))?;
+        Ok(Self {
+            id: Uuid::from(version.id()),
+            tenant_id: Uuid::from(version.tenant_id()),
+            workflow_id: Uuid::from(version.workflow_id()),
+            version: i32::try_from(version.version_number())
+                .map_err(|_| AppError::database("workflow version exceeds SQL integer range"))?,
+            graph,
+            topo_order: version.topo_order().to_vec(),
+            checksum: version.checksum().to_owned(),
+            rollback_of: version.rollback_of().map(Uuid::from),
+            created_by: version.created_by().map(Uuid::from),
+            created_at: version.created_at().into_datetime(),
+        })
+    }
+}
+
+/// Row model for append-only `rollback_records`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RollbackRecordRow {
+    /// Rollback history primary key.
+    pub id: Uuid,
+    /// Row-level-security tenant.
+    pub tenant_id: Uuid,
+    /// Stable governed resource family.
+    pub resource_kind: String,
+    /// UUID of the governed resource.
+    pub resource_id: Uuid,
+    /// Version current before the rollback was published.
+    pub from_version: i64,
+    /// New monotonic version produced by the rollback.
+    pub to_version: i64,
+    /// Audited principal snapshot.
+    pub actor: Value,
+    /// Operator-supplied rollback reason.
+    pub reason: String,
+    /// Tenant-unique key for replay-safe rollback requests.
+    pub idempotency_key: String,
+    /// Immutable record timestamp.
+    pub created_at: DateTime<Utc>,
+}
+
+impl RollbackRecordRow {
+    /// Hydrates the immutable rollback record and reruns its invariants.
+    pub fn into_domain(self) -> Result<RollbackRecord> {
+        let resource_kind: RollbackResourceKind = serde_json::from_value(json!(self.resource_kind))
+            .map_err(|_| AppError::database("rollback_records.resource_kind is invalid"))?;
+        let actor = hydrate("rollback_records", self.actor)?;
+        let from_version = u64::try_from(self.from_version)
+            .map_err(|_| AppError::database("rollback_records.from_version is negative"))?;
+        let to_version = u64::try_from(self.to_version)
+            .map_err(|_| AppError::database("rollback_records.to_version is negative"))?;
+        RollbackRecord::rehydrate(
+            RollbackRecordId::from_uuid(self.id),
+            TenantId::from_uuid(self.tenant_id),
+            resource_kind,
+            self.resource_id,
+            from_version,
+            to_version,
+            actor,
+            self.reason,
+            self.idempotency_key,
+            Timestamp::from_datetime(self.created_at),
+        )
+    }
+
+    /// Extracts the append-only rollback record.
+    pub fn from_domain(record: &RollbackRecord) -> Result<Self> {
+        Ok(Self {
+            id: Uuid::from(record.id),
+            tenant_id: Uuid::from(record.tenant_id),
+            resource_kind: record.resource_kind.to_string(),
+            resource_id: record.resource_id,
+            from_version: i64::try_from(record.from_version)
+                .map_err(|_| AppError::database("rollback from_version exceeds SQL range"))?,
+            to_version: i64::try_from(record.to_version)
+                .map_err(|_| AppError::database("rollback to_version exceeds SQL range"))?,
+            actor: serde_json::to_value(&record.actor)
+                .map_err(|error| AppError::serialization(format!("rollback actor: {error}")))?,
+            reason: record.reason.clone(),
+            idempotency_key: record.idempotency_key.clone(),
+            created_at: record.created_at.into_datetime(),
         })
     }
 }
@@ -1441,6 +2069,7 @@ impl TaskRow {
         "organization_id",
         "project_id",
         "execution_id",
+        "correlation_id",
         "idempotency_key",
         "operation",
         "status",
@@ -1471,6 +2100,7 @@ impl TaskRow {
         if let Some(execution) = self.execution_id {
             spec.insert("execution_id".to_owned(), json!(execution));
         }
+        spec.insert("correlation_id".to_owned(), json!(self.correlation_id));
         spec.insert("idempotency_key".to_owned(), json!(self.idempotency_key));
         spec.insert("operation".to_owned(), json!(self.kind));
         spec.insert("status".to_owned(), json!(self.status));
@@ -1555,6 +2185,23 @@ mod spec_rows_tests {
     }
 
     #[test]
+    fn execution_step_row_roundtrip_preserves_optional_node_and_zero_attempt() {
+        let tenant = TenantId::new();
+        let execution_id = mas_common::ids::ExecutionId::new();
+        let step = ExecutionStep::new(execution_id, "tool.invoke", 2, None);
+        let row = ExecutionStepRow::from_domain(&step, tenant).expect("step row");
+        assert_eq!(row.node_key, None);
+        assert_eq!(row.attempt, 0);
+        let restored = row.into_domain().expect("step hydration");
+        assert_eq!(restored.id, step.id);
+        assert_eq!(restored.execution_id, step.execution_id);
+        assert_eq!(restored.node_key, None);
+        assert_eq!(restored.sequence, 2);
+        assert_eq!(restored.attempt, 0);
+        assert_eq!(restored.step_type, "tool.invoke");
+    }
+
+    #[test]
     fn agent_row_roundtrip_via_synthetic_aggregate() {
         let agent_json = json!({
             "id": Uuid::now_v7(),
@@ -1596,6 +2243,41 @@ mod spec_rows_tests {
         let back = row.into_domain().expect("hydrate");
         let roundtrip = serde_json::to_value(&back).expect("dehydrate");
         assert_eq!(roundtrip, serde_json::to_value(&agent).expect("expect"));
+    }
+
+    #[test]
+    fn task_row_roundtrip_preserves_correlation_and_request_identity() {
+        let tenant = TenantId::new();
+        let organization = OrganizationId::new();
+        let project = ProjectId::new();
+        let request_id = Uuid::now_v7();
+        let agent_version_id = mas_common::ids::AgentVersionId::new();
+        let correlation_id = "corr-durable-task-roundtrip";
+        let task = mas_domain::Task::new(
+            tenant,
+            organization,
+            project,
+            Some(mas_common::ids::AgentId::new()),
+            None,
+            "agent.run",
+            json!({"prompt": "safe test input"}),
+            TaskPriority::Normal,
+            "idem-task-row-roundtrip",
+            "test-user",
+        )
+        .expect("task")
+        .with_agent_version_id(agent_version_id)
+        .expect("version pin")
+        .with_request_id(request_id)
+        .with_correlation_id(correlation_id)
+        .expect("correlation id");
+
+        let row = TaskRow::from_domain(&task).expect("row");
+        assert_eq!(row.correlation_id, correlation_id);
+        let restored = row.into_domain().expect("restored task");
+        assert_eq!(restored.correlation_id, correlation_id);
+        assert_eq!(restored.request_id, Some(request_id));
+        assert_eq!(restored.agent_version_id, Some(agent_version_id));
     }
 
     #[test]

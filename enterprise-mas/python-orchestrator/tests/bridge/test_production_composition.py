@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from mas_orchestrator.config.enums import Environment, ProviderMode
+from mas_orchestrator.config.enums import Environment, ProviderMode, TransportSecurity
 from mas_orchestrator.config.settings import (
     ProviderSettings,
     SecuritySettings,
@@ -392,3 +392,93 @@ class TestBridgeServerComposition:
         )
 
         assert config.address == "127.0.0.1:9100"
+
+    async def test_production_server_refuses_plaintext(self) -> None:
+        """A deployment cannot bypass TLS by constructing the server directly."""
+        with pytest.raises(ConfigurationError, match="insecure transport"):
+            GrpcServerConfig(environment=Environment.PRODUCTION)
+
+    async def test_service_tls_configuration_reaches_the_server(self) -> None:
+        """The configured cert/key and environment reach the bind adapter."""
+        settings = ServiceSettings(
+            grpc_transport_security=TransportSecurity.TLS,
+            grpc_certificate_chain_path="/run/secrets/bridge.crt",
+            grpc_private_key_path="/run/secrets/bridge.key",
+        )
+
+        config = GrpcServerConfig.from_service_settings(
+            settings,
+            environment=Environment.PRODUCTION,
+        )
+
+        assert config.transport_security is TransportSecurity.TLS
+        assert config.certificate_chain_path == "/run/secrets/bridge.crt"
+        assert config.private_key_path == "/run/secrets/bridge.key"
+        assert config.environment is Environment.PRODUCTION
+
+    async def test_tls_server_binds_with_secure_port(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The TLS credentials are passed to gRPC rather than ignored."""
+        import grpc
+        from tests.bridge.conftest import RecordingExecutionService, resolver
+
+        from mas_orchestrator.grpc.agent_bridge_servicer import AgentBridgeServicer
+
+        class RecordingServer:
+            def __init__(self) -> None:
+                self.secure_binding: tuple[str, object] | None = None
+                self.insecure_binding: str | None = None
+
+            def add_generic_rpc_handlers(self, handlers: object) -> None:
+                return None
+
+            def add_registered_method_handlers(self, name: str, handlers: object) -> None:
+                return None
+
+            def add_secure_port(self, address: str, credentials: object) -> int:
+                self.secure_binding = (address, credentials)
+                return 49152
+
+            def add_insecure_port(self, address: str) -> int:
+                self.insecure_binding = address
+                return 49152
+
+            async def start(self) -> None:
+                return None
+
+            async def stop(self, grace: float) -> None:
+                return None
+
+        recorded_server = RecordingServer()
+        credentials = object()
+        server_options: dict[str, object] = {}
+
+        def build_recording_server(*args: object, **kwargs: object) -> RecordingServer:
+            server_options.update(kwargs)
+            return recorded_server
+
+        monkeypatch.setattr(grpc.aio, "server", build_recording_server)
+        monkeypatch.setattr(
+            "mas_orchestrator.security.transport.build_server_credentials",
+            lambda config: credentials,
+        )
+        servicer = AgentBridgeServicer(
+            execution_service=RecordingExecutionService(),  # type: ignore[arg-type]
+            identity_resolver=resolver(),
+        )
+        server = GrpcServer(
+            servicer=servicer,
+            config=GrpcServerConfig(
+                host="127.0.0.1",
+                port=9100,
+                transport_security=TransportSecurity.TLS,
+                certificate_chain_path="/run/secrets/bridge.crt",
+                private_key_path="/run/secrets/bridge.key",
+            ),
+        )
+
+        await server.start()
+
+        assert recorded_server.secure_binding == ("127.0.0.1:9100", credentials)
+        assert recorded_server.insecure_binding is None
+        assert server_options["maximum_concurrent_rpcs"] == 64
+        await server.stop()

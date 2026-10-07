@@ -1452,9 +1452,11 @@ dependencies = [
  "mas-contracts",
  "mas-domain",
  "mas-events",
+ "mas-execution",
  "mas-observability",
  "mas-policy",
  "mas-quota",
+ "mas-security",
  "mas-tenancy",
  "serde",
  "serde_json",
@@ -1518,6 +1520,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "sha2",
  "url",
  "uuid",
 ]
@@ -1639,6 +1642,7 @@ dependencies = [
  "mas-contracts",
  "mas-domain",
  "mas-events",
+ "mas-execution",
  "mas-messaging",
  "mas-policy",
  "mas-quota",
@@ -2605,6 +2609,7 @@ version = "0.23.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
@@ -3426,13 +3431,16 @@ dependencies = [
  "percent-encoding",
  "pin-project",
  "prost",
+ "rustls-native-certs",
  "socket2 0.5.10",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tower",
  "tower-layer",
  "tower-service",
  "tracing",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]

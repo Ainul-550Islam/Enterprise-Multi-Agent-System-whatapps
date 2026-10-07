@@ -23,6 +23,7 @@ publish = false
 [dependencies]
 mas-common = { workspace = true }
 mas-domain = { workspace = true }
+mas-execution = { workspace = true }
 mas-contracts = { workspace = true }
 # mas-events is pulled in because the durable submission units of work write
 # their domain events into the transactional outbox *inside the same
@@ -39,6 +40,7 @@ mas-policy = { workspace = true }
 mas-quota = { workspace = true }
 # Entitlement resolution lives in mas-tenancy; the gate composes it.
 mas-tenancy = { workspace = true }
+mas-security = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

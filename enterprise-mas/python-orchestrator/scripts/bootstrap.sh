@@ -24,13 +24,20 @@ python3 -m pip install -q --disable-pip-version-check \
     "pydantic-settings>=2.5,<3" \
     "structlog>=24.1" \
     "httpx>=0.27" \
-    "grpcio>=1.66" \
-    "grpcio-tools>=1.66" \
-    "protobuf>=5.27" \
+    "grpcio>=1.84" \
+    "grpcio-tools>=1.84" \
+    "protobuf>=7.35.1,<8" \
+    "beautifulsoup4>=4.12,<5" \
+    "defusedxml>=0.7.1,<1" \
+    "pgvector>=0.3,<1" \
+    "pypdf>=5,<7" \
+    "psycopg[binary,pool]>=3.2,<4" \
+    "python-docx>=1.1,<2" \
     "pytest>=8.2" \
     "pytest-asyncio>=0.24" \
     "ruff>=0.6" \
-    "mypy>=1.11"
+    "mypy>=1.11" \
+    "types-defusedxml>=0.7.0"
 
 # Install the package itself, not only its dev dependencies.
 #

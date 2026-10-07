@@ -227,6 +227,9 @@ impl PgTaskBroker {
             if let Some(agent) = get("agent_id").as_str() {
                 frame.insert("agent_id".to_owned(), json!(agent));
             }
+            if let Some(agent_version) = get("agent_version_id").as_str() {
+                frame.insert("agent_version_id".to_owned(), json!(agent_version));
+            }
             if let Some(workflow) = get("workflow_id").as_str() {
                 frame.insert("workflow_id".to_owned(), json!(workflow));
             }
@@ -247,6 +250,9 @@ impl PgTaskBroker {
                 );
             }
             frame.insert("correlation_id".to_owned(), json!(&correlation_id));
+            if let Some(request_id) = get("request_id").as_str() {
+                frame.insert("request_id".to_owned(), json!(request_id));
+            }
             frame.insert("enqueued_at".to_owned(), json!(enqueued_at));
             let payload = serde_json::Value::Object(frame);
 
@@ -301,10 +307,22 @@ impl BrokerPort for PgTaskBroker {
             "queued_at".to_owned(),
             serde_json::Value::from(message.enqueued_at.to_rfc3339_millis()),
         );
+        if let Some(request_id) = message.request_id {
+            spec.insert(
+                "request_id".to_owned(),
+                serde_json::Value::from(request_id.to_string()),
+            );
+        }
         if let Some(agent) = message.agent_id {
             spec.insert(
                 "agent_id".to_owned(),
                 serde_json::Value::from(v7_str(agent)),
+            );
+        }
+        if let Some(agent_version) = message.agent_version_id {
+            spec.insert(
+                "agent_version_id".to_owned(),
+                serde_json::Value::from(v7_str(agent_version)),
             );
         }
         if let Some(workflow) = message.workflow_id {

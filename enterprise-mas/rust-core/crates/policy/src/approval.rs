@@ -299,6 +299,8 @@ pub trait ApprovalStorePort: Send + Sync + fmt::Debug {
     async fn get(&self, id: ApprovalRequestId) -> Result<Option<ApprovalRequest>>;
     /// Pending requests for a tenant (dashboards / sweepers).
     async fn list_pending(&self, tenant_id: TenantId) -> Result<Vec<ApprovalRequest>>;
+    /// All request states for a tenant-scoped history view.
+    async fn list_for_tenant(&self, tenant_id: TenantId) -> Result<Vec<ApprovalRequest>>;
 }
 
 /// In-memory approval store with tenant isolation on reads.
@@ -359,6 +361,17 @@ impl ApprovalStorePort for InMemoryApprovalStore {
             .filter(|request| {
                 request.tenant_id == tenant_id && request.status == ApprovalStatus::Pending
             })
+            .cloned()
+            .collect())
+    }
+
+    async fn list_for_tenant(&self, tenant_id: TenantId) -> Result<Vec<ApprovalRequest>> {
+        Ok(self
+            .requests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .filter(|request| request.tenant_id == tenant_id)
             .cloned()
             .collect())
     }

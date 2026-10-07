@@ -70,6 +70,8 @@ pub const NOTIFICATIONS_SUBJECT: &str = "mas.notifications";
 pub const MAX_NODES_PER_WORKFLOW: usize = 500;
 pub const MAX_STEPS_PER_EXECUTION: u32 = 1_000;
 pub const MAX_TOOL_CALLS_PER_EXECUTION: u32 = 500;
+/// Maximum nested agent-delegation depth supported by the runtime.
+pub const MAX_DELEGATION_DEPTH: u32 = 5;
 pub const MAX_TOKENS_PER_EXECUTION: u64 = 1_000_000;
 pub const MAX_PARALLEL_TASKS_PER_EXECUTION: u32 = 64;
 pub const MAX_EXECUTION_DURATION_MS: u64 = 86_400_000; // 24h

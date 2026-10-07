@@ -140,13 +140,13 @@ impl TokenVerifierPort for PostgresApiKeyVerifier {
                 return Err(unauthenticated());
             }
         }
-        // Telemetry best-effort: never let the marker write block authN.
-        let _ = self.store.touch_last_used(row.id).await;
-
         // The key row decides the tenant. This is the whole point of the
         // change: a bearer secret is bound to the tenant that minted it, and
         // no header on the request can move it.
         let tenant_id = mas_common::ids::TenantId::from_uuid(row.tenant_id);
+        // Telemetry best-effort: never let the marker write block authN. The
+        // tenant argument is from the verified row, not request metadata.
+        let _ = self.store.touch_last_used(row.id, tenant_id).await;
         let organization_id = mas_common::ids::OrganizationId::from_uuid(row.organization_id);
 
         let mut principal = SecurityPrincipal::new(
@@ -242,6 +242,8 @@ mod tests {
             status: "active".to_owned(),
             expires_at: None,
             last_used_at: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
         };
         let scopes = PostgresApiKeyVerifier::scopes_from(&row);
         assert!(

@@ -3,7 +3,8 @@
 use mas_common::enums::{TaskPriority, TaskStatus};
 use mas_common::error::AppError;
 use mas_common::ids::{
-    AgentId, ExecutionId, OrganizationId, ProjectId, TaskId, TenantId, WorkflowId,
+    AgentId, AgentVersionId, ExecutionId, OrganizationId, ProjectId, TaskAttemptId, TaskId,
+    TenantId, WorkflowId,
 };
 use mas_common::pagination::PageRequest;
 use mas_common::result::Result;
@@ -192,6 +193,9 @@ pub struct TaskQueueMessage {
     pub execution_id: Option<ExecutionId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<AgentId>,
+    /// Submission-time version pin, kept in the durable frame across retries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_version_id: Option<AgentVersionId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow_id: Option<WorkflowId>,
     /// Global idempotency key — duplicates collapse to the same `task_id`.
@@ -203,6 +207,13 @@ pub struct TaskQueueMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deadline: Option<Timestamp>,
     pub correlation_id: String,
+    /// API request id for tracing the originating submission across retries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<uuid::Uuid>,
+    /// The durable attempt created by the worker claim. This is absent in the
+    /// persisted queue frame and attached only to the handler's claimed copy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_attempt_id: Option<TaskAttemptId>,
     pub enqueued_at: Timestamp,
 }
 
@@ -239,6 +250,7 @@ impl TaskQueueMessage {
             input,
             execution_id,
             agent_id,
+            agent_version_id: None,
             workflow_id,
             idempotency_key,
             priority,
@@ -246,10 +258,33 @@ impl TaskQueueMessage {
             max_attempts,
             deadline,
             correlation_id: correlation_id.to_owned(),
+            request_id: None,
+            task_attempt_id: None,
             enqueued_at: Timestamp::now(),
         };
         staged.validate()?;
         Ok(staged)
+    }
+
+    /// Attaches the originating platform request id before publishing.
+    #[must_use]
+    pub fn with_request_id(mut self, request_id: uuid::Uuid) -> Self {
+        self.request_id = Some(request_id);
+        self
+    }
+
+    /// Copies the immutable agent-version pin from the durable task row.
+    #[must_use]
+    pub fn with_agent_version_id(mut self, version_id: AgentVersionId) -> Self {
+        self.agent_version_id = Some(version_id);
+        self
+    }
+
+    /// Attaches the durable attempt identity after the worker wins its claim.
+    #[must_use]
+    pub fn with_task_attempt_id(mut self, task_attempt_id: TaskAttemptId) -> Self {
+        self.task_attempt_id = Some(task_attempt_id);
+        self
     }
 
     /// Wire-side invariants (checked by producers before framing).
@@ -259,6 +294,13 @@ impl TaskQueueMessage {
         validation::validate_length("idempotency_key", &self.idempotency_key, 1, 512)?;
         validation::validate_non_empty("correlation_id", &self.correlation_id)?;
         validation::validate_length("correlation_id", &self.correlation_id, 1, 256)?;
+        if self.agent_version_id.is_some() && self.agent_id.is_none() {
+            return Err(AppError::invalid_field(
+                "agent_version_id",
+                "workflow_target",
+                "only agent tasks can pin an agent version",
+            ));
+        }
         if self.max_attempts == 0 {
             return Err(AppError::validation("max_attempts must be at least 1"));
         }
@@ -269,5 +311,66 @@ impl TaskQueueMessage {
             )));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod queue_attempt_tests {
+    use super::*;
+
+    fn message() -> TaskQueueMessage {
+        TaskQueueMessage::staged(
+            TaskId::new(),
+            TenantId::new(),
+            OrganizationId::new(),
+            ProjectId::new(),
+            "execution.run".to_owned(),
+            serde_json::json!({"prompt": "hello"}),
+            Some(ExecutionId::new()),
+            Some(AgentId::new()),
+            None,
+            "idem-1".to_owned(),
+            TaskPriority::Normal,
+            1,
+            3,
+            None,
+            "corr-1",
+        )
+        .expect("valid staged message")
+    }
+
+    #[test]
+    fn old_queue_frames_without_an_attempt_id_remain_compatible() {
+        let encoded = serde_json::to_vec(&message()).expect("serialize");
+        let decoded: TaskQueueMessage = serde_json::from_slice(&encoded).expect("decode");
+        assert_eq!(decoded.task_attempt_id, None);
+    }
+
+    #[test]
+    fn attempt_id_is_attached_after_claim_and_round_trips() {
+        let task_attempt_id = TaskAttemptId::new();
+        let claimed = message().with_task_attempt_id(task_attempt_id);
+        let encoded = serde_json::to_vec(&claimed).expect("serialize");
+        let decoded: TaskQueueMessage = serde_json::from_slice(&encoded).expect("decode");
+        assert_eq!(decoded.task_attempt_id, Some(task_attempt_id));
+    }
+
+    #[test]
+    fn pinned_agent_version_survives_queue_frame_round_trip() {
+        let version_id = AgentVersionId::new();
+        let pinned = message().with_agent_version_id(version_id);
+        pinned.validate().expect("valid pinned agent task");
+
+        let encoded = serde_json::to_vec(&pinned).expect("serialize");
+        let decoded: TaskQueueMessage = serde_json::from_slice(&encoded).expect("decode");
+        assert_eq!(decoded.agent_version_id, Some(version_id));
+        assert_eq!(decoded.agent_id, pinned.agent_id);
+
+        let mut invalid = decoded;
+        invalid.agent_id = None;
+        assert!(
+            invalid.validate().is_err(),
+            "version pin needs an agent target"
+        );
     }
 }

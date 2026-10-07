@@ -100,6 +100,15 @@ impl AuditSinkPort for InMemoryAuditSink {
     }
 }
 
+/// The canonical security-key lifecycle writes to the same append-only sink
+/// as application mutations; it does not get a separate, lossy audit path.
+#[async_trait]
+impl mas_security::AuditSinkPort for InMemoryAuditSink {
+    async fn record(&self, event: &AuditEvent) -> Result<()> {
+        <Self as AuditSinkPort>::record(self, event).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

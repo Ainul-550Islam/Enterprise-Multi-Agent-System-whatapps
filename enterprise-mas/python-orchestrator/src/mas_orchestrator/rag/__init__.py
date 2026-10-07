@@ -44,6 +44,7 @@ from mas_orchestrator.rag.embeddings import (
     Embedder,
     EmbedderUnavailable,
     HashingEmbedder,
+    OpenAIEmbedder,
     cosine_similarity,
 )
 from mas_orchestrator.rag.index import (
@@ -78,6 +79,7 @@ from mas_orchestrator.rag.parsing import (
     Parser,
     detect_format,
 )
+from mas_orchestrator.rag.pgvector_index import PgVectorIndex
 from mas_orchestrator.rag.reranking import (
     LexicalReranker,
     NoReranker,
@@ -143,7 +145,9 @@ __all__ = [
     "LexicalIndex",
     "LexicalReranker",
     "NoReranker",
+    "OpenAIEmbedder",
     "Parser",
+    "PgVectorIndex",
     "RagContext",
     "Reranker",
     "RerankerUnavailable",

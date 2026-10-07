@@ -224,6 +224,7 @@ impl DispatchPort for DurableDispatcher {
                     Box::new(PgServices::new(inner.clone())),
                     Box::new(PgServices::new(inner.clone())),
                     Box::new(PgServices::new(inner.clone())),
+                    Box::new(PgServices::new(inner.clone())),
                     Box::new(PostgresAuditLog::new(audit)),
                     Arc::new(PgDurableExecution::new(inner)),
                     control_plane,

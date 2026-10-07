@@ -40,7 +40,8 @@
 use mas_common::enums::{ExecutionStatus, TaskPriority, TaskStatus};
 use mas_common::error::AppError;
 use mas_common::ids::{
-    AgentId, ExecutionId, OrganizationId, ProjectId, TaskAttemptId, TaskId, TenantId, WorkflowId,
+    AgentId, AgentVersionId, ExecutionId, OrganizationId, ProjectId, TaskAttemptId, TaskId,
+    TenantId, WorkflowId,
 };
 use mas_common::result::Result;
 use mas_common::timestamps::Timestamp;
@@ -70,6 +71,9 @@ pub struct SubmissionIntent {
     pub project_id: ProjectId,
     pub workflow_id: Option<WorkflowId>,
     pub agent_id: Option<AgentId>,
+    /// Version selected by the Rust runtime catalog at submission. Required for
+    /// agent tasks so retries never float to a subsequently published version.
+    pub agent_version_id: Option<AgentVersionId>,
     /// Request body. Hashed into `fingerprint`; never stored verbatim in the
     /// idempotency ledger.
     pub input: Value,
@@ -82,6 +86,8 @@ pub struct SubmissionIntent {
     pub max_attempts: u32,
     pub deadline: Option<Timestamp>,
     pub correlation_id: String,
+    /// The originating API request id, propagated through outbox and retries.
+    pub request_id: uuid::Uuid,
     pub created_by: String,
     /// The actor recorded on every transition this unit produces.
     pub actor: TransitionActor,
@@ -109,6 +115,20 @@ impl SubmissionIntent {
                 "a submission targets either a workflow or an agent, never both",
             ));
         }
+        if self.agent_id.is_some() && self.agent_version_id.is_none() {
+            return Err(AppError::invalid_field(
+                "agent_version_id",
+                "missing_pin",
+                "agent submissions must pin a published version before durable submission",
+            ));
+        }
+        if self.agent_id.is_none() && self.agent_version_id.is_some() {
+            return Err(AppError::invalid_field(
+                "agent_version_id",
+                "workflow_target",
+                "workflow submissions cannot pin an agent version",
+            ));
+        }
         if self.operation.trim().is_empty() {
             return Err(AppError::invalid_field(
                 "operation",
@@ -116,6 +136,8 @@ impl SubmissionIntent {
                 "a submission must name the operation its task will run",
             ));
         }
+        mas_common::validation::validate_non_empty("correlation_id", &self.correlation_id)?;
+        mas_common::validation::validate_length("correlation_id", &self.correlation_id, 1, 256)?;
         if self.max_attempts == 0 {
             return Err(AppError::invalid_field(
                 "max_attempts",
@@ -618,6 +640,7 @@ mod tests {
             project_id: ProjectId::new(),
             workflow_id: Some(WorkflowId::new()),
             agent_id: None,
+            agent_version_id: None,
             input: serde_json::json!({"prompt": "hi"}),
             idempotency_key: Some("k".to_owned()),
             fingerprint: "ab".repeat(32),
@@ -626,6 +649,7 @@ mod tests {
             max_attempts: 3,
             deadline: None,
             correlation_id: "corr".to_owned(),
+            request_id: uuid::Uuid::now_v7(),
             created_by: "user-1".to_owned(),
             actor: TransitionActor::worker("w-1").expect("actor"),
             create_initial_attempt: false,
@@ -642,6 +666,15 @@ mod tests {
         let mut neither = intent();
         neither.workflow_id = None;
         assert!(neither.validate().is_err());
+
+        let mut unpinned_agent = intent();
+        unpinned_agent.workflow_id = None;
+        unpinned_agent.agent_id = Some(AgentId::new());
+        assert!(unpinned_agent.validate().is_err());
+
+        let mut workflow_with_agent_pin = intent();
+        workflow_with_agent_pin.agent_version_id = Some(AgentVersionId::new());
+        assert!(workflow_with_agent_pin.validate().is_err());
 
         let mut no_attempts = intent();
         no_attempts.max_attempts = 0;

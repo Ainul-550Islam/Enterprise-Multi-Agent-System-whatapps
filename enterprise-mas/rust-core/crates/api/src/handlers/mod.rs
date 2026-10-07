@@ -26,6 +26,7 @@ pub mod control_plane;
 pub mod executions;
 pub mod health;
 pub mod internal;
+pub mod rollbacks;
 pub mod schedules;
 pub mod tenancy;
 pub mod workflows;
@@ -35,9 +36,41 @@ use axum::http::request::Parts;
 
 use crate::context::RequestContext;
 use crate::response::ApiError;
+use mas_application::context::ServiceContext;
+use mas_common::ids::ProjectId;
+use mas_common::result::Result;
+use mas_security::{Action, AuthorizationRequest, AuthorizationService, ResourceKind};
 
 /// Default body size cap for all JSON routes (256 KiB).
 pub const MAX_BODY_BYTES: usize = 256 * 1024;
+
+/// Authorizes a tenant resource through the canonical security matrix and
+/// returns the scope-bound application context. The principal and scope must
+/// already have been authenticated and resolved by middleware; no role or
+/// tenant claim is read from handler input.
+pub(crate) fn authorized_service_context(
+    ctx: &RequestContext,
+    resource: ResourceKind,
+    action: Action,
+    project_id: Option<ProjectId>,
+) -> Result<ServiceContext> {
+    let scope = ctx.require_scope()?;
+    let principal = ctx
+        .principal
+        .as_ref()
+        .ok_or_else(|| mas_common::error::AppError::unauthorized("unauthenticated"))?;
+    let request = AuthorizationRequest {
+        resource,
+        action,
+        tenant_id: scope.tenant_id(),
+        organization_id: scope.organization_id(),
+        project_id,
+    };
+    AuthorizationService::new()
+        .authorize(principal, &request)
+        .into_result()?;
+    ctx.service_context()
+}
 
 /// Extractor: the middleware-attached request context (absence = 500, the
 /// layer always runs first; this trips only on misconfigured routers).

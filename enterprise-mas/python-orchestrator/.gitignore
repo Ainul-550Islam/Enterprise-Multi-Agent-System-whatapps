@@ -27,10 +27,8 @@ coverage.xml
 .mypy_cache/
 .ruff_cache/
 
-# Generated protobuf artifacts (regenerate with scripts/generate_proto.sh)
-src/mas_orchestrator/grpc/generated/*_pb2.py
-src/mas_orchestrator/grpc/generated/*_pb2.pyi
-src/mas_orchestrator/grpc/generated/*_pb2_grpc.py
+# Generated protobuf artifacts are checked in so package installs and CI do
+# not require the Rust checkout or protoc. Regenerate with scripts/generate_proto.sh.
 
 # Secret-bearing local development files — NEVER commit real credentials
 .env

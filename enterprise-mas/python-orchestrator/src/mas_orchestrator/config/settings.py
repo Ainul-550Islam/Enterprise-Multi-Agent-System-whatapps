@@ -39,6 +39,7 @@ from typing import Any, Final
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
 from mas_orchestrator.config.enums import (
+    DataSourceKind,
     Environment,
     GuardrailFailureMode,
     LogFormat,
@@ -134,6 +135,26 @@ class ServiceSettings(_Frozen):
     bind_host: str = Field(default="127.0.0.1", min_length=1, max_length=255)
     bind_port: int = Field(default=9100, ge=1, le=65535)
 
+    #: Explicit opt-in for a listener reachable outside the process loopback.
+    #: In production, setting this is an operator assertion that network policy
+    #: keeps the TLS-authenticated bridge on a private service network.
+    allow_remote_bridge_clients: bool = False
+
+    #: Transport security for the inbound AgentBridge gRPC listener. Plaintext
+    #: is permitted only in development/test and is rejected by startup
+    #: validation in staging/production.
+    grpc_transport_security: TransportSecurity = TransportSecurity.INSECURE
+
+    #: PEM server certificate chain and private-key paths for TLS/mTLS. The
+    #: private-key bytes are loaded only when the listener starts.
+    grpc_certificate_chain_path: str | None = Field(default=None, max_length=4096)
+    grpc_private_key_path: str | None = Field(default=None, max_length=4096)
+
+    #: PEM client-CA bundle for mTLS, and whether the server requires a client
+    #: certificate. When enabled, unauthenticated TLS clients are refused.
+    grpc_client_ca_bundle_path: str | None = Field(default=None, max_length=4096)
+    grpc_require_client_certificate: bool = False
+
     #: Maximum accepted request body size in bytes.
     max_request_bytes: int = Field(default=DEFAULT_MAX_PROMPT_BYTES, ge=1024, le=8 * 1024 * 1024)
 
@@ -148,6 +169,43 @@ class ServiceSettings(_Frozen):
     #: Grace period for in-flight work during shutdown before cancellation
     #: is escalated.
     shutdown_grace_seconds: float = Field(default=20.0, ge=0, le=600)
+
+    @model_validator(mode="after")
+    def _validate_grpc_transport(self) -> ServiceSettings:
+        """Rejects partial TLS configuration and credentials ignored by plaintext."""
+        has_certificate = bool(self.grpc_certificate_chain_path)
+        has_private_key = bool(self.grpc_private_key_path)
+        requires_client_certificate = (
+            self.grpc_transport_security is TransportSecurity.MTLS
+            or self.grpc_require_client_certificate
+        )
+
+        if self.grpc_transport_security is TransportSecurity.INSECURE:
+            if (
+                has_certificate
+                or has_private_key
+                or self.grpc_client_ca_bundle_path
+                or self.grpc_require_client_certificate
+            ):
+                raise ValueError(
+                    "service.grpc TLS material cannot be configured when "
+                    "grpc_transport_security='insecure'"
+                )
+            return self
+
+        if not has_certificate or not has_private_key:
+            raise ValueError(
+                "service.grpc TLS requires both grpc_certificate_chain_path "
+                "and grpc_private_key_path"
+            )
+        if requires_client_certificate and not self.grpc_client_ca_bundle_path:
+            raise ValueError("service.grpc mTLS requires grpc_client_ca_bundle_path")
+        if self.grpc_client_ca_bundle_path and not requires_client_certificate:
+            raise ValueError(
+                "service.grpc_client_ca_bundle_path requires mTLS or "
+                "grpc_require_client_certificate=true"
+            )
+        return self
 
 
 class ProviderSettings(_Frozen):
@@ -280,6 +338,96 @@ class MemorySettings(_Frozen):
     enforce_tenant_filters: bool = True
 
 
+class DataHubSettings(_Frozen):
+    """Bounds and allow-lists for the tenant-scoped Data Hub ingestion plane.
+
+    Rust owns data-source/document metadata and tenant authorization. These
+    settings only constrain Python-side fetching, parsing, embedding and
+    vector storage; they do not contain credentials or caller-controlled
+    filesystem paths.
+    """
+
+    allowed_source_kinds: tuple[DataSourceKind, ...] = (DataSourceKind.UPLOAD,)
+    max_document_bytes: int = Field(default=32 * 1024 * 1024, ge=1, le=32 * 1024 * 1024)
+    max_upload_bytes: int = Field(default=32 * 1024 * 1024, ge=1, le=32 * 1024 * 1024)
+    max_sync_bytes: int = Field(default=64 * 1024 * 1024, ge=1, le=512 * 1024 * 1024)
+    max_pages_per_sync: int = Field(default=500, ge=1, le=10_000)
+    max_crawl_depth: int = Field(default=3, ge=0, le=20)
+    max_crawl_pages: int = Field(default=100, ge=1, le=10_000)
+    allowed_mime_types: tuple[str, ...] = (
+        "text/plain",
+        "text/markdown",
+        "text/html",
+        "text/csv",
+        "application/json",
+        "application/pdf",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    )
+    crawl_egress_allowlist: tuple[str, ...] = ()
+    object_storage_egress_allowlist: tuple[str, ...] = ()
+    database_url_secret_ref: str | None = Field(default=None, max_length=512)
+    database_role: str | None = Field(default=None, max_length=63)
+
+    @field_validator("crawl_egress_allowlist", "object_storage_egress_allowlist")
+    @classmethod
+    def _normalise_egress_hosts(cls, hosts: tuple[str, ...]) -> tuple[str, ...]:
+        """Accepts DNS hostnames only; URL schemes, paths, and IP literals are refused."""
+        import ipaddress
+        import re
+
+        result: list[str] = []
+        for host in hosts:
+            candidate = host.strip().rstrip(".").lower()
+            if not candidate or "://" in candidate or "/" in candidate:
+                raise ValueError("Data Hub egress entries must be hostnames, not URLs")
+            try:
+                ipaddress.ip_address(candidate)
+            except ValueError:
+                pass
+            else:
+                raise ValueError("Data Hub egress allow-lists must use DNS names, not IP literals")
+            if not re.fullmatch(
+                r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\.(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?))*",
+                candidate,
+            ):
+                raise ValueError("Data Hub egress entry is not a valid DNS hostname")
+            result.append(candidate)
+        if len(set(result)) != len(result):
+            raise ValueError("Data Hub egress allow-list must not contain duplicate hosts")
+        return tuple(result)
+
+    @field_validator("allowed_source_kinds")
+    @classmethod
+    def _unique_source_kinds(cls, kinds: tuple[DataSourceKind, ...]) -> tuple[DataSourceKind, ...]:
+        """Rejects duplicate source capabilities in configuration."""
+        if len(set(kinds)) != len(kinds):
+            raise ValueError("data_hub.allowed_source_kinds must not contain duplicates")
+        return kinds
+
+    @field_validator("allowed_mime_types")
+    @classmethod
+    def _normalise_mime_types(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        """Requires normalized media types without parameters or wildcards."""
+        import re
+
+        normalised = tuple(value.strip().lower() for value in values)
+        if any(
+            not re.fullmatch(r"[a-z0-9!#$&^_.+-]+/[a-z0-9!#$&^_.+-]+", value)
+            for value in normalised
+        ):
+            raise ValueError("data_hub.allowed_mime_types must contain exact media types")
+        if len(set(normalised)) != len(normalised):
+            raise ValueError("data_hub.allowed_mime_types must not contain duplicates")
+        return normalised
+
+    @model_validator(mode="after")
+    def _document_caps_sane(self) -> DataHubSettings:
+        """Prevents upload-specific settings from exceeding the document cap."""
+        if self.max_upload_bytes > self.max_document_bytes:
+            raise ValueError("data_hub.max_upload_bytes must not exceed max_document_bytes")
+        return self
+
+
 class RagSettings(_Frozen):
     """Retrieval-augmented generation configuration."""
 
@@ -291,6 +439,11 @@ class RagSettings(_Frozen):
 
     #: Embedding dimensionality. Zero means "unknown, do not assume".
     embedding_dimensions: int = Field(default=0, ge=0, le=16_384)
+    embedding_provider: str = Field(default="openai", min_length=1, max_length=64)
+    embedding_model: str = Field(default="text-embedding-3-small", min_length=1, max_length=128)
+    embedding_api_key_secret_ref: str | None = Field(
+        default="env:MAS_OPENAI_API_KEY", max_length=256
+    )
 
     #: Chunking window.
     chunk_size_chars: int = Field(default=1_200, ge=64, le=64_000)
@@ -485,6 +638,7 @@ class Settings(_Frozen):
     tools: ToolSettings = Field(default_factory=ToolSettings)
     memory: MemorySettings = Field(default_factory=MemorySettings)
     rag: RagSettings = Field(default_factory=RagSettings)
+    data_hub: DataHubSettings = Field(default_factory=DataHubSettings)
     guardrails: GuardrailSettings = Field(default_factory=GuardrailSettings)
     agents: AgentRuntimeSettings = Field(default_factory=AgentRuntimeSettings)
     observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
@@ -650,6 +804,7 @@ __all__ = [
     "DEFAULT_MAX_TOOL_RESULT_BYTES",
     "ENV_PREFIX",
     "AgentRuntimeSettings",
+    "DataHubSettings",
     "GuardrailSettings",
     "MemorySettings",
     "ObservabilitySettings",

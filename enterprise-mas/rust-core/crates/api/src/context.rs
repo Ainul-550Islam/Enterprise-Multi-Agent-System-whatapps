@@ -122,6 +122,7 @@ impl RequestContext {
             mas_security::PrincipalKind::System => mas_domain::AuditActorKind::System,
         };
         let actor = mas_domain::AuditActor::new(actor_kind, &principal.actor_id)?;
+        let resolved_role = principal.role_in(scope.tenant_id(), scope.organization_id());
         ServiceContext::new(
             actor,
             Some(scope.tenant_id()),
@@ -129,6 +130,11 @@ impl RequestContext {
             &self.correlation_id,
             &Timestamp::now(),
         )
+        .map(|context| {
+            context
+                .with_request_id(self.request_id)
+                .with_resolved_role(resolved_role)
+        })
     }
 
     /// Errors `403 FORBIDDEN` when no scope was resolved.
@@ -257,6 +263,30 @@ mod tests {
         let scope = context.require_scope().expect("resolved");
         assert_eq!(scope.tenant_id(), tenant);
         assert_eq!(scope.organization_id(), organization);
+    }
+
+    #[test]
+    fn service_context_preserves_the_transport_request_id() {
+        let tenant = TenantId::new();
+        let organization = OrganizationId::new();
+        let request_id = uuid::Uuid::from_u128(0x1234);
+        let context = RequestContext::with_claims(ScopeClaims::default(), "corr".to_owned())
+            .with_resolved(
+                SecurityPrincipal::new(
+                    "user-1",
+                    PrincipalKind::User,
+                    Some(tenant),
+                    mas_security::ScopeSet::denied(),
+                ),
+                AuthoritativeScope::resolved(tenant, organization, "user-1"),
+            );
+        let context = RequestContext {
+            request_id,
+            ..context
+        };
+
+        let service = context.service_context().expect("service context");
+        assert_eq!(service.request_id, request_id);
     }
 
     /// A claim that disagrees with the resolved scope is recorded, not

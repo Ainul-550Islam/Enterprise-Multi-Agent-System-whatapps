@@ -215,6 +215,12 @@ define_id!(/// Identifies an immutable `WorkflowVersion`.
 WorkflowVersionId);
 define_id!(/// Identifies a persisted `WorkflowNode` row.
 WorkflowNodeId);
+define_id!(/// Identifies a Rust-owned Data Hub source.
+DataSourceId);
+define_id!(/// Identifies Rust-owned Data Hub document metadata.
+DocumentId);
+define_id!(/// Identifies an append-only governance rollback record.
+RollbackRecordId);
 define_id!(/// Identifies a `Task` (unit of dispatched work).
 TaskId);
 define_id!(/// Identifies one `TaskAttempt` of a task.

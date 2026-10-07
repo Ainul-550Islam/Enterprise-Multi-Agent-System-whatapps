@@ -29,4 +29,7 @@
 //! module today is [`run_slots`], the concurrency gate; any future adapter that
 //! needs both the worker's port and the runtime pool belongs here too.
 
+pub mod agent_runtime_bridge;
 pub mod run_slots;
+
+pub use agent_runtime_bridge::{PostgresAgentRuntimeSnapshotResolver, ResolvedAgentBridge};

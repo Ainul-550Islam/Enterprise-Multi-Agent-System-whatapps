@@ -125,6 +125,34 @@ pub async fn get(
         .into_api(&ctx)
 }
 
+/// `GET /v1/executions/{execution_id}/steps` — safe, tenant-scoped
+/// execution-step timeline. Payload references are never exposed.
+pub async fn steps(
+    State(state): State<AppState>,
+    Path(execution_id): Path<ExecutionId>,
+    Ctx(ctx): Ctx,
+) -> ApiResult<Vec<mas_contracts::execution::ExecutionStepDto>> {
+    let service_ctx = crate::handlers::authorized_service_context(
+        &ctx,
+        mas_security::ResourceKind::Execution,
+        mas_security::Action::Read,
+        None,
+    )
+    .map_err(|error| crate::response::ApiError::new(error, &ctx))?;
+    let steps = state
+        .executions
+        .list_steps(&service_ctx, execution_id)
+        .await
+        .map_err(|error| crate::response::ApiError::new(error, &ctx))?;
+    Ok(crate::response::ok(
+        &ctx,
+        steps
+            .iter()
+            .map(mas_application::dto::execution_step_response)
+            .collect(),
+    ))
+}
+
 /// `GET /v1/executions` — tenant-scoped list.
 pub async fn list(
     State(state): State<AppState>,

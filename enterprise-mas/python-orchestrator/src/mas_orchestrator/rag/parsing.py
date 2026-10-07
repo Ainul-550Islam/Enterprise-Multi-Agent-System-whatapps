@@ -1,24 +1,32 @@
-"""Document parsing.
+"""Bounded parsers for untrusted RAG/Data Hub content.
 
-Parsing turns bytes into text. It is also the first place untrusted content
-enters the system, so the parser's second job is to strip the things that only
-exist to affect the reader: scripts, styles, and markup that would otherwise be
-concatenated into a prompt where a model may act on it.
-
-The parsers here are deliberately plain. They do not attempt to be a full HTML
-or Markdown implementation; where a format is richer than what we handle, the
-leftover markup is removed rather than passed through looking meaningful.
+Parsing turns source bytes into plain text. It is also the first place
+untrusted content enters the system, so scripts, styles, executable markup,
+malformed containers, decompression bombs, and excessive page/row counts are
+rejected or removed before prompt construction. Rich-format parsers are
+optional dependencies and are imported only when their format is requested.
 """
 
 from __future__ import annotations
 
+import csv
 import html
+import io
 import json
 import re
+import zipfile
 from typing import Final
 
-from mas_orchestrator.contracts.errors import InvalidRequestError
+from mas_orchestrator.contracts.errors import ConfigurationError, InvalidRequestError
 from mas_orchestrator.rag.models import DocumentFormat
+
+MAX_PARSED_CHARS: Final[int] = 8_000_000
+MAX_PDF_PAGES: Final[int] = 500
+MAX_CSV_ROWS: Final[int] = 100_000
+MAX_CSV_COLUMNS: Final[int] = 2_000
+MAX_DOCX_MEMBERS: Final[int] = 5_000
+MAX_DOCX_UNCOMPRESSED_BYTES: Final[int] = 64 * 1024 * 1024
+MAX_DOCX_COMPRESSION_RATIO: Final[int] = 200
 
 # --- HTML handling ---------------------------------------------------------
 
@@ -43,36 +51,51 @@ _MD_HEADING: Final[re.Pattern[str]] = re.compile(r"^#{1,6}\s*", re.MULTILINE)
 _MD_EMPHASIS: Final[re.Pattern[str]] = re.compile(r"(\*\*|__|\*|_|~~|`)")
 _MD_HTML: Final[re.Pattern[str]] = re.compile(r"<[^>]+>")
 
-MAX_PARSED_CHARS: Final[int] = 8_000_000
-
 
 class Parser:
-    """Turns document content into plain text."""
+    """Turns bounded document content into normalized plain text."""
 
-    def parse(self, content: str, format: DocumentFormat) -> str:  # noqa: A002
-        """Parses content into plain text.
+    def parse(self, content: str | bytes, format: DocumentFormat) -> str:  # noqa: A002
+        """Parses one document according to its trusted, declared format.
 
         Args:
-            content: Raw document content.
-            format: The declared format.
+            content: Raw text or source bytes, already bounded by the caller.
+            format: Format derived from the source MIME type, not model output.
 
         Returns:
-            Plain text.
+            Plain text, never more than :data:`MAX_PARSED_CHARS` characters.
 
         Raises:
-            InvalidRequestError: If JSON content is malformed, or the parsed
-                text exceeds :data:`MAX_PARSED_CHARS`.
+            ConfigurationError: A requested optional parser is not installed.
+            InvalidRequestError: The bytes are malformed or exceed parser caps.
         """
-        if not content.strip():
+        if isinstance(content, bytes):
+            if not content:
+                return ""
+        elif not content.strip():
             return ""
 
-        dispatch = {
-            DocumentFormat.TEXT: _parse_text,
-            DocumentFormat.MARKDOWN: _parse_markdown,
-            DocumentFormat.JSON: _parse_json,
-            DocumentFormat.HTML: _parse_html,
-        }
-        parsed = dispatch[format](content)
+        if format is DocumentFormat.PDF:
+            parsed = _parse_pdf(content)
+        elif format is DocumentFormat.DOCX:
+            parsed = _parse_docx(content)
+        else:
+            text = _decode_text(content)
+            dispatch = {
+                DocumentFormat.TEXT: _parse_text,
+                DocumentFormat.MARKDOWN: _parse_markdown,
+                DocumentFormat.JSON: _parse_json,
+                DocumentFormat.HTML: _parse_html,
+                DocumentFormat.CSV: _parse_csv,
+            }
+            try:
+                parser = dispatch[format]
+            except KeyError as error:
+                raise InvalidRequestError(
+                    "document format is not supported",
+                    details={"format": str(format)},
+                ) from error
+            parsed = parser(text)
 
         if len(parsed) > MAX_PARSED_CHARS:
             raise InvalidRequestError(
@@ -82,18 +105,26 @@ class Parser:
         return parsed
 
 
+def _decode_text(content: str | bytes) -> str:
+    """Decodes text formats strictly; replacement characters hide corruption."""
+    if isinstance(content, str):
+        return content
+    try:
+        return content.decode("utf-8-sig", errors="strict")
+    except UnicodeDecodeError as error:
+        raise InvalidRequestError(
+            "text document is not valid UTF-8",
+            details={"byte_offset": error.start},
+        ) from error
+
+
 def _parse_text(content: str) -> str:
     """Normalises whitespace only."""
     return _normalise(content)
 
 
 def _parse_markdown(content: str) -> str:
-    """Reduces Markdown to readable text.
-
-    Code fences are kept, because code is often the subject of the document.
-    Links keep their label and lose their target, since a URL in retrieved
-    context is a plausible injection vector and rarely part of the meaning.
-    """
+    """Reduces Markdown to readable text while retaining code and labels."""
     text = _MD_CODE.sub(lambda match: match.group(0).strip("`"), content)
     text = _MD_IMAGE.sub("", text)
     text = _MD_LINK.sub(r"\1", text)
@@ -104,11 +135,7 @@ def _parse_markdown(content: str) -> str:
 
 
 def _parse_json(content: str) -> str:
-    """Flattens JSON into labelled lines.
-
-    Values are prefixed with their path so a chunk taken out of context still
-    says which field it came from.
-    """
+    """Flattens JSON into labelled lines, preserving object paths."""
     try:
         payload = json.loads(content)
     except json.JSONDecodeError as error:
@@ -132,44 +159,151 @@ def _parse_json(content: str) -> str:
     return _normalise("\n".join(lines))
 
 
-def _parse_html(content: str) -> str:
-    """Strips HTML to text.
+def _parse_csv(content: str) -> str:
+    """Flattens bounded CSV into labelled cells without spreadsheet execution."""
+    try:
+        reader = csv.reader(io.StringIO(content, newline=""), strict=True)
+        rows: list[list[str]] = []
+        for row_number, row in enumerate(reader, start=1):
+            if row_number > MAX_CSV_ROWS:
+                raise InvalidRequestError(
+                    "CSV exceeds the maximum row count",
+                    details={"limit": MAX_CSV_ROWS},
+                )
+            if len(row) > MAX_CSV_COLUMNS:
+                raise InvalidRequestError(
+                    "CSV row exceeds the maximum column count",
+                    details={"limit": MAX_CSV_COLUMNS, "row": row_number},
+                )
+            rows.append(row)
+    except csv.Error as error:
+        raise InvalidRequestError("document is not valid CSV") from error
+    if not rows:
+        return ""
+    header = rows[0]
+    lines: list[str] = []
+    for row_number, row in enumerate(rows[1:], start=2):
+        for column, value in enumerate(row):
+            name = header[column].strip() if column < len(header) else f"column_{column + 1}"
+            if value.strip():
+                lines.append(f"row {row_number} {name}: {value}")
+    return _normalise("\n".join(lines))
 
-    Scripts, styles and comments are removed whole rather than tag-by-tag:
-    their content is executable or presentational, and leaving any of it in
-    retrieved context is how markup becomes instruction.
-    """
+
+def _parse_html(content: str) -> str:
+    """Removes executable/presentational HTML before text extraction."""
     text = _SCRIPT.sub(" ", content)
     text = _COMMENT.sub(" ", text)
     text = _BLOCK_TAGS.sub("\n", text)
     text = _TAG.sub(" ", text)
     text = html.unescape(text)
-    # A stray unescaped entity reference is a sign of double-encoded content.
     text = _ENTITY_REF.sub(" ", text)
     return _normalise(text)
 
 
+def _parse_pdf(content: str | bytes) -> str:
+    """Extracts bounded, text-only PDF pages using the optional pypdf parser."""
+    try:
+        from pypdf import PdfReader
+    except ImportError as error:
+        raise ConfigurationError(
+            "PDF ingestion requires the optional ingest extra",
+            details={"extra": "ingest", "parser": "pypdf"},
+        ) from error
+    raw = content if isinstance(content, bytes) else content.encode("utf-8")
+    try:
+        reader = PdfReader(io.BytesIO(raw), strict=True)
+        if len(reader.pages) > MAX_PDF_PAGES:
+            raise InvalidRequestError(
+                "PDF exceeds the maximum page count",
+                details={"limit": MAX_PDF_PAGES, "pages": len(reader.pages)},
+            )
+        pages: list[str] = []
+        for page_number, page in enumerate(reader.pages, start=1):
+            if len("\n".join(pages)) > MAX_PARSED_CHARS:
+                break
+            pages.append(f"Page {page_number}\n{page.extract_text() or ''}")
+        return _normalise("\n\n".join(pages))
+    except InvalidRequestError:
+        raise
+    except Exception as error:
+        raise InvalidRequestError("PDF document is malformed or unreadable") from error
+
+
+def _parse_docx(content: str | bytes) -> str:
+    """Extracts DOCX paragraphs/tables after ZIP-bomb and member validation."""
+    try:
+        from docx import Document
+    except ImportError as error:
+        raise ConfigurationError(
+            "DOCX ingestion requires the optional ingest extra",
+            details={"extra": "ingest", "parser": "python-docx"},
+        ) from error
+    raw = content if isinstance(content, bytes) else content.encode("utf-8")
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+            members = archive.infolist()
+            total_size = sum(member.file_size for member in members)
+            if len(members) > MAX_DOCX_MEMBERS or total_size > MAX_DOCX_UNCOMPRESSED_BYTES:
+                raise InvalidRequestError(
+                    "DOCX package exceeds parser safety limits",
+                    details={
+                        "member_limit": MAX_DOCX_MEMBERS,
+                        "uncompressed_byte_limit": MAX_DOCX_UNCOMPRESSED_BYTES,
+                    },
+                )
+            for member in members:
+                if member.file_size > 0 and member.compress_size == 0:
+                    raise InvalidRequestError("DOCX package has an invalid compressed member")
+                if (
+                    member.compress_size > 0
+                    and member.file_size / member.compress_size > MAX_DOCX_COMPRESSION_RATIO
+                ):
+                    raise InvalidRequestError("DOCX package exceeds the compression-ratio limit")
+            if "word/document.xml" not in archive.namelist():
+                raise InvalidRequestError("DOCX package has no Word document part")
+        document = Document(io.BytesIO(raw))
+        lines = [paragraph.text for paragraph in document.paragraphs if paragraph.text.strip()]
+        for table in document.tables:
+            for row in table.rows:
+                lines.append(" | ".join(cell.text.strip() for cell in row.cells))
+        return _normalise("\n".join(lines))
+    except InvalidRequestError:
+        raise
+    except (zipfile.BadZipFile, OSError, ValueError) as error:
+        raise InvalidRequestError("DOCX document is malformed or unreadable") from error
+
+
 def _normalise(text: str) -> str:
-    """Collapses whitespace into a stable form."""
+    """Collapses whitespace into a stable, citation-friendly form."""
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = _WS.sub(" ", text)
     text = _BLANKS.sub("\n\n", text)
     return "\n".join(line.strip() for line in text.split("\n")).strip()
 
 
-def detect_format(content: str, *, declared: DocumentFormat | None = None) -> DocumentFormat:
-    """Guesses a format when none is declared.
-
-    A declared format always wins: guessing over a correct declaration would
-    let a document opt itself into a different parser.
-    """
+def detect_format(
+    content: str | bytes, *, declared: DocumentFormat | None = None
+) -> DocumentFormat:
+    """Guesses text/PDF format when none is declared; trusted MIME wins."""
     if declared is not None:
         return declared
-    stripped = content.lstrip()
+    if isinstance(content, bytes):
+        if content.startswith(b"%PDF-"):
+            return DocumentFormat.PDF
+        prefix = content[:4096].lstrip()
+        try:
+            stripped = prefix.decode("utf-8-sig", errors="strict")
+        except UnicodeDecodeError:
+            return DocumentFormat.TEXT
+    else:
+        stripped = content.lstrip()
     if stripped.startswith("<"):
         return DocumentFormat.HTML
     if stripped.startswith("{") or stripped.startswith("["):
         return DocumentFormat.JSON
-    if _MD_HEADING.search(content) or "```" in content or _MD_LINK.search(content):
+    if _MD_HEADING.search(stripped) or "```" in stripped or _MD_LINK.search(stripped):
         return DocumentFormat.MARKDOWN
+    if "," in stripped.splitlines()[0] if stripped.splitlines() else False:
+        return DocumentFormat.CSV
     return DocumentFormat.TEXT

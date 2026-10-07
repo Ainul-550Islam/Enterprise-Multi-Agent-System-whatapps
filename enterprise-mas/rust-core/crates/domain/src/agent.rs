@@ -28,6 +28,16 @@ string_enum! {
     }
 }
 
+string_enum! {
+    /// Ownership class used to distinguish user-managed agents from immutable platform agents.
+    AgentOrigin {
+        /// Created and managed by a tenant user.
+        User => "user",
+        /// Shipped and managed by the platform.
+        System => "system",
+    }
+}
+
 /// Orchestration-level agent configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
@@ -104,8 +114,19 @@ pub struct Agent {
     /// Latest published version number (monotonic); `None` while unpublished.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_version: Option<u64>,
+    /// User-configured baseline used only for the dashboard's time-saved estimate.
+    /// `None` means unknown; callers must not substitute a guessed value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_minutes_per_task: Option<u32>,
+    /// Whether the agent is tenant-managed or a platform-owned system agent.
+    #[serde(default = "default_agent_origin")]
+    pub origin: AgentOrigin,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
+}
+
+fn default_agent_origin() -> AgentOrigin {
+    AgentOrigin::User
 }
 
 impl Agent {
@@ -146,14 +167,59 @@ impl Agent {
             config: AgentConfig::default(),
             capabilities: Vec::new(),
             current_version: None,
+            baseline_minutes_per_task: None,
+            origin: AgentOrigin::User,
             created_at: now,
             updated_at: now,
         })
     }
 
+    /// Creates the system-owned, already-published v1 platform assistant.
+    ///
+    /// This is the only creation path that may establish a system agent's
+    /// first published version. Subsequent API mutation and publication are
+    /// refused by the aggregate's guard methods.
+    pub fn create_system_published(
+        tenant_id: TenantId,
+        organization_id: OrganizationId,
+        project_id: ProjectId,
+        name: impl Into<String>,
+        slug: Slug,
+        baseline_minutes_per_task: Option<u32>,
+    ) -> Result<Self> {
+        if baseline_minutes_per_task == Some(0) {
+            return Err(AppError::invalid_field(
+                "baseline_minutes_per_task",
+                "out_of_range",
+                "must be greater than zero when configured",
+            ));
+        }
+        let mut agent = Self::create(
+            tenant_id,
+            organization_id,
+            project_id,
+            name,
+            slug,
+            AgentKind::Standard,
+        )?;
+        agent.origin = AgentOrigin::System;
+        agent.status = AgentStatus::Active;
+        agent.current_version = Some(1);
+        agent.baseline_minutes_per_task = baseline_minutes_per_task;
+        agent.validate()?;
+        Ok(agent)
+    }
+
     /// Full aggregate invariant check (used pre-publish and by repositories).
     pub fn validate(&self) -> Result<()> {
         validation::validate_resource_name("name", &self.name)?;
+        if self.baseline_minutes_per_task == Some(0) {
+            return Err(AppError::invalid_field(
+                "baseline_minutes_per_task",
+                "out_of_range",
+                "must be greater than zero when configured",
+            ));
+        }
         self.config.validate()?;
         // Capability pairs must be mutually compatible.
         for (index, capability) in self.capabilities.iter().enumerate() {
@@ -212,6 +278,7 @@ impl Agent {
 
     /// Draft → Active. Requires a validated configuration.
     pub fn enable(&mut self) -> Result<()> {
+        self.assert_not_system_owned("change lifecycle state")?;
         self.validate()?;
         match self.status {
             AgentStatus::Draft | AgentStatus::Disabled => {
@@ -225,6 +292,7 @@ impl Agent {
     }
 
     pub fn disable(&mut self) -> Result<()> {
+        self.assert_not_system_owned("change lifecycle state")?;
         match self.status {
             AgentStatus::Active => {
                 self.status = AgentStatus::Disabled;
@@ -239,6 +307,7 @@ impl Agent {
     }
 
     pub fn archive(&mut self) -> Result<()> {
+        self.assert_not_system_owned("archive")?;
         match self.status {
             AgentStatus::Archived => Ok(()),
             AgentStatus::Active => Err(AppError::conflict(
@@ -255,6 +324,7 @@ impl Agent {
     /// Records a new published version number (monotonic, set by application
     /// layer after inserting the `AgentVersion` row).
     pub fn record_published_version(&mut self, version: u64) -> Result<()> {
+        self.assert_not_system_owned("republish")?;
         if let Some(current) = self.current_version {
             if version <= current {
                 return Err(AppError::conflict(format!(
@@ -267,13 +337,43 @@ impl Agent {
         Ok(())
     }
 
+    /// Sets the operator-provided time-saving baseline on a user-managed agent.
+    pub fn set_baseline_minutes_per_task(&mut self, baseline: Option<u32>) -> Result<()> {
+        self.assert_mutable("update dashboard baseline")?;
+        if baseline == Some(0) {
+            return Err(AppError::invalid_field(
+                "baseline_minutes_per_task",
+                "out_of_range",
+                "must be greater than zero when configured",
+            ));
+        }
+        self.baseline_minutes_per_task = baseline;
+        self.touch();
+        Ok(())
+    }
+
     /// Whether runtime execution may reference this agent.
     #[must_use]
     pub fn is_executable(&self) -> bool {
         self.status == AgentStatus::Active && self.current_version.is_some()
     }
 
+    /// Refuses API mutations of system-owned agents.
+    pub fn ensure_api_mutable(&self, action: &str) -> Result<()> {
+        self.assert_not_system_owned(action)
+    }
+
+    fn assert_not_system_owned(&self, action: &str) -> Result<()> {
+        if self.origin == AgentOrigin::System {
+            return Err(AppError::forbidden(format!(
+                "system-owned agents cannot {action} through the API"
+            )));
+        }
+        Ok(())
+    }
+
     fn assert_mutable(&self, action: &str) -> Result<()> {
+        self.assert_not_system_owned(action)?;
         match self.status {
             AgentStatus::Draft | AgentStatus::Disabled => Ok(()),
             other => Err(AppError::conflict(format!(

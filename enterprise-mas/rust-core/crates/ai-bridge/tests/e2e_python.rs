@@ -10,9 +10,11 @@
 // So this test spawns a real Python server and drives it with a real
 // `GrpcAgentBridge` over a real TCP socket.
 //
-// It skips, rather than fails, when Python or the orchestrator package is not
-// installed, so `cargo test` stays usable in a Rust-only environment. A skipped
-// end-to-end test is visible in the run summary; a hard failure would not be.
+// These integration tests are ignored by default so a Rust-only unit-test run
+// remains usable. Run them explicitly with `cargo test -p mas-ai-bridge
+// --test e2e_python -- --ignored`. Once selected, missing Python dependencies,
+// a missing checkout path, or a server startup failure is a test failure—not a
+// green early return.
 
 //! Cross-language end-to-end test.
 //!
@@ -23,15 +25,23 @@
 //!
 //! Set `MAS_E2E_STUB` to override the server script's location.
 
+use std::ffi::OsString;
 use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::sync::mpsc;
+use std::time::Duration;
 
 use mas_ai_bridge::{GrpcAgentBridge, GrpcAgentBridgeConfig};
 use mas_common::enums::Environment;
-use mas_common::ids::{AgentId, OrganizationId, ProjectId, TenantId};
+use mas_common::ids::{
+    AgentId, AgentVersionId, OrganizationId, ProjectId, TaskAttemptId, TaskId, TenantId,
+};
 use mas_domain::{ResourceLimits, TokenBudget};
-use mas_execution::agent_bridge::{AgentBridge, AgentRunRequest, AgentRunVerdict};
+use mas_execution::agent_bridge::{
+    AgentBridge, AgentRunRequest, AgentRunVerdict, AgentRuntimeConfiguration, AgentRuntimeLimits,
+    AgentRuntimeSnapshot,
+};
 use mas_orchestration::runtime_context::RuntimeContext;
 use mas_security::secret_string::SecretString;
 use uuid::Uuid;
@@ -53,37 +63,97 @@ const INTERNAL_SECRET: &str = "internal-shared-secret";
 /// `DEFAULT_INTERNAL_SERVICE`, and is on the servicer's allowlist.
 const INTERNAL_SERVICE: &str = "mas-worker";
 
-/// The Python harness, resolved from the environment or by convention.
-fn stub_script() -> Option<std::path::PathBuf> {
-    if let Ok(path) = std::env::var("MAS_E2E_STUB") {
-        return Some(std::path::PathBuf::from(path));
+/// The sibling Python package root, with an explicit override for split checkouts.
+fn python_root() -> Result<PathBuf, String> {
+    if let Some(root) = std::env::var_os("MAS_E2E_PYTHON_ROOT") {
+        let root = PathBuf::from(root)
+            .canonicalize()
+            .map_err(|error| format!("MAS_E2E_PYTHON_ROOT cannot be resolved: {error}"))?;
+        if root.is_dir() {
+            return Ok(root);
+        }
+        return Err(format!(
+            "MAS_E2E_PYTHON_ROOT is not a directory: {}",
+            root.display()
+        ));
     }
-    // This file lives at <workspace>/crates/ai-bridge/tests/. `..` walks back
-    // to <workspace>, so five levels reach the checkout root that holds
-    // `python-orchestrator/` beside the Rust tree. Probed rather than assumed:
-    // a wrong guess here once made every test below report "passed" while
-    // silently doing nothing.
-    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../../..");
-    let relative = "python-orchestrator/tests/bridge/stub_server.py";
-    [
-        root.join(relative),
-        std::path::PathBuf::from("/home/user").join(relative),
-    ]
-    .into_iter()
-    .find(|base| base.is_file())
+
+    // CARGO_MANIFEST_DIR is rust-core/crates/ai-bridge; the Python package is
+    // the sibling enterprise-mas/python-orchestrator, three parents upward.
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../python-orchestrator")
+        .canonicalize()
+        .map_err(|error| {
+            format!("cannot locate sibling python-orchestrator; set MAS_E2E_PYTHON_ROOT: {error}")
+        })?;
+    if !root.is_dir() {
+        return Err(format!(
+            "Python orchestrator root is not a directory: {}",
+            root.display()
+        ));
+    }
+    Ok(root)
 }
 
-/// Whether the Python side is usable at all.
-fn python_available(script: &std::path::Path) -> bool {
-    Command::new("python3")
+/// The Python test server, resolved from the environment or package root.
+fn stub_script(root: &Path) -> Result<PathBuf, String> {
+    let script = match std::env::var_os("MAS_E2E_STUB") {
+        Some(path) => {
+            let path = PathBuf::from(path);
+            if path.is_absolute() {
+                path
+            } else {
+                std::env::current_dir()
+                    .map_err(|error| format!("cannot read current directory: {error}"))?
+                    .join(path)
+            }
+        },
+        None => root.join("tests/bridge/stub_server.py"),
+    };
+    if script.is_file() {
+        Ok(script)
+    } else {
+        Err(format!(
+            "Python AgentBridge test server does not exist: {}",
+            script.display()
+        ))
+    }
+}
+
+/// Builds a Python import path that resolves this checkout without requiring
+/// an editable install. Existing paths are preserved for caller dependencies.
+fn python_path(root: &Path) -> Result<OsString, String> {
+    let mut paths = vec![root.join("src")];
+    if let Some(existing) = std::env::var_os("PYTHONPATH") {
+        paths.extend(std::env::split_paths(&existing));
+    }
+    std::env::join_paths(paths).map_err(|error| format!("invalid PYTHONPATH: {error}"))
+}
+
+/// Fails with dependency diagnostics instead of turning an unavailable Python
+/// bridge into a passing integration test.
+fn python_available(root: &Path) -> Result<(), String> {
+    let import_path = python_path(root)?;
+    let python = std::env::var_os("MAS_E2E_PYTHON").unwrap_or_else(|| "python3".into());
+    let output = Command::new(python)
         .arg("-c")
-        .arg("import mas_orchestrator")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
-        && script.is_file()
+        .arg(
+            "import grpc; import mas_orchestrator; \
+             from mas_orchestrator.grpc.generated import mas_api_pb2, mas_api_pb2_grpc",
+        )
+        .env("PYTHONPATH", import_path)
+        .current_dir(root)
+        .output()
+        .map_err(|error| format!("cannot run Python import check: {error}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Python bridge imports failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
 }
 
 /// A running Python server, terminated on drop.
@@ -104,50 +174,98 @@ impl Drop for Server {
 }
 
 /// Starts the Python server and returns once it reports its port.
-fn spawn(behaviour: &str, delay: f64) -> Option<Server> {
-    let script = stub_script()?;
-    if !python_available(&script) {
-        return None;
-    }
+fn spawn(behaviour: &str, delay: f64) -> Result<Server, String> {
+    let root = python_root()?;
+    let script = stub_script(&root)?;
+    python_available(&root)?;
 
-    let mut child = Command::new("python3")
+    let python = std::env::var_os("MAS_E2E_PYTHON").unwrap_or_else(|| "python3".into());
+    let mut child = Command::new(python)
         .arg(&script)
         .arg("--behaviour")
         .arg(behaviour)
         .arg("--delay")
         .arg(delay.to_string())
+        .env("PYTHONPATH", python_path(&root)?)
+        .current_dir(&root)
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::inherit())
         .spawn()
-        .ok()?;
+        .map_err(|error| format!("cannot start Python AgentBridge server: {error}"))?;
 
-    // The server prints its port once it is listening. Reading that line is
-    // the readiness signal: connecting on a guess would race the bind.
-    let stdout = child.stdout.take()?;
-    let mut reader = BufReader::new(stdout);
-    let mut line = String::new();
-    let deadline = Instant::now() + Duration::from_secs(30);
-
-    loop {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => break,
-            Ok(_) => {
-                if let Some(value) = line.trim().strip_prefix("PORT=") {
-                    if let Ok(port) = value.parse::<u16>() {
-                        return Some(Server { child, port });
-                    }
-                }
-            },
-            Err(_) => break,
+    // The server prints its port once it is listening. A reader thread allows
+    // a real bounded startup wait; a blocking read_line on this thread would
+    // make a broken server hang the integration test forever.
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("Python AgentBridge server stdout was not captured".to_owned());
+        },
+    };
+    let (sender, receiver) = mpsc::sync_channel::<std::result::Result<String, String>>(1);
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) => {
+                    let _ = sender.send(Err(
+                        "Python AgentBridge server exited before announcing its port".to_owned(),
+                    ));
+                    return;
+                },
+                Ok(_) if line.trim().starts_with("PORT=") => {
+                    let _ = sender.send(Ok(line));
+                    return;
+                },
+                Ok(_) => {},
+                Err(error) => {
+                    let _ = sender.send(Err(format!(
+                        "cannot read Python AgentBridge server readiness: {error}"
+                    )));
+                    return;
+                },
+            }
         }
-        if Instant::now() > deadline {
-            break;
-        }
-    }
+    });
 
-    let _ = child.kill();
-    None
+    let announcement = match receiver.recv_timeout(Duration::from_secs(30)) {
+        Ok(announcement) => announcement,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "Python AgentBridge server did not become ready within 30 seconds: {error}"
+            ));
+        },
+    };
+    let line = match announcement {
+        Ok(line) => line,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        },
+    };
+    let port = match line
+        .trim()
+        .strip_prefix("PORT=")
+        .and_then(|value| value.parse::<u16>().ok())
+        .filter(|port| *port != 0)
+    {
+        Some(port) => port,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "Python AgentBridge server returned an invalid port: {line:?}"
+            ));
+        },
+    };
+
+    Ok(Server { child, port })
 }
 
 /// Builds a bridge pointed at `port`, with the credential the stub accepts.
@@ -165,6 +283,7 @@ fn bridge(port: u16) -> GrpcAgentBridgeConfig {
         // stopped signing, or signed the wrong bytes, would fail here.
         internal_signing_secret: Some(SecretString::new(INTERNAL_SECRET.to_owned())),
         internal_service_id: INTERNAL_SERVICE.to_owned(),
+        ..Default::default()
     }
 }
 
@@ -188,44 +307,90 @@ fn miskeyed_bridge(port: u16) -> GrpcAgentBridgeConfig {
     }
 }
 
-/// Builds a properly scoped run request.
+/// Builds the complete immutable configuration attached to the Rust-owned
+/// version selected by each cross-language test request.
+fn runtime_snapshot(
+    agent_id: AgentId,
+    tenant_id: TenantId,
+    organization_id: OrganizationId,
+    project_id: ProjectId,
+    agent_version_id: AgentVersionId,
+) -> AgentRuntimeSnapshot {
+    AgentRuntimeSnapshot {
+        agent_id,
+        tenant_id,
+        organization_id,
+        project_id,
+        agent_version_id,
+        version_number: 1,
+        configuration_checksum: "a".repeat(64),
+        name: "E2E Agent".to_owned(),
+        slug: "e2e-agent".to_owned(),
+        kind: "standard".to_owned(),
+        status: "active".to_owned(),
+        origin: "user".to_owned(),
+        read_only: false,
+        configuration: AgentRuntimeConfiguration {
+            description: Some("cross-language pinned-version fixture".to_owned()),
+            model_hint: Some("test/snapshot-model".to_owned()),
+            system_prompt: "Immutable E2E version prompt".to_owned(),
+            limits: AgentRuntimeLimits::default(),
+            tags: vec!["e2e".to_owned()],
+            allowed_tools: vec!["search".to_owned()],
+        },
+    }
+}
+
+/// Builds a properly scoped run request with a pinned Rust snapshot.
 fn request() -> AgentRunRequest {
+    let tenant_id = TenantId::new();
+    let organization_id = OrganizationId::new();
+    let project_id = ProjectId::new();
+    let agent_id = AgentId::new();
+    let agent_version_id = AgentVersionId::new();
     let context = RuntimeContext::new(
-        TenantId::new(),
-        OrganizationId::new(),
-        ProjectId::new(),
+        tenant_id,
+        organization_id,
+        project_id,
         "e2e",
         Environment::Development,
     )
     .expect("context");
 
-    AgentRunRequest::from_context(
+    let mut request = AgentRunRequest::from_context(
         &context,
-        AgentId::new(),
+        agent_id,
         serde_json::json!({"prompt": "hello from rust"}),
         ResourceLimits::default(),
         &TokenBudget::unlimited(),
     )
-    .expect("request")
+    .expect("request");
+    request.agent_version = Some(agent_version_id.to_string());
+    request.agent_snapshot = Some(runtime_snapshot(
+        agent_id,
+        tenant_id,
+        organization_id,
+        project_id,
+        agent_version_id,
+    ));
+    request
 }
 
-/// Skips the test with a visible reason when the Python side is missing.
+/// Converts an unavailable bridge prerequisite into a visible test failure.
 macro_rules! require_python {
     ($server:expr) => {{
-        match $server {
-            Some(server) => server,
-            None => {
-                eprintln!(
-                    "SKIPPED: the Python orchestrator is not available; \
-                     install it (`pip install -e .`) or set MAS_E2E_STUB"
-                );
-                return;
-            },
-        }
+        $server.unwrap_or_else(|error| {
+            panic!(
+                "cross-language AgentBridge setup failed: {error}; install \
+                 python-orchestrator dependencies and generate the protobuf \
+                 bindings, or set MAS_E2E_PYTHON_ROOT / MAS_E2E_STUB"
+            )
+        })
     }};
 }
 
 #[tokio::test]
+#[ignore = "requires Python dependencies; run this target with --ignored"]
 async fn a_successful_run_crosses_the_language_boundary() {
     let server = require_python!(spawn("success", 0.0));
     let bridge = GrpcAgentBridge::connect(bridge(server.port))
@@ -235,12 +400,19 @@ async fn a_successful_run_crosses_the_language_boundary() {
     let verdict = bridge.run(request()).await.expect("run");
 
     match verdict {
-        AgentRunVerdict::Succeeded { output, usage: _ } => {
+        AgentRunVerdict::Succeeded {
+            output,
+            usage: _,
+            model_key,
+            finish_reason,
+        } => {
             assert_eq!(
                 output,
                 serde_json::json!("the answer"),
                 "output round-tripped"
             );
+            assert_eq!(model_key, None, "the runtime did not report a model");
+            assert_eq!(finish_reason.as_deref(), Some("completed"));
         },
         AgentRunVerdict::Failed { code, message, .. } => {
             panic!("expected success, got failure {code}: {message}");
@@ -249,6 +421,7 @@ async fn a_successful_run_crosses_the_language_boundary() {
 }
 
 #[tokio::test]
+#[ignore = "requires Python dependencies; run this target with --ignored"]
 async fn a_python_failure_arrives_with_its_machine_readable_code() {
     let server = require_python!(spawn("failure", 0.0));
     let bridge = GrpcAgentBridge::connect(bridge(server.port))
@@ -262,7 +435,7 @@ async fn a_python_failure_arrives_with_its_machine_readable_code() {
             code,
             message,
             retryable,
-            usage: _,
+            ..
         } => {
             assert_eq!(
                 code, "model_timeout",
@@ -280,7 +453,14 @@ async fn a_python_failure_arrives_with_its_machine_readable_code() {
 /// The default `request()` mints random ids, which is right for the tests above
 /// but useless for isolation: to prove a run executed under *this* tenant, the
 /// caller has to know which tenant it asked for.
-fn scoped_request(tenant: Uuid, organization: Uuid, project: Uuid) -> AgentRunRequest {
+fn scoped_request(
+    tenant: Uuid,
+    organization: Uuid,
+    project: Uuid,
+    request_id: Uuid,
+    task_id: Uuid,
+    task_attempt_id: Uuid,
+) -> AgentRunRequest {
     let context = RuntimeContext::new(
         TenantId::from(tenant),
         OrganizationId::from(organization),
@@ -288,16 +468,30 @@ fn scoped_request(tenant: Uuid, organization: Uuid, project: Uuid) -> AgentRunRe
         "e2e",
         Environment::Development,
     )
-    .expect("context");
+    .expect("context")
+    .with_request_id(request_id);
 
-    AgentRunRequest::from_context(
+    let agent_id = AgentId::new();
+    let agent_version_id = AgentVersionId::new();
+    let mut request = AgentRunRequest::from_context(
         &context,
-        AgentId::new(),
+        agent_id,
         serde_json::json!({"prompt": "hello from rust"}),
         ResourceLimits::default(),
         &TokenBudget::unlimited(),
     )
-    .expect("request")
+    .expect("request");
+    request.agent_version = Some(agent_version_id.to_string());
+    request.agent_snapshot = Some(runtime_snapshot(
+        agent_id,
+        context.tenant_id(),
+        context.organization_id(),
+        context.project_id(),
+        agent_version_id,
+    ));
+    request.task_id = Some(TaskId::from_uuid(task_id));
+    request.task_attempt_id = Some(TaskAttemptId::from_uuid(task_attempt_id));
+    request
 }
 
 /// Reads the scope the Python side reported back.
@@ -308,6 +502,7 @@ fn reported_scope(output: &serde_json::Value) -> serde_json::Value {
 }
 
 #[tokio::test]
+#[ignore = "requires Python dependencies; run this target with --ignored"]
 async fn each_run_executes_under_the_scope_rust_sent() {
     // Tenant isolation is a property no single side can prove. Rust can assert
     // it puts a tenant on the wire; Python can assert it reads one. Neither can
@@ -322,6 +517,9 @@ async fn each_run_executes_under_the_scope_rust_sent() {
     let tenants = [Uuid::from_u128(1), Uuid::from_u128(2)];
     let organizations = [Uuid::from_u128(11), Uuid::from_u128(12)];
     let projects = [Uuid::from_u128(21), Uuid::from_u128(22)];
+    let request_ids = [Uuid::from_u128(31), Uuid::from_u128(32)];
+    let task_ids = [Uuid::from_u128(41), Uuid::from_u128(42)];
+    let task_attempt_ids = [Uuid::from_u128(51), Uuid::from_u128(52)];
 
     let mut reported = Vec::new();
     for index in 0..2 {
@@ -330,12 +528,15 @@ async fn each_run_executes_under_the_scope_rust_sent() {
                 tenants[index],
                 organizations[index],
                 projects[index],
+                request_ids[index],
+                task_ids[index],
+                task_attempt_ids[index],
             ))
             .await
             .expect("run");
 
         let output = match verdict {
-            AgentRunVerdict::Succeeded { output, usage: _ } => output,
+            AgentRunVerdict::Succeeded { output, .. } => output,
             AgentRunVerdict::Failed { code, message, .. } => {
                 panic!("expected success, got {code}: {message}")
             },
@@ -360,6 +561,21 @@ async fn each_run_executes_under_the_scope_rust_sent() {
             projects[index].to_string(),
             "run {index} executed under the caller's project"
         );
+        assert_eq!(
+            scope["request_id"].as_str().expect("request_id"),
+            request_ids[index].to_string(),
+            "run {index} retains the originating request id"
+        );
+        assert_eq!(
+            scope["task_id"].as_str().expect("task_id"),
+            task_ids[index].to_string(),
+            "run {index} retains the durable task id"
+        );
+        assert_eq!(
+            scope["task_attempt_id"].as_str().expect("task_attempt_id"),
+            task_attempt_ids[index].to_string(),
+            "run {index} retains the durable worker claim attempt id"
+        );
     }
 
     // The decisive assertion: two runs on one connection must not share scope.
@@ -377,6 +593,7 @@ async fn each_run_executes_under_the_scope_rust_sent() {
 }
 
 #[tokio::test]
+#[ignore = "requires Python dependencies; run this target with --ignored"]
 async fn a_failure_never_carries_a_credential_across_the_wire() {
     // The stub raises an error whose own text embeds an API-key-shaped value
     // and a bearer token. That is not contrived: a provider adapter raises
@@ -421,6 +638,7 @@ async fn a_failure_never_carries_a_credential_across_the_wire() {
 }
 
 #[tokio::test]
+#[ignore = "requires Python dependencies; run this target with --ignored"]
 async fn a_wrong_credential_is_refused() {
     let server = require_python!(spawn("success", 0.0));
     let mut config = bridge(server.port);
@@ -451,6 +669,7 @@ async fn a_wrong_credential_is_refused() {
 }
 
 #[tokio::test]
+#[ignore = "requires Python dependencies; run this target with --ignored"]
 async fn a_missing_credential_is_refused() {
     let server = require_python!(spawn("success", 0.0));
     let mut config = bridge(server.port);
@@ -473,6 +692,7 @@ async fn a_missing_credential_is_refused() {
 }
 
 #[tokio::test]
+#[ignore = "requires Python dependencies; run this target with --ignored"]
 async fn a_subject_that_disagrees_with_the_credential_is_refused() {
     // The token authenticates the subject "rust-core". Declaring a different
     // subject in the body is exactly the forgery the orchestrator exists to
@@ -499,6 +719,7 @@ async fn a_subject_that_disagrees_with_the_credential_is_refused() {
 }
 
 #[tokio::test]
+#[ignore = "requires Python dependencies; run this target with --ignored"]
 async fn a_deadline_the_python_side_cannot_meet_is_not_a_success() {
     // A slow server plus a tight Rust deadline. The run may fail with a timeout
     // or be cancelled; what it must never do is return Succeeded, because the
@@ -531,6 +752,7 @@ async fn a_deadline_the_python_side_cannot_meet_is_not_a_success() {
 }
 
 #[tokio::test]
+#[ignore = "requires Python dependencies; run this target with --ignored"]
 async fn a_cancelled_run_is_never_reported_as_success() {
     let server = require_python!(spawn("hang", 0.0));
     let bridge = GrpcAgentBridge::connect(bridge(server.port))
@@ -572,6 +794,7 @@ async fn a_cancelled_run_is_never_reported_as_success() {
 /// two serializations disagreed by a single byte, this test would fail with
 /// `Unauthenticated` rather than passing silently.
 #[tokio::test]
+#[ignore = "requires Python dependencies; run this target with --ignored"]
 async fn a_signed_call_is_accepted_across_the_language_boundary() {
     let server = require_python!(spawn("success", 0.0));
     let bridge = GrpcAgentBridge::connect(bridge(server.port))
@@ -594,6 +817,7 @@ async fn a_signed_call_is_accepted_across_the_language_boundary() {
 /// *this* message. With a secret configured on the receiver, the absence of a
 /// signature is a refusal, not a fallback.
 #[tokio::test]
+#[ignore = "requires Python dependencies; run this target with --ignored"]
 async fn an_unsigned_call_is_refused() {
     let server = require_python!(spawn("success", 0.0));
     let bridge = GrpcAgentBridge::connect(unsigned_bridge(server.port))
@@ -616,6 +840,7 @@ async fn an_unsigned_call_is_refused() {
 /// The MAC is keyed. A structurally perfect signature produced without the
 /// shared secret proves nothing, and must not be accepted.
 #[tokio::test]
+#[ignore = "requires Python dependencies; run this target with --ignored"]
 async fn a_signature_under_the_wrong_secret_is_refused() {
     let server = require_python!(spawn("success", 0.0));
     let bridge = GrpcAgentBridge::connect(miskeyed_bridge(server.port))

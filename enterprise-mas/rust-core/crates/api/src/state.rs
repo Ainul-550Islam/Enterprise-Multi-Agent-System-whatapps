@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use mas_application::agent_service::AgentService;
 use mas_application::execution_service::ExecutionService;
+use mas_application::rollback_service::RollbackApplicationService;
 use mas_application::schedule_service::ScheduleService;
 use mas_application::tenancy_service::TenancyService;
 use mas_application::workflow_service::WorkflowService;
@@ -52,6 +53,8 @@ pub struct AppState {
     pub agents: Arc<AgentService>,
     /// Workflow lifecycle use-cases.
     pub workflows: Arc<WorkflowService>,
+    /// Agent/workflow rollback dispatch and tenant-scoped history.
+    pub rollbacks: Option<Arc<RollbackApplicationService>>,
     /// Execution lifecycle use-cases.
     pub executions: Arc<ExecutionService>,
     /// Schedule lifecycle use-cases.
@@ -100,6 +103,14 @@ impl std::fmt::Debug for AppState {
 }
 
 impl AppState {
+    /// Installs the rollback use case after the shared agent/workflow services
+    /// have been composed over their common history store.
+    #[must_use]
+    pub fn with_rollbacks(mut self, rollbacks: Arc<RollbackApplicationService>) -> Self {
+        self.rollbacks = Some(rollbacks);
+        self
+    }
+
     /// The canonical control plane.
     #[must_use]
     pub fn control_plane(&self) -> &Arc<mas_application::control_plane::ControlPlane> {
@@ -152,6 +163,7 @@ impl AppState {
             tenancy,
             agents,
             workflows,
+            rollbacks: None,
             executions,
             schedules,
             control_plane,
@@ -181,12 +193,18 @@ pub mod test_support {
     use mas_application::workflow_service::WorkflowService;
     use mas_observability::health::HealthRegistry;
 
-    use super::AppState;
+    use super::{AppState, RollbackApplicationService};
     use crate::auth::StaticTokenVerifier;
     use mas_security::{PrincipalKind, ScopeSet, SecurityPrincipal};
 
     /// Fresh, fully-wired state over one shared in-memory store.
     pub fn inmemory_state() -> AppState {
+        inmemory_state_with_store().0
+    }
+
+    /// Fresh in-memory state and the shared backing store, for tests that need
+    /// to seed read models written by an external runtime.
+    pub fn inmemory_state_with_store() -> (AppState, Arc<InMemoryServices>) {
         let store = Arc::new(InMemoryServices::new());
         let audit = Arc::new(InMemoryAuditSink::new());
         let control_plane =
@@ -200,29 +218,45 @@ pub mod test_support {
             Box::new(audit.clone()),
             Box::new(control_plane.entitlement_store()),
         ));
-        let agents = Arc::new(AgentService::new(
+        let agents = Arc::new(
+            AgentService::new(
+                Box::new(store.clone()),
+                Box::new(store.clone()),
+                Box::new(store.clone()),
+                Box::new(audit.clone()),
+            )
+            .with_rollback_store(Box::new(store.clone())),
+        );
+        let workflows = Arc::new(
+            WorkflowService::new(
+                Box::new(store.clone()),
+                Box::new(store.clone()),
+                Box::new(store.clone()),
+                Box::new(audit.clone()),
+            )
+            .with_rollback_store(Box::new(store.clone())),
+        );
+        let rollbacks = Arc::new(RollbackApplicationService::new(
+            Arc::clone(&agents),
+            Arc::clone(&workflows),
             Box::new(store.clone()),
-            Box::new(store.clone()),
-            Box::new(store.clone()),
-            Box::new(audit.clone()),
-        ));
-        let workflows = Arc::new(WorkflowService::new(
-            Box::new(store.clone()),
-            Box::new(store.clone()),
-            Box::new(audit.clone()),
         ));
         // The durable port is mandatory. The in-memory implementation is
         // accepted here only because this is the crate's test harness — the
         // production composition root wires `PgDurableExecution`.
         let durable = Arc::new(InMemoryDurableExecution::new());
-        let executions = Arc::new(ExecutionService::new(
-            Box::new(store.clone()),
-            Box::new(store.clone()),
-            Box::new(store.clone()),
-            Box::new(audit.clone()),
-            durable,
-            Arc::clone(&control_plane),
-        ));
+        let executions = Arc::new(
+            ExecutionService::new(
+                Box::new(store.clone()),
+                Box::new(store.clone()),
+                Box::new(store.clone()),
+                Box::new(store.clone()),
+                Box::new(audit.clone()),
+                durable,
+                Arc::clone(&control_plane),
+            )
+            .with_step_store(Box::new(store.clone())),
+        );
         let schedules = Arc::new(ScheduleService::new(
             Box::new(store.clone()),
             Box::new(audit.clone()),
@@ -246,11 +280,11 @@ pub mod test_support {
                     store.clone(),
                 )),
                 Arc::new(crate::inmemory_directory::InMemoryMembershipDirectory::new(
-                    store,
+                    store.clone(),
                 )),
             ),
         ));
-        AppState::new(
+        let state = AppState::new(
             "mas-api-test",
             env!("CARGO_PKG_VERSION"),
             verifier,
@@ -274,5 +308,7 @@ pub mod test_support {
                 "inmemory-internal-secret".to_owned(),
             )),
         )
+        .with_rollbacks(rollbacks);
+        (state, store)
     }
 }

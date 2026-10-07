@@ -47,6 +47,44 @@ const ENV_TIMEOUT_MS: &str = "MAS_AI_BRIDGE_TIMEOUT_MS";
 const PATH_TIMEOUT_MS: &str = "ai_bridge.timeout_ms";
 const ENV_MAX_RESPONSE_BYTES: &str = "MAS_AI_BRIDGE_MAX_RESPONSE_BYTES";
 const PATH_MAX_RESPONSE_BYTES: &str = "ai_bridge.max_response_bytes";
+const ENV_INTERNAL_SIGNING_SECRET: &str = "MAS_AI_BRIDGE_INTERNAL_SIGNING_SECRET";
+const PATH_INTERNAL_SIGNING_SECRET: &str = "ai_bridge.internal_signing_secret";
+const ENV_TLS_CA_CERTIFICATE_PATH: &str = "MAS_AI_BRIDGE_TLS_CA_CERTIFICATE_PATH";
+const PATH_TLS_CA_CERTIFICATE_PATH: &str = "ai_bridge.tls_ca_certificate_path";
+const ENV_TLS_CLIENT_CERTIFICATE_PATH: &str = "MAS_AI_BRIDGE_TLS_CLIENT_CERTIFICATE_PATH";
+const PATH_TLS_CLIENT_CERTIFICATE_PATH: &str = "ai_bridge.tls_client_certificate_path";
+const ENV_TLS_CLIENT_PRIVATE_KEY_PATH: &str = "MAS_AI_BRIDGE_TLS_CLIENT_PRIVATE_KEY_PATH";
+const PATH_TLS_CLIENT_PRIVATE_KEY_PATH: &str = "ai_bridge.tls_client_private_key_path";
+
+/// Reads a non-empty PEM file without ever including its contents in errors.
+fn read_bridge_pem(path: &str, label: &str) -> Result<Vec<u8>> {
+    let contents = std::fs::read(path).map_err(|error| {
+        mas_common::error::AppError::validation(format!(
+            "cannot read configured AI bridge {label} at {path}: {error}"
+        ))
+    })?;
+    if contents.iter().all(u8::is_ascii_whitespace) {
+        return Err(mas_common::error::AppError::validation(format!(
+            "configured AI bridge {label} at {path} is empty"
+        )));
+    }
+    Ok(contents)
+}
+
+/// Reads a non-empty PEM private key into the redacting secret type.
+fn read_bridge_private_key(path: &str) -> Result<SecretString> {
+    let contents = std::fs::read_to_string(path).map_err(|error| {
+        mas_common::error::AppError::validation(format!(
+            "cannot read configured AI bridge TLS client key at {path}: {error}"
+        ))
+    })?;
+    if contents.trim().is_empty() {
+        return Err(mas_common::error::AppError::validation(format!(
+            "configured AI bridge TLS client key at {path} is empty"
+        )));
+    }
+    Ok(SecretString::new(contents))
+}
 
 /// Default per-call RPC timeout when the request carries no deadline.
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
@@ -61,6 +99,11 @@ const DEFAULT_MAX_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
 pub struct AgentBridgeSettings {
     endpoint: String,
     token: Option<SecretString>,
+    internal_signing_secret: Option<SecretString>,
+    tls_ca_certificate: Option<Vec<u8>>,
+    tls_client_certificate: Option<Vec<u8>>,
+    tls_client_private_key: Option<SecretString>,
+    requires_production_security: bool,
     timeout: Duration,
     max_response_bytes: usize,
 }
@@ -78,8 +121,25 @@ impl AgentBridgeSettings {
         let endpoint = merger.string(ENV_ENDPOINT, PATH_ENDPOINT, "");
         if endpoint.trim().is_empty() {
             return Err(mas_common::error::AppError::validation(format!(
-                "worker production requires {PATH_ENDPOINT} / {ENV_ENDPOINT}: \
+                "worker requires {PATH_ENDPOINT} / {ENV_ENDPOINT}: \
                  the Python AI orchestrator endpoint must be configured explicitly"
+            )));
+        }
+
+        let environment = merger.string("MAS_ENV", "environment", "development");
+        let requires_production_security = match environment.as_str() {
+            "development" | "test" => false,
+            "production" => true,
+            other => {
+                return Err(mas_common::error::AppError::validation(format!(
+                    "unsupported MAS_ENV {other:?}; expected development, test, or production"
+                )))
+            },
+        };
+
+        if requires_production_security && !endpoint.starts_with("https://") {
+            return Err(mas_common::error::AppError::validation(format!(
+                "production requires {PATH_ENDPOINT} / {ENV_ENDPOINT} to use https"
             )));
         }
 
@@ -97,9 +157,81 @@ impl AgentBridgeSettings {
             Some(SecretString::new(raw_token))
         };
 
+        let raw_signing_secret = merger.string(
+            ENV_INTERNAL_SIGNING_SECRET,
+            PATH_INTERNAL_SIGNING_SECRET,
+            "",
+        );
+        let internal_signing_secret = if raw_signing_secret.trim().is_empty() {
+            None
+        } else {
+            Some(SecretString::new(raw_signing_secret))
+        };
+        if requires_production_security && internal_signing_secret.is_none() {
+            return Err(mas_common::error::AppError::validation(format!(
+                "production requires {PATH_INTERNAL_SIGNING_SECRET} / \
+                 {ENV_INTERNAL_SIGNING_SECRET}: the Python bridge requires \
+                 body-bound internal service signatures"
+            )));
+        }
+
+        let ca_path = merger.string(
+            ENV_TLS_CA_CERTIFICATE_PATH,
+            PATH_TLS_CA_CERTIFICATE_PATH,
+            "",
+        );
+        let tls_ca_certificate = if ca_path.trim().is_empty() {
+            None
+        } else {
+            Some(read_bridge_pem(&ca_path, "TLS CA certificate")?)
+        };
+
+        let certificate_path = merger.string(
+            ENV_TLS_CLIENT_CERTIFICATE_PATH,
+            PATH_TLS_CLIENT_CERTIFICATE_PATH,
+            "",
+        );
+        let private_key_path = merger.string(
+            ENV_TLS_CLIENT_PRIVATE_KEY_PATH,
+            PATH_TLS_CLIENT_PRIVATE_KEY_PATH,
+            "",
+        );
+        let (tls_client_certificate, tls_client_private_key) = match (
+            certificate_path.trim().is_empty(),
+            private_key_path.trim().is_empty(),
+        ) {
+            (true, true) => (None, None),
+            (false, false) => (
+                Some(read_bridge_pem(
+                    &certificate_path,
+                    "TLS client certificate",
+                )?),
+                Some(read_bridge_private_key(&private_key_path)?),
+            ),
+            _ => {
+                return Err(mas_common::error::AppError::validation(format!(
+                    "AI bridge mutual TLS requires both {PATH_TLS_CLIENT_CERTIFICATE_PATH} \
+                         and {PATH_TLS_CLIENT_PRIVATE_KEY_PATH}"
+                )))
+            },
+        };
+
+        if !endpoint.starts_with("https://")
+            && (tls_ca_certificate.is_some() || tls_client_certificate.is_some())
+        {
+            return Err(mas_common::error::AppError::validation(
+                "AI bridge TLS material requires an https endpoint",
+            ));
+        }
+
         Ok(Self {
             endpoint,
             token,
+            internal_signing_secret,
+            tls_ca_certificate,
+            tls_client_certificate,
+            tls_client_private_key,
+            requires_production_security,
             timeout: Duration::from_millis(timeout_ms.max(1)),
             max_response_bytes: usize::try_from(max_response_bytes.max(1024))
                 .unwrap_or(DEFAULT_MAX_RESPONSE_BYTES as usize),
@@ -122,6 +254,22 @@ impl AgentBridgeSettings {
         }
     }
 
+    /// Returns the signing secret when configured and refuses its absence in
+    /// production. Development/test may rely on the Python server's explicitly
+    /// configured non-signing posture.
+    fn require_internal_signing_secret(&self) -> Result<Option<SecretString>> {
+        match self.internal_signing_secret.clone() {
+            Some(secret) => Ok(Some(secret)),
+            None if self.requires_production_security => {
+                Err(mas_common::error::AppError::validation(format!(
+                    "production requires {PATH_INTERNAL_SIGNING_SECRET} / \
+                     {ENV_INTERNAL_SIGNING_SECRET}"
+                )))
+            },
+            None => Ok(None),
+        }
+    }
+
     /// The configured endpoint, for log lines that must not print credentials.
     pub fn endpoint(&self) -> &str {
         &self.endpoint
@@ -130,11 +278,16 @@ impl AgentBridgeSettings {
     /// Connects a [`GrpcAgentBridge`] from these settings.
     pub async fn connect(&self) -> Result<GrpcAgentBridge> {
         let token = self.require_token()?;
+        let internal_signing_secret = self.require_internal_signing_secret()?;
         let config = GrpcAgentBridgeConfig {
             endpoint: self.endpoint.clone(),
             default_timeout: self.timeout,
             max_response_bytes: self.max_response_bytes,
             bearer_token: Some(token),
+            internal_signing_secret,
+            tls_ca_certificate: self.tls_ca_certificate.clone(),
+            tls_client_certificate: self.tls_client_certificate.clone(),
+            tls_client_private_key: self.tls_client_private_key.clone(),
             ..Default::default()
         };
         GrpcAgentBridge::connect(config).await
@@ -156,7 +309,7 @@ pub struct AgentRunDispatch {
     /// cancellation, all rebuilt from the message rather than trusted from it.
     pub context: RuntimeContext,
     /// The task's durable identity, carried to the orchestrator.
-    pub durable: mas_execution::executor::DurableRunIdentity<'static>,
+    pub durable: mas_execution::executor::DurableRunIdentity,
     /// The rendered input handed to the agent.
     pub input: serde_json::Value,
 }
@@ -257,11 +410,10 @@ impl AgentRunHandler {
             context,
             durable: mas_execution::executor::DurableRunIdentity {
                 task_id: message.task_id,
-                // Leaked to `'static` deliberately: the key is a `String` the
-                // message owns, and the dispatch borrows it for the duration of
-                // one run. Cloning per task would allocate on every dispatch to
-                // satisfy a lifetime the runtime does not actually need to own.
-                idempotency_key: Box::leak(message.idempotency_key.clone().into_boxed_str()),
+                task_attempt_id: message.task_attempt_id,
+                // The identity owns the key for the duration of the awaited
+                // run and drops it with the dispatch; no process-lifetime leak.
+                idempotency_key: message.idempotency_key.clone(),
             },
             input: message.input.clone(),
         })
@@ -292,6 +444,12 @@ impl AgentRunHandler {
         });
 
         context = context.with_correlation_id(message.correlation_id.clone());
+        if let Some(request_id) = message.request_id {
+            context = context.with_request_id(request_id);
+        }
+        if let Some(version_id) = message.agent_version_id {
+            context = context.with_agent_version_id(version_id);
+        }
         context = context.for_execution(execution_id, None);
         // The run is cancelled by the worker's shutdown path, so a graceful
         // drain stops AI work instead of abandoning it mid-flight.
@@ -441,7 +599,9 @@ fn usage_json(usage: Option<&mas_domain::ResourceUsageSummary>) -> serde_json::V
 mod tests {
     use super::*;
     use mas_common::error::AppError;
-    use mas_common::ids::{AgentId, ExecutionId, OrganizationId, ProjectId, TaskId, TenantId};
+    use mas_common::ids::{
+        AgentId, ExecutionId, OrganizationId, ProjectId, TaskAttemptId, TaskId, TenantId,
+    };
     use mas_execution::agent_bridge::{AgentRunVerdict, AgentUsage};
     // `execute` comes from the trait, not from an inherent impl: the handler is
     // only meaningful as a `TaskHandlerPort`.
@@ -466,6 +626,8 @@ mod tests {
             "corr-1",
         )
         .expect("message")
+        .with_agent_version_id(mas_common::ids::AgentVersionId::new())
+        .with_request_id(uuid::Uuid::from_u128(901))
     }
 
     fn handler() -> AgentRunHandler {
@@ -526,6 +688,8 @@ mod tests {
                     steps: 1,
                     active_time_ms: 5,
                 },
+                model_key: Some("openai/gpt-4o".to_owned()),
+                finish_reason: Some("completed".to_owned()),
             })
         }
     }
@@ -555,6 +719,8 @@ mod tests {
                 message: "tool 'shell' is not permitted for this agent".to_owned(),
                 retryable: false,
                 usage: AgentUsage::default(),
+                correlation_id: None,
+                request_id: None,
             })
         }
     }
@@ -577,15 +743,37 @@ mod tests {
     #[test]
     fn build_dispatch_propagates_task_identity_and_idempotency() {
         let handler = handler();
-        let message = message();
+        let task_attempt_id = TaskAttemptId::new();
+        let message = message().with_task_attempt_id(task_attempt_id);
 
         let dispatch = handler.build_dispatch(&message).expect("dispatch");
 
         assert_eq!(dispatch.durable.task_id, message.task_id);
+        assert_eq!(dispatch.durable.task_attempt_id, Some(task_attempt_id));
         assert_eq!(dispatch.execution_id, message.execution_id.expect("seeded"));
         assert_eq!(dispatch.durable.idempotency_key, "idem-1");
         assert_eq!(dispatch.context.correlation_id(), "corr-1");
+        assert_eq!(dispatch.context.request_id(), message.request_id);
         assert_eq!(dispatch.context.execution_id(), message.execution_id);
+        let version_id = message.agent_version_id.expect("test message is pinned");
+        assert_eq!(dispatch.context.agent_version_id(), Some(version_id));
+        let restored = RuntimeContext::from_snapshot(dispatch.context.snapshot())
+            .expect("restore pinned context");
+        assert_eq!(restored.agent_version_id(), Some(version_id));
+
+        let bridge_request = mas_execution::agent_bridge::AgentRunRequest::from_context(
+            &dispatch.context,
+            dispatch.agent_id,
+            dispatch.input.clone(),
+            mas_domain::ResourceLimits::default(),
+            &mas_domain::TokenBudget::unlimited(),
+        )
+        .expect("build bridge request from durable context");
+        let expected_version = version_id.to_string();
+        assert_eq!(
+            bridge_request.agent_version.as_deref(),
+            Some(expected_version.as_str())
+        );
     }
 
     #[test]
@@ -657,13 +845,15 @@ mod tests {
         message.deadline = Some(Timestamp::from_unix_ms(1).expect("timestamp"));
 
         let dispatch = handler.build_dispatch(&message).expect("dispatch");
-        let remaining = dispatch
-            .context
-            .remaining()
-            .expect("an expired deadline still yields a timeout");
+        let deadline_epoch_ms = dispatch.context.snapshot().deadline_epoch_ms;
+        let remaining = dispatch.context.remaining();
         assert!(
-            remaining <= Duration::from_millis(1),
-            "an expired deadline fails fast inside the bridge: {remaining:?}"
+            deadline_epoch_ms.is_some(),
+            "an expired task deadline is converted into a bounded runtime deadline"
+        );
+        assert!(
+            remaining.is_none_or(|duration| duration <= Duration::from_millis(1)),
+            "an expired deadline is either already elapsed or no more than one millisecond away: {remaining:?}"
         );
     }
 
@@ -798,5 +988,63 @@ mod tests {
             .expect_err("no credential must be refused before connecting");
         let rendered = format!("{error}");
         assert!(rendered.contains(PATH_TOKEN), "names the key: {rendered}");
+    }
+
+    #[test]
+    fn production_settings_require_https_transport() {
+        use mas_common::config::Merger;
+        let mut table = toml::Table::new();
+        table.insert(
+            "environment".to_owned(),
+            toml::Value::String("production".to_owned()),
+        );
+        table.insert(
+            "ai_bridge".to_owned(),
+            toml::Value::Table({
+                let mut inner = toml::Table::new();
+                inner.insert(
+                    "endpoint".to_owned(),
+                    toml::Value::String("http://orchestrator.internal:9100".to_owned()),
+                );
+                inner
+            }),
+        );
+        let layered = toml::Value::Table(table);
+        let merger = Merger::new(&layered);
+
+        let error = AgentBridgeSettings::from_merger(&merger)
+            .expect_err("production must not connect over plaintext gRPC");
+
+        assert!(format!("{error}").contains("https"));
+    }
+
+    #[test]
+    fn production_settings_require_the_python_shared_signing_secret() {
+        use mas_common::config::Merger;
+        let mut table = toml::Table::new();
+        table.insert(
+            "environment".to_owned(),
+            toml::Value::String("production".to_owned()),
+        );
+        table.insert(
+            "ai_bridge".to_owned(),
+            toml::Value::Table({
+                let mut inner = toml::Table::new();
+                inner.insert(
+                    "endpoint".to_owned(),
+                    toml::Value::String("https://orchestrator.internal:9100".to_owned()),
+                );
+                inner
+            }),
+        );
+        let layered = toml::Value::Table(table);
+        let merger = Merger::new(&layered);
+
+        let error = AgentBridgeSettings::from_merger(&merger)
+            .expect_err("production must sign every request body");
+        let rendered = format!("{error}");
+
+        assert!(rendered.contains(PATH_INTERNAL_SIGNING_SECRET));
+        assert!(rendered.contains(ENV_INTERNAL_SIGNING_SECRET));
     }
 }

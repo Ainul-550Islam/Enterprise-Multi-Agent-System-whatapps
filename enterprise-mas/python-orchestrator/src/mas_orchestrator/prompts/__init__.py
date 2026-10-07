@@ -14,6 +14,13 @@ an injection rather than as a directive.
 
 from __future__ import annotations
 
+from mas_orchestrator.prompts.builtin_assistant import (
+    PLATFORM_ASSISTANT_BODY,
+    PLATFORM_ASSISTANT_PROMPT,
+    PLATFORM_ASSISTANT_VERSION,
+    QUICK_ACTION_PROMPTS,
+    register_builtin_assistant_prompt,
+)
 from mas_orchestrator.prompts.hashing import (
     FINGERPRINT_LENGTH,
     FINGERPRINT_PREFIX,
@@ -69,6 +76,10 @@ __all__ = [
     "MAX_PROMPT_CHARS",
     "MAX_RENDERED_CHARS",
     "PLANNER_SYSTEM",
+    "PLATFORM_ASSISTANT_BODY",
+    "PLATFORM_ASSISTANT_PROMPT",
+    "PLATFORM_ASSISTANT_VERSION",
+    "QUICK_ACTION_PROMPTS",
     "STANDARD_SYSTEM",
     "SUMMARISATION",
     "SUPERVISOR_SYSTEM",
@@ -93,6 +104,7 @@ __all__ = [
     "join",
     "next_version",
     "prepare",
+    "register_builtin_assistant_prompt",
     "register_system_prompts",
     "render",
     "scan_template",

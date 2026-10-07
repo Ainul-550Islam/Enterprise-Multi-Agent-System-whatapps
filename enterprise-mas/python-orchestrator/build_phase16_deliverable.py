@@ -32,9 +32,10 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-REPO = Path("/home/user/repo/enterprise-mas/rust-core")
-PY = Path("/home/user/python-orchestrator")
-OUT = Path("/home/user/RUST_PYTHON_BRIDGE_PHASE16_FILES.md")
+WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
+REPO = WORKSPACE_ROOT / "enterprise-mas" / "rust-core"
+PY = WORKSPACE_ROOT / "enterprise-mas" / "python-orchestrator"
+OUT = WORKSPACE_ROOT / "RUST_PYTHON_BRIDGE_PHASE16_FILES.md"
 
 # (display path, absolute path, language)
 FILES: list[tuple[str, Path, str]] = [

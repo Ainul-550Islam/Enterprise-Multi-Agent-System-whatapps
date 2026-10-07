@@ -31,6 +31,7 @@ Python-only checkout.
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 from typing import Final
@@ -53,11 +54,33 @@ from mas_orchestrator.grpc.metadata import (
     TENANT_HEADER,
 )
 
-#: The Rust workspace, relative to this file.
-RUST_CORE: Final[Path] = (
-    Path(__file__).resolve().parents[2] / ".." / "repo" / "enterprise-mas" / "rust-core"
-).resolve()
 
+def _rust_core_root() -> Path:
+    """Finds the sibling Rust workspace or honors an explicit override.
+
+    Python-only source distributions legitimately omit Rust and will skip
+    these source-contract tests. In a monorepo checkout, the sibling
+    ``rust-core`` path is discovered automatically instead of relying on a
+    machine-specific absolute path.
+    """
+    configured = os.environ.get("MAS_RUST_CORE_ROOT")
+    if configured:
+        return Path(configured).expanduser().resolve()
+
+    python_root = Path(__file__).resolve().parents[2]
+    candidates = (
+        python_root.parent / "rust-core",
+        python_root / ".." / "rust-core",
+        python_root.parent / "repo" / "enterprise-mas" / "rust-core",
+    )
+    return next(
+        (candidate.resolve() for candidate in candidates if (candidate / "crates").is_dir()),
+        candidates[0].resolve(),
+    )
+
+
+#: The Rust workspace, relative to this file or ``MAS_RUST_CORE_ROOT``.
+RUST_CORE: Final[Path] = _rust_core_root()
 AI_BRIDGE_LIB: Final[Path] = RUST_CORE / "crates" / "ai-bridge" / "src" / "lib.rs"
 
 #: Python sources read as data, resolved from this file rather than the cwd so

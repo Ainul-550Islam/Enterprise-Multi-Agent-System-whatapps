@@ -789,7 +789,12 @@ impl PgDurableExecution {
                 .clone()
                 .unwrap_or_else(|| execution_id.to_string()),
             intent.created_by.clone(),
-        )?;
+        )?
+        .with_request_id(intent.request_id)
+        .with_correlation_id(intent.correlation_id.clone())?;
+        if let Some(version_id) = intent.agent_version_id {
+            task = task.with_agent_version_id(version_id)?;
+        }
         task.max_attempts = intent.max_attempts;
         task.attach_execution(execution_id)?;
         if let Some(deadline) = intent.deadline {
@@ -1127,7 +1132,7 @@ impl PgDurableExecution {
                 organization_id: task.organization_id,
                 project_id: task.project_id,
                 execution_id: task.execution_id.unwrap_or_else(ExecutionId::new),
-                correlation_id: query.worker.clone(),
+                correlation_id: task.correlation_id.clone(),
                 actor: query.worker.clone(),
                 occurred_at: query.now,
             };
@@ -1347,7 +1352,7 @@ impl PgDurableExecution {
             organization_id: task.organization_id,
             project_id: task.project_id,
             execution_id: task.execution_id.unwrap_or_else(ExecutionId::new),
-            correlation_id: settlement.worker.clone(),
+            correlation_id: task.correlation_id.clone(),
             actor: settlement.actor.id.clone(),
             occurred_at: settlement.now,
         };
@@ -1417,7 +1422,7 @@ impl PgDurableExecution {
             &mut *conn,
             tenant,
             task.organization_id,
-            &settlement.worker,
+            &task.correlation_id,
             &transitions,
         )
         .await?;

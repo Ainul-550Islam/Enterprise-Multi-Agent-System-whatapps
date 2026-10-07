@@ -34,7 +34,7 @@ use crate::node_adapters::{AdapterWiring, AgentNodeExecutor, RunScope, SharedSco
 use crate::resource_guard::{GuardSnapshot, ResourceGuard};
 use crate::step_runner::StepRunner;
 use mas_common::error::AppError;
-use mas_common::ids::{AgentId, ExecutionId, ExecutionStepId, TaskId};
+use mas_common::ids::{AgentId, ExecutionId, ExecutionStepId, TaskAttemptId, TaskId};
 use mas_common::result::Result;
 use mas_domain::{
     ExecutionStep, ResourceLimits, TokenBudget, WorkflowGraph, WorkflowNode, WorkflowNodeType,
@@ -122,12 +122,17 @@ pub struct AgentRunOutcome {
 /// so the orchestrator can attribute the run to the task that owns it and
 /// deduplicate a redelivery instead of re-running paid work. Graph runs that
 /// were never a queue message pass `None`.
-#[derive(Debug, Clone, Copy)]
-pub struct DurableRunIdentity<'a> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableRunIdentity {
     /// The durable task that owns this run.
     pub task_id: TaskId,
+    /// The durable attempt that owns this particular delivery, when known.
+    pub task_attempt_id: Option<TaskAttemptId>,
     /// The task's idempotency key: the deduplication handle for the run.
-    pub idempotency_key: &'a str,
+    ///
+    /// Owned so the identity remains valid across the awaited bridge call; a
+    /// borrowed `'static` key would require leaking one allocation per task.
+    pub idempotency_key: String,
 }
 
 /// A classified agent-node failure returned by [`Executor::run_agent_node`].
@@ -409,7 +414,7 @@ impl Executor {
         agent_id: AgentId,
         input: serde_json::Value,
         context: &RuntimeContext,
-        durable: Option<DurableRunIdentity<'_>>,
+        durable: Option<DurableRunIdentity>,
     ) -> Result<AgentRunOutcome> {
         if self.config.step_guard_charge_per_step == 0 {
             return Err(AppError::invalid_field(
@@ -456,8 +461,13 @@ impl Executor {
                 input,
                 context,
                 attempt: 1,
-                task_id: durable.map(|identity| identity.task_id),
-                idempotency_key: durable.map(|identity| identity.idempotency_key),
+                task_id: durable.as_ref().map(|identity| identity.task_id),
+                task_attempt_id: durable
+                    .as_ref()
+                    .and_then(|identity| identity.task_attempt_id),
+                idempotency_key: durable
+                    .as_ref()
+                    .map(|identity| identity.idempotency_key.as_str()),
             })
             .await;
 
@@ -959,6 +969,8 @@ mod tests {
                     steps: 1,
                     active_time_ms: 3,
                 },
+                model_key: None,
+                finish_reason: Some("completed".to_owned()),
             })
         }));
 
@@ -1013,6 +1025,8 @@ mod tests {
                 message: "provider rate limited the run".to_owned(),
                 retryable: true,
                 usage: AgentUsage::default(),
+                correlation_id: None,
+                request_id: None,
             })
         }));
 
@@ -1083,6 +1097,8 @@ mod tests {
             Ok(AgentRunVerdict::Succeeded {
                 output: serde_json::json!({"ok": true}),
                 usage: AgentUsage::default(),
+                model_key: None,
+                finish_reason: Some("completed".to_owned()),
             })
         }));
         let scopes = SharedScopes::new();
@@ -1134,6 +1150,8 @@ mod tests {
             Ok(AgentRunVerdict::Succeeded {
                 output: serde_json::json!({"ok": true}),
                 usage: AgentUsage::default(),
+                model_key: None,
+                finish_reason: Some("completed".to_owned()),
             })
         }));
 
@@ -1146,7 +1164,8 @@ mod tests {
                 &agent_context(tenant, org, project),
                 Some(DurableRunIdentity {
                     task_id,
-                    idempotency_key: "idem-durable-1",
+                    task_attempt_id: None,
+                    idempotency_key: "idem-durable-1".to_owned(),
                 }),
             )
             .await

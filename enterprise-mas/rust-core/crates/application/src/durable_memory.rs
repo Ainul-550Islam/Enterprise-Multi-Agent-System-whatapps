@@ -264,7 +264,7 @@ impl InMemoryDurableExecution {
             organization_id: task_snapshot.organization_id,
             project_id: task_snapshot.project_id,
             execution_id: task_snapshot.execution_id.unwrap_or_else(ExecutionId::new),
-            correlation_id: task_id.to_string(),
+            correlation_id: task_snapshot.correlation_id.clone(),
             actor: actor.label(),
             occurred_at: query.now,
         };
@@ -421,7 +421,12 @@ impl DurableExecutionPort for InMemoryDurableExecution {
                 format!("exec:{}", execution.id)
             }),
             intent.created_by.clone(),
-        )?;
+        )?
+        .with_request_id(intent.request_id)
+        .with_correlation_id(intent.correlation_id.clone())?;
+        if let Some(version_id) = intent.agent_version_id {
+            task = task.with_agent_version_id(version_id)?;
+        }
         task.max_attempts = intent.max_attempts;
         if let Some(deadline) = intent.deadline {
             task.deadline = Some(deadline);
@@ -574,6 +579,7 @@ impl DurableExecutionPort for InMemoryDurableExecution {
             let organization_id = task.organization_id;
             let project_id = task.project_id;
             let execution_id = task.execution_id;
+            let correlation_id = task.correlation_id.clone();
 
             let attempt = TaskAttempt::start(
                 tenant_id,
@@ -620,7 +626,7 @@ impl DurableExecutionPort for InMemoryDurableExecution {
                 organization_id,
                 project_id,
                 execution_id: execution_id.unwrap_or_else(ExecutionId::new),
-                correlation_id: task_id.to_string(),
+                correlation_id,
                 actor: format!("worker:{}", query.worker),
                 occurred_at: query.now,
             };
@@ -811,7 +817,7 @@ impl DurableExecutionPort for InMemoryDurableExecution {
             organization_id,
             project_id,
             execution_id: execution_for_context,
-            correlation_id: task.id.to_string(),
+            correlation_id: task.correlation_id.clone(),
             actor: settlement.actor.label(),
             occurred_at: settlement.now,
         };
@@ -1245,6 +1251,7 @@ mod tests {
             project_id: ProjectId::new(),
             workflow_id: Some(mas_common::ids::WorkflowId::new()),
             agent_id: None,
+            agent_version_id: None,
             input: serde_json::json!({"prompt": "hi"}),
             idempotency_key: Some(key.to_owned()),
             fingerprint: fingerprint.to_owned(),
@@ -1253,6 +1260,7 @@ mod tests {
             max_attempts: 3,
             deadline: None,
             correlation_id: "corr-1".to_owned(),
+            request_id: uuid::Uuid::now_v7(),
             created_by: "user-1".to_owned(),
             actor: mas_domain::TransitionActor::principal("user-1", TenantId::new())
                 .expect("actor"),
@@ -1291,6 +1299,22 @@ mod tests {
             .metrics()
             .registry()
             .counter_value(family, &mas_observability::metrics::LabelSet::empty())
+    }
+
+    #[tokio::test]
+    async fn durable_task_retains_its_originating_request_id() {
+        let store = InMemoryDurableExecution::new();
+        let submission = intent("request-id-task", A);
+        let request_id = submission.request_id;
+        let receipt = store.submit(submission).await.expect("submit");
+        let (task, _) = store
+            .load_task(receipt.task.tenant_id, receipt.task.id)
+            .await
+            .expect("load task")
+            .expect("persisted task");
+
+        assert_eq!(receipt.task.request_id, Some(request_id));
+        assert_eq!(task.request_id, Some(request_id));
     }
 
     #[tokio::test]
@@ -1429,6 +1453,55 @@ mod tests {
             format!("{error}").contains("k1"),
             "names the offending key: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn task_claim_and_settlement_events_keep_submission_correlation() {
+        let store = InMemoryDurableExecution::new();
+        let correlation_id = "corr-submission-e2e";
+        let mut submission = intent("idem-correlation-roundtrip", A);
+        submission.correlation_id = correlation_id.to_owned();
+        let receipt = store.submit(submission).await.expect("submit");
+
+        let worker = "worker-correlation";
+        let claim = store
+            .claim(claim_query(worker, 1))
+            .await
+            .expect("claim")
+            .pop()
+            .expect("one claim");
+        assert_eq!(claim.task.id, receipt.task.id);
+
+        let claimed_event = store
+            .outbox()
+            .into_iter()
+            .find(|record| record.envelope.event_type == events::TASK_CLAIMED)
+            .expect("claim event");
+        assert_eq!(claimed_event.envelope.correlation_id, correlation_id);
+
+        store
+            .settle(TaskSettlement {
+                tenant_id: claim.task.tenant_id,
+                task_id: claim.task.id,
+                attempt_id: claim.attempt.id,
+                worker: worker.to_owned(),
+                expected_version: claim.task.version(),
+                outcome: TaskOutcome::Succeeded {
+                    usage: ExecutionUsage::default(),
+                },
+                execution: None,
+                actor: TransitionActor::worker(worker).expect("worker actor"),
+                now: now().checked_add(Duration::from_secs(1)).expect("time"),
+            })
+            .await
+            .expect("settle");
+
+        let succeeded_event = store
+            .outbox()
+            .into_iter()
+            .find(|record| record.envelope.event_type == events::TASK_SUCCEEDED)
+            .expect("success event");
+        assert_eq!(succeeded_event.envelope.correlation_id, correlation_id);
     }
 
     #[tokio::test]

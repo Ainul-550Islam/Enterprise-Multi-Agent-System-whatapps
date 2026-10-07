@@ -6,13 +6,14 @@ use mas_common::error::AppError;
 use mas_common::ids::{AgentId, ProjectId, UserId};
 use mas_common::result::Result;
 use mas_contracts::agent::AgentResponse;
+use mas_contracts::rollback::{RollbackRequest, RollbackResponseDto};
 use mas_domain::value_objects::Slug;
-use mas_domain::{Agent, AgentKind, AgentVersion};
+use mas_domain::{Agent, AgentKind, AgentVersion, RollbackRecord, RollbackResourceKind};
 
 use crate::audit::{self, AuditSinkPort};
 use crate::context::ServiceContext;
 use crate::dto;
-use crate::stores::{AgentStorePort, AgentVersionStorePort, ProjectStorePort};
+use crate::stores::{AgentStorePort, AgentVersionStorePort, ProjectStorePort, RollbackStorePort};
 
 /// Use-cases over agents and their immutable versions.
 #[derive(Debug)]
@@ -20,6 +21,7 @@ pub struct AgentService {
     projects: Box<dyn ProjectStorePort>,
     agents: Box<dyn AgentStorePort>,
     versions: Box<dyn AgentVersionStorePort>,
+    rollbacks: Option<Box<dyn RollbackStorePort>>,
     audit: Box<dyn AuditSinkPort>,
 }
 
@@ -35,8 +37,16 @@ impl AgentService {
             projects,
             agents,
             versions,
+            rollbacks: None,
             audit,
         }
+    }
+
+    /// Attaches the append-only rollback history port.
+    #[must_use]
+    pub fn with_rollback_store(mut self, rollbacks: Box<dyn RollbackStorePort>) -> Self {
+        self.rollbacks = Some(rollbacks);
+        self
     }
 
     /// Registers a new agent in `Draft`, enforcing:
@@ -151,6 +161,133 @@ impl AgentService {
         Ok(versions)
     }
 
+    /// Publishes a new monotonic version from an earlier immutable snapshot.
+    /// Repeating the same tenant-scoped idempotency key returns the original
+    /// receipt only when the resource, target version, and reason also match.
+    pub async fn rollback_version(
+        &self,
+        ctx: &ServiceContext,
+        agent_id: AgentId,
+        request: &RollbackRequest,
+    ) -> Result<RollbackResponseDto> {
+        request.validate()?;
+        let tenant_id = ctx.require_tenant()?;
+        let mut agent = self.scope_checked(ctx, agent_id).await?;
+        agent.ensure_api_mutable("roll back")?;
+        if agent.status == mas_common::enums::AgentStatus::Archived {
+            return Err(AppError::conflict("archived agents cannot be rolled back"));
+        }
+        let rollback_store = self
+            .rollbacks
+            .as_ref()
+            .ok_or_else(|| AppError::internal("agent rollback history store is not configured"))?;
+        if let Some(existing) = rollback_store
+            .get_by_idempotency(tenant_id, &request.idempotency_key)
+            .await?
+        {
+            return self.replay_rollback(&existing, agent_id, request).await;
+        }
+
+        let current_version = agent.current_version.ok_or_else(|| {
+            AppError::conflict("an unpublished agent has no version to roll back")
+        })?;
+        let versions = self.versions.list(agent_id).await?;
+        let source = versions
+            .iter()
+            .find(|version| version.version_number() == request.target_version_number)
+            .ok_or_else(|| {
+                AppError::not_found(
+                    "agent version",
+                    format!("{}:{}", agent_id, request.target_version_number),
+                )
+            })?;
+        if source.version_number() >= current_version {
+            return Err(AppError::conflict(
+                "rollback target must be older than the current agent version",
+            ));
+        }
+        let next_version = current_version
+            .checked_add(1)
+            .ok_or_else(|| AppError::conflict("agent version counter is exhausted"))?;
+        let publisher = authenticated_user(ctx)?;
+        let version = AgentVersion::publish(
+            agent_id,
+            next_version,
+            source.configuration_checksum().to_owned(),
+            source.configuration_snapshot().clone(),
+            publisher,
+        )?
+        .as_rollback_of(source.id());
+        let record = RollbackRecord::new(
+            tenant_id,
+            RollbackResourceKind::Agent,
+            *agent.id.as_uuid(),
+            current_version,
+            next_version,
+            ctx.actor.clone(),
+            request.reason.clone(),
+            request.idempotency_key.clone(),
+        )?;
+        agent.record_published_version(next_version)?;
+
+        if let Err(error) = rollback_store
+            .commit_agent_rollback(&agent, &version, &record)
+            .await
+        {
+            if let Some(existing) = rollback_store
+                .get_by_idempotency(tenant_id, &request.idempotency_key)
+                .await?
+            {
+                return self.replay_rollback(&existing, agent_id, request).await;
+            }
+            return Err(error);
+        }
+        audit::record_mutation(
+            ctx,
+            self.audit.as_ref(),
+            "agent.rollback_version",
+            "agent",
+            Some(agent_id.to_string()),
+            mas_domain::AuditOutcome::Success,
+        )
+        .await?;
+        Ok(rollback_response(&record, request.target_version_number))
+    }
+
+    async fn replay_rollback(
+        &self,
+        record: &RollbackRecord,
+        agent_id: AgentId,
+        request: &RollbackRequest,
+    ) -> Result<RollbackResponseDto> {
+        if record.resource_kind != RollbackResourceKind::Agent
+            || record.resource_id != *agent_id.as_uuid()
+            || record.reason != request.reason
+        {
+            return Err(AppError::conflict(
+                "rollback idempotency key was already used for a different operation",
+            ));
+        }
+        let versions = self.versions.list(agent_id).await?;
+        let created = versions
+            .iter()
+            .find(|version| version.version_number() == record.to_version)
+            .ok_or_else(|| AppError::database("rollback record has no published agent version"))?;
+        let source_id = created
+            .rollback_of()
+            .ok_or_else(|| AppError::database("rollback version is missing its source link"))?;
+        let source = versions
+            .iter()
+            .find(|version| version.id() == source_id)
+            .ok_or_else(|| AppError::database("rollback source version is missing"))?;
+        if source.version_number() != request.target_version_number {
+            return Err(AppError::conflict(
+                "rollback idempotency key was already used with a different target version",
+            ));
+        }
+        Ok(rollback_response(record, source.version_number()))
+    }
+
     async fn scope_checked(&self, ctx: &ServiceContext, agent_id: AgentId) -> Result<Agent> {
         let tenant_id = ctx.require_tenant()?;
         let organization_id = ctx.require_organization()?;
@@ -173,6 +310,31 @@ impl AgentService {
             .await?
             .filter(|p| p.tenant_id == tenant_id && p.organization_id == organization_id)
             .ok_or_else(|| AppError::not_found("project", project.to_string()))
+    }
+}
+
+fn authenticated_user(ctx: &ServiceContext) -> Result<UserId> {
+    if ctx.actor.kind != mas_domain::AuditActorKind::User {
+        return Err(AppError::forbidden(
+            "agent rollback requires an authenticated user principal",
+        ));
+    }
+    let user = UserId::parse_str(&ctx.actor.id)
+        .map_err(|_| AppError::forbidden("authenticated user id is invalid"))?;
+    if user.is_nil() {
+        return Err(AppError::forbidden("authenticated user id is invalid"));
+    }
+    Ok(user)
+}
+
+fn rollback_response(record: &RollbackRecord, source_version: u64) -> RollbackResponseDto {
+    RollbackResponseDto {
+        rollback_record_id: record.id,
+        resource_kind: record.resource_kind.to_string(),
+        resource_id: record.resource_id.to_string(),
+        from_version: record.from_version,
+        to_version: record.to_version,
+        source_version,
     }
 }
 
@@ -218,7 +380,8 @@ mod tests {
             Box::new(store.clone()),
             Box::new(store.clone()),
             Box::new(audit.clone()),
-        );
+        )
+        .with_rollback_store(Box::new(store.clone()));
         let system = ServiceContext::system("setup", &now).expect("ctx");
         let organization = tenancy
             .register_organization(&system, "Acme Ltd.", "Acme", "acme-agents")
@@ -248,6 +411,93 @@ mod tests {
             audit,
             publisher,
         }
+    }
+
+    #[tokio::test]
+    async fn rollback_publishes_a_forward_version_and_replays_idempotently() {
+        let fixture = fixture().await;
+        let agent = fixture
+            .service
+            .register(
+                &fixture.tenant_ctx,
+                fixture.project,
+                "Rollback target",
+                "rollback-target",
+                AgentKind::Standard,
+            )
+            .await
+            .expect("register");
+        fixture
+            .service
+            .publish_version(
+                &fixture.tenant_ctx,
+                agent.id,
+                &checksum("a1"),
+                serde_json::json!({"model": "one"}),
+                fixture.publisher,
+            )
+            .await
+            .expect("first version");
+        fixture
+            .service
+            .publish_version(
+                &fixture.tenant_ctx,
+                agent.id,
+                &checksum("b2"),
+                serde_json::json!({"model": "two"}),
+                fixture.publisher,
+            )
+            .await
+            .expect("second version");
+        let user_ctx = ServiceContext::new(
+            mas_domain::AuditActor::new(
+                mas_domain::AuditActorKind::User,
+                fixture.publisher.to_string(),
+            )
+            .expect("user actor"),
+            fixture.tenant_ctx.tenant_id,
+            fixture.tenant_ctx.organization_id,
+            "agent-rollback-test",
+            &Timestamp::now(),
+        )
+        .expect("scoped context");
+        let request = RollbackRequest {
+            target_version_number: 1,
+            reason: "revert a regression".to_owned(),
+            idempotency_key: "rollback-agent-1".to_owned(),
+        };
+        let first = fixture
+            .service
+            .rollback_version(&user_ctx, agent.id, &request)
+            .await
+            .expect("rollback");
+        assert_eq!(first.from_version, 2);
+        assert_eq!(first.to_version, 3);
+        assert_eq!(first.source_version, 1);
+        let replay = fixture
+            .service
+            .rollback_version(&user_ctx, agent.id, &request)
+            .await
+            .expect("idempotent replay");
+        assert_eq!(replay.rollback_record_id, first.rollback_record_id);
+        assert_eq!(
+            fixture
+                .service
+                .get(&user_ctx, agent.id)
+                .await
+                .expect("agent")
+                .current_version,
+            Some(3)
+        );
+        let conflicting = RollbackRequest {
+            target_version_number: 2,
+            ..request
+        };
+        assert!(fixture
+            .service
+            .rollback_version(&user_ctx, agent.id, &conflicting)
+            .await
+            .is_err());
     }
 
     #[tokio::test]

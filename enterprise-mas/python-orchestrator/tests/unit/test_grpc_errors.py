@@ -18,6 +18,7 @@ from mas_orchestrator.contracts.errors import (
     PolicyDeniedError,
     TenantContextError,
 )
+from mas_orchestrator.grpc import DataHubBridgeServicer, details_from_abort
 from mas_orchestrator.grpc.errors import (
     CODE_TO_STATUS,
     STATUS_TO_CODE,
@@ -30,6 +31,10 @@ from mas_orchestrator.grpc.errors import (
 
 class TestCodeCoverage:
     """Every domain code must be mappable in both directions."""
+
+    def test_public_grpc_package_exports_data_hub_and_abort_details(self) -> None:
+        assert DataHubBridgeServicer.__name__ == "DataHubBridgeServicer"
+        assert callable(details_from_abort)
 
     def test_every_code_has_a_status(self) -> None:
         for code in ErrorCode:

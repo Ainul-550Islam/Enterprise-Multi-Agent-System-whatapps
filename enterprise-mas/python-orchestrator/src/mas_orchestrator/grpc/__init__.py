@@ -15,8 +15,10 @@ This package contains the transport between Python and the Rust Core:
 * :mod:`mas_orchestrator.grpc.errors` — bidirectional status<->error mapping.
 * :mod:`mas_orchestrator.grpc.agent_bridge_servicer` — production
   ``AgentBridgeApi`` servicer: the inbound Rust → Python trust boundary.
+* :mod:`mas_orchestrator.grpc.data_hub_servicer` — optional
+  ``DataHubBridgeApi`` servicer, reusing that same authenticated trust boundary.
 * :mod:`mas_orchestrator.grpc.server` — server bootstrap, message bounds and
-  orderly shutdown for that surface.
+  orderly shutdown for both surfaces.
 * :mod:`mas_orchestrator.grpc.generated` — protobuf bindings generated from the
   authoritative Rust ``.proto``. Never hand-edited.
 
@@ -43,10 +45,12 @@ from mas_orchestrator.grpc.client import (
     RustCoreClientConfig,
     client_from_settings,
 )
+from mas_orchestrator.grpc.data_hub_servicer import DataHubBridgeServicer
 from mas_orchestrator.grpc.errors import (
     CODE_TO_STATUS,
     STATUS_TO_CODE,
     abort_with_error,
+    details_from_abort,
     error_from_grpc_status,
     is_retryable_status,
     to_grpc_status,
@@ -83,6 +87,7 @@ __all__ = [
     "AgentBridgeServicer",
     "AgentBridgeServicerConfig",
     "ChannelConfig",
+    "DataHubBridgeServicer",
     "GrpcServer",
     "GrpcServerConfig",
     "ManagedChannel",

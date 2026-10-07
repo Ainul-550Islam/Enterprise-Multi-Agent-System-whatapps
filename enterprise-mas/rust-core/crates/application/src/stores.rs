@@ -12,13 +12,16 @@
 
 use async_trait::async_trait;
 use mas_common::ids::{
-    AgentId, AgentVersionId, ExecutionId, MembershipId, OrganizationId, ProjectId, ScheduleId,
-    TenantId, UserId, WorkflowId,
+    AgentId, AgentVersionId, ApprovalRequestId, ConnectorId, DataSourceId, DocumentId, ExecutionId,
+    ExecutionStepId, MembershipId, OrganizationId, PolicyId, ProjectId, RollbackRecordId,
+    ScheduleId, TenantId, ToolId, UsageRecordId, UserId, WebhookId, WorkflowId, WorkflowVersionId,
 };
 use mas_common::result::Result;
+use mas_common::timestamps::Timestamp;
 use mas_domain::{
-    Agent, AgentVersion, Execution, Membership, Organization, Project, Schedule, Tenant, User,
-    Workflow,
+    Agent, AgentVersion, Connector, DataSource, Document, Execution, ExecutionStep, Membership,
+    Notification, Organization, Policy, Project, RollbackRecord, RollbackResourceKind, Schedule,
+    Tenant, Tool, UsageRecord, User, WebhookEndpoint, Workflow, WorkflowVersion,
 };
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -105,6 +108,141 @@ pub trait ScheduleStorePort: std::fmt::Debug + Send + Sync {
     async fn list(&self, tenant: TenantId) -> Result<Vec<Schedule>>;
 }
 
+#[async_trait]
+pub trait ToolStorePort: std::fmt::Debug + Send + Sync {
+    async fn save(&self, tool: &Tool) -> Result<()>;
+    async fn get(&self, id: ToolId) -> Result<Option<Tool>>;
+    async fn list(&self, tenant: TenantId, project: Option<ProjectId>) -> Result<Vec<Tool>>;
+}
+
+#[async_trait]
+pub trait PolicyStorePort: std::fmt::Debug + Send + Sync {
+    async fn save(&self, policy: &Policy) -> Result<()>;
+    async fn get(&self, id: PolicyId) -> Result<Option<Policy>>;
+    async fn list(&self, tenant: TenantId) -> Result<Vec<Policy>>;
+}
+
+#[async_trait]
+pub trait ConnectorStorePort: std::fmt::Debug + Send + Sync {
+    async fn save(&self, connector: &Connector) -> Result<()>;
+    async fn get(&self, id: ConnectorId) -> Result<Option<Connector>>;
+    async fn list(&self, tenant: TenantId) -> Result<Vec<Connector>>;
+}
+
+#[async_trait]
+pub trait WebhookStorePort: std::fmt::Debug + Send + Sync {
+    async fn save(&self, endpoint: &WebhookEndpoint) -> Result<()>;
+    async fn get(&self, id: WebhookId) -> Result<Option<WebhookEndpoint>>;
+    async fn list(&self, tenant: TenantId) -> Result<Vec<WebhookEndpoint>>;
+}
+
+#[async_trait]
+pub trait UsageStorePort: std::fmt::Debug + Send + Sync {
+    /// Usage is append-only; duplicate IDs are conflicts.
+    async fn append(&self, record: &UsageRecord) -> Result<()>;
+    async fn get(&self, id: UsageRecordId) -> Result<Option<UsageRecord>>;
+    async fn list(
+        &self,
+        tenant: TenantId,
+        from: Timestamp,
+        to: Timestamp,
+    ) -> Result<Vec<UsageRecord>>;
+}
+
+#[async_trait]
+pub trait NotificationStorePort: std::fmt::Debug + Send + Sync {
+    async fn save(&self, notification: &Notification) -> Result<()>;
+    async fn get(&self, id: uuid::Uuid) -> Result<Option<Notification>>;
+    async fn list(&self, tenant: TenantId) -> Result<Vec<Notification>>;
+}
+
+#[async_trait]
+pub trait WorkflowVersionStorePort: std::fmt::Debug + Send + Sync {
+    /// Inserts an immutable snapshot; a workflow version number is unique.
+    async fn append(&self, version: &WorkflowVersion) -> Result<()>;
+    /// Atomically persists a published workflow pointer and its immutable snapshot.
+    async fn publish_snapshot(&self, workflow: &Workflow, version: &WorkflowVersion) -> Result<()>;
+    async fn get(&self, id: WorkflowVersionId) -> Result<Option<WorkflowVersion>>;
+    async fn get_number(
+        &self,
+        workflow: WorkflowId,
+        version_number: u64,
+    ) -> Result<Option<WorkflowVersion>>;
+    async fn list(&self, workflow: WorkflowId) -> Result<Vec<WorkflowVersion>>;
+}
+
+#[async_trait]
+pub trait RollbackStorePort: std::fmt::Debug + Send + Sync {
+    /// Appends a rollback record; idempotency-key uniqueness is tenant-scoped.
+    async fn append(&self, record: &RollbackRecord) -> Result<()>;
+    async fn get(&self, id: RollbackRecordId) -> Result<Option<RollbackRecord>>;
+    async fn get_by_idempotency(
+        &self,
+        tenant: TenantId,
+        idempotency_key: &str,
+    ) -> Result<Option<RollbackRecord>>;
+    async fn list(&self, tenant: TenantId, limit: u16) -> Result<Vec<RollbackRecord>>;
+    /// Atomically inserts an agent rollback version, advances the agent, and
+    /// appends the idempotency/audit history row.
+    async fn commit_agent_rollback(
+        &self,
+        agent: &Agent,
+        version: &AgentVersion,
+        record: &RollbackRecord,
+    ) -> Result<()>;
+    /// Atomically inserts a workflow rollback snapshot, advances the workflow,
+    /// and appends the idempotency/audit history row.
+    async fn commit_workflow_rollback(
+        &self,
+        workflow: &Workflow,
+        version: &WorkflowVersion,
+        record: &RollbackRecord,
+    ) -> Result<()>;
+}
+
+#[async_trait]
+pub trait DataSourceStorePort: std::fmt::Debug + Send + Sync {
+    async fn save(&self, source: &DataSource) -> Result<()>;
+    async fn get(&self, id: DataSourceId) -> Result<Option<DataSource>>;
+    async fn list(&self, tenant: TenantId, project: ProjectId) -> Result<Vec<DataSource>>;
+}
+
+#[async_trait]
+pub trait DocumentStorePort: std::fmt::Debug + Send + Sync {
+    async fn save(&self, document: &Document) -> Result<()>;
+    async fn get(&self, id: DocumentId) -> Result<Option<Document>>;
+    async fn list(&self, tenant: TenantId, source: DataSourceId) -> Result<Vec<Document>>;
+}
+
+#[async_trait]
+pub trait ExecutionStepStorePort: std::fmt::Debug + Send + Sync {
+    async fn save(&self, step: &ExecutionStep) -> Result<()>;
+    async fn get(&self, id: ExecutionStepId) -> Result<Option<ExecutionStep>>;
+    async fn list(&self, execution: ExecutionId) -> Result<Vec<ExecutionStep>>;
+}
+
+/// Data returned by the analytics read port. Each member is already scoped to
+/// one tenant and bounded by the requested current/previous time window.
+#[derive(Debug, Clone, Default)]
+pub struct AnalyticsSnapshot {
+    /// Tenant agents, used for counts and baseline time-saved estimates.
+    pub agents: Vec<Agent>,
+    /// Executions observed during either requested comparison window.
+    pub executions: Vec<Execution>,
+    /// Usage observations observed during either requested comparison window.
+    pub usage_records: Vec<UsageRecord>,
+}
+
+#[async_trait]
+pub trait AnalyticsStorePort: std::fmt::Debug + Send + Sync {
+    async fn snapshot(
+        &self,
+        tenant: TenantId,
+        previous_from: Timestamp,
+        current_to: Timestamp,
+    ) -> Result<AnalyticsSnapshot>;
+}
+
 /// Unified in-memory state behind one lock.
 #[derive(Debug, Default)]
 struct StoreState {
@@ -119,6 +257,18 @@ struct StoreState {
     executions: BTreeMap<ExecutionId, Execution>,
     execution_idempotency: BTreeMap<(TenantId, String), ExecutionId>,
     schedules: BTreeMap<ScheduleId, Schedule>,
+    tools: BTreeMap<ToolId, Tool>,
+    policies: BTreeMap<PolicyId, Policy>,
+    approval_requests: BTreeMap<ApprovalRequestId, mas_policy::approval::ApprovalRequest>,
+    connectors: BTreeMap<ConnectorId, Connector>,
+    webhooks: BTreeMap<WebhookId, WebhookEndpoint>,
+    usage_records: BTreeMap<UsageRecordId, UsageRecord>,
+    notifications: BTreeMap<uuid::Uuid, Notification>,
+    workflow_versions: BTreeMap<WorkflowVersionId, WorkflowVersion>,
+    rollback_records: BTreeMap<RollbackRecordId, RollbackRecord>,
+    data_sources: BTreeMap<DataSourceId, DataSource>,
+    documents: BTreeMap<DocumentId, Document>,
+    execution_steps: BTreeMap<ExecutionStepId, ExecutionStep>,
 }
 
 /// Single-struct in-memory implementation of every port. Shares one lock
@@ -150,6 +300,18 @@ impl InMemoryServices {
             + state.workflows.len()
             + state.executions.len()
             + state.schedules.len()
+            + state.tools.len()
+            + state.policies.len()
+            + state.approval_requests.len()
+            + state.connectors.len()
+            + state.webhooks.len()
+            + state.usage_records.len()
+            + state.notifications.len()
+            + state.workflow_versions.len()
+            + state.rollback_records.len()
+            + state.data_sources.len()
+            + state.documents.len()
+            + state.execution_steps.len()
     }
 
     /// Whether the store is completely empty.
@@ -570,6 +732,759 @@ impl ScheduleStorePort for InMemoryServices {
     }
 }
 
+#[async_trait]
+impl ToolStorePort for InMemoryServices {
+    async fn save(&self, tool: &Tool) -> Result<()> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .tools
+            .insert(tool.id, tool.clone());
+        Ok(())
+    }
+
+    async fn get(&self, id: ToolId) -> Result<Option<Tool>> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .tools
+            .get(&id)
+            .cloned())
+    }
+
+    async fn list(&self, tenant: TenantId, project: Option<ProjectId>) -> Result<Vec<Tool>> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .tools
+            .values()
+            .filter(|tool| {
+                tool.tenant_id == tenant
+                    && project.is_none_or(|project| tool.project_id == Some(project))
+            })
+            .cloned()
+            .collect())
+    }
+}
+
+#[async_trait]
+impl PolicyStorePort for InMemoryServices {
+    async fn save(&self, policy: &Policy) -> Result<()> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .policies
+            .insert(policy.id, policy.clone());
+        Ok(())
+    }
+
+    async fn get(&self, id: PolicyId) -> Result<Option<Policy>> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .policies
+            .get(&id)
+            .cloned())
+    }
+
+    async fn list(&self, tenant: TenantId) -> Result<Vec<Policy>> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .policies
+            .values()
+            .filter(|policy| policy.tenant_id == Some(tenant))
+            .cloned()
+            .collect())
+    }
+}
+
+#[async_trait]
+impl mas_policy::approval::ApprovalStorePort for InMemoryServices {
+    async fn insert(&self, request: &mas_policy::approval::ApprovalRequest) -> Result<()> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.approval_requests.contains_key(&request.id) {
+            return Err(mas_common::error::AppError::conflict(format!(
+                "approval request {} already exists",
+                request.id
+            )));
+        }
+        state.approval_requests.insert(request.id, request.clone());
+        Ok(())
+    }
+
+    async fn update(&self, request: &mas_policy::approval::ApprovalRequest) -> Result<()> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !state.approval_requests.contains_key(&request.id) {
+            return Err(mas_common::error::AppError::not_found(
+                "approval request",
+                request.id.to_string(),
+            ));
+        }
+        state.approval_requests.insert(request.id, request.clone());
+        Ok(())
+    }
+
+    async fn get(
+        &self,
+        id: ApprovalRequestId,
+    ) -> Result<Option<mas_policy::approval::ApprovalRequest>> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .approval_requests
+            .get(&id)
+            .cloned())
+    }
+
+    async fn list_pending(
+        &self,
+        tenant_id: TenantId,
+    ) -> Result<Vec<mas_policy::approval::ApprovalRequest>> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .approval_requests
+            .values()
+            .filter(|request| {
+                request.tenant_id == tenant_id
+                    && request.status == mas_policy::approval::ApprovalStatus::Pending
+            })
+            .cloned()
+            .collect())
+    }
+
+    async fn list_for_tenant(
+        &self,
+        tenant_id: TenantId,
+    ) -> Result<Vec<mas_policy::approval::ApprovalRequest>> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .approval_requests
+            .values()
+            .filter(|request| request.tenant_id == tenant_id)
+            .cloned()
+            .collect())
+    }
+}
+
+#[async_trait]
+impl ConnectorStorePort for InMemoryServices {
+    async fn save(&self, connector: &Connector) -> Result<()> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .connectors
+            .insert(connector.id, connector.clone());
+        Ok(())
+    }
+
+    async fn get(&self, id: ConnectorId) -> Result<Option<Connector>> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .connectors
+            .get(&id)
+            .cloned())
+    }
+
+    async fn list(&self, tenant: TenantId) -> Result<Vec<Connector>> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .connectors
+            .values()
+            .filter(|connector| connector.tenant_id == tenant)
+            .cloned()
+            .collect())
+    }
+}
+
+#[async_trait]
+impl WebhookStorePort for InMemoryServices {
+    async fn save(&self, endpoint: &WebhookEndpoint) -> Result<()> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .webhooks
+            .insert(endpoint.id, endpoint.clone());
+        Ok(())
+    }
+
+    async fn get(&self, id: WebhookId) -> Result<Option<WebhookEndpoint>> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .webhooks
+            .get(&id)
+            .cloned())
+    }
+
+    async fn list(&self, tenant: TenantId) -> Result<Vec<WebhookEndpoint>> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .webhooks
+            .values()
+            .filter(|endpoint| endpoint.tenant_id == tenant)
+            .cloned()
+            .collect())
+    }
+}
+
+#[async_trait]
+impl UsageStorePort for InMemoryServices {
+    async fn append(&self, record: &UsageRecord) -> Result<()> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.usage_records.contains_key(&record.id) {
+            return Err(mas_common::error::AppError::conflict(format!(
+                "usage record {} already exists",
+                record.id
+            )));
+        }
+        state.usage_records.insert(record.id, record.clone());
+        Ok(())
+    }
+
+    async fn get(&self, id: UsageRecordId) -> Result<Option<UsageRecord>> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .usage_records
+            .get(&id)
+            .cloned())
+    }
+
+    async fn list(
+        &self,
+        tenant: TenantId,
+        from: Timestamp,
+        to: Timestamp,
+    ) -> Result<Vec<UsageRecord>> {
+        let mut records = self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .usage_records
+            .values()
+            .filter(|record| {
+                record.tenant_id == tenant && record.occurred_at >= from && record.occurred_at < to
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        records.sort_by_key(|record| record.occurred_at);
+        Ok(records)
+    }
+}
+
+#[async_trait]
+impl NotificationStorePort for InMemoryServices {
+    async fn save(&self, notification: &Notification) -> Result<()> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .notifications
+            .insert(notification.id, notification.clone());
+        Ok(())
+    }
+
+    async fn get(&self, id: uuid::Uuid) -> Result<Option<Notification>> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .notifications
+            .get(&id)
+            .cloned())
+    }
+
+    async fn list(&self, tenant: TenantId) -> Result<Vec<Notification>> {
+        let mut notifications = self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .notifications
+            .values()
+            .filter(|notification| notification.tenant_id == tenant)
+            .cloned()
+            .collect::<Vec<_>>();
+        notifications.sort_by_key(|notification| notification.created_at);
+        Ok(notifications)
+    }
+}
+
+#[async_trait]
+impl WorkflowVersionStorePort for InMemoryServices {
+    async fn append(&self, version: &WorkflowVersion) -> Result<()> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.workflow_versions.contains_key(&version.id())
+            || state.workflow_versions.values().any(|stored| {
+                stored.workflow_id() == version.workflow_id()
+                    && stored.version_number() == version.version_number()
+            })
+        {
+            return Err(mas_common::error::AppError::conflict(format!(
+                "workflow {} version {} already exists",
+                version.workflow_id(),
+                version.version_number()
+            )));
+        }
+        state
+            .workflow_versions
+            .insert(version.id(), version.clone());
+        Ok(())
+    }
+
+    async fn publish_snapshot(&self, workflow: &Workflow, version: &WorkflowVersion) -> Result<()> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if workflow.id != version.workflow_id()
+            || workflow.tenant_id != version.tenant_id()
+            || workflow.published_version != Some(version.version_number())
+        {
+            return Err(mas_common::error::AppError::invalid_field(
+                "workflow_version",
+                "scope_mismatch",
+                "workflow pointer and published snapshot do not match",
+            ));
+        }
+        let existing = state.workflows.get(&workflow.id).ok_or_else(|| {
+            mas_common::error::AppError::not_found("workflow", workflow.id.to_string())
+        })?;
+        if existing.tenant_id != workflow.tenant_id
+            || existing.published_version.unwrap_or(0).checked_add(1)
+                != Some(version.version_number())
+        {
+            return Err(mas_common::error::AppError::conflict(
+                "workflow version is stale or belongs to another tenant",
+            ));
+        }
+        if state.workflow_versions.contains_key(&version.id())
+            || state.workflow_versions.values().any(|stored| {
+                stored.workflow_id() == version.workflow_id()
+                    && stored.version_number() == version.version_number()
+            })
+        {
+            return Err(mas_common::error::AppError::conflict(format!(
+                "workflow {} version {} already exists",
+                version.workflow_id(),
+                version.version_number()
+            )));
+        }
+        state
+            .workflow_versions
+            .insert(version.id(), version.clone());
+        state.workflows.insert(workflow.id, workflow.clone());
+        Ok(())
+    }
+
+    async fn get(&self, id: WorkflowVersionId) -> Result<Option<WorkflowVersion>> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .workflow_versions
+            .get(&id)
+            .cloned())
+    }
+
+    async fn get_number(
+        &self,
+        workflow: WorkflowId,
+        version_number: u64,
+    ) -> Result<Option<WorkflowVersion>> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .workflow_versions
+            .values()
+            .find(|version| {
+                version.workflow_id() == workflow && version.version_number() == version_number
+            })
+            .cloned())
+    }
+
+    async fn list(&self, workflow: WorkflowId) -> Result<Vec<WorkflowVersion>> {
+        let mut versions = self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .workflow_versions
+            .values()
+            .filter(|version| version.workflow_id() == workflow)
+            .cloned()
+            .collect::<Vec<_>>();
+        versions.sort_by_key(WorkflowVersion::version_number);
+        Ok(versions)
+    }
+}
+
+#[async_trait]
+impl RollbackStorePort for InMemoryServices {
+    async fn append(&self, record: &RollbackRecord) -> Result<()> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.rollback_records.contains_key(&record.id)
+            || state.rollback_records.values().any(|stored| {
+                stored.tenant_id == record.tenant_id
+                    && stored.idempotency_key == record.idempotency_key
+            })
+        {
+            return Err(mas_common::error::AppError::conflict(
+                "rollback idempotency key or record id already exists",
+            ));
+        }
+        state.rollback_records.insert(record.id, record.clone());
+        Ok(())
+    }
+
+    async fn get(&self, id: RollbackRecordId) -> Result<Option<RollbackRecord>> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .rollback_records
+            .get(&id)
+            .cloned())
+    }
+
+    async fn get_by_idempotency(
+        &self,
+        tenant: TenantId,
+        idempotency_key: &str,
+    ) -> Result<Option<RollbackRecord>> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .rollback_records
+            .values()
+            .find(|record| record.tenant_id == tenant && record.idempotency_key == idempotency_key)
+            .cloned())
+    }
+
+    async fn list(&self, tenant: TenantId, limit: u16) -> Result<Vec<RollbackRecord>> {
+        let mut records = self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .rollback_records
+            .values()
+            .filter(|record| record.tenant_id == tenant)
+            .cloned()
+            .collect::<Vec<_>>();
+        records.sort_by(|left, right| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        records.truncate(usize::from(limit));
+        Ok(records)
+    }
+
+    async fn commit_agent_rollback(
+        &self,
+        agent: &Agent,
+        version: &AgentVersion,
+        record: &RollbackRecord,
+    ) -> Result<()> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        validate_rollback_commit(
+            &state,
+            record,
+            RollbackResourceKind::Agent,
+            *agent.id.as_uuid(),
+            agent.tenant_id,
+            record.to_version,
+        )?;
+        let previous = state
+            .agents
+            .get(&agent.id)
+            .ok_or_else(|| mas_common::error::AppError::not_found("agent", agent.id.to_string()))?;
+        if previous.tenant_id != record.tenant_id
+            || previous.current_version != Some(record.from_version)
+        {
+            return Err(mas_common::error::AppError::conflict(
+                "agent changed while rollback was being committed",
+            ));
+        }
+        if version.agent_id() != agent.id
+            || version.version_number() != record.to_version
+            || version.rollback_of().is_none()
+            || agent.current_version != Some(record.to_version)
+        {
+            return Err(mas_common::error::AppError::invalid_field(
+                "rollback",
+                "incoherent_commit",
+                "agent, version and rollback record do not describe one transition",
+            ));
+        }
+        if state.agent_versions.contains_key(&version.id())
+            || state.agent_versions.values().any(|stored| {
+                stored.agent_id() == version.agent_id()
+                    && stored.version_number() == version.version_number()
+            })
+        {
+            return Err(mas_common::error::AppError::conflict(
+                "agent version number already exists",
+            ));
+        }
+        state.agent_versions.insert(version.id(), version.clone());
+        state.agents.insert(agent.id, agent.clone());
+        state.rollback_records.insert(record.id, record.clone());
+        Ok(())
+    }
+
+    async fn commit_workflow_rollback(
+        &self,
+        workflow: &Workflow,
+        version: &WorkflowVersion,
+        record: &RollbackRecord,
+    ) -> Result<()> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        validate_rollback_commit(
+            &state,
+            record,
+            RollbackResourceKind::Workflow,
+            *workflow.id.as_uuid(),
+            workflow.tenant_id,
+            record.to_version,
+        )?;
+        let previous = state.workflows.get(&workflow.id).ok_or_else(|| {
+            mas_common::error::AppError::not_found("workflow", workflow.id.to_string())
+        })?;
+        if previous.tenant_id != record.tenant_id
+            || previous.published_version != Some(record.from_version)
+        {
+            return Err(mas_common::error::AppError::conflict(
+                "workflow changed while rollback was being committed",
+            ));
+        }
+        if version.workflow_id() != workflow.id
+            || version.tenant_id() != workflow.tenant_id
+            || version.version_number() != record.to_version
+            || version.rollback_of().is_none()
+            || workflow.published_version != Some(record.to_version)
+        {
+            return Err(mas_common::error::AppError::invalid_field(
+                "rollback",
+                "incoherent_commit",
+                "workflow, version and rollback record do not describe one transition",
+            ));
+        }
+        if state.workflow_versions.contains_key(&version.id())
+            || state.workflow_versions.values().any(|stored| {
+                stored.workflow_id() == version.workflow_id()
+                    && stored.version_number() == version.version_number()
+            })
+        {
+            return Err(mas_common::error::AppError::conflict(
+                "workflow version number already exists",
+            ));
+        }
+        state
+            .workflow_versions
+            .insert(version.id(), version.clone());
+        state.workflows.insert(workflow.id, workflow.clone());
+        state.rollback_records.insert(record.id, record.clone());
+        Ok(())
+    }
+}
+
+fn validate_rollback_commit(
+    state: &StoreState,
+    record: &RollbackRecord,
+    kind: RollbackResourceKind,
+    resource_id: uuid::Uuid,
+    tenant_id: TenantId,
+    version: u64,
+) -> Result<()> {
+    if record.resource_kind != kind
+        || record.resource_id != resource_id
+        || record.tenant_id != tenant_id
+        || record.to_version != version
+    {
+        return Err(mas_common::error::AppError::invalid_field(
+            "rollback",
+            "scope_mismatch",
+            "rollback record does not match its resource transition",
+        ));
+    }
+    if state.rollback_records.contains_key(&record.id)
+        || state.rollback_records.values().any(|stored| {
+            stored.tenant_id == record.tenant_id && stored.idempotency_key == record.idempotency_key
+        })
+    {
+        return Err(mas_common::error::AppError::conflict(
+            "rollback idempotency key or record id already exists",
+        ));
+    }
+    Ok(())
+}
+
+#[async_trait]
+impl DataSourceStorePort for InMemoryServices {
+    async fn save(&self, source: &DataSource) -> Result<()> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .data_sources
+            .insert(source.id, source.clone());
+        Ok(())
+    }
+
+    async fn get(&self, id: DataSourceId) -> Result<Option<DataSource>> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .data_sources
+            .get(&id)
+            .cloned())
+    }
+
+    async fn list(&self, tenant: TenantId, project: ProjectId) -> Result<Vec<DataSource>> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .data_sources
+            .values()
+            .filter(|source| source.tenant_id == tenant && source.project_id == project)
+            .cloned()
+            .collect())
+    }
+}
+
+#[async_trait]
+impl DocumentStorePort for InMemoryServices {
+    async fn save(&self, document: &Document) -> Result<()> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .documents
+            .insert(document.id, document.clone());
+        Ok(())
+    }
+
+    async fn get(&self, id: DocumentId) -> Result<Option<Document>> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .documents
+            .get(&id)
+            .cloned())
+    }
+
+    async fn list(&self, tenant: TenantId, source: DataSourceId) -> Result<Vec<Document>> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .documents
+            .values()
+            .filter(|document| document.tenant_id == tenant && document.source_id == source)
+            .cloned()
+            .collect())
+    }
+}
+
+#[async_trait]
+impl ExecutionStepStorePort for InMemoryServices {
+    async fn save(&self, step: &ExecutionStep) -> Result<()> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .execution_steps
+            .insert(step.id, step.clone());
+        Ok(())
+    }
+
+    async fn get(&self, id: ExecutionStepId) -> Result<Option<ExecutionStep>> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .execution_steps
+            .get(&id)
+            .cloned())
+    }
+
+    async fn list(&self, execution: ExecutionId) -> Result<Vec<ExecutionStep>> {
+        let mut steps = self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .execution_steps
+            .values()
+            .filter(|step| step.execution_id == execution)
+            .cloned()
+            .collect::<Vec<_>>();
+        steps.sort_by_key(|step| step.sequence);
+        Ok(steps)
+    }
+}
+
+#[async_trait]
+impl AnalyticsStorePort for InMemoryServices {
+    async fn snapshot(
+        &self,
+        tenant: TenantId,
+        previous_from: Timestamp,
+        current_to: Timestamp,
+    ) -> Result<AnalyticsSnapshot> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let from_ms = previous_from.to_unix_ms();
+        let to_ms = current_to.to_unix_ms();
+        let agents = state
+            .agents
+            .values()
+            .filter(|agent| agent.tenant_id == tenant)
+            .cloned()
+            .collect();
+        let executions = state
+            .executions
+            .values()
+            .filter(|execution| {
+                let observed_at = execution.finished_at.unwrap_or(execution.created_at);
+                execution.tenant_id == tenant
+                    && observed_at.to_unix_ms() >= from_ms
+                    && observed_at.to_unix_ms() < to_ms
+            })
+            .cloned()
+            .collect();
+        let usage_records = state
+            .usage_records
+            .values()
+            .filter(|record| {
+                record.tenant_id == tenant
+                    && record.occurred_at.to_unix_ms() >= from_ms
+                    && record.occurred_at.to_unix_ms() < to_ms
+            })
+            .cloned()
+            .collect();
+        Ok(AnalyticsSnapshot {
+            agents,
+            executions,
+            usage_records,
+        })
+    }
+}
+
 // ---------------------------------------------------------------------
 // `Arc` delegation — services hold `Box<dyn …Port>`; tests/harnesses
 // share one `Arc<InMemoryServices>` across every dependency slot.
@@ -640,6 +1555,69 @@ arc_delegate!(ScheduleStorePort => InMemoryServices {
     fn save(schedule: &Schedule) -> Result<()>;
     fn get(id: ScheduleId) -> Result<Option<Schedule>>;
     fn list(tenant: TenantId) -> Result<Vec<Schedule>>;
+});
+arc_delegate!(ToolStorePort => InMemoryServices {
+    fn save(tool: &Tool) -> Result<()>;
+    fn get(id: ToolId) -> Result<Option<Tool>>;
+    fn list(tenant: TenantId, project: Option<ProjectId>) -> Result<Vec<Tool>>;
+});
+arc_delegate!(PolicyStorePort => InMemoryServices {
+    fn save(policy: &Policy) -> Result<()>;
+    fn get(id: PolicyId) -> Result<Option<Policy>>;
+    fn list(tenant: TenantId) -> Result<Vec<Policy>>;
+});
+arc_delegate!(ConnectorStorePort => InMemoryServices {
+    fn save(connector: &Connector) -> Result<()>;
+    fn get(id: ConnectorId) -> Result<Option<Connector>>;
+    fn list(tenant: TenantId) -> Result<Vec<Connector>>;
+});
+arc_delegate!(WebhookStorePort => InMemoryServices {
+    fn save(endpoint: &WebhookEndpoint) -> Result<()>;
+    fn get(id: WebhookId) -> Result<Option<WebhookEndpoint>>;
+    fn list(tenant: TenantId) -> Result<Vec<WebhookEndpoint>>;
+});
+arc_delegate!(UsageStorePort => InMemoryServices {
+    fn append(record: &UsageRecord) -> Result<()>;
+    fn get(id: UsageRecordId) -> Result<Option<UsageRecord>>;
+    fn list(tenant: TenantId, from: Timestamp, to: Timestamp) -> Result<Vec<UsageRecord>>;
+});
+arc_delegate!(NotificationStorePort => InMemoryServices {
+    fn save(notification: &Notification) -> Result<()>;
+    fn get(id: uuid::Uuid) -> Result<Option<Notification>>;
+    fn list(tenant: TenantId) -> Result<Vec<Notification>>;
+});
+arc_delegate!(WorkflowVersionStorePort => InMemoryServices {
+    fn append(version: &WorkflowVersion) -> Result<()>;
+    fn publish_snapshot(workflow: &Workflow, version: &WorkflowVersion) -> Result<()>;
+    fn get(id: WorkflowVersionId) -> Result<Option<WorkflowVersion>>;
+    fn get_number(workflow: WorkflowId, version_number: u64) -> Result<Option<WorkflowVersion>>;
+    fn list(workflow: WorkflowId) -> Result<Vec<WorkflowVersion>>;
+});
+arc_delegate!(RollbackStorePort => InMemoryServices {
+    fn append(record: &RollbackRecord) -> Result<()>;
+    fn get(id: RollbackRecordId) -> Result<Option<RollbackRecord>>;
+    fn get_by_idempotency(tenant: TenantId, idempotency_key: &str) -> Result<Option<RollbackRecord>>;
+    fn list(tenant: TenantId, limit: u16) -> Result<Vec<RollbackRecord>>;
+    fn commit_agent_rollback(agent: &Agent, version: &AgentVersion, record: &RollbackRecord) -> Result<()>;
+    fn commit_workflow_rollback(workflow: &Workflow, version: &WorkflowVersion, record: &RollbackRecord) -> Result<()>;
+});
+arc_delegate!(DataSourceStorePort => InMemoryServices {
+    fn save(source: &DataSource) -> Result<()>;
+    fn get(id: DataSourceId) -> Result<Option<DataSource>>;
+    fn list(tenant: TenantId, project: ProjectId) -> Result<Vec<DataSource>>;
+});
+arc_delegate!(DocumentStorePort => InMemoryServices {
+    fn save(document: &Document) -> Result<()>;
+    fn get(id: DocumentId) -> Result<Option<Document>>;
+    fn list(tenant: TenantId, source: DataSourceId) -> Result<Vec<Document>>;
+});
+arc_delegate!(ExecutionStepStorePort => InMemoryServices {
+    fn save(step: &ExecutionStep) -> Result<()>;
+    fn get(id: ExecutionStepId) -> Result<Option<ExecutionStep>>;
+    fn list(execution: ExecutionId) -> Result<Vec<ExecutionStep>>;
+});
+arc_delegate!(AnalyticsStorePort => InMemoryServices {
+    fn snapshot(tenant: TenantId, previous_from: Timestamp, current_to: Timestamp) -> Result<AnalyticsSnapshot>;
 });
 
 #[cfg(test)]

@@ -21,12 +21,21 @@
 //     so a green suite always means the property was actually checked.
 
 
+use axum::body::Body;
+use axum::http::{Method, Request, StatusCode};
 use mas_api::handlers::internal::ScheduleRunRequest;
+use mas_api::router::router;
 use mas_api::scope_resolution::ScopeClaims;
-use mas_api::state::test_support::inmemory_state;
-use mas_common::ids::{OrganizationId, ProjectId, ScheduleId, TenantId};
+use mas_api::state::test_support::{inmemory_state, inmemory_state_with_store};
+use mas_api::state::AppState;
+use mas_application::context::ServiceContext;
+use mas_application::stores::{InMemoryServices, MembershipStorePort};
+use mas_common::ids::{
+    AgentId, ExecutionId, OrganizationId, ProjectId, ScheduleId, TenantId, UserId, WorkflowId,
+};
 use mas_common::timestamps::Timestamp;
 use mas_domain::MembershipRole;
+use std::sync::Arc;
 use mas_security::internal_service::{sign, SERVICE_HEADER, SIGNATURE_HEADER};
 use mas_security::{
     Action, AuthorizationDecision, AuthorizationRequest, AuthorizationService, AuthFailureKind,
@@ -768,4 +777,433 @@ async fn the_failure_taxonomy_has_at_least_eight_distinct_kinds() {
         codes.len() >= 8,
         "at least eight distinct failure codes required, got {codes:?}"
     );
+}
+
+// ── 8. New HTTP version, rollback and execution-timeline routes ─────────────
+
+struct ProtectedRouteFixture {
+    app: axum::Router,
+    tenant: TenantId,
+    other_tenant: TenantId,
+    organization: OrganizationId,
+    agent: AgentId,
+    workflow: WorkflowId,
+    execution: ExecutionId,
+}
+
+async fn add_active_tenant(
+    state: &AppState,
+    system: &ServiceContext,
+    organization: OrganizationId,
+    name: &str,
+    slug: &str,
+) -> TenantId {
+    let organization_scope = system
+        .clone()
+        .with_scope(TenantId::new(), organization);
+    let tenant = state
+        .tenancy
+        .register_tenant(
+            &organization_scope,
+            name,
+            slug,
+            mas_common::enums::Environment::Production,
+            mas_domain::IsolationMode::SharedRls,
+        )
+        .await
+        .expect("register tenant");
+    let tenant_scope = system
+        .clone()
+        .with_scope(tenant.id, organization);
+    state
+        .tenancy
+        .activate_tenant(&tenant_scope, tenant.id)
+        .await
+        .expect("activate tenant");
+    tenant.id
+}
+
+async fn add_active_user(
+    state: &AppState,
+    store: &Arc<InMemoryServices>,
+    system: &ServiceContext,
+    tenant_scope: &ServiceContext,
+    email: &str,
+    role: MembershipRole,
+) -> UserId {
+    let user = state
+        .tenancy
+        .register_user(system, email, "Security matrix user")
+        .await
+        .expect("register matrix user");
+    let mut membership = state
+        .tenancy
+        .invite_membership(tenant_scope, user.id, role)
+        .await
+        .expect("invite matrix user");
+    membership
+        .accept_invitation()
+        .expect("accept matrix invitation");
+    store
+        .save(&membership)
+        .await
+        .expect("persist active matrix membership");
+    user.id
+}
+
+fn route_user_principal(
+    user_id: UserId,
+    tenant: TenantId,
+    organization: OrganizationId,
+    role: MembershipRole,
+) -> SecurityPrincipal {
+    SecurityPrincipal::new(
+        user_id.to_string(),
+        PrincipalKind::User,
+        Some(tenant),
+        ScopeSet::denied(),
+    )
+    .with_organization(organization)
+    .with_memberships(vec![TenantMembership::new(organization, tenant, role)])
+}
+
+async fn protected_route_fixture() -> ProtectedRouteFixture {
+    let (mut state, store) = inmemory_state_with_store();
+    let system = ServiceContext::for_service(
+        "authorization-matrix-seed",
+        "authorization-matrix-route-fixture",
+        &Timestamp::now(),
+    )
+    .expect("system context");
+    let organization = state
+        .tenancy
+        .register_organization(
+            &system,
+            "Route Matrix Ltd.",
+            "Route Matrix",
+            "route-matrix-org",
+        )
+        .await
+        .expect("register organization");
+    let tenant = add_active_tenant(
+        &state,
+        &system,
+        organization.id,
+        "Route Matrix Tenant A",
+        "route-matrix-a",
+    )
+    .await;
+    let other_tenant = add_active_tenant(
+        &state,
+        &system,
+        organization.id,
+        "Route Matrix Tenant B",
+        "route-matrix-b",
+    )
+    .await;
+    let tenant_scope = system
+        .clone()
+        .with_scope(tenant, organization.id);
+    let other_tenant_scope = system
+        .clone()
+        .with_scope(other_tenant, organization.id);
+    let project = state
+        .tenancy
+        .register_project(&tenant_scope, "Route Security Project", "route-security-project")
+        .await
+        .expect("register project");
+    let owner_a = add_active_user(
+        &state,
+        &store,
+        &system,
+        &tenant_scope,
+        "route-owner-a@example.test",
+        MembershipRole::Owner,
+    )
+    .await;
+    let viewer_a = add_active_user(
+        &state,
+        &store,
+        &system,
+        &tenant_scope,
+        "route-viewer-a@example.test",
+        MembershipRole::Viewer,
+    )
+    .await;
+    let owner_b = add_active_user(
+        &state,
+        &store,
+        &system,
+        &other_tenant_scope,
+        "route-owner-b@example.test",
+        MembershipRole::Owner,
+    )
+    .await;
+
+    state.verifier = Arc::new(
+        mas_api::auth::StaticTokenVerifier::new()
+            .with_token(
+                "route-owner-a",
+                route_user_principal(owner_a, tenant, organization.id, MembershipRole::Owner),
+            )
+            .with_token(
+                "route-viewer-a",
+                route_user_principal(viewer_a, tenant, organization.id, MembershipRole::Viewer),
+            )
+            .with_token(
+                "route-owner-b",
+                route_user_principal(
+                    owner_b,
+                    other_tenant,
+                    organization.id,
+                    MembershipRole::Owner,
+                ),
+            ),
+    );
+
+    let agent = state
+        .agents
+        .register(
+            &tenant_scope,
+            project.id,
+            "Route Matrix Agent",
+            "route-matrix-agent",
+            mas_domain::AgentKind::Standard,
+        )
+        .await
+        .expect("register agent");
+    let workflow = state
+        .workflows
+        .create(&tenant_scope, project.id, "Route Matrix Workflow")
+        .await
+        .expect("create workflow");
+    let nodes = vec![
+        mas_domain::WorkflowNode::new(
+            "start",
+            mas_domain::WorkflowNodeType::Start,
+            "Start",
+        )
+        .expect("start node"),
+        mas_domain::WorkflowNode::new(
+            "finish",
+            mas_domain::WorkflowNodeType::End,
+            "Finish",
+        )
+        .expect("finish node"),
+    ];
+    let edges = vec![mas_domain::WorkflowEdge::new("start", "finish").expect("workflow edge")];
+    state
+        .workflows
+        .update_graph(&tenant_scope, workflow.id, nodes, edges)
+        .await
+        .expect("save workflow graph");
+    state
+        .workflows
+        .publish(&tenant_scope, workflow.id)
+        .await
+        .expect("publish workflow version");
+    let submission = state
+        .executions
+        .submit(
+            &tenant_scope,
+            project.id,
+            Some(workflow.id),
+            None,
+            json!({"seed": "cross-tenant route matrix"}),
+            Some("route-matrix-execution"),
+        )
+        .await
+        .expect("create execution");
+    let execution = submission.execution.id;
+    let app = router(state);
+
+    ProtectedRouteFixture {
+        app,
+        tenant,
+        other_tenant,
+        organization: organization.id,
+        agent: agent.id,
+        workflow: workflow.id,
+        execution,
+    }
+}
+
+fn route_rollback_body(idempotency_key: &str) -> serde_json::Value {
+    json!({
+        "target_version_number": 1,
+        "reason": "security matrix route check",
+        "idempotency_key": idempotency_key
+    })
+}
+
+fn route_http_request(
+    method: Method,
+    path: &str,
+    token: Option<&str>,
+    tenant: TenantId,
+    organization: OrganizationId,
+    body: Option<serde_json::Value>,
+) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("x-tenant-id", tenant.to_string())
+        .header("x-organization-id", organization.to_string());
+    if let Some(token) = token {
+        builder = builder.header("authorization", format!("Bearer {token}"));
+    }
+    let body = match body {
+        Some(value) => {
+            builder = builder.header("content-type", "application/json");
+            Body::from(serde_json::to_vec(&value).expect("serialize request body"))
+        },
+        None => Body::empty(),
+    };
+    builder.body(body).expect("route request")
+}
+
+fn protected_route_cases(
+    fixture: &ProtectedRouteFixture,
+) -> Vec<(Method, String, Option<serde_json::Value>)> {
+    vec![
+        (
+            Method::GET,
+            format!("/v1/agents/{}/versions", fixture.agent),
+            None,
+        ),
+        (
+            Method::POST,
+            format!("/v1/agents/{}/versions", fixture.agent),
+            Some(json!({
+                "configuration_checksum": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                "configuration_snapshot": {"model_hint": "matrix-model"}
+            })),
+        ),
+        (
+            Method::POST,
+            format!("/v1/agents/{}/versions/1/rollback", fixture.agent),
+            Some(route_rollback_body("route-agent-rollback-matrix")),
+        ),
+        (
+            Method::GET,
+            format!("/v1/workflows/{}/versions", fixture.workflow),
+            None,
+        ),
+        (
+            Method::POST,
+            format!("/v1/workflows/{}/publish", fixture.workflow),
+            None,
+        ),
+        (
+            Method::POST,
+            format!("/v1/workflows/{}/disable", fixture.workflow),
+            None,
+        ),
+        (
+            Method::POST,
+            format!("/v1/workflows/{}/versions/1/rollback", fixture.workflow),
+            Some(route_rollback_body("route-workflow-rollback-matrix")),
+        ),
+        (
+            Method::GET,
+            format!("/v1/executions/{}/steps", fixture.execution),
+            None,
+        ),
+        (Method::GET, "/v1/rollbacks?limit=10".to_owned(), None),
+    ]
+}
+
+/// Every newly added version, rollback, and execution-step route remains
+/// behind bearer authentication, including the mutating publication paths.
+#[tokio::test]
+async fn new_version_rollback_and_timeline_routes_require_authentication() {
+    let fixture = protected_route_fixture().await;
+    for (method, path, body) in protected_route_cases(&fixture) {
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(route_http_request(
+                method.clone(),
+                &path,
+                None,
+                fixture.tenant,
+                fixture.organization,
+                body,
+            ))
+            .await
+            .expect("HTTP response");
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "unauthenticated route must be 401: {method} {path}"
+        );
+    }
+}
+
+/// A principal authorized in tenant B cannot name tenant A's real resources
+/// through the new route family; a forged tenant hint is likewise hidden.
+#[tokio::test]
+async fn new_version_rollback_and_timeline_routes_hide_cross_tenant_resources() {
+    let fixture = protected_route_fixture().await;
+    for (method, path, body) in protected_route_cases(&fixture) {
+        let claimed_tenant = if path.starts_with("/v1/rollbacks") {
+            fixture.tenant
+        } else {
+            fixture.other_tenant
+        };
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(route_http_request(
+                method.clone(),
+                &path,
+                Some("route-owner-b"),
+                claimed_tenant,
+                fixture.organization,
+                body,
+            ))
+            .await
+            .expect("HTTP response");
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "cross-tenant route must hide resource as 404: {method} {path}"
+        );
+    }
+}
+
+/// Viewer can read version/timeline projections, but cannot publish/rollback
+/// or inspect the audit-classified rollback history.
+#[tokio::test]
+async fn new_version_rollback_and_timeline_routes_enforce_role_permissions() {
+    let fixture = protected_route_fixture().await;
+    let cases = protected_route_cases(&fixture);
+    for (method, path, body) in cases {
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(route_http_request(
+                method.clone(),
+                &path,
+                Some("route-viewer-a"),
+                fixture.tenant,
+                fixture.organization,
+                body,
+            ))
+            .await
+            .expect("HTTP response");
+        if method == Method::GET && !path.starts_with("/v1/rollbacks") {
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "read permission should allow the viewer: {method} {path}"
+            );
+        } else {
+            assert_eq!(
+                response.status(),
+                StatusCode::FORBIDDEN,
+                "insufficient role must be 403: {method} {path}"
+            );
+        }
+    }
 }

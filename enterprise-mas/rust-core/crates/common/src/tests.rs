@@ -50,6 +50,9 @@ fn ids_roundtrip_display_fromstr_serde() {
     check!(WorkflowId);
     check!(WorkflowVersionId);
     check!(WorkflowNodeId);
+    check!(DataSourceId);
+    check!(DocumentId);
+    check!(RollbackRecordId);
     check!(TaskId);
     check!(TaskAttemptId);
     check!(ExecutionId);

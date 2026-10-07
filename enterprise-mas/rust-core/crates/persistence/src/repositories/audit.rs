@@ -214,3 +214,10 @@ impl mas_application::audit::AuditSinkPort for PostgresAuditLog {
         self.append(event).await
     }
 }
+
+#[async_trait::async_trait]
+impl mas_security::AuditSinkPort for PostgresAuditLog {
+    async fn record(&self, event: &AuditEvent) -> Result<()> {
+        self.append(event).await
+    }
+}

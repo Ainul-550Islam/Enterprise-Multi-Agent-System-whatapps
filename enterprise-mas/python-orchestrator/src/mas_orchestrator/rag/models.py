@@ -32,6 +32,9 @@ class DocumentFormat(StrEnum):
     MARKDOWN = "markdown"
     JSON = "json"
     HTML = "html"
+    CSV = "csv"
+    PDF = "pdf"
+    DOCX = "docx"
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,7 +109,7 @@ class SourceDocument:
 
     document_id: str
     title: str
-    content: str
+    content: str | bytes
     format: DocumentFormat = DocumentFormat.TEXT
     access: DocumentAccess = field(default_factory=lambda: DocumentAccess(tenant_id=""))
     source_uri: str | None = None
@@ -117,11 +120,18 @@ class SourceDocument:
             raise InvalidRequestError(
                 "document id must not be empty", details={"field": "document_id"}
             )
-        if not self.content.strip():
-            raise InvalidRequestError(
-                "document content must not be empty", details={"field": "content"}
-            )
-        encoded = len(self.content.encode("utf-8"))
+        if isinstance(self.content, bytes):
+            if not self.content:
+                raise InvalidRequestError(
+                    "document content must not be empty", details={"field": "content"}
+                )
+            encoded = len(self.content)
+        else:
+            if not self.content.strip():
+                raise InvalidRequestError(
+                    "document content must not be empty", details={"field": "content"}
+                )
+            encoded = len(self.content.encode("utf-8"))
         if encoded > MAX_DOCUMENT_BYTES:
             raise InvalidRequestError(
                 "document exceeds the maximum size",

@@ -35,6 +35,9 @@ tonic = { version = "0.13", default-features = false, features = [
     "codegen",
     "prost",
     "transport",
+    "tls-ring",
+    "tls-native-roots",
+    "tls-webpki-roots",
 ] }
 tracing = { workspace = true }
 uuid = { workspace = true }

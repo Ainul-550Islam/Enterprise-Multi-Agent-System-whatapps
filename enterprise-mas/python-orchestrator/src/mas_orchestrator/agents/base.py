@@ -138,6 +138,8 @@ class AgentSpec:
         system_prompt: The agent's instructions.
         limits: Execution ceilings.
         tags: Free-form labels.
+        read_only: Product-owned definition that user-facing agent lifecycle
+            operations must not edit or delete.
     """
 
     agent_id: str
@@ -153,6 +155,7 @@ class AgentSpec:
     system_prompt: str = ""
     limits: AgentLimits = field(default_factory=AgentLimits)
     tags: tuple[str, ...] = ()
+    read_only: bool = False
 
     def __post_init__(self) -> None:
         for field_name in ("agent_id", "agent_version_id", "name", "slug", "tenant_id"):
@@ -164,6 +167,8 @@ class AgentSpec:
             raise InvalidRequestError(
                 "limits must be an AgentLimits instance", details={"field": "limits"}
             )
+        if not isinstance(self.read_only, bool):
+            raise InvalidRequestError("read_only must be a boolean", details={"field": "read_only"})
 
     @property
     def is_runnable(self) -> bool:

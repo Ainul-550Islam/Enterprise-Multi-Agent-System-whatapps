@@ -35,6 +35,7 @@
 //! `NodeExecutorRegistry`, making workflows runnable end-to-end.
 
 pub mod agent_bridge;
+pub mod data_hub_bridge;
 pub mod executor;
 pub mod node_adapters;
 pub mod output_validator;
@@ -48,6 +49,11 @@ pub mod tool_runner;
 pub use agent_bridge::InMemoryAgentBridge;
 pub use agent_bridge::{
     AgentBridge, AgentRunRequest, AgentRunStatus, AgentRunVerdict, AgentUsage, CANCELLATION_CODE,
+};
+pub use data_hub_bridge::{
+    DataHubBridgePort, DataHubCallContext, DataHubDocumentIngestionResult,
+    DataHubIngestDocumentRequest, DataHubPurgeDocumentRequest, DataHubPurgeDocumentResult,
+    DataHubSourceKind, DataHubSyncSourceRequest, DataHubSyncSourceResult,
 };
 pub use executor::{Executor, ExecutorConfig, RunOutcome, StepStorePort};
 pub use mas_orchestration::checkpoint::NodeExecutionState;

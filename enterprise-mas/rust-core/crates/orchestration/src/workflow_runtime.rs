@@ -717,6 +717,7 @@ async fn run_node_attempt(
                         context,
                         attempt,
                         task_id: None,
+                        task_attempt_id: None,
                         idempotency_key: None,
                     })
                     .await

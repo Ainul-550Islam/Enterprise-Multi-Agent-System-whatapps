@@ -42,19 +42,22 @@ use crate::error::map_sqlx;
 use crate::rows::{AgentRow, AgentVersionRow};
 
 /// Full projected row columns for `agents` queries.
-pub const AGENT_COLUMNS: &str =
-    "id, tenant_id, organization_id, name, slug, status, spec, created_at, updated_at";
+pub const AGENT_COLUMNS: &str = "id, tenant_id, organization_id, name, slug, status, \
+    baseline_minutes_per_task, origin, spec, created_at, updated_at";
 /// Full projected columns for `agent_versions`.
 pub const AGENT_VERSION_COLUMNS: &str =
     "id, agent_id, tenant_id, version, deployment, spec, created_at";
 
 const AGENT_UPSERT: &str = "INSERT INTO agents (
-        id, tenant_id, organization_id, name, slug, status, spec, created_at, updated_at
-    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        id, tenant_id, organization_id, name, slug, status,
+        baseline_minutes_per_task, origin, spec, created_at, updated_at
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
     ON CONFLICT (id) DO UPDATE SET
         name = EXCLUDED.name,
         slug = EXCLUDED.slug,
         status = EXCLUDED.status,
+        baseline_minutes_per_task = EXCLUDED.baseline_minutes_per_task,
+        origin = EXCLUDED.origin,
         spec = EXCLUDED.spec,
         updated_at = EXCLUDED.updated_at";
 
@@ -77,6 +80,9 @@ fn agent_bind_projection(row: &AgentRow) -> Result<Vec<serde_json::Value>> {
         serde_json::Value::String(row.name.clone()),
         serde_json::Value::String(row.slug.clone()),
         serde_json::Value::String(row.status.clone()),
+        row.baseline_minutes_per_task
+            .map_or(serde_json::Value::Null, serde_json::Value::from),
+        serde_json::Value::String(row.origin.clone()),
         row.spec.clone(),
         serde_json::Value::from(Timestamp::from_datetime(row.created_at).to_rfc3339_millis()),
         serde_json::Value::from(Timestamp::from_datetime(row.updated_at).to_rfc3339_millis()),
@@ -91,6 +97,10 @@ fn fetch_agent(pg_row: sqlx::postgres::PgRow) -> Result<AgentRow> {
         name: pg_row.try_get("name").map_err(map_sqlx)?,
         slug: pg_row.try_get("slug").map_err(map_sqlx)?,
         status: pg_row.try_get("status").map_err(map_sqlx)?,
+        baseline_minutes_per_task: pg_row
+            .try_get("baseline_minutes_per_task")
+            .map_err(map_sqlx)?,
+        origin: pg_row.try_get("origin").map_err(map_sqlx)?,
         spec: pg_row.try_get("spec").map_err(map_sqlx)?,
         created_at: pg_row.try_get("created_at").map_err(map_sqlx)?,
         updated_at: pg_row.try_get("updated_at").map_err(map_sqlx)?,
@@ -151,6 +161,8 @@ impl AgentStore {
             .bind(&row.name)
             .bind(&row.slug)
             .bind(&row.status)
+            .bind(row.baseline_minutes_per_task)
+            .bind(&row.origin)
             .bind(&row.spec)
             .bind(row.created_at)
             .bind(row.updated_at)
@@ -386,10 +398,10 @@ mod tests {
 
     #[test]
     fn upsert_column_count_matches_projection() {
-        // The 9 bind slots in AGENT_UPSERT line up with AgentRow's columns.
+        // The 11 bind slots in AGENT_UPSERT line up with AgentRow's columns.
         let bind_marks = AGENT_UPSERT.matches('$').count();
-        assert_eq!(bind_marks, 9, "statement arity drifted from AgentRow");
-        assert_eq!(AGENT_COLUMNS.split(',').count(), 9);
+        assert_eq!(bind_marks, 11, "statement arity drifted from AgentRow");
+        assert_eq!(AGENT_COLUMNS.split(',').count(), 11);
         // And the bind projection's order is the semantic contract.
         let agent_row = AgentRow {
             id: Uuid::now_v7(),
@@ -398,6 +410,8 @@ mod tests {
             name: "x".to_owned(),
             slug: "x".to_owned(),
             status: "draft".to_owned(),
+            baseline_minutes_per_task: None,
+            origin: "user".to_owned(),
             spec: serde_json::json!({}),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),

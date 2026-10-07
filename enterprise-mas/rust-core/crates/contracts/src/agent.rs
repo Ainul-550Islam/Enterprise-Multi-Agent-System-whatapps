@@ -187,3 +187,26 @@ pub struct AgentResponse {
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
 }
+
+/// Safe wire projection of one immutable agent configuration version.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentVersionDto {
+    /// Immutable version id.
+    pub id: AgentVersionId,
+    /// Owning agent.
+    pub agent_id: AgentId,
+    /// Monotonic per-agent version number.
+    pub version_number: u64,
+    /// Canonical checksum of the immutable snapshot.
+    pub configuration_checksum: String,
+    /// Published configuration snapshot.
+    pub configuration_snapshot: serde_json::Value,
+    /// Authenticated publisher.
+    pub published_by: mas_common::ids::UserId,
+    /// Publication timestamp.
+    pub published_at: Timestamp,
+    /// Deployment lifecycle status.
+    pub deployment_status: mas_common::enums::DeploymentStatus,
+    /// Source snapshot if created by rollback.
+    pub rollback_of: Option<AgentVersionId>,
+}

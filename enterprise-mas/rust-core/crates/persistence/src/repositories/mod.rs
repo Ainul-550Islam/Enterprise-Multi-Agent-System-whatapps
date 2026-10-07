@@ -28,13 +28,16 @@ pub mod api_keys;
 pub mod audit;
 pub mod broker;
 pub mod control_plane;
+pub mod execution_steps;
 pub mod executions;
 pub mod outbox;
+pub mod rollbacks;
 pub mod schedules;
 mod scoped;
 pub mod services;
 pub mod tasks;
 pub mod tenancy;
+pub mod workflow_versions;
 pub mod workflows;
 
 pub use crate::durable::PgDurableExecution;
@@ -45,6 +48,7 @@ pub use control_plane::{
     PostgresPlanStore, PostgresPolicyStore, PostgresQuotaRegistry, PostgresReservationStore,
     PostgresSubscriptionStore, PostgresUsageLedger,
 };
+pub use execution_steps::PostgresExecutionStepStore;
 pub use outbox::PostgresOutboxStore;
 pub use scoped::{DocumentTable, ScopedStore};
 pub use tenancy::{MembershipStore, OrganizationStore, ProjectStore, TenantStore, UserStore};

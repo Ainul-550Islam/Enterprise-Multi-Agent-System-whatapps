@@ -90,6 +90,11 @@ class TestMandatoryIdentity:
         assert context.agent_version_id is None
         assert context.project_id is None
 
+    def test_task_attempt_requires_owning_task(self) -> None:
+        with pytest.raises(TenantContextError) as excinfo:
+            _build(task_attempt_id="attempt-1")
+        assert excinfo.value.details["reason"] == "missing_task_id"
+
 
 class TestValidConstruction:
     """A well-formed context is immutable and usable."""

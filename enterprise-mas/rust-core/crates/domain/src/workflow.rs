@@ -385,7 +385,14 @@ impl Workflow {
             },
         }
         self.validate_graph()?;
-        let version = self.published_version.unwrap_or(0) + 1;
+        let version = self
+            .published_version
+            .unwrap_or(0)
+            .checked_add(1)
+            .filter(|version| *version <= i32::MAX as u64)
+            .ok_or_else(|| {
+                AppError::conflict("workflow version counter is exhausted or out of range")
+            })?;
         self.published_version = Some(version);
         self.status = WorkflowStatus::Published;
         self.touch();

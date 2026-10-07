@@ -1,6 +1,6 @@
 //! Workflow lifecycle DTOs.
 
-use mas_common::ids::{ProjectId, WorkflowId};
+use mas_common::ids::{ProjectId, UserId, WorkflowId, WorkflowVersionId};
 use mas_common::result::Result;
 use mas_common::timestamps::Timestamp;
 use mas_common::validation;
@@ -162,6 +162,13 @@ pub struct PublishWorkflowRequest {
 
 impl PublishWorkflowRequest {
     pub fn validate(&self) -> Result<()> {
+        if self.workflow_id.is_nil() {
+            return Err(mas_common::error::AppError::invalid_field(
+                "workflow_id",
+                "required",
+                "workflow id must be concrete",
+            ));
+        }
         Ok(())
     }
 }
@@ -175,7 +182,7 @@ pub struct WorkflowResponse {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    /// `draft` | `validating` | `published` | `disabled` | `archived`
+    /// `draft` | `published` | `disabled` | `archived`
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub published_version: Option<u64>,
@@ -183,4 +190,29 @@ pub struct WorkflowResponse {
     pub graph: Option<WorkflowGraphDto>,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
+}
+
+/// Immutable published graph snapshot returned by version-history endpoints.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowVersionDto {
+    /// Stable snapshot id.
+    pub id: WorkflowVersionId,
+    /// Owning workflow.
+    pub workflow_id: WorkflowId,
+    /// Tenant scope.
+    pub tenant_id: mas_common::ids::TenantId,
+    /// Monotonic per-workflow version number.
+    pub version_number: u64,
+    /// SHA-256 of the canonical graph and topological order.
+    pub checksum: String,
+    /// Immutable published graph.
+    pub graph: WorkflowGraphDto,
+    /// Deterministic node execution order.
+    pub topo_order: Vec<String>,
+    /// Authenticated user who published, when the caller is a user.
+    pub created_by: Option<UserId>,
+    /// Publication instant.
+    pub created_at: Timestamp,
+    /// Source version if this snapshot was created by rollback.
+    pub rollback_of: Option<WorkflowVersionId>,
 }

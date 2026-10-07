@@ -22,6 +22,7 @@ bill per run, and test the provider rather than the bridge.
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -58,9 +59,12 @@ from mas_orchestrator.security.internal_service import (
     signed_internal_signature,
 )
 
-TENANT = "tenant-alpha"
-OTHER_TENANT = "tenant-beta"
-ORGANIZATION = "org-1"
+TENANT = "11111111-1111-4111-8111-111111111111"
+OTHER_TENANT = "22222222-2222-4222-8222-222222222222"
+ORGANIZATION = "33333333-3333-4333-8333-333333333333"
+PROJECT = "44444444-4444-4444-8444-444444444444"
+AGENT = "55555555-5555-4555-8555-555555555555"
+AGENT_VERSION = "66666666-6666-4666-8666-666666666666"
 CREDENTIAL = "bridge-service-token"
 SUBJECT = "rust-core"
 
@@ -94,6 +98,7 @@ class RecordedRun:
     request_text: str
     context: Any
     cancel_event: asyncio.Event
+    agent_spec: Any
 
 
 @dataclass(slots=True)
@@ -130,7 +135,7 @@ class RecordingExecutionService:
             Exception: The configured error, if one was set.
         """
         event = cancel_event if cancel_event is not None else asyncio.Event()
-        self.runs.append(RecordedRun(request.request, request.context, event))
+        self.runs.append(RecordedRun(request.request, request.context, event, request.agent_spec))
 
         if self.delay_seconds:
             if self.honour_cancel:
@@ -179,7 +184,7 @@ def success_result(execution_id: str = "exec-1", content: str = "the answer") ->
     """
     return ExecutionResult(
         execution_id=execution_id,
-        agent_id="platform.default",
+        agent_id=AGENT,
         termination=Termination.COMPLETED,
         content=content,
     )
@@ -200,10 +205,56 @@ def failed_result(
     """
     return ExecutionResult(
         execution_id="exec-1",
-        agent_id="platform.default",
+        agent_id=AGENT,
         termination=termination,
         content="",
         error=error,
+    )
+
+
+def snapshot_json(
+    *,
+    tenant_id: str = TENANT,
+    organization_id: str = ORGANIZATION,
+    project_id: str = PROJECT,
+    agent_id: str = AGENT,
+    agent_version_id: str = AGENT_VERSION,
+    status: str = "active",
+    version_number: int = 2,
+    model_hint: str = "provider/model-test",
+    system_prompt: str = "Rust-published test instructions",
+) -> str:
+    """Builds a UUID-backed Rust runtime snapshot for bridge tests."""
+    return json.dumps(
+        {
+            "agent_id": agent_id,
+            "tenant_id": tenant_id,
+            "organization_id": organization_id,
+            "project_id": project_id,
+            "agent_version_id": agent_version_id,
+            "version_number": version_number,
+            "configuration_checksum": "a" * 64,
+            "name": "Test Agent",
+            "slug": "test-agent",
+            "kind": "standard",
+            "status": status,
+            "origin": "user",
+            "read_only": False,
+            "configuration": {
+                "description": None,
+                "model_hint": model_hint,
+                "system_prompt": system_prompt,
+                "limits": {
+                    "max_steps": 25,
+                    "max_tool_calls": 50,
+                    "max_delegation_depth": 0,
+                    "timeout_seconds": None,
+                },
+                "tags": ["bridge-test"],
+                "allowed_tools": [],
+            },
+        },
+        separators=(",", ":"),
     )
 
 
@@ -211,8 +262,11 @@ def request(
     *,
     tenant_id: str = TENANT,
     organization_id: str = ORGANIZATION,
+    project_id: str = PROJECT,
     input_json: str = "hello",
-    agent_id: str = "platform.default",
+    agent_id: str = AGENT,
+    agent_version: str = AGENT_VERSION,
+    agent_snapshot_json: str | None = None,
     correlation_id: str = "corr-1",
     request_id: str = "req-1",
     execution_id: str = "exec-1",
@@ -223,10 +277,13 @@ def request(
     """Builds a well-formed ``AgentRunRequest``.
 
     Args:
-        tenant_id: Authoritative tenant.
-        organization_id: Authoritative organization.
+        tenant_id: Authoritative tenant UUID.
+        organization_id: Authoritative organization UUID.
+        project_id: Authoritative project UUID.
         input_json: The run input.
-        agent_id: The agent to run.
+        agent_id: The agent UUID to run.
+        agent_version: The immutable version UUID.
+        agent_snapshot_json: Optional raw snapshot override for validation tests.
         correlation_id: Correlation id.
         request_id: Request id.
         execution_id: Execution id.
@@ -248,6 +305,19 @@ def request(
         protocol_version=str(CURRENT_PROTOCOL_VERSION),
         deadline_rfc3339=deadline_rfc3339,
         identity=mas_api_pb2.ServiceIdentityMsg(subject=identity_subject),
+    )
+    message.agent_version = agent_version
+    message.project_id = project_id
+    message.agent_snapshot_json = (
+        agent_snapshot_json
+        if agent_snapshot_json is not None
+        else snapshot_json(
+            tenant_id=tenant_id,
+            organization_id=organization_id,
+            project_id=project_id,
+            agent_id=agent_id,
+            agent_version_id=agent_version,
+        )
     )
     if idempotency_key:
         message.idempotency_key = idempotency_key

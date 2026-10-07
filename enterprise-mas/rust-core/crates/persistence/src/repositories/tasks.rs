@@ -175,6 +175,30 @@ mod tests {
     }
 
     #[test]
+    fn task_request_id_survives_the_jsonb_spec_roundtrip() {
+        let request_id = Uuid::from_u128(0x5A17);
+        let task = Task::new(
+            mas_common::ids::TenantId::new(),
+            mas_common::ids::OrganizationId::new(),
+            mas_common::ids::ProjectId::new(),
+            Some(mas_common::ids::AgentId::new()),
+            None,
+            "agent.run",
+            serde_json::json!({"prompt": "preserve tracing identity"}),
+            mas_common::enums::TaskPriority::Normal,
+            "request-id-roundtrip",
+            "test-user",
+        )
+        .expect("task")
+        .with_request_id(request_id);
+
+        let row = TaskRow::from_domain(&task).expect("task row");
+        let restored = row.into_domain().expect("restored task");
+
+        assert_eq!(restored.request_id, Some(request_id));
+    }
+
+    #[test]
     fn created_by_is_materialized_on_both_directions() {
         // `domain::Task::created_by` is required, so hydration must always find
         // it. Rows written by the durable broker rely on the column default.

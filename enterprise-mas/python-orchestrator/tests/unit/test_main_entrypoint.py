@@ -13,11 +13,13 @@ from __future__ import annotations
 
 import asyncio
 import signal
+from types import SimpleNamespace
 
 import pytest
 
 from mas_orchestrator import main as entrypoint
 from mas_orchestrator.api.app import AppConfig
+from mas_orchestrator.config.validation import ConfigurationError
 from mas_orchestrator.main import (
     EXIT_CONFIGURATION_ERROR,
     SHUTDOWN_SIGNALS,
@@ -32,6 +34,13 @@ from mas_orchestrator.main import (
     run,
 )
 from mas_orchestrator.services.lifecycle import DrainReport, ShutdownPhase, exit_code_for
+
+_RUST_CORE_TOKEN_REF_ENV = "MAS_ORCH_RUST_CORE__BEARER_TOKEN_SECRET_REF"
+
+
+def _set_valid_bootstrap_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Provide a reference name, never credential material, for validation tests."""
+    monkeypatch.setenv(_RUST_CORE_TOKEN_REF_ENV, "rust_core_service_token")
 
 
 class TestParseArgs:
@@ -58,18 +67,42 @@ class TestParseArgs:
 
 
 class TestBootstrap:
-    def test_bootstrap_validates_before_constructing(self) -> None:
+    def test_bootstrap_validates_before_constructing(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # A process that starts with bad configuration and discovers it mid-run
         # has already served requests under it.
+        _set_valid_bootstrap_environment(monkeypatch)
         built = bootstrap()
         assert isinstance(built, Bootstrap)
         assert built.settings.environment is not None
+
+    def test_bootstrap_rejects_invalid_cross_field_configuration(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.delenv(_RUST_CORE_TOKEN_REF_ENV, raising=False)
+
+        with pytest.raises(ConfigurationError, match=r"rust_core\.bearer_token_secret_ref"):
+            bootstrap()
 
     def test_bootstrap_propagates_a_configuration_error(self) -> None:
         # Letting it propagate is the point: a misconfigured process must not
         # start.
         with pytest.raises(ValueError, match="is not a valid Environment"):
             bootstrap(environment="not-an-environment")
+
+    def test_bootstrap_calls_cross_field_validation(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _set_valid_bootstrap_environment(monkeypatch)
+        checked: list[object] = []
+
+        def validate(settings: object) -> object:
+            checked.append(settings)
+            return settings
+
+        monkeypatch.setattr(entrypoint, "validate_settings_or_raise", validate)
+
+        built = bootstrap()
+
+        assert checked == [built.settings]
 
 
 class TestServeStub:
@@ -164,7 +197,8 @@ class TestAppConfig:
 
 
 class TestMain:
-    def test_main_runs_the_drill(self) -> None:
+    def test_main_runs_the_drill(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _set_valid_bootstrap_environment(monkeypatch)
         assert main(["--once"]) == 0
 
     def test_main_rejects_an_unknown_environment(self) -> None:
@@ -173,8 +207,36 @@ class TestMain:
         with pytest.raises(SystemExit):
             main(["--environment", "not-a-real-environment"])
 
-    def test_main_runs_the_drill_in_production_shapes(self) -> None:
+    def test_main_runs_the_drill_in_production_shapes(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _set_valid_bootstrap_environment(monkeypatch)
         assert main(["--once", "--environment", "development"]) == 0
+
+    def test_bridge_server_wires_data_hub_through_agent_bridge_identity(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from mas_orchestrator.config.settings import Settings
+        from mas_orchestrator.grpc.data_hub_servicer import DataHubBridgeServicer
+
+        bundle = SimpleNamespace(
+            execution_service=object(),
+            identity_resolver=object(),
+            data_hub_service=object(),
+            aclose=lambda: None,
+        )
+        monkeypatch.setattr(entrypoint, "build_runtime_bundle", lambda _settings: bundle)
+        monkeypatch.setattr(entrypoint, "_internal_signing_secret", lambda _settings: None)
+
+        coordinator = ShutdownCoordinator()
+        server = entrypoint.build_bridge_server(Settings(), coordinator)
+
+        assert isinstance(server._data_hub_servicer, DataHubBridgeServicer)
+        assert server._data_hub_servicer._service is bundle.data_hub_service
+        assert server._data_hub_servicer._agent_bridge is server._servicer
+        assert server._closeables == (bundle,)
 
 
 def test_module_exposes_an_entrypoint() -> None:

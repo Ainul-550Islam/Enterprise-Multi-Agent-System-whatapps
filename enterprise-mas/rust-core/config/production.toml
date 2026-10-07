@@ -41,6 +41,9 @@ lease_ttl_ms = 45000
 max_in_flight = 64
 drain_timeout_ms = 60000
 worker_name = "worker-prod-1"
+# The production worker is a real AI execution worker, not an empty consumer.
+# Bridge endpoint/token/signing key are supplied via the MAS_AI_BRIDGE_* env vars.
+handlers = "execution.run"
 retry_base_ms = 500
 retry_cap_ms = 30000
 retry_max_deliver = 10
@@ -58,3 +61,30 @@ log_level = "info"
 # Scraped by the platform Prometheus; bind to pod IP via env in real deploys.
 metrics_addr = "0.0.0.0:9102"
 otlp_endpoint = ""
+
+# Identity provider endpoints are explicit HTTPS origins in production. The
+# invalid example host intentionally fails closed until replaced at deploy time.
+[oidc]
+issuer = "https://identity.example.invalid/realms/mas"
+jwks_url = "https://identity.example.invalid/realms/mas/protocol/openid-connect/certs"
+algs = ["RS256", "ES256"]
+clock_skew_seconds = 30
+jwks_cache_ttl_seconds = 300
+
+# SSE resources are bounded per connection and per tenant.
+[stream]
+heartbeat_ms = 15000
+buffer_size = 256
+max_connections_per_tenant = 100
+
+# Dashboard refresh is an operator-controlled background cadence.
+[analytics]
+rollup_refresh_interval_seconds = 300
+rollup_lookback_days = 90
+
+# Upload/crawl limits never grow based on request content.
+[data_hub]
+max_upload_bytes = 33554432
+max_document_bytes = 33554432
+max_pages_per_sync = 500
+max_crawl_depth = 3

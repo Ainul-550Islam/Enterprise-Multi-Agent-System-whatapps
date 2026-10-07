@@ -273,6 +273,13 @@ message AgentRunRequest {
   // `authorization` bearer header carries the same principal as proof of
   // possession and is cross-checked against this field.
   ServiceIdentityMsg identity = 16;
+  // Durable worker claim attempt; absent for non-queue-driven runs.
+  optional string task_attempt_id = 17;
+  // Complete, sanitized Rust-owned agent/version runtime snapshot. This JSON
+  // is covered by the existing body-bound internal signature; Python must
+  // validate every identity/version field before using it and must never
+  // substitute a process-local catalog entry.
+  string agent_snapshot_json = 18;
 }
 
 // Authenticated internal service identity (mirrors
@@ -336,5 +343,101 @@ message AgentRunReply {
 message BridgeHealthReply {
   bool healthy = 1;
   // Human-readable detail; must never contain secret material.
+  string detail = 2;
+}
+
+// -------------------------- Data Hub bridge ---------------------------------
+//
+// Rust authorizes and signs every source/document snapshot. Python verifies
+// the same bearer identity and body-bound signature as AgentBridgeApi before
+// reading source content or touching the isolated RAG plane. The catalogue is
+// Rust-owned; this API carries snapshots and returns sync/index results only.
+service DataHubBridgeApi {
+  rpc SyncSource(SyncSourceRequest) returns (SyncSourceReply);
+  rpc IngestDocument(IngestDocumentRequest) returns (DocumentIngestionReply);
+  rpc PurgeDocument(PurgeDocumentRequest) returns (PurgeDocumentReply);
+  rpc Health(Empty) returns (DataHubHealthReply);
+}
+
+message SyncSourceRequest {
+  string tenant_id = 1;
+  string organization_id = 2;
+  string project_id = 3;
+  string correlation_id = 4;
+  string request_id = 5;
+  string protocol_version = 6;
+  string deadline_rfc3339 = 7;
+  ServiceIdentityMsg identity = 8;
+  string source_id = 9;
+  string source_name = 10;
+  string source_kind = 11;  // upload|object_storage|web
+  string configuration_json = 12;  // non-secret config + secret references only
+  optional string credential_secret_ref = 13;
+  optional string cursor = 14;  // opaque Rust-persisted adapter state
+  repeated string required_roles = 15;
+  repeated string denied_principals = 16;
+}
+
+message SyncSourceReply {
+  string source_id = 1;
+  uint32 discovered_count = 2;
+  uint32 changed_count = 3;
+  uint32 indexed_count = 4;
+  uint32 failed_count = 5;
+  string next_cursor = 6;
+  repeated string errors = 7;  // safe document-id:error-code summaries only
+}
+
+message IngestDocumentRequest {
+  string tenant_id = 1;
+  string organization_id = 2;
+  string project_id = 3;
+  string correlation_id = 4;
+  string request_id = 5;
+  string protocol_version = 6;
+  string deadline_rfc3339 = 7;
+  ServiceIdentityMsg identity = 8;
+  string source_id = 9;
+  string document_id = 10;
+  string source_kind = 11;
+  string title = 12;
+  string mime_type = 13;
+  bytes content = 14;
+  optional string source_uri = 15;
+  optional string content_sha256 = 16;
+  repeated string required_roles = 17;
+  repeated string denied_principals = 18;
+  string metadata_json = 19;
+}
+
+message DocumentIngestionReply {
+  string document_id = 1;
+  string sha256 = 2;
+  uint64 byte_count = 3;
+  uint32 chunk_count = 4;
+  uint32 embedded_count = 5;
+  optional string skipped_reason = 6;
+}
+
+message PurgeDocumentRequest {
+  string tenant_id = 1;
+  string organization_id = 2;
+  string project_id = 3;
+  string correlation_id = 4;
+  string request_id = 5;
+  string protocol_version = 6;
+  string deadline_rfc3339 = 7;
+  ServiceIdentityMsg identity = 8;
+  string source_id = 9;
+  string document_id = 10;
+}
+
+message PurgeDocumentReply {
+  string document_id = 1;
+  uint64 removed_chunks = 2;
+}
+
+message DataHubHealthReply {
+  bool healthy = 1;
   string detail = 2;
 }

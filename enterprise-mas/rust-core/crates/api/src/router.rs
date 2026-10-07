@@ -29,8 +29,8 @@ use axum::routing::{get, post, put};
 use axum::Router;
 
 use crate::handlers::{
-    agents, control_plane, executions, health, internal, schedules, tenancy, workflows, Ctx,
-    MAX_BODY_BYTES,
+    agents, control_plane, executions, health, internal, rollbacks, schedules, tenancy, workflows,
+    Ctx, MAX_BODY_BYTES,
 };
 use crate::middleware::{authenticated_layer, request_context_layer};
 use crate::response::ApiError;
@@ -52,15 +52,34 @@ pub fn router(state: AppState) -> Router {
         // ---- agents -------------------------------------------------
         .route("/v1/agents", post(agents::register).get(agents::list))
         .route("/v1/agents/{agent_id}", get(agents::get))
-        .route("/v1/agents/{agent_id}/versions", post(agents::publish_version))
+        .route(
+            "/v1/agents/{agent_id}/versions",
+            get(agents::list_versions).post(agents::publish_version),
+        )
+        .route(
+            "/v1/agents/{agent_id}/versions/{version}/rollback",
+            post(rollbacks::rollback_agent),
+        )
         // ---- workflows ----------------------------------------------
         .route("/v1/workflows", post(workflows::create).get(workflows::list))
         .route("/v1/workflows/{workflow_id}", get(workflows::get))
         .route("/v1/workflows/{workflow_id}/graph", put(workflows::update_graph))
+        .route("/v1/workflows/{workflow_id}/publish", post(workflows::publish))
+        .route("/v1/workflows/{workflow_id}/disable", post(workflows::disable))
+        .route(
+            "/v1/workflows/{workflow_id}/versions",
+            get(workflows::list_versions),
+        )
+        .route(
+            "/v1/workflows/{workflow_id}/versions/{version}/rollback",
+            post(rollbacks::rollback_workflow),
+        )
+        .route("/v1/rollbacks", get(rollbacks::list))
         // ---- executions ---------------------------------------------
         .route("/v1/projects/{project_id}/executions", post(executions::submit))
         .route("/v1/executions", get(executions::list))
         .route("/v1/executions/{execution_id}", get(executions::get))
+        .route("/v1/executions/{execution_id}/steps", get(executions::steps))
         .route("/v1/executions/{execution_id}/start", post(executions::start))
         .route("/v1/executions/{execution_id}/pause", post(executions::pause))
         .route("/v1/executions/{execution_id}/resume", post(executions::resume))
@@ -144,25 +163,29 @@ async fn not_found(Ctx(ctx): Ctx) -> ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::test_support::inmemory_state;
+    use crate::state::test_support::{inmemory_state, inmemory_state_with_store};
     use axum::body::Body;
     use axum::http::header;
     use axum::http::{Method, Request, StatusCode};
     use http_body_util::BodyExt;
     use mas_application::context::ServiceContext;
+    use mas_application::stores::{ExecutionStepStorePort, InMemoryServices, MembershipStorePort};
     use mas_common::ids::{OrganizationId, TenantId};
     use mas_common::timestamps::Timestamp;
+    use mas_domain::ExecutionStep;
+    use std::sync::Arc;
     use tower::ServiceExt;
 
     struct Seeded {
         router: Router,
+        store: Arc<InMemoryServices>,
         tenant: TenantId,
         organization: OrganizationId,
         project: mas_common::ids::ProjectId,
     }
 
     async fn seeded() -> Seeded {
-        let state = inmemory_state();
+        let (mut state, store) = inmemory_state_with_store();
         let system =
             ServiceContext::for_service("seed", "http-it-1", &Timestamp::now()).expect("ctx");
         let organization = state
@@ -197,9 +220,40 @@ mod tests {
             .register_project(&tenant_scoped, "Core", "core-http")
             .await
             .expect("project");
+        let owner = state
+            .tenancy
+            .register_user(&system, "router-owner@example.test", "Router Owner")
+            .await
+            .expect("owner user");
+        let mut owner_membership = state
+            .tenancy
+            .invite_membership(&tenant_scoped, owner.id, mas_domain::MembershipRole::Owner)
+            .await
+            .expect("owner membership");
+        owner_membership
+            .accept_invitation()
+            .expect("accept owner invitation");
+        MembershipStorePort::save(&store, &owner_membership)
+            .await
+            .expect("activate owner membership");
+        let principal = mas_security::SecurityPrincipal::new(
+            owner.id.to_string(),
+            mas_security::PrincipalKind::User,
+            Some(tenant.id),
+            mas_security::ScopeSet::denied(),
+        )
+        .with_organization(organization.id)
+        .with_memberships(vec![mas_security::TenantMembership::new(
+            organization.id,
+            tenant.id,
+            mas_domain::MembershipRole::Owner,
+        )]);
+        state.verifier =
+            Arc::new(crate::auth::StaticTokenVerifier::new().with_token("test-token", principal));
         let router = router(state);
         Seeded {
             router,
+            store,
             tenant: tenant.id,
             organization: organization.id,
             project: project.id,
@@ -373,6 +427,127 @@ mod tests {
             "deterministic topological order returned"
         );
 
+        // Publishing creates an immutable v1 snapshot visible through the
+        // tenant-scoped version-history endpoint.
+        let response = seeded
+            .router
+            .clone()
+            .oneshot(scoped_request(
+                &seeded,
+                Method::POST,
+                &format!("/v1/workflows/{workflow_id}/publish"),
+                None,
+            ))
+            .await
+            .expect("publish response");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let published_v1 = json_body(response).await;
+        assert_eq!(published_v1["data"]["version_number"], 1);
+
+        let response = seeded
+            .router
+            .clone()
+            .oneshot(scoped_request(
+                &seeded,
+                Method::GET,
+                &format!("/v1/workflows/{workflow_id}/versions"),
+                None,
+            ))
+            .await
+            .expect("version history response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let versions = json_body(response).await;
+        assert_eq!(versions["data"].as_array().expect("versions").len(), 1);
+        assert_eq!(versions["data"][0]["version_number"], 1);
+        assert_eq!(
+            versions["data"][0]["graph"]["nodes"]
+                .as_array()
+                .expect("nodes")
+                .len(),
+            3
+        );
+
+        // Republish as v2, then roll back to v1. Rollback is forward-versioned
+        // (v3) and the exact idempotency replay returns the same receipt.
+        let response = seeded
+            .router
+            .clone()
+            .oneshot(scoped_request(
+                &seeded,
+                Method::POST,
+                &format!("/v1/workflows/{workflow_id}/disable"),
+                None,
+            ))
+            .await
+            .expect("disable response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = seeded
+            .router
+            .clone()
+            .oneshot(scoped_request(
+                &seeded,
+                Method::POST,
+                &format!("/v1/workflows/{workflow_id}/publish"),
+                None,
+            ))
+            .await
+            .expect("republish response");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(json_body(response).await["data"]["version_number"], 2);
+
+        let rollback_body = serde_json::json!({
+            "target_version_number": 1,
+            "reason": "restore the approved graph",
+            "idempotency_key": "http-workflow-rollback-1"
+        });
+        let rollback_path = format!("/v1/workflows/{workflow_id}/versions/1/rollback");
+        let response = seeded
+            .router
+            .clone()
+            .oneshot(scoped_request(
+                &seeded,
+                Method::POST,
+                &rollback_path,
+                Some(rollback_body.clone()),
+            ))
+            .await
+            .expect("rollback response");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let rollback_receipt = json_body(response).await;
+        assert_eq!(rollback_receipt["data"]["from_version"], 2);
+        assert_eq!(rollback_receipt["data"]["to_version"], 3);
+        let response = seeded
+            .router
+            .clone()
+            .oneshot(scoped_request(
+                &seeded,
+                Method::POST,
+                &rollback_path,
+                Some(rollback_body),
+            ))
+            .await
+            .expect("idempotent rollback response");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(
+            json_body(response).await["data"]["rollback_record_id"],
+            rollback_receipt["data"]["rollback_record_id"]
+        );
+        let response = seeded
+            .router
+            .clone()
+            .oneshot(scoped_request(
+                &seeded,
+                Method::GET,
+                "/v1/rollbacks?limit=10",
+                None,
+            ))
+            .await
+            .expect("rollback history response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let history = json_body(response).await;
+        assert_eq!(history["data"].as_array().expect("history").len(), 1);
+        assert!(history["data"][0].get("idempotency_key").is_none());
+
         // Submit an execution with an Idempotency-Key header.
         let submit_path = format!("/v1/projects/{}/executions", seeded.project);
         let make_submit = |workflow_id: &str| {
@@ -396,6 +571,97 @@ mod tests {
         assert!(response.headers().get("x-idempotent-replay").is_none());
         let first_body = json_body(response).await;
         let execution_id = first_body["data"]["id"].as_str().expect("id").to_owned();
+
+        // Timeline reads are tenant-scoped and return an empty ordered list
+        // until the runtime has persisted step rows.
+        let response = seeded
+            .router
+            .clone()
+            .oneshot(scoped_request(
+                &seeded,
+                Method::GET,
+                &format!("/v1/executions/{execution_id}/steps"),
+                None,
+            ))
+            .await
+            .expect("execution steps response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(json_body(response).await["data"]
+            .as_array()
+            .expect("timeline")
+            .is_empty());
+
+        // Seed runtime-owned step rows out of order, then verify the HTTP
+        // projection is ordered and never exposes object-storage references.
+        let execution_id_value = mas_common::ids::ExecutionId::from_uuid(
+            uuid::Uuid::parse_str(&execution_id).expect("execution id"),
+        );
+        let mut later_step = ExecutionStep::new(
+            execution_id_value,
+            "agent.run",
+            2,
+            Some("finish".to_owned()),
+        )
+        .with_agent(mas_common::ids::AgentId::new())
+        .with_input_ref("object://private/agent-input");
+        later_step.begin().expect("begin later step");
+        later_step
+            .succeed(Some("object://private/agent-output".to_owned()))
+            .expect("complete later step");
+        let mut earlier_step = ExecutionStep::new(
+            execution_id_value,
+            "tool.invoke",
+            0,
+            Some("triage".to_owned()),
+        )
+        .with_tool(mas_common::ids::ToolId::new())
+        .with_input_ref("object://private/tool-input");
+        earlier_step.begin().expect("begin earlier step");
+        earlier_step
+            .succeed(Some("object://private/tool-output".to_owned()))
+            .expect("complete earlier step");
+        ExecutionStepStorePort::save(&seeded.store, &later_step)
+            .await
+            .expect("persist later runtime step");
+        ExecutionStepStorePort::save(&seeded.store, &earlier_step)
+            .await
+            .expect("persist earlier runtime step");
+
+        let response = seeded
+            .router
+            .clone()
+            .oneshot(scoped_request(
+                &seeded,
+                Method::GET,
+                &format!("/v1/executions/{execution_id}/steps"),
+                None,
+            ))
+            .await
+            .expect("populated execution steps response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let timeline = json_body(response).await["data"]
+            .as_array()
+            .expect("populated timeline")
+            .clone();
+        assert_eq!(timeline.len(), 2);
+        assert_eq!(timeline[0]["sequence"], 0);
+        assert_eq!(timeline[0]["kind"], "tool.invoke");
+        assert_eq!(timeline[0]["node_key"], "triage");
+        assert_eq!(timeline[0]["status"], "completed");
+        assert_eq!(timeline[0]["attempt"], 1);
+        assert!(timeline[0]["tool_id"].is_string());
+        assert!(timeline[0]["latency_ms"].is_u64());
+        assert_eq!(timeline[1]["sequence"], 2);
+        assert_eq!(timeline[1]["kind"], "agent.run");
+        assert_eq!(timeline[1]["node_key"], "finish");
+        assert_eq!(timeline[1]["status"], "completed");
+        assert!(timeline[1]["agent_id"].is_string());
+        for step in &timeline {
+            assert!(step.get("input_ref").is_none());
+            assert!(step.get("output_ref").is_none());
+            assert!(step.get("tokens_input").is_none());
+            assert!(step.get("tokens_output").is_none());
+        }
 
         // Replay: same key ⇒ same execution with the replay header set.
         let response = seeded
@@ -435,6 +701,137 @@ mod tests {
         let body = json_body(response).await;
         assert_eq!(body["error"]["code"], "CONFLICT");
 
+        // The publisher is derived from the authenticated user, never from
+        // request JSON; list_versions returns the immutable safe projection.
+        let response = seeded
+            .router
+            .clone()
+            .oneshot(scoped_request(
+                &seeded,
+                Method::POST,
+                &format!("/v1/agents/{agent_id}/versions"),
+                Some(serde_json::json!({
+                    "configuration_checksum": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                    "configuration_snapshot": {"model_hint": "test-model"}
+                })),
+            ))
+            .await
+            .expect("publish agent version response");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let published_agent_version = json_body(response).await;
+        assert_eq!(published_agent_version["data"]["version_number"], 1);
+        let response = seeded
+            .router
+            .clone()
+            .oneshot(scoped_request(
+                &seeded,
+                Method::POST,
+                &format!("/v1/agents/{agent_id}/versions"),
+                Some(serde_json::json!({
+                    "configuration_checksum": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                    "configuration_snapshot": {"model_hint": "forged"},
+                    "published_by": "00000000-0000-0000-0000-000000000000"
+                })),
+            ))
+            .await
+            .expect("forged publisher response");
+        assert!(
+            response.status().is_client_error(),
+            "clients may not submit the publisher identity"
+        );
+        let response = seeded
+            .router
+            .clone()
+            .oneshot(scoped_request(
+                &seeded,
+                Method::GET,
+                &format!("/v1/agents/{agent_id}/versions"),
+                None,
+            ))
+            .await
+            .expect("agent version history response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let agent_versions = json_body(response).await;
+        assert_eq!(agent_versions["data"][0]["version_number"], 1);
+        assert_eq!(
+            agent_versions["data"][0]["published_by"],
+            published_agent_version["data"]["published_by"]
+        );
+
+        let response = seeded
+            .router
+            .clone()
+            .oneshot(scoped_request(
+                &seeded,
+                Method::POST,
+                &format!("/v1/agents/{agent_id}/versions"),
+                Some(serde_json::json!({
+                    "configuration_checksum": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+                    "configuration_snapshot": {"model_hint": "test-model-v2"}
+                })),
+            ))
+            .await
+            .expect("publish second agent version response");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(json_body(response).await["data"]["version_number"], 2);
+
+        let agent_rollback_body = serde_json::json!({
+            "target_version_number": 1,
+            "reason": "restore the approved agent configuration",
+            "idempotency_key": "http-agent-rollback-1"
+        });
+        let agent_rollback_path = format!("/v1/agents/{agent_id}/versions/1/rollback");
+        let response = seeded
+            .router
+            .clone()
+            .oneshot(scoped_request(
+                &seeded,
+                Method::POST,
+                &agent_rollback_path,
+                Some(agent_rollback_body.clone()),
+            ))
+            .await
+            .expect("agent rollback response");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let agent_rollback_receipt = json_body(response).await;
+        assert_eq!(agent_rollback_receipt["data"]["from_version"], 2);
+        assert_eq!(agent_rollback_receipt["data"]["to_version"], 3);
+        assert_eq!(agent_rollback_receipt["data"]["source_version"], 1);
+        let response = seeded
+            .router
+            .clone()
+            .oneshot(scoped_request(
+                &seeded,
+                Method::POST,
+                &agent_rollback_path,
+                Some(agent_rollback_body),
+            ))
+            .await
+            .expect("idempotent agent rollback response");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(
+            json_body(response).await["data"]["rollback_record_id"],
+            agent_rollback_receipt["data"]["rollback_record_id"]
+        );
+        let response = seeded
+            .router
+            .clone()
+            .oneshot(scoped_request(
+                &seeded,
+                Method::GET,
+                "/v1/rollbacks?limit=10",
+                None,
+            ))
+            .await
+            .expect("combined rollback history response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let combined_history = json_body(response).await;
+        assert_eq!(
+            combined_history["data"].as_array().expect("history").len(),
+            2
+        );
+        assert!(combined_history["data"][0].get("idempotency_key").is_none());
+
         // Transition over HTTP: start → pause → resume.
         let do_post = |path: String| scoped_request(&seeded, Method::POST, &path, None);
         let response = seeded
@@ -466,10 +863,9 @@ mod tests {
             .expect("response");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
-        // Scope headers are mandatory on tenant routes when the principal has
-        // no tenant binding of its own. It is a malformed request (400), not
-        // an authorization failure (403): nothing was denied, because nothing
-        // was ever asked for.
+        // A principal bound to exactly one tenant needs no scope header: the
+        // resolver selects its sole authoritative binding rather than
+        // treating absent request metadata as an error.
         let no_scope = request(Method::GET, "/v1/executions", None);
         let response = seeded
             .router
@@ -477,8 +873,8 @@ mod tests {
             .oneshot(no_scope)
             .await
             .expect("response");
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.status(), StatusCode::OK);
         let body = json_body(response).await;
-        assert_eq!(body["error"]["code"], "VALIDATION_FAILED");
+        assert_eq!(body["data"].as_array().expect("executions").len(), 1);
     }
 }

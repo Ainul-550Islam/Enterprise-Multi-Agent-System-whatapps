@@ -126,6 +126,56 @@ pub struct ExecutionResponse {
     pub finished_at: Option<Timestamp>,
 }
 
+/// Safe execution-step timeline item. Object-storage references and step input
+/// or output payloads are deliberately excluded.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionStepDto {
+    /// Step identifier.
+    pub id: mas_common::ids::ExecutionStepId,
+    /// Parent execution.
+    pub execution_id: ExecutionId,
+    /// Stable step kind such as `tool.invoke` or `agent.run`.
+    pub kind: String,
+    /// Zero-based sequence within the execution.
+    pub sequence: u64,
+    /// Workflow node key when applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_key: Option<String>,
+    /// One-based execution attempt.
+    pub attempt: u32,
+    /// Lifecycle status.
+    pub status: mas_common::enums::ExecutionStepStatus,
+    /// Tool invoked by this step, when applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_id: Option<mas_common::ids::ToolId>,
+    /// Agent invoked by this step, when applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<AgentId>,
+    /// Per-step input token count, absent when the runtime did not record it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_input: Option<u64>,
+    /// Per-step output token count, absent when the runtime did not record it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_output: Option<u64>,
+    /// Elapsed execution time in milliseconds, when a start instant is known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<u64>,
+    /// Safe classified failure code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    /// Redacted, truncated failure description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+    /// Start timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<Timestamp>,
+    /// Finish timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<Timestamp>,
+    /// Creation timestamp.
+    pub created_at: Timestamp,
+}
+
 /// One streamed execution event (SSE lines / gRPC stream frames).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionEventResponse {

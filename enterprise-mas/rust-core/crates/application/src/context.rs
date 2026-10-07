@@ -6,7 +6,7 @@ use mas_common::ids::{OrganizationId, TenantId};
 use mas_common::result::Result;
 use mas_common::timestamps::Timestamp;
 use mas_common::validation;
-use mas_domain::{AuditActor, AuditActorKind};
+use mas_domain::{AuditActor, AuditActorKind, MembershipRole};
 
 /// The request-scoped context every application service receives.
 ///
@@ -23,7 +23,13 @@ pub struct ServiceContext {
     pub actor: AuditActor,
     pub tenant_id: Option<TenantId>,
     pub organization_id: Option<OrganizationId>,
+    /// Role proven by the authenticated principal for this resolved scope.
+    /// Never populated from a request body or header.
+    pub resolved_role: Option<MembershipRole>,
     pub correlation_id: String,
+    /// The unique request identifier that remains stable across durable task
+    /// delivery and every retry of the originating execution.
+    pub request_id: uuid::Uuid,
     pub requested_at: Timestamp,
 }
 
@@ -43,7 +49,9 @@ impl ServiceContext {
             actor,
             tenant_id,
             organization_id,
+            resolved_role: None,
             correlation_id,
+            request_id: uuid::Uuid::now_v7(),
             requested_at: *requested_at,
         })
     }
@@ -73,6 +81,28 @@ impl ServiceContext {
             correlation_id,
             requested_at,
         )
+    }
+
+    /// Replaces the generated request identifier with the transport's
+    /// request identifier so the API response and durable work share one id.
+    #[must_use]
+    pub fn with_request_id(mut self, request_id: uuid::Uuid) -> Self {
+        self.request_id = request_id;
+        self
+    }
+
+    /// Carries the role proven by the authentication/scope-resolution layer.
+    /// Callers must not pass a role from request data.
+    #[must_use]
+    pub fn with_resolved_role(mut self, role: Option<MembershipRole>) -> Self {
+        self.resolved_role = role;
+        self
+    }
+
+    /// Requires a role resolved for the current authenticated scope.
+    pub fn require_resolved_role(&self) -> Result<MembershipRole> {
+        self.resolved_role
+            .ok_or_else(|| AppError::forbidden("a resolved membership role is required"))
     }
 
     /// Convenience: clone with a concrete tenant/organization scope.

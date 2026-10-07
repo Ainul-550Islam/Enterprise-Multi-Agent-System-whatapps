@@ -6,10 +6,10 @@
 
 """Server bootstrap for the inbound Rust → Python gRPC surface.
 
-The orchestrator exposes exactly one service to Rust on this port:
-``AgentBridgeApi``. Keeping the surface narrow is deliberate — every additional
-service is another place a caller could arrive without the identity checks the
-servicer enforces.
+The orchestrator exposes ``AgentBridgeApi`` and, when the Data Hub is wired,
+``DataHubBridgeApi`` on the same private listener. The Data Hub servicer does
+not add a second identity implementation: it delegates body-signature, bearer,
+scope, and tenant reconciliation to AgentBridge's existing boundary.
 
 Three properties this module is responsible for:
 
@@ -25,6 +25,9 @@ Three properties this module is responsible for:
   or raises. There is no "try the port, else pick another" path, because a
   service listening somewhere other than where its clients are configured to
   look is worse than one that fails to start.
+* **Shared trust boundary.** AgentBridge and the optional DataHubBridge are
+  registered on the same listener; DataHub RPC authorization is delegated to
+  the AgentBridge servicer's existing validation path.
 """
 
 from __future__ import annotations
@@ -34,13 +37,17 @@ from concurrent import futures
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final
 
+from mas_orchestrator.config.enums import Environment, TransportSecurity
 from mas_orchestrator.grpc.generated import mas_api_pb2_grpc
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from grpc import aio
 
     from mas_orchestrator.config.settings import ServiceSettings
     from mas_orchestrator.grpc.agent_bridge_servicer import AgentBridgeServicer
+    from mas_orchestrator.grpc.data_hub_servicer import DataHubBridgeServicer
     from mas_orchestrator.services.lifecycle import ShutdownCoordinator
 
 _LOGGER: Final[logging.Logger] = logging.getLogger(__name__)
@@ -86,6 +93,14 @@ class GrpcServerConfig:
         graceful_stop_seconds: Grace period for in-flight calls on stop.
         max_receive_bytes: Inbound message ceiling.
         max_send_bytes: Outbound message ceiling.
+        transport_security: Plaintext, TLS, or mutual TLS mode.
+        environment: Deployment environment used to reject plaintext outside
+            development/test.
+        certificate_chain_path: PEM server certificate chain path.
+        private_key_path: PEM server private key path.
+        ca_bundle_path: Client CA bundle for mTLS.
+        require_client_certificate: Whether callers must present a trusted
+            client certificate.
     """
 
     host: str = "127.0.0.1"
@@ -94,10 +109,22 @@ class GrpcServerConfig:
     graceful_stop_seconds: float = GRACEFUL_STOP_SECONDS
     max_receive_bytes: int = DEFAULT_MAX_RECEIVE_BYTES
     max_send_bytes: int = DEFAULT_MAX_SEND_BYTES
+    transport_security: TransportSecurity = TransportSecurity.INSECURE
+    environment: Environment = Environment.DEVELOPMENT
+    certificate_chain_path: str | None = None
+    private_key_path: str | None = None
+    ca_bundle_path: str | None = None
+    require_client_certificate: bool = False
 
     def __post_init__(self) -> None:
         from mas_orchestrator.contracts.errors import ConfigurationError
+        from mas_orchestrator.security.transport import validate_transport_security
 
+        validate_transport_security(
+            self.transport_security,
+            self.environment,
+            direction="server",
+        )
         if not self.host.strip():
             raise ConfigurationError("grpc bind host must not be empty", details={"field": "host"})
         if not 0 <= self.port <= 65535:
@@ -129,12 +156,15 @@ class GrpcServerConfig:
         cls,
         settings: ServiceSettings,
         *,
+        environment: Environment = Environment.DEVELOPMENT,
         graceful_stop_seconds: float = GRACEFUL_STOP_SECONDS,
     ) -> GrpcServerConfig:
         """Derives transport settings from the service configuration.
 
         Args:
             settings: The orchestrator's service settings.
+            environment: Running deployment environment, used to reject
+                plaintext in staging/production.
             graceful_stop_seconds: Grace period, taken from the shutdown
                 configuration by the caller.
 
@@ -150,6 +180,12 @@ class GrpcServerConfig:
             port=settings.bind_port,
             graceful_stop_seconds=graceful_stop_seconds,
             max_receive_bytes=settings.max_request_bytes,
+            transport_security=settings.grpc_transport_security,
+            environment=environment,
+            certificate_chain_path=settings.grpc_certificate_chain_path,
+            private_key_path=settings.grpc_private_key_path,
+            ca_bundle_path=settings.grpc_client_ca_bundle_path,
+            require_client_certificate=settings.grpc_require_client_certificate,
         )
 
     @property
@@ -159,10 +195,14 @@ class GrpcServerConfig:
 
 
 class GrpcServer:
-    """Owns the gRPC server exposing ``AgentBridgeApi``.
+    """Owns the gRPC server exposing AgentBridgeApi and optional DataHubBridgeApi.
 
     Args:
-        servicer: The bridge servicer to register.
+        servicer: The AgentBridge servicer to register.
+        data_hub_servicer: Optional Data Hub servicer, authenticated by the same
+            AgentBridge trust boundary.
+        closeables: Runtime resources closed once after graceful drain or failed
+            startup.
         config: Transport settings.
         logger: Logger override, for tests.
     """
@@ -171,10 +211,15 @@ class GrpcServer:
         self,
         *,
         servicer: AgentBridgeServicer,
+        data_hub_servicer: DataHubBridgeServicer | None = None,
+        closeables: Sequence[object] = (),
         config: GrpcServerConfig | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
         self._servicer = servicer
+        self._data_hub_servicer = data_hub_servicer
+        self._closeables = tuple(closeables)
+        self._resources_closed = False
         self._config = config or GrpcServerConfig()
         self._logger = logger or _LOGGER
         self._server: aio.Server | None = None
@@ -213,46 +258,106 @@ class GrpcServer:
         from grpc import aio
 
         from mas_orchestrator.contracts.errors import DependencyUnavailableError
+        from mas_orchestrator.security.transport import (
+            ServerTransportConfig,
+            build_server_credentials,
+        )
 
-        server = aio.server(
-            futures.ThreadPoolExecutor(
+        executor: futures.ThreadPoolExecutor | None = None
+        server: aio.Server | None = None
+        bound = 0
+        try:
+            server_credentials = build_server_credentials(
+                ServerTransportConfig(
+                    security=self._config.transport_security,
+                    environment=self._config.environment,
+                    certificate_chain_path=self._config.certificate_chain_path,
+                    private_key_path=self._config.private_key_path,
+                    ca_bundle_path=self._config.ca_bundle_path,
+                    require_client_certificate=self._config.require_client_certificate,
+                )
+            )
+            if self._data_hub_servicer is not None:
+                await self._data_hub_servicer.startup()
+
+            executor = futures.ThreadPoolExecutor(
                 max_workers=self._config.max_concurrent_rpcs,
                 thread_name_prefix="mas-bridge",
-            ),
-            options=(
-                ("grpc.max_receive_message_length", self._config.max_receive_bytes),
-                ("grpc.max_send_message_length", self._config.max_send_bytes),
-                ("grpc.so_reuseport", 0),
-            ),
-        )
-        # The generated registrar is untyped; the call is a no-op on failure
-        # because binding below is what actually validates the address.
-        mas_api_pb2_grpc.add_AgentBridgeApiServicer_to_server(  # type: ignore[no-untyped-call]
-            self._servicer, server
-        )
-
-        try:
-            bound: int = server.add_insecure_port(self._config.address)
-        except OSError as error:
-            await server.stop(0)
-            # Reports the address, never the configuration: a bind failure is
-            # an operational fault, and the fix is to free the port or change
-            # the configured address.
-            raise DependencyUnavailableError(
-                f"cannot bind the agent bridge server to {self._config.address}",
-                details={"host": self._config.host, "port": self._config.port},
-            ) from error
-
-        if bound == 0:
-            await server.stop(0)
-            raise DependencyUnavailableError(
-                f"cannot bind the agent bridge server to {self._config.address}",
-                details={"host": self._config.host, "port": self._config.port},
             )
+            server = aio.server(
+                migration_thread_pool=executor,
+                maximum_concurrent_rpcs=self._config.max_concurrent_rpcs,
+                options=(
+                    ("grpc.max_receive_message_length", self._config.max_receive_bytes),
+                    ("grpc.max_send_message_length", self._config.max_send_bytes),
+                    ("grpc.so_reuseport", 0),
+                ),
+            )
+            # The generated registrar is untyped; the call is a no-op on failure
+            # because binding below is what actually validates the address.
+            mas_api_pb2_grpc.add_AgentBridgeApiServicer_to_server(  # type: ignore[no-untyped-call]
+                self._servicer, server
+            )
+            if self._data_hub_servicer is not None:
+                mas_api_pb2_grpc.add_DataHubBridgeApiServicer_to_server(  # type: ignore[no-untyped-call]
+                    self._data_hub_servicer, server
+                )
 
-        await server.start()
+            try:
+                if server_credentials is None:
+                    bound = int(server.add_insecure_port(self._config.address))
+                else:
+                    bound = int(server.add_secure_port(self._config.address, server_credentials))
+            except OSError as error:
+                # Reports the address, never the configuration: a bind failure
+                # is operational, and the fix is to free the port or change the
+                # configured address.
+                raise DependencyUnavailableError(
+                    f"cannot bind the agent bridge server to {self._config.address}",
+                    details={"host": self._config.host, "port": self._config.port},
+                ) from error
+
+            if bound == 0:
+                raise DependencyUnavailableError(
+                    f"cannot bind the agent bridge server to {self._config.address}",
+                    details={"host": self._config.host, "port": self._config.port},
+                )
+
+            await server.start()
+        except BaseException:
+            # The socket may already be bound even when aio.Server.start()
+            # fails. Dispose the listener and every composed resource before
+            # propagating the original startup error.
+            if server is not None:
+                try:
+                    await server.stop(0)
+                except Exception as stop_error:
+                    self._logger.exception(
+                        "gRPC server failed to stop after startup failure",
+                        extra={
+                            "event": "bridge.start_cleanup_failed",
+                            "error_type": type(stop_error).__name__,
+                        },
+                    )
+            if executor is not None:
+                executor.shutdown(wait=False, cancel_futures=True)
+            await self._close_owned_resources()
+            raise
+
+        assert server is not None
         self._server = server
         self._bound_port = bound
+
+        if self._config.host not in ("127.0.0.1", "localhost", "::1"):
+            self._logger.warning(
+                "agent bridge server is reachable beyond process loopback",
+                extra={
+                    "event": "bridge.non_loopback_bind",
+                    "host": self._config.host,
+                    "port": bound,
+                    "transport_security": self._config.transport_security.value,
+                },
+            )
 
         self._logger.info(
             "agent bridge server listening",
@@ -260,7 +365,16 @@ class GrpcServer:
                 "event": "bridge.listening",
                 "address": self._config.address,
                 "bound_port": bound,
-                "service": "mas.api.v1.AgentBridgeApi",
+                "services": [
+                    "mas.api.v1.AgentBridgeApi",
+                    *(
+                        ["mas.api.v1.DataHubBridgeApi"]
+                        if self._data_hub_servicer is not None
+                        else []
+                    ),
+                ],
+                "transport_security": self._config.transport_security.value,
+                "max_concurrent_rpcs": self._config.max_concurrent_rpcs,
                 "max_receive_bytes": self._config.max_receive_bytes,
             },
         )
@@ -276,6 +390,7 @@ class GrpcServer:
         """
         server = self._server
         if server is None:
+            await self._close_owned_resources()
             return
 
         self._server = None
@@ -286,12 +401,35 @@ class GrpcServer:
                 "grace_seconds": self._config.graceful_stop_seconds,
             },
         )
-        await server.stop(self._config.graceful_stop_seconds)
-        self._bound_port = None
+        try:
+            await server.stop(self._config.graceful_stop_seconds)
+        finally:
+            self._bound_port = None
+            await self._close_owned_resources()
         self._logger.info(
             "agent bridge server stopped",
             extra={"event": "bridge.stopped"},
         )
+
+    async def _close_owned_resources(self) -> None:
+        """Closes composed runtime resources once, after request drain."""
+        if self._resources_closed:
+            return
+        self._resources_closed = True
+        for resource in reversed(self._closeables):
+            close = getattr(resource, "aclose", None)
+            if close is None:
+                continue
+            try:
+                await close()
+            except Exception as error:
+                self._logger.exception(
+                    "gRPC server resource failed to close",
+                    extra={
+                        "event": "bridge.resource_close_failed",
+                        "error_type": type(error).__name__,
+                    },
+                )
 
     def register_with(self, coordinator: ShutdownCoordinator) -> None:
         """Wires this server into the process shutdown coordinator.

@@ -75,7 +75,7 @@ class ProviderMode(StrEnum):
 
 
 class TransportSecurity(StrEnum):
-    """Transport security mode for outbound Rust Core gRPC calls."""
+    """Transport security mode for gRPC client and server transports."""
 
     #: Plaintext. Development/test only; refused in production.
     INSECURE = "insecure"
@@ -116,6 +116,18 @@ class VectorBackend(StrEnum):
     DISABLED = "disabled"
 
 
+class DataSourceKind(StrEnum):
+    """Data Hub source kinds accepted by the ingestion plane.
+
+    Values are wire/configuration contracts shared with Rust's
+    ``DataSourceKind`` domain enum.
+    """
+
+    UPLOAD = "upload"
+    OBJECT_STORAGE = "object_storage"
+    WEB = "web"
+
+
 class ToolExecutionMode(StrEnum):
     """How tool code execution is performed.
 
@@ -149,6 +161,7 @@ class GuardrailFailureMode(StrEnum):
 
 
 __all__ = [
+    "DataSourceKind",
     "Environment",
     "GuardrailFailureMode",
     "LogFormat",

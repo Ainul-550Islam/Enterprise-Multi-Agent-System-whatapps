@@ -235,19 +235,27 @@ async fn harness(owner: sqlx::PgPool, runtime: sqlx::PgPool) -> Harness {
         Box::new(audit.clone()),
         Box::new(control_plane.entitlement_store()),
     ));
-    let agents = Arc::new(AgentService::new(
-        Box::new(store.clone()),
-        Box::new(store.clone()),
-        Box::new(store.clone()),
-        Box::new(audit.clone()),
-    ));
-    let workflows = Arc::new(WorkflowService::new(
-        Box::new(store.clone()),
-        Box::new(store.clone()),
-        Box::new(audit.clone()),
-    ));
+    let agents = Arc::new(
+        AgentService::new(
+            Box::new(store.clone()),
+            Box::new(store.clone()),
+            Box::new(store.clone()),
+            Box::new(audit.clone()),
+        )
+        .with_rollback_store(Box::new(store.clone())),
+    );
+    let workflows = Arc::new(
+        WorkflowService::new(
+            Box::new(store.clone()),
+            Box::new(store.clone()),
+            Box::new(store.clone()),
+            Box::new(audit.clone()),
+        )
+        .with_rollback_store(Box::new(store.clone())),
+    );
     let durable = Arc::new(InMemoryDurableExecution::new());
     let executions = Arc::new(ExecutionService::new(
+        Box::new(store.clone()),
         Box::new(store.clone()),
         Box::new(store.clone()),
         Box::new(store.clone()),

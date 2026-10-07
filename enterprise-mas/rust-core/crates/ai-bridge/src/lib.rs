@@ -50,6 +50,7 @@ use mas_execution::agent_bridge::{
     AgentBridge, AgentRunRequest, AgentRunVerdict, AgentUsage, CANCELLATION_CODE,
 };
 use mas_security::secret_string::SecretString;
+use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
 
 pub mod gen {
     //! Generated `mas.api.v1` client stubs (build.rs).
@@ -62,6 +63,12 @@ pub mod gen {
 
     tonic::include_proto!("mas.api.v1");
 }
+
+mod data_hub;
+
+pub use data_hub::{
+    GrpcDataHubBridge, GrpcDataHubBridgeConfig, DEFAULT_MAX_REQUEST_BYTES, MAX_REQUEST_BYTES,
+};
 
 use gen::agent_bridge_api_client::AgentBridgeApiClient;
 use gen::{agent_run_reply, AgentRunReply, BridgeHealthReply, ResourceLimitsMsg};
@@ -84,7 +91,7 @@ const PROTOCOL_VERSION_HEADER: &str = "x-ai-protocol-version";
 const IDEMPOTENCY_HEADER: &str = "idempotency-key";
 
 /// The AI wire protocol version this adapter speaks.
-const AI_PROTOCOL_VERSION: &str = "1.0.0";
+const AI_PROTOCOL_VERSION: &str = "1.1.0";
 
 /// A deadline shorter than this is not worth a round trip: fail fast instead of
 /// starting work that cannot finish.
@@ -149,6 +156,15 @@ pub struct GrpcAgentBridgeConfig {
     /// runs inside the worker, so it signs as `mas-worker`. The orchestrator
     /// allowlists that id.
     pub internal_service_id: String,
+    /// PEM trust bundle for a private bridge-server CA. When absent, the
+    /// platform and WebPKI root stores are used.
+    pub tls_ca_certificate: Option<Vec<u8>>,
+    /// Optional client certificate chain used when the Python listener
+    /// requires mutual TLS. The private key is kept separately in a redacting
+    /// secret wrapper and is never included in Debug output.
+    pub tls_client_certificate: Option<Vec<u8>>,
+    /// Private key paired with `tls_client_certificate` for mutual TLS.
+    pub tls_client_private_key: Option<SecretString>,
 }
 
 impl Default for GrpcAgentBridgeConfig {
@@ -163,6 +179,9 @@ impl Default for GrpcAgentBridgeConfig {
             service_scopes: vec!["execute_agent".to_owned()],
             internal_signing_secret: None,
             internal_service_id: DEFAULT_INTERNAL_SERVICE_ID.to_owned(),
+            tls_ca_certificate: None,
+            tls_client_certificate: None,
+            tls_client_private_key: None,
         }
     }
 }
@@ -171,6 +190,8 @@ impl Default for GrpcAgentBridgeConfig {
 #[derive(Debug, Clone)]
 pub struct GrpcAgentBridge {
     client: AgentBridgeApiClient<tonic::transport::Channel>,
+    /// Reused by sibling bridge adapters so both services share one TLS/auth configuration.
+    channel: tonic::transport::Channel,
     config: GrpcAgentBridgeConfig,
 }
 
@@ -185,8 +206,46 @@ impl GrpcAgentBridge {
         if config.endpoint.trim().is_empty() {
             return Err(AppError::validation("ai bridge endpoint must not be empty"));
         }
-        let endpoint = tonic::transport::Endpoint::from_shared(config.endpoint.clone())
-            .map_err(|err| AppError::validation(format!("invalid ai bridge endpoint: {err}")))?
+        let mut endpoint = Endpoint::from_shared(config.endpoint.clone())
+            .map_err(|err| AppError::validation(format!("invalid ai bridge endpoint: {err}")))?;
+
+        let has_client_certificate = config.tls_client_certificate.is_some();
+        let has_client_key = config.tls_client_private_key.is_some();
+        if has_client_certificate != has_client_key {
+            return Err(AppError::validation(
+                "ai bridge mutual TLS requires both a client certificate and private key",
+            ));
+        }
+
+        if endpoint.uri().scheme_str() == Some("https") {
+            let mut tls = ClientTlsConfig::new().with_enabled_roots();
+            if let Some(ca_certificate) = config.tls_ca_certificate.as_deref() {
+                if ca_certificate.iter().all(u8::is_ascii_whitespace) {
+                    return Err(AppError::validation(
+                        "ai bridge CA certificate must not be empty",
+                    ));
+                }
+                tls = tls.ca_certificate(Certificate::from_pem(ca_certificate));
+            }
+            if let (Some(certificate), Some(private_key)) = (
+                config.tls_client_certificate.as_deref(),
+                config.tls_client_private_key.as_ref(),
+            ) {
+                tls = tls.identity(Identity::from_pem(
+                    certificate,
+                    private_key.expose().as_bytes(),
+                ));
+            }
+            endpoint = endpoint.tls_config(tls).map_err(|err| {
+                AppError::validation(format!("invalid ai bridge TLS config: {err}"))
+            })?;
+        } else if config.tls_ca_certificate.is_some() || has_client_certificate {
+            return Err(AppError::validation(
+                "ai bridge TLS credentials require an https endpoint",
+            ));
+        }
+
+        let endpoint = endpoint
             .connect_timeout(Duration::from_secs(5))
             .timeout(config.default_timeout)
             .http2_keep_alive_interval(Duration::from_secs(30))
@@ -196,10 +255,14 @@ impl GrpcAgentBridge {
             AppError::external_service("ai-orchestrator", format!("connect failed: {}", err))
         })?;
 
-        let client =
-            AgentBridgeApiClient::new(channel).max_decoding_message_size(config.max_response_bytes);
+        let client = AgentBridgeApiClient::new(channel.clone())
+            .max_decoding_message_size(config.max_response_bytes);
 
-        Ok(Self { client, config })
+        Ok(Self {
+            client,
+            channel,
+            config,
+        })
     }
 
     /// Computes the RPC timeout for a request.
@@ -229,6 +292,13 @@ impl GrpcAgentBridge {
         Ok(gen::AgentRunRequest {
             agent_id: request.agent_id.to_string(),
             agent_version: request.agent_version.clone(),
+            agent_snapshot_json: request
+                .agent_snapshot
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|err| AppError::serialization(format!("agent runtime snapshot: {err}")))?
+                .unwrap_or_default(),
             input_json: serde_json::to_string(&request.input)
                 .map_err(|err| AppError::serialization(format!("agent input: {err}")))?,
             correlation_id: request.correlation_id.clone(),
@@ -238,6 +308,7 @@ impl GrpcAgentBridge {
                 .map(|id| id.to_string())
                 .unwrap_or_default(),
             task_id: request.task_id.map(|id| id.to_string()).unwrap_or_default(),
+            task_attempt_id: request.task_attempt_id.map(|id| id.to_string()),
             tenant_id: request
                 .tenant_id
                 .map(|id| id.to_string())
@@ -277,6 +348,11 @@ impl GrpcAgentBridge {
                 Ok(AgentRunVerdict::Succeeded {
                     output,
                     usage: decode_usage(success.usage),
+                    model_key: success
+                        .model_key
+                        .filter(|model_key| !model_key.trim().is_empty()),
+                    finish_reason: (!success.finish_reason.trim().is_empty())
+                        .then_some(success.finish_reason),
                 })
             },
             Some(agent_run_reply::Verdict::Failed(failure)) => Ok(AgentRunVerdict::Failed {
@@ -284,6 +360,9 @@ impl GrpcAgentBridge {
                 message: failure.message,
                 retryable: failure.retryable,
                 usage: decode_usage(failure.usage),
+                correlation_id: (!failure.correlation_id.trim().is_empty())
+                    .then_some(failure.correlation_id),
+                request_id: (!failure.request_id.trim().is_empty()).then_some(failure.request_id),
             }),
             None => Err(AppError::external_service(
                 "ai-orchestrator",
@@ -411,6 +490,8 @@ impl AgentBridge for GrpcAgentBridge {
                         message: "agent run cancelled".to_owned(),
                         retryable: false,
                         usage: AgentUsage::default(),
+                        correlation_id: Some(request.correlation_id.clone()),
+                        request_id: request.request_id.clone(),
                     });
                 }
                 tracing::warn!(
@@ -700,8 +781,11 @@ fn decode_usage(usage: Option<gen::AgentUsageMsg>) -> AgentUsage {
 mod tests {
     use super::*;
     use mas_common::enums::Environment;
-    use mas_common::ids::AgentId;
+    use mas_common::ids::{AgentId, TaskAttemptId, TaskId};
     use mas_domain::{ResourceLimits, TokenBudget};
+    use mas_execution::agent_bridge::{
+        AgentRuntimeConfiguration, AgentRuntimeLimits, AgentRuntimeSnapshot,
+    };
     use mas_orchestration::runtime_context::RuntimeContext;
 
     fn context() -> RuntimeContext {
@@ -774,11 +858,13 @@ mod tests {
         gen::AgentRunRequest {
             agent_id: "00000000-0000-0000-0000-000000000001".to_owned(),
             agent_version: Some("v1".to_owned()),
+            agent_snapshot_json: String::new(),
             input_json: "{\"prompt\":\"hi\"}".to_owned(),
             correlation_id: "corr-1".to_owned(),
             request_id: "req-1".to_owned(),
             execution_id: "exec-1".to_owned(),
             task_id: "task-1".to_owned(),
+            task_attempt_id: None,
             tenant_id: "tenant-1".to_owned(),
             organization_id: "org-1".to_owned(),
             project_id: Some("proj-1".to_owned()),
@@ -840,7 +926,10 @@ mod tests {
     fn the_signature_covers_the_bytes_python_will_verify() {
         use prost::Message;
 
-        let body = pinned_request().encode_to_vec();
+        let mut signed_request = pinned_request();
+        signed_request.agent_snapshot_json =
+            r#"{"agent_id":"00000000-0000-0000-0000-000000000001","version_number":2}"#.to_owned();
+        let body = signed_request.encode_to_vec();
         let secret = b"s3cr3t";
         let signed_at = mas_common::timestamps::Timestamp::from_unix_ms(1_700_000_000_000)
             .expect("fixed instant");
@@ -861,7 +950,8 @@ mod tests {
         assert!(verified.is("mas-worker"));
 
         // And a signature over one body does not verify over another.
-        let mut tampered = pinned_request();
+        let mut tampered = signed_request.clone();
+        tampered.agent_snapshot_json.push(' ');
         tampered.tenant_id = "tenant-2".to_owned();
         assert!(
             mas_security::internal_service::verify(
@@ -900,6 +990,45 @@ mod tests {
     }
 
     #[test]
+    fn encode_request_serializes_the_rust_runtime_snapshot() {
+        let mut request = request();
+        let version_id = mas_common::ids::AgentVersionId::new();
+        request.agent_version = Some(version_id.to_string());
+        request.agent_snapshot = Some(AgentRuntimeSnapshot {
+            agent_id: request.agent_id,
+            tenant_id: request.tenant_id.expect("tenant"),
+            organization_id: request.organization_id.expect("organization"),
+            project_id: request.project_id.expect("project"),
+            agent_version_id: version_id,
+            version_number: 4,
+            configuration_checksum: "a".repeat(64),
+            name: "Runtime agent".to_owned(),
+            slug: "runtime-agent".to_owned(),
+            kind: "standard".to_owned(),
+            status: "active".to_owned(),
+            origin: "user".to_owned(),
+            read_only: false,
+            configuration: AgentRuntimeConfiguration {
+                description: Some("published description".to_owned()),
+                model_hint: Some("provider/model-v4".to_owned()),
+                system_prompt: "immutable instructions".to_owned(),
+                limits: AgentRuntimeLimits::default(),
+                tags: vec!["versioned".to_owned()],
+                allowed_tools: vec!["search".to_owned()],
+            },
+        });
+
+        let wire = GrpcAgentBridge::encode_request(&request).expect("encode");
+        let snapshot: serde_json::Value =
+            serde_json::from_str(&wire.agent_snapshot_json).expect("snapshot JSON");
+        assert_eq!(snapshot["agent_id"], request.agent_id.to_string());
+        assert_eq!(snapshot["agent_version_id"], version_id.to_string());
+        assert_eq!(snapshot["version_number"], 4);
+        assert_eq!(snapshot["configuration"]["model_hint"], "provider/model-v4");
+        assert_eq!(snapshot["configuration"]["allowed_tools"][0], "search");
+    }
+
+    #[test]
     fn decode_reply_requires_a_verdict() {
         let error = GrpcAgentBridge::decode_reply(AgentRunReply { verdict: None })
             .expect_err("an empty reply must not become a success");
@@ -923,10 +1052,17 @@ mod tests {
             })),
         };
         match GrpcAgentBridge::decode_reply(reply).expect("decode") {
-            AgentRunVerdict::Succeeded { output, usage } => {
+            AgentRunVerdict::Succeeded {
+                output,
+                usage,
+                model_key,
+                finish_reason,
+            } => {
                 assert_eq!(output["answer"], 42);
                 assert_eq!(usage.total_tokens(), 30);
                 assert_eq!(usage.tool_calls, 1);
+                assert_eq!(model_key.as_deref(), Some("openai/gpt-4o"));
+                assert_eq!(finish_reason.as_deref(), Some("completed"));
             },
             other => panic!("expected success, got {other:?}"),
         }
@@ -947,13 +1083,18 @@ mod tests {
         match GrpcAgentBridge::decode_reply(reply).expect("decode") {
             AgentRunVerdict::Failed {
                 code,
+                message,
                 retryable,
                 usage,
-                ..
+                correlation_id,
+                request_id,
             } => {
                 assert_eq!(code, "model_timeout");
+                assert_eq!(message, "provider timed out");
                 assert!(retryable, "retryability must survive the boundary");
                 assert_eq!(usage.total_tokens(), 0);
+                assert_eq!(correlation_id.as_deref(), Some("corr-1"));
+                assert_eq!(request_id.as_deref(), Some("req-1"));
             },
             other => panic!("expected failure, got {other:?}"),
         }
@@ -985,6 +1126,17 @@ mod tests {
         request.idempotency_key = Some("idem-42".to_owned());
         let wire = GrpcAgentBridge::encode_request(&request).expect("encode");
         assert_eq!(wire.idempotency_key.as_deref(), Some("idem-42"));
+    }
+
+    #[test]
+    fn encode_request_carries_the_durable_task_attempt_id() {
+        let mut request = request();
+        request.task_id = Some(TaskId::new());
+        let attempt_id = TaskAttemptId::new();
+        request.task_attempt_id = Some(attempt_id);
+
+        let wire = GrpcAgentBridge::encode_request(&request).expect("encode");
+        assert_eq!(wire.task_attempt_id, Some(attempt_id.to_string()));
     }
 
     #[test]
@@ -1039,13 +1191,21 @@ mod tests {
         use mas_security::secret_string::SecretString;
         let config = GrpcAgentBridgeConfig {
             bearer_token: Some(SecretString::new("super-secret-value")),
+            internal_signing_secret: Some(SecretString::new("internal-mac-secret")),
+            tls_client_private_key: Some(SecretString::new("private-key-material")),
             ..Default::default()
         };
         let rendered = format!("{config:?}");
-        assert!(
-            !rendered.contains("super-secret-value"),
-            "a Debug dump of the config must not leak the credential: {rendered}"
-        );
+        for secret in [
+            "super-secret-value",
+            "internal-mac-secret",
+            "private-key-material",
+        ] {
+            assert!(
+                !rendered.contains(secret),
+                "a Debug dump of the config must not leak {secret}: {rendered}"
+            );
+        }
     }
 
     #[test]

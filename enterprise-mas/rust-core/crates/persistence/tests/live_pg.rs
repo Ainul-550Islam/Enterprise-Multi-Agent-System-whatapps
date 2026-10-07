@@ -611,24 +611,32 @@ async fn api_keys_prefix_lookup_and_touch() {
     .await
     .expect("api key seed");
 
+    // Authentication runs before a tenant request scope exists. This lookup
+    // must still pass under FORCE RLS through its prefix-only SELECT policy.
+    let auth_store = ApiKeyStore::new(pool.clone());
+    let candidates = auth_store
+        .find_by_prefix(&prefix)
+        .await
+        .expect("pre-scope prefix lookup");
+    let row = candidates
+        .iter()
+        .find(|candidate| candidate.id == key_id)
+        .expect("seeded row among prefix candidates");
+    assert_eq!(row.status, "active");
+    assert_eq!(row.secret_hash, digest);
+    assert!(
+        !row.role.as_str().is_empty(),
+        "migration 0016 backfills a role onto every key"
+    );
+
     scoped(pool.clone(), tenant, organization, |pool| async move {
         let store = ApiKeyStore::new(pool);
-        let candidates = store.find_by_prefix(&prefix).await.expect("prefix lookup");
-        let row = candidates
-            .iter()
-            .find(|c| c.id == key_id)
-            .expect("seeded row among prefix candidates");
-        assert_eq!(row.status, "active");
-        assert_eq!(row.secret_hash, digest);
-        // Every key carries a role; an unbounded key cannot exist any more.
-        assert!(
-            !row.role.as_str().is_empty(),
-            "migration 0016 backfills a role onto every key"
-        );
-
-        store.touch_last_used(key_id).await.expect("touch");
+        store.touch_last_used(key_id, tenant).await.expect("touch");
         let after = store.find_by_prefix(&prefix).await.expect("re-read");
-        let touched = after.iter().find(|c| c.id == key_id).expect("row");
+        let touched = after
+            .iter()
+            .find(|candidate| candidate.id == key_id)
+            .expect("row");
         assert!(
             touched.last_used_at.is_some(),
             "touch_last_used writes the marker"
@@ -701,6 +709,8 @@ async fn broker_publish_fetch_ack_round_trip() {
     use mas_messaging::subjects::{Subject, SubjectFilter};
 
     let task_uuid = uuid::Uuid::now_v7();
+    let agent_id = mas_common::ids::AgentId::new();
+    let agent_version_id = mas_common::ids::AgentVersionId::new();
     let idempotency_key = format!("broker-{}", uuid::Uuid::now_v7());
     let message = mas_contracts::task::TaskQueueMessage::staged(
         TaskId::from(task_uuid),
@@ -710,7 +720,7 @@ async fn broker_publish_fetch_ack_round_trip() {
         "execution.run".to_owned(),
         serde_json::json!({"itest": "broker"}),
         None,
-        None,
+        Some(agent_id),
         None,
         idempotency_key.clone(),
         TaskPriority::Normal,
@@ -719,7 +729,8 @@ async fn broker_publish_fetch_ack_round_trip() {
         None,
         &format!("frame-{}", uuid::Uuid::now_v7()),
     )
-    .expect("staged message");
+    .expect("staged message")
+    .with_agent_version_id(agent_version_id);
     let codec = JsonEventCodec::new(CodecConfig::default());
     let frame = codec.encode_value(&message).expect("frame");
 
@@ -772,6 +783,8 @@ async fn broker_publish_fetch_ack_round_trip() {
     let decoded: mas_contracts::task::TaskQueueMessage =
         codec.decode_value(&ours.payload).expect("decode");
     assert_eq!(*decoded.task_id.as_uuid(), task_uuid);
+    assert_eq!(decoded.agent_id, Some(agent_id));
+    assert_eq!(decoded.agent_version_id, Some(agent_version_id));
 
     // Production settles the row through the lifecycle store BEFORE acking
     // (worker/src/consumer.rs): `PgTaskBroker::ack(Ack)` only validates that
@@ -893,6 +906,7 @@ fn durable_intent(scope: &Scope, agent: mas_common::ids::AgentId, key: &str) -> 
         project_id: scope.project_id(),
         workflow_id: None,
         agent_id: Some(agent),
+        agent_version_id: Some(mas_common::ids::AgentVersionId::new()),
         input,
         idempotency_key: Some(key.to_owned()),
         fingerprint,
@@ -901,6 +915,7 @@ fn durable_intent(scope: &Scope, agent: mas_common::ids::AgentId, key: &str) -> 
         max_attempts: 3,
         deadline: None,
         correlation_id: format!("corr-{key}"),
+        request_id: uuid::Uuid::now_v7(),
         created_by: "user-1".to_owned(),
         actor: TransitionActor::principal("user-1", scope.tenant_id()).expect("actor"),
         create_initial_attempt: false,

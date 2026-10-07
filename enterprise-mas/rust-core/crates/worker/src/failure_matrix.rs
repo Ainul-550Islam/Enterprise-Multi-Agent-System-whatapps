@@ -294,6 +294,7 @@ fn submission_intent(key: &str) -> SubmissionIntent {
         project_id: project(),
         workflow_id: Some(workflow()),
         agent_id: None,
+        agent_version_id: None,
         input: payload(key),
         idempotency_key: Some(key.to_owned()),
         fingerprint: fingerprint(key),
@@ -302,6 +303,7 @@ fn submission_intent(key: &str) -> SubmissionIntent {
         max_attempts: 3,
         deadline: None,
         correlation_id: format!("corr-{key}"),
+        request_id: uuid::Uuid::now_v7(),
         created_by: "user-1".to_owned(),
         actor: TransitionActor::principal("user-1", tenant()).expect("actor"),
         create_initial_attempt: false,
@@ -320,7 +322,7 @@ async fn seed(rig: &Rig, key: &str) -> mas_domain::Task {
 }
 
 fn queue_message(task: &mas_domain::Task) -> TaskQueueMessage {
-    TaskQueueMessage::staged(
+    let message = TaskQueueMessage::staged(
         task.id,
         task.tenant_id,
         task.organization_id,
@@ -337,7 +339,15 @@ fn queue_message(task: &mas_domain::Task) -> TaskQueueMessage {
         task.deadline,
         "corr-matrix",
     )
-    .expect("message")
+    .expect("message");
+    let message = match task.agent_version_id {
+        Some(version_id) => message.with_agent_version_id(version_id),
+        None => message,
+    };
+    match task.request_id {
+        Some(request_id) => message.with_request_id(request_id),
+        None => message,
+    }
 }
 
 async fn publish(rig: &Rig, payload: &TaskQueueMessage) -> u64 {

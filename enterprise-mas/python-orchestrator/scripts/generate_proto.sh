@@ -21,9 +21,17 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-# Default location of the Rust workspace inside this repository checkout.
-DEFAULT_RUST_CORE="${ROOT_DIR}/../repo/enterprise-mas/rust-core"
-RUST_CORE="${1:-${DEFAULT_RUST_CORE}}"
+# The Python package and Rust workspace are siblings in the repository.
+# Preserve the old packaged-checkout location as a fallback for existing builds.
+DEFAULT_RUST_CORE="${ROOT_DIR}/../rust-core"
+LEGACY_RUST_CORE="${ROOT_DIR}/../repo/enterprise-mas/rust-core"
+if [[ -n "${1:-}" ]]; then
+  RUST_CORE="$1"
+elif [[ -d "${DEFAULT_RUST_CORE}" ]]; then
+  RUST_CORE="${DEFAULT_RUST_CORE}"
+else
+  RUST_CORE="${LEGACY_RUST_CORE}"
+fi
 
 PROTO_REL="crates/api/proto/mas/api/v1/mas.proto"
 PROTO_PATH="${RUST_CORE}/${PROTO_REL}"
@@ -39,7 +47,7 @@ fi
 
 if ! python3 -c "import grpc_tools.protoc" >/dev/null 2>&1; then
   echo "error: grpcio-tools is not installed" >&2
-  echo "hint: python3 -m pip install 'grpcio-tools>=1.66'" >&2
+  echo "hint: python3 -m pip install 'grpcio-tools>=1.84'" >&2
   exit 1
 fi
 

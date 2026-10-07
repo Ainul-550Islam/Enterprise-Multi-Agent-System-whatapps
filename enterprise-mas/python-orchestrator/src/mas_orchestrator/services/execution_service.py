@@ -62,6 +62,7 @@ from mas_orchestrator.services.idempotency import (
 )
 
 if TYPE_CHECKING:
+    from mas_orchestrator.agents.base import AgentSpec
     from mas_orchestrator.agents.router import AgentRoutingRequest
     from mas_orchestrator.context import ExecutionContext
     from mas_orchestrator.guardrails.manager import GuardrailManager
@@ -128,6 +129,7 @@ class ExecutionRequest:
         context: Authoritative execution context.
         routing: Optional agent selection constraints.
         agent_id: Run a specific agent rather than selecting one.
+        agent_spec: Optional immutable Rust-resolved definition for this run.
         state: Optional starting state.
         protocol_version: The protocol version claimed by the caller.
     """
@@ -136,12 +138,38 @@ class ExecutionRequest:
     context: ExecutionContext
     routing: AgentRoutingRequest | None = None
     agent_id: str | None = None
+    agent_spec: AgentSpec | None = None
     state: AgentState | None = None
     protocol_version: str = str(CURRENT_PROTOCOL_VERSION)
 
     def __post_init__(self) -> None:
         if not self.request.strip():
             raise InvalidRequestError("request must not be empty", details={"field": "request"})
+        if self.agent_spec is not None:
+            selected_agent_id = self.agent_id or self.context.agent_id
+            if self.agent_spec.agent_id != selected_agent_id:
+                raise InvalidRequestError(
+                    "Rust-resolved agent snapshot does not match the requested agent",
+                    details={"field": "agent_id"},
+                )
+            if self.agent_spec.tenant_id != self.context.tenant_id:
+                raise InvalidRequestError(
+                    "Rust-resolved agent snapshot does not match the execution tenant",
+                    details={"field": "tenant_id"},
+                )
+            if (
+                self.context.agent_version_id is not None
+                and self.agent_spec.agent_version_id != self.context.agent_version_id
+            ):
+                raise InvalidRequestError(
+                    "Rust-resolved agent snapshot does not match the pinned version",
+                    details={"field": "agent_version_id"},
+                )
+            if not self.agent_spec.is_runnable:
+                raise InvalidRequestError(
+                    "Rust-resolved agent snapshot is not runnable",
+                    details={"field": "agent_spec.status"},
+                )
 
 
 class ExecutionService:
@@ -245,6 +273,7 @@ class ExecutionService:
                 state=request.state,
                 cancel_event=cancel_event,
                 agent_id=request.agent_id,
+                agent_spec=request.agent_spec,
             )
         except asyncio.CancelledError as error:
             result = ExecutionResult(

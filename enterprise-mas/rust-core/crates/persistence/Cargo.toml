@@ -32,6 +32,9 @@ mas-tenancy = { workspace = true }
 mas-messaging = { workspace = true }
 mas-scheduling = { workspace = true }
 mas-worker = { workspace = true }
+# PostgreSQL also supplies the runtime's durable step-store adapter; the
+# execution crate depends only on domain/runtime ports, so this edge is acyclic.
+mas-execution = { workspace = true }
 # The control-plane repositories implement the policy and quota ports over
 # Postgres. Both crates are leaf-ish (common/domain/orchestration only), so
 # this edge is acyclic and lets the Postgres adapters live with every other

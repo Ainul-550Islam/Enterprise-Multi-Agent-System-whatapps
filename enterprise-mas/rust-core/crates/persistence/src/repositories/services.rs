@@ -14,14 +14,14 @@
 //!   audit records inside their own commits.
 
 use mas_application::stores::{
-    AgentStorePort, AgentVersionStorePort, ExecutionStorePort, MembershipStorePort,
-    OrganizationStorePort, ProjectStorePort, ScheduleStorePort, TenantStorePort, UserStorePort,
-    WorkflowStorePort,
+    AgentStorePort, AgentVersionStorePort, ExecutionStepStorePort, ExecutionStorePort,
+    MembershipStorePort, OrganizationStorePort, ProjectStorePort, RollbackStorePort,
+    ScheduleStorePort, TenantStorePort, UserStorePort, WorkflowStorePort, WorkflowVersionStorePort,
 };
 use mas_common::error::AppError;
 use mas_common::ids::{
-    AgentId, AgentVersionId, ExecutionId, MembershipId, OrganizationId, ProjectId, ScheduleId,
-    TenantId, UserId, WorkflowId,
+    AgentId, AgentVersionId, ExecutionId, ExecutionStepId, MembershipId, OrganizationId, ProjectId,
+    RollbackRecordId, ScheduleId, TenantId, UserId, WorkflowId, WorkflowVersionId,
 };
 use mas_common::result::Result;
 use mas_domain::agent::Agent;
@@ -34,6 +34,8 @@ use mas_domain::schedule::Schedule;
 use mas_domain::tenant::Tenant;
 use mas_domain::user::User;
 use mas_domain::workflow::Workflow;
+use mas_domain::ExecutionStep;
+use mas_domain::{RollbackRecord, WorkflowVersion};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
@@ -41,8 +43,11 @@ use crate::error::map_sqlx;
 use crate::rows::{MembershipRow, OrganizationRow, ProjectRow, TenantRow, UserRow};
 
 use super::agents::{AgentStore, AgentVersionStore};
+use super::execution_steps::PostgresExecutionStepStore;
 use super::executions::ExecutionStore;
+use super::rollbacks::PostgresRollbackStore;
 use super::schedules::ScheduleStore;
+use super::workflow_versions::PostgresWorkflowVersionStore;
 use super::workflows::WorkflowStore;
 
 const ORG_COLUMNS: &str =
@@ -150,7 +155,10 @@ pub struct PgServices {
     agents: AgentStore,
     agent_versions: AgentVersionStore,
     workflows: WorkflowStore,
+    workflow_versions: PostgresWorkflowVersionStore,
+    rollbacks: PostgresRollbackStore,
     executions: ExecutionStore,
+    execution_steps: PostgresExecutionStepStore,
     schedules: ScheduleStore,
 }
 
@@ -162,7 +170,10 @@ impl PgServices {
             agents: AgentStore::new(pool.clone()),
             agent_versions: AgentVersionStore::new(pool.clone()),
             workflows: WorkflowStore::new(pool.clone()),
+            workflow_versions: PostgresWorkflowVersionStore::new(pool.clone()),
+            rollbacks: PostgresRollbackStore::new(pool.clone()),
             executions: ExecutionStore::new(pool.clone()),
+            execution_steps: PostgresExecutionStepStore::new(pool.clone()),
             schedules: ScheduleStore::new(pool.clone()),
             pool,
         }
@@ -172,6 +183,13 @@ impl PgServices {
     #[must_use]
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// Execution-runtime step persistence adapter, shared by the API timeline
+    /// reader and the worker executor.
+    #[must_use]
+    pub const fn execution_steps(&self) -> &PostgresExecutionStepStore {
+        &self.execution_steps
     }
 }
 
@@ -622,6 +640,84 @@ impl WorkflowStorePort for PgServices {
 }
 
 #[async_trait::async_trait]
+impl WorkflowVersionStorePort for PgServices {
+    async fn append(&self, version: &WorkflowVersion) -> Result<()> {
+        self.workflow_versions.append(version).await
+    }
+
+    async fn publish_snapshot(&self, workflow: &Workflow, version: &WorkflowVersion) -> Result<()> {
+        self.workflow_versions
+            .publish_snapshot(workflow, version)
+            .await
+    }
+
+    async fn get(&self, id: WorkflowVersionId) -> Result<Option<WorkflowVersion>> {
+        self.workflow_versions.get(id).await
+    }
+
+    async fn get_number(
+        &self,
+        workflow: WorkflowId,
+        version_number: u64,
+    ) -> Result<Option<WorkflowVersion>> {
+        self.workflow_versions
+            .get_number(workflow, version_number)
+            .await
+    }
+
+    async fn list(&self, workflow: WorkflowId) -> Result<Vec<WorkflowVersion>> {
+        self.workflow_versions.list(workflow).await
+    }
+}
+
+#[async_trait::async_trait]
+impl RollbackStorePort for PgServices {
+    async fn append(&self, record: &RollbackRecord) -> Result<()> {
+        self.rollbacks.append(record).await
+    }
+
+    async fn get(&self, id: RollbackRecordId) -> Result<Option<RollbackRecord>> {
+        self.rollbacks.get(id).await
+    }
+
+    async fn get_by_idempotency(
+        &self,
+        tenant: TenantId,
+        idempotency_key: &str,
+    ) -> Result<Option<RollbackRecord>> {
+        self.rollbacks
+            .get_by_idempotency(tenant, idempotency_key)
+            .await
+    }
+
+    async fn list(&self, tenant: TenantId, limit: u16) -> Result<Vec<RollbackRecord>> {
+        self.rollbacks.list(tenant, limit).await
+    }
+
+    async fn commit_agent_rollback(
+        &self,
+        agent: &Agent,
+        version: &AgentVersion,
+        record: &RollbackRecord,
+    ) -> Result<()> {
+        self.rollbacks
+            .commit_agent_rollback(agent, version, record)
+            .await
+    }
+
+    async fn commit_workflow_rollback(
+        &self,
+        workflow: &Workflow,
+        version: &WorkflowVersion,
+        record: &RollbackRecord,
+    ) -> Result<()> {
+        self.rollbacks
+            .commit_workflow_rollback(workflow, version, record)
+            .await
+    }
+}
+
+#[async_trait::async_trait]
 impl ExecutionStorePort for PgServices {
     async fn save(&self, execution: &Execution) -> Result<()> {
         self.executions.save(execution).await
@@ -648,6 +744,21 @@ impl ExecutionStorePort for PgServices {
         self.executions
             .idempotency_put(tenant, key, execution)
             .await
+    }
+}
+
+#[async_trait::async_trait]
+impl ExecutionStepStorePort for PgServices {
+    async fn save(&self, step: &ExecutionStep) -> Result<()> {
+        self.execution_steps.save(step).await
+    }
+
+    async fn get(&self, id: ExecutionStepId) -> Result<Option<ExecutionStep>> {
+        self.execution_steps.get(id).await
+    }
+
+    async fn list(&self, execution: ExecutionId) -> Result<Vec<ExecutionStep>> {
+        self.execution_steps.list(execution).await
     }
 }
 

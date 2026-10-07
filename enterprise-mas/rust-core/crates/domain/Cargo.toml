@@ -22,3 +22,4 @@ chrono.workspace = true
 url.workspace = true
 semver.workspace = true
 cron.workspace = true
+sha2.workspace = true

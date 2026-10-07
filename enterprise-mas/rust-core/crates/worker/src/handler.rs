@@ -84,6 +84,7 @@ impl TaskHandlerPort for OperationDispatcher {
 #[cfg(any(test, feature = "testutils"))]
 pub mod canned {
     use super::*;
+    use mas_common::ids::TaskAttemptId;
     use std::sync::Mutex;
 
     /// Scripted handler: fails N times with each queued [`AppError`], then
@@ -92,6 +93,7 @@ pub mod canned {
     pub struct CannedHandler {
         failures: Mutex<Vec<AppError>>,
         invocations: Mutex<u32>,
+        task_attempt_ids: Mutex<Vec<Option<TaskAttemptId>>>,
     }
 
     impl CannedHandler {
@@ -102,6 +104,7 @@ pub mod canned {
             Self {
                 failures: Mutex::new(failures),
                 invocations: Mutex::new(0),
+                task_attempt_ids: Mutex::new(Vec::new()),
             }
         }
 
@@ -115,12 +118,22 @@ pub mod canned {
         pub fn invocations(&self) -> u32 {
             *self.invocations.lock().expect("lock")
         }
+
+        /// Durable attempt identities observed by the handler, in call order.
+        #[must_use]
+        pub fn task_attempt_ids(&self) -> Vec<Option<TaskAttemptId>> {
+            self.task_attempt_ids.lock().expect("lock").clone()
+        }
     }
 
     #[async_trait]
     impl TaskHandlerPort for CannedHandler {
         async fn execute(&self, message: &TaskQueueMessage) -> Result<serde_json::Value> {
             *self.invocations.lock().expect("lock") += 1;
+            self.task_attempt_ids
+                .lock()
+                .expect("lock")
+                .push(message.task_attempt_id);
             let mut failures = self.failures.lock().expect("lock");
             if let Some(err) = failures.pop() {
                 return Err(err);
@@ -161,6 +174,7 @@ mod tests {
             input: serde_json::json!({}),
             execution_id: Some(mas_common::ids::ExecutionId::new()),
             agent_id: None,
+            agent_version_id: None,
             workflow_id: None,
             idempotency_key: "idem-1".to_owned(),
             priority: mas_common::enums::TaskPriority::Normal,
@@ -168,6 +182,8 @@ mod tests {
             max_attempts: 5,
             deadline: None,
             correlation_id: "corr-disp".to_owned(),
+            request_id: None,
+            task_attempt_id: None,
             enqueued_at: mas_common::timestamps::Timestamp::now(),
         };
         let out = dispatcher.execute(&msg).await.expect("routed");

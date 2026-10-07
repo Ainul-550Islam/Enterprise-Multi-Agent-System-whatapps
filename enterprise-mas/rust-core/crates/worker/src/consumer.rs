@@ -567,7 +567,12 @@ impl Mediator {
         }
 
         // ── 3c. Run the handler, heartbeating at half ack_wait. ───────
-        let outcome = self.execute(&claim, task_msg, sequence).await;
+        // The attempt id is known only after the durable claim, so it is
+        // attached to an owned handler copy rather than the persisted broker
+        // frame. Python can then distinguish a true retry from a redelivery
+        // of the same attempt without inventing an attempt identifier.
+        let handler_message = task_msg.clone().with_task_attempt_id(claim.attempt.id);
+        let outcome = self.execute(&claim, &handler_message, sequence).await;
 
         // ── 3d. Settle durably, THEN ack. Terminal state is committed
         //       before the broker is told the message is handled, so a
@@ -1006,6 +1011,7 @@ mod tests {
                 project_id,
                 workflow_id: Some(workflow_id),
                 agent_id: None,
+                agent_version_id: None,
                 input,
                 idempotency_key: Some(key.to_owned()),
                 fingerprint,
@@ -1014,6 +1020,7 @@ mod tests {
                 max_attempts: 5,
                 deadline: None,
                 correlation_id: "corr-worker-test".to_owned(),
+                request_id: uuid::Uuid::now_v7(),
                 created_by: "svc-test".to_owned(),
                 actor: TransitionActor::system("test").expect("actor"),
                 create_initial_attempt: false,
@@ -1025,7 +1032,7 @@ mod tests {
     }
 
     fn queue_message(task: &mas_domain::Task) -> TaskQueueMessage {
-        TaskQueueMessage::staged(
+        let message = TaskQueueMessage::staged(
             task.id,
             task.tenant_id,
             task.organization_id,
@@ -1042,7 +1049,15 @@ mod tests {
             task.deadline,
             "corr-worker-test",
         )
-        .expect("message")
+        .expect("message");
+        let message = match task.agent_version_id {
+            Some(version_id) => message.with_agent_version_id(version_id),
+            None => message,
+        };
+        match task.request_id {
+            Some(request_id) => message.with_request_id(request_id),
+            None => message,
+        }
     }
 
     async fn publish(rig: &Rig, payload: &TaskQueueMessage) -> u64 {
@@ -1240,6 +1255,29 @@ mod tests {
             slots.released(),
             1,
             "the slot was returned on the failure path too"
+        );
+    }
+
+    /// The durable claim's attempt id reaches the handler on the claimed copy.
+    #[tokio::test]
+    async fn durable_claim_attempt_id_is_attached_to_handler_message() {
+        let rig = rig();
+        let task = seed(&rig, "idem-attempt-propagation").await;
+        let mediator = mediator(
+            &rig,
+            "w-attempt-propagation",
+            Arc::new(ScriptedRunSlots::new(RunSlot::NotMetered)),
+        );
+
+        let outcome = mediator.mediate(delivery(&task)).await;
+
+        assert!(matches!(outcome.settlement, Settlement::Ack));
+        let attempts = rig.durable.attempts();
+        assert_eq!(attempts.len(), 1, "claim created one durable attempt");
+        assert_eq!(
+            rig.handler.task_attempt_ids(),
+            vec![Some(attempts[0].id)],
+            "the handler receives the id minted by the durable claim"
         );
     }
 

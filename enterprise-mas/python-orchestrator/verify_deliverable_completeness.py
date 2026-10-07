@@ -30,9 +30,10 @@ import re
 import sys
 from pathlib import Path
 
-DELIVERABLE = Path("/home/user/RUST_PYTHON_BRIDGE_PHASE16_FILES.md")
-PYTHON_ROOT = Path("/home/user/python-orchestrator")
-REPO_ROOT = Path("/home/user/repo/enterprise-mas/rust-core")
+WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
+DELIVERABLE = WORKSPACE_ROOT / "RUST_PYTHON_BRIDGE_PHASE16_FILES.md"
+PYTHON_ROOT = WORKSPACE_ROOT / "enterprise-mas" / "python-orchestrator"
+REPO_ROOT = WORKSPACE_ROOT / "enterprise-mas" / "rust-core"
 
 #: Phrases that mean "content removed here".
 ELISION_MARKERS: tuple[str, ...] = (

@@ -39,12 +39,16 @@ use std::sync::Arc;
 // `AgentBridge` is imported for its `health()` method, which the boot-time
 // readiness probe calls on the concrete bridge.
 use agent_execution::{AgentBridgeSettings, AgentRunHandler};
+use mas_execution::agent_bridge::AgentRuntimeSnapshotResolver;
 use mas_execution::AgentBridge;
 use mas_messaging::broker::BrokerPort;
 use mas_worker::consumer::{ConsumerConfig, TaskConsumer};
 use mas_worker::handler::OperationDispatcher;
 use mas_worker::AttemptCoordinator;
 use mas_worker::ConsumerOutcome;
+use mas_worker_service::agent_runtime_bridge::{
+    PostgresAgentRuntimeSnapshotResolver, ResolvedAgentBridge,
+};
 use mas_worker_service::run_slots::ControlPlaneRunSlots;
 
 #[tokio::main]
@@ -228,6 +232,12 @@ async fn run() -> Result<(), String> {
         .map(str::trim)
         .filter(|h| !h.is_empty())
         .collect::<Vec<_>>();
+    let environment = merger.string("MAS_ENV", "environment", "development");
+    if environment == "production" && !bound.contains(&"execution.run") {
+        return Err(
+            "production worker requires worker.handlers to include execution.run".to_owned(),
+        );
+    }
 
     // The AI bridge is resolved BEFORE the consumer starts, and a missing
     // configuration aborts the boot. Binding an echo handler here instead would
@@ -255,12 +265,22 @@ async fn run() -> Result<(), String> {
             },
         }
 
+        // Resolve the tenant-scoped immutable agent snapshot inside the
+        // canonical bridge path. `PgServices` will use the RLS-armed transaction
+        // owned by the resolver; the durable worker role receives no broader
+        // agent/version table grants.
+        let resolver: Arc<dyn AgentRuntimeSnapshotResolver> =
+            Arc::new(PostgresAgentRuntimeSnapshotResolver::new(pool.clone()));
+        let grpc_bridge: Arc<dyn AgentBridge> = Arc::new(bridge);
+        let resolved_bridge: Arc<dyn AgentBridge> =
+            Arc::new(ResolvedAgentBridge::new(resolver, grpc_bridge));
+
         // The cancellation token the graceful-drain path owns: cancelling it
         // stops in-flight AI work instead of abandoning it mid-run.
         let cancellation = mas_orchestration::cancellation::CancellationToken::new();
         dispatcher = dispatcher.with_handler(
             "execution.run",
-            Arc::new(AgentRunHandler::new(Arc::new(bridge), cancellation)),
+            Arc::new(AgentRunHandler::new(resolved_bridge, cancellation)),
         );
     }
     let ops: Vec<&str> = dispatcher.operations();
@@ -403,6 +423,20 @@ mod tests {
             .expect_err("unknown broker kinds must fail at boot, not silently degrade");
         assert!(err.contains("broker.kind"), "names the knob: {err}");
         assert!(err.contains("redis"), "echoes the invalid value: {err}");
+    }
+
+    #[test]
+    fn checked_in_production_config_selects_the_real_execution_handler() {
+        let production: toml::Value =
+            toml::from_str(include_str!("../../../config/production.toml"))
+                .expect("production config is valid TOML");
+        let handler = production
+            .get("worker")
+            .and_then(|worker| worker.get("handlers"))
+            .and_then(toml::Value::as_str)
+            .expect("production config explicitly sets worker.handlers");
+
+        assert_eq!(handler, "execution.run");
     }
 
     #[cfg(feature = "nats")]

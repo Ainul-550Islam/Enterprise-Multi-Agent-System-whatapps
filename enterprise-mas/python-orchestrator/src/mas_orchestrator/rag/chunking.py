@@ -91,7 +91,12 @@ class Chunker:
                     start_char=start,
                     end_char=end,
                     access=document.access,
-                    metadata={"title": document.title},
+                    metadata={
+                        "title": document.title,
+                        "source_uri": document.source_uri,
+                        "start_char": start,
+                        "end_char": end,
+                    },
                 )
             )
         return chunks

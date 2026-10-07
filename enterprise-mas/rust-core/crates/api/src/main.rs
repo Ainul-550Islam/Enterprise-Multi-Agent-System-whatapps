@@ -42,6 +42,7 @@ use mas_api::state::AppState;
 use mas_application::agent_service::AgentService;
 use mas_application::audit::InMemoryAuditSink;
 use mas_application::execution_service::ExecutionService;
+use mas_application::rollback_service::RollbackApplicationService;
 use mas_application::schedule_service::ScheduleService;
 use mas_application::stores::InMemoryServices;
 use mas_application::tenancy_service::TenancyService;
@@ -93,6 +94,7 @@ async fn run() -> Result<i32, String> {
         tenancy,
         agents,
         workflows,
+        rollbacks,
         executions,
         schedules,
         control_plane,
@@ -136,7 +138,8 @@ async fn run() -> Result<i32, String> {
         // Internal-call authentication. `None` ⇒ every internal route
         // refuses, rather than trusting the network.
         internal_secret,
-    );
+    )
+    .with_rollbacks(rollbacks);
 
     let (http_addr, grpc_addr) = (
         parse_addr_value(
@@ -181,6 +184,7 @@ type ServiceSet = (
     Arc<TenancyService>,
     Arc<AgentService>,
     Arc<WorkflowService>,
+    Arc<RollbackApplicationService>,
     Arc<ExecutionService>,
     Arc<ScheduleService>,
     // The canonical control plane, and the Postgres control-plane stores
@@ -238,28 +242,44 @@ fn compose_inmemory(merger: &mas_common::config::Merger<'_>) -> Result<ServiceSe
         Box::new(audit.clone()),
         Box::new(control_plane.entitlement_store()),
     ));
-    let agents = Arc::new(AgentService::new(
+    let agents = Arc::new(
+        AgentService::new(
+            Box::new(store.clone()),
+            Box::new(store.clone()),
+            Box::new(store.clone()),
+            Box::new(audit.clone()),
+        )
+        .with_rollback_store(Box::new(store.clone())),
+    );
+    let workflows = Arc::new(
+        WorkflowService::new(
+            Box::new(store.clone()),
+            Box::new(store.clone()),
+            Box::new(store.clone()),
+            Box::new(audit.clone()),
+        )
+        .with_rollback_store(Box::new(store.clone())),
+    );
+    let rollbacks = Arc::new(RollbackApplicationService::new(
+        Arc::clone(&agents),
+        Arc::clone(&workflows),
         Box::new(store.clone()),
-        Box::new(store.clone()),
-        Box::new(store.clone()),
-        Box::new(audit.clone()),
     ));
-    let workflows = Arc::new(WorkflowService::new(
-        Box::new(store.clone()),
-        Box::new(store.clone()),
-        Box::new(audit.clone()),
-    ));
-    let executions = Arc::new(ExecutionService::new(
-        Box::new(store.clone()),
-        Box::new(store.clone()),
-        Box::new(store.clone()),
-        Box::new(audit.clone()),
-        Arc::new(mas_application::durable_memory::InMemoryDurableExecution::new()),
-        // The same control plane the tenancy service provisions through. One
-        // process, one gate: a second instance would not see the subscriptions
-        // the first one's provisioning wrote.
-        Arc::clone(&control_plane),
-    ));
+    let executions = Arc::new(
+        ExecutionService::new(
+            Box::new(store.clone()),
+            Box::new(store.clone()),
+            Box::new(store.clone()),
+            Box::new(store.clone()),
+            Box::new(audit.clone()),
+            Arc::new(mas_application::durable_memory::InMemoryDurableExecution::new()),
+            // The same control plane the tenancy service provisions through. One
+            // process, one gate: a second instance would not see the subscriptions
+            // the first one's provisioning wrote.
+            Arc::clone(&control_plane),
+        )
+        .with_step_store(Box::new(store.clone())),
+    );
     let schedules = Arc::new(ScheduleService::new(
         Box::new(store),
         Box::new(audit.clone()) as Box<dyn mas_application::audit::AuditSinkPort>,
@@ -281,6 +301,7 @@ fn compose_inmemory(merger: &mas_common::config::Merger<'_>) -> Result<ServiceSe
         tenancy,
         agents,
         workflows,
+        rollbacks,
         executions,
         schedules,
         // The ExecutionService owns one handle; this is a second handle to
@@ -409,17 +430,24 @@ async fn compose_production(merger: &mas_common::config::Merger<'_>) -> Result<S
         Box::new(PostgresAuditLog::new(audit_pool.clone())),
         Box::new(control_plane.entitlement_store()),
     ));
-    let agents = Arc::new(AgentService::new(
-        Box::new(PgServices::new(pool.clone())),
-        Box::new(PgServices::new(pool.clone())),
-        Box::new(PgServices::new(pool.clone())),
-        Box::new(PostgresAuditLog::new(audit_pool.clone())),
-    ));
-    let workflows = Arc::new(WorkflowService::new(
-        Box::new(PgServices::new(pool.clone())),
-        Box::new(PgServices::new(pool.clone())),
-        Box::new(PostgresAuditLog::new(audit_pool.clone())),
-    ));
+    let agents = Arc::new(
+        AgentService::new(
+            Box::new(PgServices::new(pool.clone())),
+            Box::new(PgServices::new(pool.clone())),
+            Box::new(PgServices::new(pool.clone())),
+            Box::new(PostgresAuditLog::new(audit_pool.clone())),
+        )
+        .with_rollback_store(Box::new(PgServices::new(pool.clone()))),
+    );
+    let workflows = Arc::new(
+        WorkflowService::new(
+            Box::new(PgServices::new(pool.clone())),
+            Box::new(PgServices::new(pool.clone())),
+            Box::new(PgServices::new(pool.clone())),
+            Box::new(PostgresAuditLog::new(audit_pool.clone())),
+        )
+        .with_rollback_store(Box::new(PgServices::new(pool.clone()))),
+    );
     // The durable port is Postgres: submission, claiming, settlement and
     // cancellation all run as one transaction each against the same pool the
     // rest of the service uses.
@@ -428,14 +456,23 @@ async fn compose_production(merger: &mas_common::config::Merger<'_>) -> Result<S
     // service that happened to write a line.
     let audit_log = Arc::new(PostgresAuditLog::new(audit_pool.clone()));
     let audit_sink: Arc<dyn mas_application::audit::AuditSinkPort> = audit_log.clone();
-    let executions = Arc::new(ExecutionService::new(
+    let rollbacks = Arc::new(RollbackApplicationService::new(
+        Arc::clone(&agents),
+        Arc::clone(&workflows),
         Box::new(PgServices::new(pool.clone())),
-        Box::new(PgServices::new(pool.clone())),
-        Box::new(PgServices::new(pool.clone())),
-        Box::new(audit_log.clone()),
-        Arc::new(PgDurableExecution::new(pool.clone())),
-        Arc::clone(&control_plane),
     ));
+    let executions = Arc::new(
+        ExecutionService::new(
+            Box::new(PgServices::new(pool.clone())),
+            Box::new(PgServices::new(pool.clone())),
+            Box::new(PgServices::new(pool.clone())),
+            Box::new(PgServices::new(pool.clone())),
+            Box::new(audit_log.clone()),
+            Arc::new(PgDurableExecution::new(pool.clone())),
+            Arc::clone(&control_plane),
+        )
+        .with_step_store(Box::new(PgServices::new(pool.clone()))),
+    );
     let schedules = Arc::new(ScheduleService::new(
         Box::new(PgServices::new(pool.clone())),
         Box::new(PostgresAuditLog::new(audit_pool.clone())),
@@ -500,6 +537,7 @@ async fn compose_production(merger: &mas_common::config::Merger<'_>) -> Result<S
         tenancy,
         agents,
         workflows,
+        rollbacks,
         executions,
         schedules,
         // A second handle to the control plane the ExecutionService owns —

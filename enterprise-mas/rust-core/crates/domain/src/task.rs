@@ -35,7 +35,8 @@
 use mas_common::enums::{TaskPriority, TaskStatus};
 use mas_common::error::AppError;
 use mas_common::ids::{
-    AgentId, ExecutionId, OrganizationId, ProjectId, TaskAttemptId, TaskId, TenantId, WorkflowId,
+    AgentId, AgentVersionId, ExecutionId, OrganizationId, ProjectId, TaskAttemptId, TaskId,
+    TenantId, WorkflowId,
 };
 use mas_common::result::Result;
 use mas_common::timestamps::Timestamp;
@@ -52,6 +53,12 @@ const fn default_version() -> u64 {
     1
 }
 
+/// Legacy serialized tasks without a correlation key receive a fresh local
+/// diagnostic key; persisted tasks hydrate the authoritative database value.
+fn default_correlation_id() -> String {
+    uuid::Uuid::now_v7().to_string()
+}
+
 /// The task aggregate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
@@ -62,11 +69,23 @@ pub struct Task {
     /// Exactly one of `agent_id` / `workflow_id` addresses the target runtime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<AgentId>,
+    /// Immutable agent-version selection captured at submission and retained
+    /// for every delivery/retry. Workflow tasks and legacy unpinned tasks omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_version_id: Option<AgentVersionId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow_id: Option<WorkflowId>,
     /// Owning execution, when the task was spawned by one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_id: Option<ExecutionId>,
+    /// Platform request id that initiated the durable task, retained across
+    /// broker delivery and retries for end-to-end diagnostics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<uuid::Uuid>,
+    /// End-to-end correlation key from the accepted submission. This is
+    /// materialized separately from the input and is never trusted from it.
+    #[serde(default = "default_correlation_id")]
+    pub correlation_id: String,
     /// The requested operation (e.g. `agent.run`, `tool.invoke`, `workflow.step`).
     pub operation: String,
     #[serde(default)]
@@ -133,6 +152,7 @@ impl Task {
         let operation = operation.into();
         let idempotency_key = idempotency_key.into();
         let created_by = created_by.into();
+        let id = TaskId::new();
         validation::validate_non_empty("operation", &operation)?;
         validation::validate_length("operation", &operation, 1, 128)?;
         validation::validate_non_empty("idempotency_key", &idempotency_key)?;
@@ -159,13 +179,16 @@ impl Task {
         }
         let now = Timestamp::now();
         Ok(Self {
-            id: TaskId::new(),
+            id,
             tenant_id,
             organization_id,
             project_id,
             agent_id,
+            agent_version_id: None,
             workflow_id,
             execution_id: None,
+            request_id: None,
+            correlation_id: id.to_string(),
             operation,
             input,
             priority,
@@ -191,6 +214,23 @@ impl Task {
         })
     }
 
+    /// Pins a published agent version for this durable task.
+    ///
+    /// The pin is selected at submission, not when a worker happens to claim
+    /// the task. Durable retries therefore continue to run the exact same
+    /// immutable version even if the agent publishes a newer version later.
+    pub fn with_agent_version_id(mut self, version_id: AgentVersionId) -> Result<Self> {
+        if self.agent_id.is_none() {
+            return Err(AppError::invalid_field(
+                "agent_version_id",
+                "workflow_task",
+                "only agent tasks can pin an agent version",
+            ));
+        }
+        self.agent_version_id = Some(version_id);
+        Ok(self)
+    }
+
     /// Links the task to the execution it serves.
     ///
     /// Called during atomic submission: the execution and its first task are
@@ -205,6 +245,23 @@ impl Task {
         self.execution_id = Some(execution_id);
         self.touch();
         Ok(())
+    }
+
+    /// Binds the originating request id before the task is committed.
+    #[must_use]
+    pub fn with_request_id(mut self, request_id: uuid::Uuid) -> Self {
+        self.request_id = Some(request_id);
+        self
+    }
+
+    /// Binds the accepted request's correlation id before the task is
+    /// committed, so later broker deliveries retain the original trace.
+    pub fn with_correlation_id(mut self, correlation_id: impl Into<String>) -> Result<Self> {
+        let correlation_id = correlation_id.into();
+        validation::validate_non_empty("correlation_id", &correlation_id)?;
+        validation::validate_length("correlation_id", &correlation_id, 1, 256)?;
+        self.correlation_id = correlation_id;
+        Ok(self)
     }
 
     /// Whether the task blew its deadline.

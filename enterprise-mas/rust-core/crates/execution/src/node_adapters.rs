@@ -286,6 +286,7 @@ impl NodeExecutor for AgentNodeExecutor {
         // attributes the run to the task that owns it and can deduplicate a
         // redelivery instead of re-running paid work.
         request.task_id = input.task_id;
+        request.task_attempt_id = input.task_attempt_id;
         request.idempotency_key = input.idempotency_key.map(ToOwned::to_owned);
 
         let verdict = match self.bridge.run(request).await {
@@ -305,7 +306,7 @@ impl NodeExecutor for AgentNodeExecutor {
         };
 
         match verdict {
-            AgentRunVerdict::Succeeded { output, usage } => {
+            AgentRunVerdict::Succeeded { output, usage, .. } => {
                 self.wiring
                     .with_scope(input.execution_id, |guard, steps| {
                         // Charge tool calls first: exhaustion blocks before a
@@ -328,6 +329,7 @@ impl NodeExecutor for AgentNodeExecutor {
                 message,
                 retryable,
                 usage,
+                ..
             } => {
                 let _ = self
                     .wiring
@@ -608,7 +610,9 @@ mod tests {
     use crate::agent_bridge::{AgentUsage, InMemoryAgentBridge};
     use crate::tool_runner::{InMemoryToolBridge, ToolCatalogPort};
     use mas_common::enums::{Environment, PolicyDecision};
-    use mas_common::ids::{ExecutionStepId, OrganizationId, ProjectId, TenantId};
+    use mas_common::ids::{
+        ExecutionStepId, OrganizationId, ProjectId, TaskAttemptId, TaskId, TenantId,
+    };
     use mas_domain::{SafeUrl, Tool, ToolKind, ToolRuntime, WorkflowNode};
     use mas_orchestration::engine::PolicyPort;
     use mas_orchestration::runtime_context::RuntimeContext;
@@ -701,6 +705,8 @@ mod tests {
         let execution_id = ExecutionId::new();
         let (scopes, scope) = scope_for(execution_id);
         let agent_id = AgentId::new();
+        let task_id = TaskId::new();
+        let task_attempt_id = TaskAttemptId::new();
         let bridge = Arc::new(InMemoryAgentBridge::new().with_handler(move |_request| {
             Ok(AgentRunVerdict::Succeeded {
                 output: serde_json::json!({"answer": 42}),
@@ -711,9 +717,11 @@ mod tests {
                     steps: 1,
                     active_time_ms: 3,
                 },
+                model_key: None,
+                finish_reason: Some("completed".to_owned()),
             })
         }));
-        let executor = AgentNodeExecutor::new(bridge, AdapterWiring::new(scopes));
+        let executor = AgentNodeExecutor::new(bridge.clone(), AdapterWiring::new(scopes));
         let node = WorkflowNode::new("agent-1", WorkflowNodeType::Agent, "Agent")
             .expect("node")
             .with_config(serde_json::Map::from_iter([(
@@ -729,7 +737,8 @@ mod tests {
                 input: serde_json::json!({"q": "?"}),
                 context: &context,
                 attempt: 1,
-                task_id: None,
+                task_id: Some(task_id),
+                task_attempt_id: Some(task_attempt_id),
                 idempotency_key: None,
             })
             .await
@@ -738,6 +747,11 @@ mod tests {
             NodeOutcome::Completed { output } => assert_eq!(output["answer"], 42),
             other => panic!("expected completion, got {other:?}"),
         }
+        let recorded = bridge.recorded_requests();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].task_id, Some(task_id));
+        assert_eq!(recorded[0].task_attempt_id, Some(task_attempt_id));
+
         let snapshot = scope.guard.lock().await.snapshot();
         assert_eq!(snapshot.tokens_consumed, 15);
         let steps = scope
@@ -790,6 +804,7 @@ mod tests {
                 context: &context,
                 attempt: 1,
                 task_id: None,
+                task_attempt_id: None,
                 idempotency_key: None,
             })
             .await
@@ -812,6 +827,7 @@ mod tests {
                 context: &context,
                 attempt: 1,
                 task_id: None,
+                task_attempt_id: None,
                 idempotency_key: None,
             })
             .await
@@ -848,6 +864,7 @@ mod tests {
                 context: &context,
                 attempt: 1,
                 task_id: None,
+                task_attempt_id: None,
                 idempotency_key: None,
             })
             .await
@@ -875,6 +892,7 @@ mod tests {
                 context: &context,
                 attempt: 1,
                 task_id: None,
+                task_attempt_id: None,
                 idempotency_key: None,
             })
             .await

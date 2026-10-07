@@ -47,6 +47,7 @@ run_stage "ruff lint" python3 -m ruff check src tests
 run_stage "mypy (strict)" env PYTHONPATH=src python3 -m mypy src/mas_orchestrator
 run_stage "pytest" env PYTHONPATH=src python3 -m pytest tests -q
 run_stage "compileall" python3 -m compileall -q src tests
+run_stage "deliverable build" python3 build_phase16_deliverable.py
 run_stage "deliverable completeness" python3 verify_deliverable_completeness.py
 
 echo

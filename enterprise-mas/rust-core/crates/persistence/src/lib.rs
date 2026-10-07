@@ -25,8 +25,8 @@
 //!   transaction per unit of work, named savepoints, explicit commit/rollback
 //!   (no implicit drops that silently commit).
 //! * [`migrations`] — the [`migrations::MigrationRunner`] plus the embedded
-//!   migration registry (`migrations/NNNN_name/up.sql`, 14 migrations). The
-//!   runner verifies applied versions and checksums, refuses incompatible
+//!   ordered migration registry (`migrations/NNNN_name/up.sql`). The runner
+//!   verifies applied versions and checksums, refuses incompatible
 //!   states (DB-ahead, gaps, checksum drift), and applies pending migrations
 //!   transactionally in strict order. RLS policies for every tenant-owned
 //!   table live in the SQL migration set, **not** in app code.

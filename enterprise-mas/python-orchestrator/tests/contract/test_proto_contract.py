@@ -80,6 +80,7 @@ class TestAgentRunRequestShape:
             "token_budget_max",
             "idempotency_key",
             "identity",
+            "task_attempt_id",
         ]
 
     def test_identity_fields_are_strings(self) -> None:
@@ -93,6 +94,16 @@ class TestAgentRunRequestShape:
         """Rust's proto declares `optional string project_id`."""
         field = pb.AgentRunRequest.DESCRIPTOR.fields_by_name["project_id"]
         assert field.has_presence is True
+
+    def test_task_attempt_id_is_optional_and_round_trips(self) -> None:
+        """A queue claim has an attempt id; direct runs do not."""
+        field = pb.AgentRunRequest.DESCRIPTOR.fields_by_name["task_attempt_id"]
+        assert field.number == 17
+        assert field.has_presence is True
+        request = pb.AgentRunRequest(task_id="task-1", task_attempt_id="attempt-1")
+        decoded = pb.AgentRunRequest.FromString(request.SerializeToString())
+        assert decoded.HasField("task_attempt_id")
+        assert decoded.task_attempt_id == "attempt-1"
 
     def test_required_identity_fields_are_not_optional(self) -> None:
         """Mandatory identity is a plain field, not `optional`, in proto3."""

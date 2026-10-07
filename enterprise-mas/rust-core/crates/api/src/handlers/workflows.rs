@@ -98,6 +98,83 @@ pub struct WorkflowGraphUpdateResponse {
     pub topological_order: Vec<String>,
 }
 
+/// `POST /v1/workflows/{workflow_id}/publish` — validate and append one
+/// immutable graph snapshot, advancing the workflow's monotonic version.
+pub async fn publish(
+    State(state): State<AppState>,
+    Path(workflow_id): Path<WorkflowId>,
+    Ctx(ctx): Ctx,
+) -> ApiResult<mas_contracts::workflow::WorkflowVersionDto> {
+    let service_ctx = crate::handlers::authorized_service_context(
+        &ctx,
+        mas_security::ResourceKind::Workflow,
+        mas_security::Action::Publish,
+        None,
+    )
+    .map_err(|error| crate::response::ApiError::new(error, &ctx))?;
+    state
+        .workflows
+        .publish(&service_ctx, workflow_id)
+        .await
+        .map(|version| {
+            created(
+                &ctx,
+                mas_application::dto::workflow_version_response(&version),
+            )
+        })
+        .map_err(|e| crate::response::ApiError::new(e, &ctx))
+}
+
+/// `POST /v1/workflows/{workflow_id}/disable` — stops new executions while
+/// retaining every immutable snapshot.
+pub async fn disable(
+    State(state): State<AppState>,
+    Path(workflow_id): Path<WorkflowId>,
+    Ctx(ctx): Ctx,
+) -> ApiResult<WorkflowResponse> {
+    let service_ctx = crate::handlers::authorized_service_context(
+        &ctx,
+        mas_security::ResourceKind::Workflow,
+        mas_security::Action::Update,
+        None,
+    )
+    .map_err(|error| crate::response::ApiError::new(error, &ctx))?;
+    state
+        .workflows
+        .disable(&service_ctx, workflow_id)
+        .await
+        .map(|workflow| workflow_response(&workflow))
+        .into_api(&ctx)
+}
+
+/// `GET /v1/workflows/{workflow_id}/versions` — immutable published graph
+/// snapshots, newest first; foreign-tenant workflows are hidden as 404.
+pub async fn list_versions(
+    State(state): State<AppState>,
+    Path(workflow_id): Path<WorkflowId>,
+    Ctx(ctx): Ctx,
+) -> ApiResult<Vec<mas_contracts::workflow::WorkflowVersionDto>> {
+    let service_ctx = crate::handlers::authorized_service_context(
+        &ctx,
+        mas_security::ResourceKind::Workflow,
+        mas_security::Action::Read,
+        None,
+    )
+    .map_err(|error| crate::response::ApiError::new(error, &ctx))?;
+    let versions = state
+        .workflows
+        .list_versions(&service_ctx, workflow_id)
+        .await
+        .map_err(|e| crate::response::ApiError::new(e, &ctx))?;
+    Ok(crate::response::ok(
+        &ctx,
+        versions
+            .iter()
+            .map(mas_application::dto::workflow_version_response)
+            .collect(),
+    ))
+}
+
 /// `GET /v1/workflows/{workflow_id}`.
 pub async fn get(
     State(state): State<AppState>,

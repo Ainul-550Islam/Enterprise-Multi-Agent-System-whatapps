@@ -31,6 +31,8 @@ pub mod api_key;
 pub mod audit_event;
 pub mod connector;
 pub mod credential;
+pub mod data_source;
+pub mod document;
 pub mod entitlement;
 pub mod execution;
 pub mod execution_step;
@@ -44,6 +46,7 @@ pub mod policy;
 pub mod project;
 pub mod quota;
 pub mod reservation;
+pub mod rollback_record;
 pub mod schedule;
 pub mod secret_reference;
 pub mod session;
@@ -61,15 +64,18 @@ pub mod webhook;
 pub mod workflow;
 pub mod workflow_edge;
 pub mod workflow_node;
+pub mod workflow_version;
 
 // Aggregate-level re-exports for ergonomic imports at application boundaries.
-pub use agent::{Agent, AgentConfig, AgentKind};
+pub use agent::{Agent, AgentConfig, AgentKind, AgentOrigin};
 pub use agent_capability::{AgentCapability, CapabilityType};
 pub use agent_version::AgentVersion;
 pub use api_key::{ApiKey, ApiKeyMetadataView};
 pub use audit_event::{AuditActor, AuditActorKind, AuditComplianceClass, AuditEvent, AuditOutcome};
 pub use connector::{Connector, ConnectorAuthMode};
 pub use credential::{CredentialMetadata, CredentialType, RotationMetadata};
+pub use data_source::{DataSource, DataSourceKind, DataSourceStatus};
+pub use document::{Document, DocumentStatus};
 pub use entitlement::{Entitlement, EntitlementSource, FeatureKey};
 pub use execution::{Execution, ResourceUsageSummary};
 pub use execution_step::{ExecutionStep, StepError};
@@ -85,6 +91,7 @@ pub use policy::{Policy, PolicyScope, PolicyType};
 pub use project::{Project, ProjectConfig, ProjectStatus};
 pub use quota::{EnforcementMode, Quota, QuotaDimension, QuotaPeriod};
 pub use reservation::{QuotaReservation, ReservationState};
+pub use rollback_record::{RollbackRecord, RollbackResourceKind};
 pub use schedule::{Schedule, ScheduleKind};
 pub use secret_reference::{
     SecretAvailability, SecretProviderKind, SecretReference, SecretRotationState,
@@ -110,3 +117,4 @@ pub use webhook::{SignatureConfig, WebhookDelivery, WebhookEndpoint, WebhookRetr
 pub use workflow::{Workflow, WorkflowGraph};
 pub use workflow_edge::WorkflowEdge;
 pub use workflow_node::{NodeCapability, WorkflowNode, WorkflowNodeType};
+pub use workflow_version::WorkflowVersion;

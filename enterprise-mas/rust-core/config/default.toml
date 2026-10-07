@@ -78,6 +78,29 @@ retry_base_ms = 250
 retry_cap_ms = 10000
 retry_max_deliver = 8
 
+# ── Rust → Python AI bridge ──────────────────────────────────────────────────
+[ai_bridge]
+# Endpoint is deliberately empty: execution.run refuses to boot until it is
+# configured explicitly. Production must use https://.
+# Env: MAS_AI_BRIDGE_ENDPOINT
+endpoint = ""
+# Secret-manager values are env-only; never populate these in checked-in TOML.
+# Env: MAS_AI_BRIDGE_TOKEN
+token = ""
+# Shared with Python security.internal_service_secret_ref.
+# Env: MAS_AI_BRIDGE_INTERNAL_SIGNING_SECRET
+internal_signing_secret = ""
+# Optional PEM CA for private bridge PKI; otherwise OS/WebPKI roots are used.
+# Env: MAS_AI_BRIDGE_TLS_CA_CERTIFICATE_PATH
+tls_ca_certificate_path = ""
+# Optional mTLS client identity, both paths required together.
+# Env: MAS_AI_BRIDGE_TLS_CLIENT_CERTIFICATE_PATH / MAS_AI_BRIDGE_TLS_CLIENT_PRIVATE_KEY_PATH
+tls_client_certificate_path = ""
+tls_client_private_key_path = ""
+# RPC bound settings. Env: MAS_AI_BRIDGE_TIMEOUT_MS / MAS_AI_BRIDGE_MAX_RESPONSE_BYTES
+timeout_ms = 120000
+max_response_bytes = 8388608
+
 # ── persistence (currently in-memory everywhere) ────────────────────────────
 [database]
 # Empty is *deliberate*: it selects in-memory stores which binaries refuse
@@ -96,3 +119,32 @@ log_level = "info,mas=debug"
 otlp_endpoint = ""
 # Metrics listener (empty = disabled). Env: MAS_METRICS_ADDR
 metrics_addr = ""
+
+# ── OIDC resource-server verification ───────────────────────────────────────
+[oidc]
+# Issuer and JWKS endpoint for interactive-user JWTs. Development may use a
+# local IdP; production overrides both with the deployment's trusted HTTPS IdP.
+issuer = "http://127.0.0.1:8081/realms/mas"
+jwks_url = "http://127.0.0.1:8081/realms/mas/protocol/openid-connect/certs"
+# Asymmetric IdP algorithms only; HS256 remains reserved for internal tokens.
+algs = ["RS256", "ES256"]
+clock_skew_seconds = 60
+jwks_cache_ttl_seconds = 300
+
+# ── Server-sent event stream bounds ─────────────────────────────────────────
+[stream]
+heartbeat_ms = 15000
+buffer_size = 256
+max_connections_per_tenant = 100
+
+# ── Analytics rollup refresh ─────────────────────────────────────────────────
+[analytics]
+rollup_refresh_interval_seconds = 300
+rollup_lookback_days = 90
+
+# ── Data Hub ingestion bounds ────────────────────────────────────────────────
+[data_hub]
+max_upload_bytes = 33554432
+max_document_bytes = 33554432
+max_pages_per_sync = 500
+max_crawl_depth = 3

@@ -51,14 +51,12 @@ pub async fn register(
 
 /// `POST /v1/agents/{agent_id}/versions` body.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PublishVersionBody {
     /// Canonical lowercase-hex SHA-256 of the versioned config (64 chars).
     pub configuration_checksum: String,
     /// Versioned orchestration snapshot (opaque config + capabilities).
     pub configuration_snapshot: serde_json::Value,
-    /// Who published (defaults to the authenticated subject).
-    #[serde(default)]
-    pub published_by: Option<UserId>,
 }
 
 /// `POST /v1/agents/{agent_id}/versions` — publishes the next immutable
@@ -70,29 +68,35 @@ pub async fn publish_version(
     Json(body): Json<PublishVersionBody>,
 ) -> ApiResult<serde_json::Value> {
     scoped(&ctx)?;
-    let published_by = match body.published_by {
-        Some(user) => user,
-        None => {
-            let subject = ctx
-                .principal
-                .as_ref()
-                .map(|principal| principal.actor_id.clone())
-                .unwrap_or_default();
-            mas_common::ids::UserId::parse_str(&subject).map_err(|_| {
-                crate::response::ApiError::new(
-                    mas_common::error::AppError::invalid_field(
-                        "published_by",
-                        "invalid",
-                        "provide an explicit user id (subject is not a uuid)",
-                    ),
-                    &ctx,
-                )
-            })
-        }?,
-    };
-    let service_ctx = ctx
-        .service_context()
-        .map_err(|e| crate::response::ApiError::new(e, &ctx))?;
+    let principal = ctx.principal.as_ref().ok_or_else(|| {
+        crate::response::ApiError::new(
+            mas_common::error::AppError::unauthorized("unauthenticated"),
+            &ctx,
+        )
+    })?;
+    if principal.kind != mas_security::PrincipalKind::User {
+        return Err(crate::response::ApiError::new(
+            mas_common::error::AppError::forbidden(
+                "agent version publication requires an authenticated user",
+            ),
+            &ctx,
+        ));
+    }
+    let published_by = UserId::parse_str(&principal.actor_id).map_err(|_| {
+        crate::response::ApiError::new(
+            mas_common::error::AppError::forbidden(
+                "authenticated user id is not a valid user identifier",
+            ),
+            &ctx,
+        )
+    })?;
+    let service_ctx = crate::handlers::authorized_service_context(
+        &ctx,
+        mas_security::ResourceKind::Agent,
+        mas_security::Action::Publish,
+        None,
+    )
+    .map_err(|error| crate::response::ApiError::new(error, &ctx))?;
     state
         .agents
         .publish_version(
@@ -117,6 +121,34 @@ pub async fn publish_version(
             )
         })
         .map_err(|e| crate::response::ApiError::new(e, &ctx))
+}
+
+/// `GET /v1/agents/{agent_id}/versions` — immutable version history,
+/// newest first; foreign-tenant agents are hidden as 404.
+pub async fn list_versions(
+    State(state): State<AppState>,
+    Path(agent_id): Path<AgentId>,
+    Ctx(ctx): Ctx,
+) -> ApiResult<Vec<mas_contracts::agent::AgentVersionDto>> {
+    let service_ctx = crate::handlers::authorized_service_context(
+        &ctx,
+        mas_security::ResourceKind::Agent,
+        mas_security::Action::Read,
+        None,
+    )
+    .map_err(|error| crate::response::ApiError::new(error, &ctx))?;
+    let versions = state
+        .agents
+        .list_versions(&service_ctx, agent_id)
+        .await
+        .map_err(|e| crate::response::ApiError::new(e, &ctx))?;
+    Ok(crate::response::ok(
+        &ctx,
+        versions
+            .iter()
+            .map(mas_application::dto::agent_version_response)
+            .collect(),
+    ))
 }
 
 /// `GET /v1/agents/{agent_id}` — wire `AgentResponse` (foreign tenants 404).

@@ -123,6 +123,11 @@ class ExecutionContext:
                 "execution context tenant and organization must be distinct",
                 details={"reason": "duplicate_scope_identifier"},
             )
+        if self.task_attempt_id and not self.task_id:
+            raise TenantContextError(
+                "execution context task attempt requires an owning task",
+                details={"field": "task_attempt_id", "reason": "missing_task_id"},
+            )
 
     def __str__(self) -> str:
         """Compact rendering suitable for log lines (no attributes dump)."""

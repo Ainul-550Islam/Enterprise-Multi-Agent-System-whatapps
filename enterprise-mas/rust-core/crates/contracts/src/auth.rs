@@ -170,6 +170,34 @@ pub struct ServiceIdentityClaims {
     pub expires_at: Timestamp,
 }
 
+/// Authenticated principal and server-resolved scope for UI display.
+///
+/// Permissions are hints only; every request is re-authorized server-side.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthMeResponse {
+    /// Authenticated subject identifier.
+    pub subject: String,
+    /// Verified actor category.
+    pub actor: AuthenticatedActor,
+    /// Server-resolved tenant scope, when selected.
+    pub tenant_id: Option<TenantId>,
+    /// Server-resolved organization scope, when selected.
+    pub organization_id: Option<OrganizationId>,
+    /// Roles established from verified claims and directory lookup.
+    pub roles: Vec<String>,
+    /// Effective permission labels for UI gating only.
+    pub permissions: Vec<String>,
+}
+
+/// The canonical authorization matrix, rendered for UI/admin diagnostics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PermissionMatrixResponse {
+    /// Versioned matrix vocabulary.
+    pub version: String,
+    /// Role name to resource/action grants.
+    pub roles: std::collections::BTreeMap<String, std::collections::BTreeMap<String, Vec<String>>>,
+}
+
 impl ServiceIdentityClaims {
     pub fn validate(&self) -> Result<()> {
         validation::validate_non_empty("service_name", &self.service_name)?;

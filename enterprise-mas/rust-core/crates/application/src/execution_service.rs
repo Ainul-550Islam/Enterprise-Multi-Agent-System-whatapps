@@ -45,7 +45,9 @@ use mas_common::result::Result;
 use mas_contracts::execution::ExecutionResponse;
 use mas_domain::entitlement::FeatureKey;
 use mas_domain::quota::QuotaDimension;
-use mas_domain::{AuditOutcome, Execution, Task, TaskAttempt, TransitionActor, TransitionFailure};
+use mas_domain::{
+    AuditOutcome, Execution, ExecutionStep, Task, TaskAttempt, TransitionActor, TransitionFailure,
+};
 use std::sync::Arc;
 
 use crate::audit::{self, AuditSinkPort};
@@ -57,7 +59,10 @@ use crate::durable::{
     ExecutionTransitionRequest, SubmissionIntent, SubmissionKind,
 };
 use crate::fingerprint::{FingerprintInput, RequestFingerprint};
-use crate::stores::{AgentStorePort, ProjectStorePort, WorkflowStorePort};
+use crate::stores::{
+    AgentStorePort, AgentVersionStorePort, ExecutionStepStorePort, ProjectStorePort,
+    WorkflowStorePort,
+};
 
 /// Default page size for tenant execution listings.
 const DEFAULT_LIST_LIMIT: usize = 200;
@@ -86,6 +91,7 @@ pub struct ExecutionService {
     projects: Box<dyn ProjectStorePort>,
     workflows: Box<dyn WorkflowStorePort>,
     agents: Box<dyn AgentStorePort>,
+    agent_versions: Box<dyn AgentVersionStorePort>,
     audit: Box<dyn AuditSinkPort>,
     /// The canonical atomic path. Required, not optional: an optional durable
     /// port would mean a second, non-atomic lifecycle exists.
@@ -95,6 +101,9 @@ pub struct ExecutionService {
     /// entitlement, policy and quota are simply not enforced. There is no
     /// construction of this service that skips them.
     control_plane: Arc<ControlPlane>,
+    /// Optional read model for the execution step timeline. The durable
+    /// execution path remains mandatory; this port only serves timeline reads.
+    steps: Option<Box<dyn ExecutionStepStorePort>>,
 }
 
 impl ExecutionService {
@@ -104,6 +113,7 @@ impl ExecutionService {
         projects: Box<dyn ProjectStorePort>,
         workflows: Box<dyn WorkflowStorePort>,
         agents: Box<dyn AgentStorePort>,
+        agent_versions: Box<dyn AgentVersionStorePort>,
         audit: Box<dyn AuditSinkPort>,
         durable: Arc<dyn DurableExecutionPort>,
         control_plane: Arc<ControlPlane>,
@@ -112,10 +122,20 @@ impl ExecutionService {
             projects,
             workflows,
             agents,
+            agent_versions,
             audit,
             durable,
             control_plane,
+            steps: None,
         }
+    }
+
+    /// Attaches the timeline read/write port while preserving the one required
+    /// durable execution lifecycle.
+    #[must_use]
+    pub fn with_step_store(mut self, steps: Box<dyn ExecutionStepStorePort>) -> Self {
+        self.steps = Some(steps);
+        self
     }
 
     /// The durable port this service writes through (exposed so composition
@@ -169,19 +189,36 @@ impl ExecutionService {
                 .filter(|w| w.tenant_id == tenant_id && w.organization_id == organization_id)
                 .ok_or_else(|| AppError::not_found("workflow", workflow_id.to_string()))?;
         }
-        if let Some(agent_id) = agent {
-            let agent = self
+        let agent_version_id = if let Some(agent_id) = agent {
+            let selected_agent = self
                 .agents
                 .get(agent_id)
                 .await?
                 .filter(|a| a.tenant_id == tenant_id && a.organization_id == organization_id)
                 .ok_or_else(|| AppError::not_found("agent", agent_id.to_string()))?;
-            if !agent.is_executable() {
+            if !selected_agent.is_executable() {
                 return Err(AppError::conflict(
                     "agent is not in an executable state (must be Active with a published version)",
                 ));
             }
-        }
+            let version_number = selected_agent
+                .current_version
+                .ok_or_else(|| AppError::not_found("agent version", agent_id.to_string()))?;
+            let selected_version = self
+                .agent_versions
+                .list(agent_id)
+                .await?
+                .into_iter()
+                .find(|version| {
+                    version.agent_id() == agent_id && version.version_number() == version_number
+                })
+                .ok_or_else(|| {
+                    AppError::not_found("agent version", format!("{agent_id}:{version_number}"))
+                })?;
+            Some(selected_version.id())
+        } else {
+            None
+        };
 
         // ── Fingerprint, computed before the transaction opens. ───────────
         let operation = if agent.is_some() {
@@ -251,6 +288,7 @@ impl ExecutionService {
             project_id: project,
             workflow_id: workflow,
             agent_id: agent,
+            agent_version_id,
             input,
             idempotency_key: idempotency_key.map(str::to_owned),
             fingerprint,
@@ -259,6 +297,7 @@ impl ExecutionService {
             max_attempts: constants::DEFAULT_MAX_RETRIES + 1,
             deadline: None,
             correlation_id: ctx.correlation_id.clone(),
+            request_id: ctx.request_id,
             created_by: ctx.actor.id.clone(),
             actor: actor_for(ctx)?,
             // The task is queued, not started: a worker claims it and creates
@@ -407,6 +446,34 @@ impl ExecutionService {
     /// Scope-checked fetch (existence hiding).
     pub async fn get(&self, ctx: &ServiceContext, execution_id: ExecutionId) -> Result<Execution> {
         self.scope_checked(ctx, execution_id).await
+    }
+
+    /// Lists a tenant-owned execution's persisted step timeline. The parent
+    /// execution is scope-checked first, and the store's result is validated
+    /// before any safe DTO projection is returned.
+    pub async fn list_steps(
+        &self,
+        ctx: &ServiceContext,
+        execution_id: ExecutionId,
+    ) -> Result<Vec<ExecutionStep>> {
+        let execution = self.scope_checked(ctx, execution_id).await?;
+        let store = self
+            .steps
+            .as_ref()
+            .ok_or_else(|| AppError::internal("execution step timeline store is not configured"))?;
+        let mut steps = store.list(execution_id).await?;
+        if steps.iter().any(|step| step.execution_id != execution.id) {
+            return Err(AppError::database(
+                "execution step store returned a row for a different execution",
+            ));
+        }
+        steps.sort_by(|left, right| {
+            left.sequence
+                .cmp(&right.sequence)
+                .then_with(|| left.attempt.cmp(&right.attempt))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(steps)
     }
 
     /// Fetch mapped to the wire DTO.
@@ -558,14 +625,15 @@ mod tests {
     use crate::durable_memory::InMemoryDurableExecution;
     use crate::stores::InMemoryServices;
     use mas_common::enums::ExecutionStatus;
-    use mas_common::ids::{OrganizationId, TenantId};
+    use mas_common::ids::{OrganizationId, TenantId, UserId};
     use mas_common::timestamps::Timestamp;
     use mas_domain::subscription::{Subscription, SubscriptionState};
     use mas_domain::value_objects::Slug;
-    use mas_domain::{Agent, AgentKind, Project, Workflow};
+    use mas_domain::{Agent, AgentKind, AgentVersion, Project, Workflow};
     use std::sync::Arc;
 
     struct Fixture {
+        store: Arc<InMemoryServices>,
         service: ExecutionService,
         tenant_ctx: ServiceContext,
         foreign_ctx: ServiceContext,
@@ -636,6 +704,7 @@ mod tests {
             Box::new(store.clone()),
             Box::new(store.clone()),
             Box::new(store.clone()),
+            Box::new(store.clone()),
             Box::new(audit.clone()),
             durable.clone(),
             Arc::clone(&control_plane),
@@ -647,6 +716,7 @@ mod tests {
             .expect("ctx")
             .with_scope(TenantId::new(), OrganizationId::new());
         Fixture {
+            store,
             service,
             tenant_ctx,
             foreign_ctx,
@@ -656,6 +726,80 @@ mod tests {
             audit,
             durable,
         }
+    }
+
+    #[tokio::test]
+    async fn durable_agent_submission_pins_the_selected_version_across_publication() {
+        const CHECKSUM_V1: &str =
+            "1111111111111111111111111111111111111111111111111111111111111111";
+        const CHECKSUM_V2: &str =
+            "2222222222222222222222222222222222222222222222222222222222222222";
+
+        let fixture = fixture().await;
+        let mut agent = AgentStorePort::get(fixture.store.as_ref(), fixture.agent)
+            .await
+            .expect("load agent")
+            .expect("seeded agent");
+        agent.enable().expect("activate agent");
+        agent
+            .record_published_version(1)
+            .expect("select first published version");
+        AgentStorePort::save(fixture.store.as_ref(), &agent)
+            .await
+            .expect("save active agent");
+        let version_one = AgentVersion::publish(
+            agent.id,
+            1,
+            CHECKSUM_V1,
+            serde_json::json!({"system_prompt": "version one"}),
+            UserId::new(),
+        )
+        .expect("publish first version");
+        AgentVersionStorePort::save(fixture.store.as_ref(), &version_one)
+            .await
+            .expect("save first version");
+
+        let submission = fixture
+            .service
+            .submit(
+                &fixture.tenant_ctx,
+                fixture.project,
+                None,
+                Some(fixture.agent),
+                serde_json::json!({"prompt": "run the pinned version"}),
+                Some("agent-version-pin"),
+            )
+            .await
+            .expect("submit against the current published version");
+        let task = submission.task.expect("durable task");
+        assert_eq!(task.agent_version_id, Some(version_one.id()));
+
+        // Publishing a newer version after acceptance cannot rewrite the
+        // durable task. A redelivery/retry reads this same Task aggregate.
+        agent
+            .record_published_version(2)
+            .expect("select second published version");
+        AgentStorePort::save(fixture.store.as_ref(), &agent)
+            .await
+            .expect("save agent with newer current version");
+        let version_two = AgentVersion::publish(
+            agent.id,
+            2,
+            CHECKSUM_V2,
+            serde_json::json!({"system_prompt": "version two"}),
+            UserId::new(),
+        )
+        .expect("publish second version");
+        AgentVersionStorePort::save(fixture.store.as_ref(), &version_two)
+            .await
+            .expect("save second version");
+
+        let retried_task = fixture
+            .durable
+            .task(task.id)
+            .expect("durable task survives retry scheduling");
+        assert_eq!(retried_task.agent_version_id, Some(version_one.id()));
+        assert_ne!(retried_task.agent_version_id, Some(version_two.id()));
     }
 
     #[tokio::test]

@@ -415,6 +415,37 @@ fn version_columns_exist_for_optimistic_concurrency() {
     );
 }
 
+#[test]
+fn api_key_prefix_lookup_is_narrow_and_remains_under_force_rls() {
+    let identity = std::fs::read_to_string(workspace_file("../../migrations/0003_identity/up.sql"))
+        .expect("read api key table migration");
+    let lookup = std::fs::read_to_string(workspace_file(
+        "../../migrations/0032_api_key_prefix_lookup/up.sql",
+    ))
+    .expect("read api key prefix lookup migration");
+    let repository = std::fs::read_to_string(workspace_file("src/repositories/api_keys.rs"))
+        .expect("read API-key repository");
+
+    assert!(identity.contains("ALTER TABLE api_keys ENABLE ROW LEVEL SECURITY"));
+    assert!(identity.contains("ALTER TABLE api_keys FORCE ROW LEVEL SECURITY"));
+    assert!(identity.contains("tenant_id::text = current_setting('app.current_tenant', true)"));
+    assert!(lookup.contains("CREATE POLICY api_keys_prefix_lookup"));
+    assert!(lookup.contains("ON api_keys\n    FOR SELECT"));
+    assert!(lookup.contains("prefix = current_setting('app.api_key_prefix_lookup', true)"));
+    assert!(lookup.contains("~ '^mas_[0-9a-f]{8}$'"));
+    assert!(!lookup.contains("CREATE ROLE"));
+    assert!(!lookup.contains("ALTER ROLE"));
+
+    assert!(repository.contains("SELECT set_config($1, $2, true)"));
+    assert!(repository.contains("app.api_key_prefix_lookup"));
+    assert!(repository.contains("FROM api_keys WHERE prefix = $1"));
+    assert!(repository.contains(".fetch_all(&mut *transaction)"));
+    assert!(repository.contains("transaction.commit().await"));
+    assert!(repository.contains("set_config('app.current_tenant', $1, true)"));
+    assert!(repository
+        .contains("UPDATE api_keys SET last_used_at = now() WHERE id = $1 AND tenant_id = $2"));
+}
+
 // ---------------------------------------------------------------------------
 // 3. No migration in the set is destructive
 // ---------------------------------------------------------------------------

@@ -25,7 +25,7 @@
 
 use crate::runtime_context::RuntimeContext;
 use mas_common::error::AppError;
-use mas_common::ids::{ExecutionId, ExecutionStepId, TaskId};
+use mas_common::ids::{ExecutionId, ExecutionStepId, TaskAttemptId, TaskId};
 use mas_common::result::Result;
 use mas_domain::{WorkflowNode, WorkflowNodeType};
 use serde::{Deserialize, Serialize};
@@ -157,6 +157,8 @@ pub struct NodeExecutionInput<'a> {
     /// propagated to the agent bridge so the orchestrator can attribute the run
     /// to the task that owns it.
     pub task_id: Option<TaskId>,
+    /// The durable claim attempt for this handler invocation, when present.
+    pub task_attempt_id: Option<TaskAttemptId>,
     /// The durable task's idempotency key, when dispatched from the queue.
     ///
     /// This is what stops a redelivered task from re-running paid AI work: the
@@ -353,6 +355,7 @@ mod tests {
                 context: &context,
                 attempt: 1,
                 task_id: None,
+                task_attempt_id: None,
                 idempotency_key: None,
             })
             .await
@@ -370,6 +373,7 @@ mod tests {
                 context: &context,
                 attempt: 1,
                 task_id: None,
+                task_attempt_id: None,
                 idempotency_key: None,
             })
             .await

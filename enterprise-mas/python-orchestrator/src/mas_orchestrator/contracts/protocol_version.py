@@ -62,13 +62,15 @@ class ProtocolVersion:
 
 
 #: The version this build emits and prefers.
-CURRENT_PROTOCOL_VERSION: Final[ProtocolVersion] = ProtocolVersion(1, 0, 0)
+CURRENT_PROTOCOL_VERSION: Final[ProtocolVersion] = ProtocolVersion(1, 1, 0)
 
 #: Every version this build will accept. Rust ships one of these in the
-#: ``x-ai-protocol-version`` metadata header and in the request body.
+#: ``x-ai-protocol-version`` metadata header and in the request body. The 1.1
+#: minor adds the Data Hub bridge without changing AgentBridge wire semantics.
 SUPPORTED_PROTOCOL_VERSIONS: Final[frozenset[ProtocolVersion]] = frozenset(
     {
         ProtocolVersion(1, 0, 0),
+        ProtocolVersion(1, 1, 0),
     }
 )
 

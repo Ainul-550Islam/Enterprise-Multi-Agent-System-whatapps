@@ -48,6 +48,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from mas_orchestrator.config.enums import (
+    DataSourceKind,
     Environment,
     GuardrailFailureMode,
     MemoryBackend,
@@ -57,6 +58,7 @@ from mas_orchestrator.config.enums import (
     VectorBackend,
 )
 from mas_orchestrator.config.settings import (
+    DataHubSettings,
     MemorySettings,
     ProviderSettings,
     RagSettings,
@@ -139,6 +141,52 @@ def _check_transport(settings: Settings) -> list[ConfigViolation]:
                 field="rust_core.bearer_token_secret_ref",
                 message="an authenticated Rust Core channel requires a bearer token reference",
                 remediation="set rust_core.bearer_token_secret_ref to a resolvable secret name",
+            )
+        )
+
+    service = settings.service
+    if not settings.environment.allows_fakes:
+        if service.grpc_transport_security is TransportSecurity.INSECURE:
+            violations.append(
+                ConfigViolation(
+                    field="service.grpc_transport_security",
+                    message=(
+                        "plaintext gRPC for the inbound AgentBridge is not permitted outside "
+                        "development/test"
+                    ),
+                    remediation=(
+                        "set service.grpc_transport_security to 'tls' or 'mtls' and configure "
+                        "its certificate paths"
+                    ),
+                )
+            )
+        if not service.grpc_certificate_chain_path:
+            violations.append(
+                ConfigViolation(
+                    field="service.grpc_certificate_chain_path",
+                    message="the inbound AgentBridge TLS server certificate is not configured",
+                    remediation="set the path to the mounted PEM certificate chain",
+                )
+            )
+        if not service.grpc_private_key_path:
+            violations.append(
+                ConfigViolation(
+                    field="service.grpc_private_key_path",
+                    message="the inbound AgentBridge TLS private key is not configured",
+                    remediation="set the path to the mounted PEM private key",
+                )
+            )
+
+    requires_client_certificate = (
+        service.grpc_transport_security is TransportSecurity.MTLS
+        or service.grpc_require_client_certificate
+    )
+    if requires_client_certificate and not service.grpc_client_ca_bundle_path:
+        violations.append(
+            ConfigViolation(
+                field="service.grpc_client_ca_bundle_path",
+                message="mTLS requires a CA bundle to verify the Rust client's certificate",
+                remediation="set service.grpc_client_ca_bundle_path to a mounted PEM CA bundle",
             )
         )
     return violations
@@ -355,6 +403,85 @@ def _check_backends(settings: Settings) -> list[ConfigViolation]:
     return violations
 
 
+def _check_data_hub(settings: Settings) -> list[ConfigViolation]:
+    """Validates Data Hub source egress and least-privilege storage wiring."""
+    violations: list[ConfigViolation] = []
+    data_hub: DataHubSettings = settings.data_hub
+    enabled = set(data_hub.allowed_source_kinds)
+
+    if DataSourceKind.WEB in enabled and not data_hub.crawl_egress_allowlist:
+        violations.append(
+            ConfigViolation(
+                field="data_hub.crawl_egress_allowlist",
+                message="web crawling is enabled without an egress host allow-list",
+                remediation=(
+                    "set data_hub.crawl_egress_allowlist to explicit public DNS hostnames; "
+                    "private addresses remain blocked"
+                ),
+            )
+        )
+
+    if DataSourceKind.OBJECT_STORAGE in enabled and not data_hub.object_storage_egress_allowlist:
+        violations.append(
+            ConfigViolation(
+                field="data_hub.object_storage_egress_allowlist",
+                message="object storage is enabled without an egress host allow-list",
+                remediation=(
+                    "set data_hub.object_storage_egress_allowlist to the approved storage hosts"
+                ),
+            )
+        )
+
+    if settings.rag.vector_backend is VectorBackend.PGVECTOR:
+        if not data_hub.database_role or data_hub.database_role.strip() != "mas_rag":
+            violations.append(
+                ConfigViolation(
+                    field="data_hub.database_role",
+                    message=(
+                        "pgvector requires the dedicated least-privilege RAG-plane role "
+                        "mas_rag, not the Rust runtime/database role"
+                    ),
+                    remediation="set data_hub.database_role='mas_rag' and provision migration 0028",
+                )
+            )
+        if not data_hub.database_url_secret_ref:
+            violations.append(
+                ConfigViolation(
+                    field="data_hub.database_url_secret_ref",
+                    message="pgvector requires a secret reference for the RAG-plane database URL",
+                    remediation=(
+                        "set data_hub.database_url_secret_ref to a mounted secret reference; "
+                        "never put the URL in TOML"
+                    ),
+                )
+            )
+
+    if (
+        settings.rag.vector_backend is VectorBackend.PGVECTOR
+        and settings.rag.embedding_dimensions != 1536
+    ):
+        violations.append(
+            ConfigViolation(
+                field="rag.embedding_dimensions",
+                message="the current pgvector migration stores 1536-dimensional embeddings",
+                remediation=(
+                    "configure a 1536-dimensional embedding model or apply a reviewed "
+                    "schema migration"
+                ),
+            )
+        )
+
+    if settings.rag.vector_backend is VectorBackend.PGVECTOR and not settings.rag.enabled:
+        violations.append(
+            ConfigViolation(
+                field="rag.enabled",
+                message="pgvector was selected while the RAG pipeline is disabled",
+                remediation="set rag.enabled=true or rag.vector_backend='disabled'",
+            )
+        )
+    return violations
+
+
 def _check_security(settings: Settings) -> list[ConfigViolation]:
     """Validates authentication, tenancy, and redaction invariants."""
     violations: list[ConfigViolation] = []
@@ -421,14 +548,23 @@ def _check_security(settings: Settings) -> list[ConfigViolation]:
             )
         )
 
-    if settings.is_production and settings.service.bind_host not in ("127.0.0.1", "localhost"):
-        # Not a hard failure: a service mesh may legitimately bind a pod IP.
-        # Recorded so an operator sees the exposure decision explicitly.
+    if (
+        not settings.environment.allows_fakes
+        and settings.service.bind_host not in ("127.0.0.1", "localhost", "::1")
+        and not settings.service.allow_remote_bridge_clients
+    ):
         violations.append(
             ConfigViolation(
-                field="service.bind_host",
-                message="production service binds a non-loopback address",
-                remediation="confirm an authenticating proxy fronts this listener",
+                field="service.allow_remote_bridge_clients",
+                message=(
+                    "a non-loopback AgentBridge listener requires an explicit "
+                    "private-network exposure opt-in"
+                ),
+                remediation=(
+                    "set service.allow_remote_bridge_clients=true only when "
+                    "network policy restricts this TLS-authenticated port to "
+                    "the Rust worker service"
+                ),
             )
         )
     return violations
@@ -484,6 +620,7 @@ def validate_settings(settings: Settings) -> tuple[ConfigViolation, ...]:
     violations.extend(_check_providers(settings))
     violations.extend(_check_tools(settings))
     violations.extend(_check_backends(settings))
+    violations.extend(_check_data_hub(settings))
     violations.extend(_check_security(settings))
     violations.extend(_check_guardrails(settings))
     violations.extend(_check_tool_output_trust(settings))
@@ -533,6 +670,9 @@ def production_ready_settings(environment: Environment = Environment.PRODUCTION)
         service=ServiceSettings(
             # Secret reference name, resolved at startup via the credential backend.
             service_token_secret_ref="orchestrator_service_token",  # noqa: S106
+            grpc_transport_security=TransportSecurity.TLS,
+            grpc_certificate_chain_path="/run/secrets/mas-orchestrator/tls.crt",
+            grpc_private_key_path="/run/secrets/mas-orchestrator/tls.key",
         ),
         providers=ProviderSettings(mode=ProviderMode.DISABLED),
         tools=ToolSettings(execution_mode=ToolExecutionMode.DISABLED),
