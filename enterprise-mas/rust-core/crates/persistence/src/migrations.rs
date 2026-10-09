@@ -207,6 +207,91 @@ pub static MIGRATIONS: &[Migration] = &[
         "api_key_prefix_lookup",
         "../../../migrations/0032_api_key_prefix_lookup/up.sql"
     ),
+    migration!(
+        33,
+        "delivery_and_replay_receipts",
+        "../../../migrations/0033_delivery_and_replay_receipts/up.sql"
+    ),
+    migration!(
+        34,
+        "delivery_receipt_integrity",
+        "../../../migrations/0034_delivery_receipt_integrity/up.sql"
+    ),
+    migration!(
+        35,
+        "approval_domain_parity",
+        "../../../migrations/0035_approval_domain_parity/up.sql"
+    ),
+    migration!(
+        36,
+        "data_hub_scope_integrity",
+        "../../../migrations/0036_data_hub_scope_integrity/up.sql"
+    ),
+    migration!(
+        37,
+        "connector_domain_parity",
+        "../../../migrations/0037_connector_domain_parity/up.sql"
+    ),
+    migration!(
+        38,
+        "bounded_search_indexes",
+        "../../../migrations/0038_bounded_search_indexes/up.sql"
+    ),
+    migration!(
+        39,
+        "enterprise_integration_plane",
+        "../../../migrations/0039_enterprise_integration_plane/up.sql"
+    ),
+    migration!(
+        40,
+        "oauth_pkce_callback_lifecycle",
+        "../../../migrations/0040_oauth_pkce_callback_lifecycle/up.sql"
+    ),
+    migration!(
+        41,
+        "inbound_webhook_payload_outbox",
+        "../../../migrations/0041_inbound_webhook_payload_outbox/up.sql"
+    ),
+    migration!(
+        42,
+        "inbound_webhook_endpoints",
+        "../../../migrations/0042_inbound_webhook_endpoints/up.sql"
+    ),
+    migration!(
+        43,
+        "oauth_credential_lifecycle",
+        "../../../migrations/0043_oauth_credential_lifecycle/up.sql"
+    ),
+    migration!(
+        44,
+        "oauth_token_refresh_jobs",
+        "../../../migrations/0044_oauth_token_refresh_jobs/up.sql"
+    ),
+    migration!(
+        45,
+        "oauth_token_cleanup_jobs",
+        "../../../migrations/0045_oauth_token_cleanup_jobs/up.sql"
+    ),
+    migration!(
+        46,
+        "oauth_opaque_secret_locators",
+        "../../../migrations/0046_oauth_opaque_secret_locators/up.sql"
+    ),
+    migration!(
+        47,
+        "oauth_materialization_reconciliation",
+        "../../../migrations/0047_oauth_materialization_reconciliation/up.sql"
+    ),
+    migration!(
+        48,
+        "oauth_reference_invariants",
+        "../../../migrations/0048_oauth_reference_invariants/up.sql"
+    ),
+    migration!(
+        49,
+        "integration_keyset_indexes",
+        "../../../migrations/0049_integration_keyset_indexes/up.sql"
+    ),
 ];
 
 /// A migration already recorded in the database.
@@ -540,11 +625,23 @@ mod tests {
     #[test]
     fn registry_is_contiguous_and_ordered() {
         validate_registry().expect("registry must be valid");
-        assert_eq!(MIGRATIONS.len(), 32);
+        assert_eq!(MIGRATIONS.len(), 49);
         assert_eq!(MIGRATIONS.first().map(|m| m.name), Some("extensions"));
         assert_eq!(
             MIGRATIONS.last().map(|m| m.name),
-            Some("api_key_prefix_lookup")
+            Some("integration_keyset_indexes")
+        );
+        let search_indexes = MIGRATIONS
+            .iter()
+            .find(|migration| migration.name == "bounded_search_indexes")
+            .expect("bounded search index migration is registered");
+        assert!(search_indexes
+            .sql
+            .contains("CREATE EXTENSION IF NOT EXISTS pg_trgm"));
+        assert!(search_indexes.sql.contains("name gin_trgm_ops"));
+        assert!(
+            search_indexes.sql.contains("(slug::text) gin_trgm_ops"),
+            "the indexed expression must match the ILIKE query expression"
         );
         // Versions are 1-based and strictly ascending: the runner applies them
         // in registry order and refuses gaps.

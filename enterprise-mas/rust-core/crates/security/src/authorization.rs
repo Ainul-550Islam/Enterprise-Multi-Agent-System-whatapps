@@ -88,10 +88,17 @@ string_enum! {
         Subscription => "subscription",
         ApiKey => "api_key",
         Schedule => "schedule",
+        /// Recipient-scoped durable notification lifecycle records.
+        Notification => "notification",
         Tenant => "tenant",
         Organization => "organization",
         Project => "project",
         Membership => "membership",
+        /// Rust-owned source metadata delegated to the isolated Data Hub plane.
+        DataSource => "data_source",
+        /// Rust-owned document metadata; raw content and vectors are never an
+        /// authorization resource exposed from this API.
+        Document => "document",
     }
 }
 
@@ -207,6 +214,20 @@ const fn role_grants(role: &MembershipRole) -> &'static [(ResourceKind, &'static
                 &[Action::Read, Action::Create, Action::Update, Action::Delete],
             ),
             (
+                ResourceKind::DataSource,
+                &[
+                    Action::Read,
+                    Action::Create,
+                    Action::Update,
+                    Action::Delete,
+                    Action::Execute,
+                ],
+            ),
+            (
+                ResourceKind::Document,
+                &[Action::Read, Action::Create, Action::Update, Action::Delete],
+            ),
+            (
                 ResourceKind::Credential,
                 &[
                     Action::Read,
@@ -261,6 +282,9 @@ const fn role_grants(role: &MembershipRole) -> &'static [(ResourceKind, &'static
                     Action::Execute,
                 ],
             ),
+            // The application layer additionally restricts this to the
+            // recipient or a tenant administrator.
+            (ResourceKind::Notification, &[Action::Read, Action::Update]),
             (
                 ResourceKind::Tenant,
                 &[
@@ -350,6 +374,20 @@ const fn role_grants(role: &MembershipRole) -> &'static [(ResourceKind, &'static
                 &[Action::Read, Action::Create, Action::Update, Action::Delete],
             ),
             (
+                ResourceKind::DataSource,
+                &[
+                    Action::Read,
+                    Action::Create,
+                    Action::Update,
+                    Action::Delete,
+                    Action::Execute,
+                ],
+            ),
+            (
+                ResourceKind::Document,
+                &[Action::Read, Action::Create, Action::Update, Action::Delete],
+            ),
+            (
                 ResourceKind::Credential,
                 &[
                     Action::Read,
@@ -400,6 +438,7 @@ const fn role_grants(role: &MembershipRole) -> &'static [(ResourceKind, &'static
                     Action::Execute,
                 ],
             ),
+            (ResourceKind::Notification, &[Action::Read, Action::Update]),
             (
                 ResourceKind::Tenant,
                 &[Action::Read, Action::Update, Action::Administer],
@@ -477,6 +516,19 @@ const fn role_grants(role: &MembershipRole) -> &'static [(ResourceKind, &'static
                 ResourceKind::Connector,
                 &[Action::Read, Action::Create, Action::Update],
             ),
+            (
+                ResourceKind::DataSource,
+                &[
+                    Action::Read,
+                    Action::Create,
+                    Action::Update,
+                    Action::Execute,
+                ],
+            ),
+            (
+                ResourceKind::Document,
+                &[Action::Read, Action::Create, Action::Update, Action::Delete],
+            ),
             (ResourceKind::Credential, &[Action::Read]),
             (ResourceKind::Policy, &[Action::Read]),
             (ResourceKind::Usage, &[Action::Read]),
@@ -494,6 +546,7 @@ const fn role_grants(role: &MembershipRole) -> &'static [(ResourceKind, &'static
                     Action::Execute,
                 ],
             ),
+            (ResourceKind::Notification, &[Action::Read, Action::Update]),
             (ResourceKind::Tenant, &[Action::Read]),
             (ResourceKind::Organization, &[Action::Read]),
             (
@@ -527,11 +580,14 @@ const fn role_grants(role: &MembershipRole) -> &'static [(ResourceKind, &'static
             (ResourceKind::Agent, &[Action::Read, Action::Execute]),
             (ResourceKind::Tool, &[Action::Read, Action::Execute]),
             (ResourceKind::Connector, &[Action::Read]),
+            (ResourceKind::DataSource, &[Action::Read, Action::Execute]),
+            (ResourceKind::Document, &[Action::Read]),
             (ResourceKind::Policy, &[Action::Read]),
             (
                 ResourceKind::Schedule,
                 &[Action::Read, Action::Update, Action::Execute],
             ),
+            (ResourceKind::Notification, &[Action::Read, Action::Update]),
             (ResourceKind::Tenant, &[Action::Read]),
             (ResourceKind::Organization, &[Action::Read]),
             (ResourceKind::Project, &[Action::Read]),
@@ -547,9 +603,12 @@ const fn role_grants(role: &MembershipRole) -> &'static [(ResourceKind, &'static
             (ResourceKind::Agent, &[Action::Read]),
             (ResourceKind::Tool, &[Action::Read]),
             (ResourceKind::Connector, &[Action::Read]),
+            (ResourceKind::DataSource, &[Action::Read]),
+            (ResourceKind::Document, &[Action::Read]),
             (ResourceKind::Policy, &[Action::Read]),
             (ResourceKind::Usage, &[Action::Read]),
             (ResourceKind::Schedule, &[Action::Read]),
+            (ResourceKind::Notification, &[Action::Read, Action::Update]),
             (ResourceKind::Tenant, &[Action::Read]),
             (ResourceKind::Organization, &[Action::Read]),
             (ResourceKind::Project, &[Action::Read]),
@@ -573,8 +632,14 @@ const fn role_grants(role: &MembershipRole) -> &'static [(ResourceKind, &'static
             (ResourceKind::Workflow, &[Action::Read, Action::Execute]),
             (ResourceKind::Agent, &[Action::Read, Action::Execute]),
             (ResourceKind::Tool, &[Action::Read, Action::Execute]),
+            (ResourceKind::DataSource, &[Action::Read, Action::Execute]),
+            (
+                ResourceKind::Document,
+                &[Action::Read, Action::Create, Action::Update, Action::Delete],
+            ),
             (ResourceKind::Webhook, &[Action::Read, Action::Publish]),
             (ResourceKind::Schedule, &[Action::Read]),
+            (ResourceKind::Notification, &[Action::Read]),
             (ResourceKind::Tenant, &[Action::Read]),
             (ResourceKind::Organization, &[Action::Read]),
             (ResourceKind::Project, &[Action::Read]),

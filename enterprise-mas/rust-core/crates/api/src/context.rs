@@ -75,6 +75,17 @@ impl RequestContext {
         }
     }
 
+    /// Attaches a verified platform principal without granting tenant scope.
+    ///
+    /// This exists only for explicitly platform-administered, global routes.
+    /// Tenant-owned handlers still call [`Self::require_scope`] and therefore
+    /// remain unreachable through this untenanted context.
+    #[must_use]
+    pub(crate) fn with_authenticated(mut self, principal: SecurityPrincipal) -> Self {
+        self.principal = Some(principal);
+        self
+    }
+
     /// Attaches the resolved scope and the principal as it was proven.
     ///
     /// Only the middleware calls this. It is the single point at which a
@@ -108,10 +119,50 @@ impl RequestContext {
     /// never falls back to the claimed values.
     pub fn service_context(&self) -> Result<ServiceContext> {
         let scope = self.require_scope()?;
+        let principal = self.authenticated_principal()?;
+        self.build_service_context(
+            principal,
+            Some(scope.tenant_id()),
+            Some(scope.organization_id()),
+            principal.role_in(scope.tenant_id(), scope.organization_id()),
+        )
+    }
+
+    /// Builds an untenanted context only for a verified platform administrator.
+    ///
+    /// Global bootstrap/catalog operations cannot invent a tenant just to pass
+    /// the normal resolver. This method deliberately checks the explicit
+    /// `platform:admin` capability itself, and never creates a tenant scope.
+    /// It must not be used by tenant-owned handlers: they continue to call
+    /// [`Self::service_context`], which fails closed without a resolved scope.
+    pub(crate) fn platform_service_context(&self) -> Result<ServiceContext> {
+        let principal = self.authenticated_principal()?;
+        if !principal.scopes.permits("platform:admin") {
+            return Err(AppError::forbidden(
+                "insufficient scope for a platform operation",
+            ));
+        }
+        self.build_service_context(principal, None, None, None)
+    }
+
+    fn authenticated_principal(&self) -> Result<&SecurityPrincipal> {
         let principal = self
             .principal
             .as_ref()
             .ok_or_else(|| AppError::unauthorized("unauthenticated"))?;
+        if !principal.is_usable() {
+            return Err(AppError::unauthorized("credential is expired or unusable"));
+        }
+        Ok(principal)
+    }
+
+    fn build_service_context(
+        &self,
+        principal: &SecurityPrincipal,
+        tenant_id: Option<TenantId>,
+        organization_id: Option<OrganizationId>,
+        resolved_role: Option<mas_domain::MembershipRole>,
+    ) -> Result<ServiceContext> {
         let actor_kind = match principal.kind {
             mas_security::PrincipalKind::User => mas_domain::AuditActorKind::User,
             mas_security::PrincipalKind::ApiKey => mas_domain::AuditActorKind::ApiKey,
@@ -122,11 +173,10 @@ impl RequestContext {
             mas_security::PrincipalKind::System => mas_domain::AuditActorKind::System,
         };
         let actor = mas_domain::AuditActor::new(actor_kind, &principal.actor_id)?;
-        let resolved_role = principal.role_in(scope.tenant_id(), scope.organization_id());
         ServiceContext::new(
             actor,
-            Some(scope.tenant_id()),
-            Some(scope.organization_id()),
+            tenant_id,
+            organization_id,
             &self.correlation_id,
             &Timestamp::now(),
         )
@@ -244,6 +294,30 @@ mod tests {
         );
         assert!(context.require_scope().is_err());
         assert_eq!(context.claimed_tenant, Some(tenant));
+    }
+
+    #[test]
+    fn platform_context_is_explicitly_unscoped_and_capability_gated() {
+        let context = RequestContext::with_claims(ScopeClaims::default(), "corr".to_owned())
+            .with_authenticated(SecurityPrincipal::system());
+        let platform = context
+            .platform_service_context()
+            .expect("platform system identity is allowed");
+        assert!(platform.tenant_id.is_none());
+        assert!(platform.organization_id.is_none());
+        assert!(
+            context.service_context().is_err(),
+            "tenant context must remain unavailable"
+        );
+
+        let denied = RequestContext::with_claims(ScopeClaims::default(), "corr".to_owned())
+            .with_authenticated(SecurityPrincipal::new(
+                "ordinary-user",
+                PrincipalKind::User,
+                None,
+                mas_security::ScopeSet::denied(),
+            ));
+        assert!(denied.platform_service_context().is_err());
     }
 
     #[test]

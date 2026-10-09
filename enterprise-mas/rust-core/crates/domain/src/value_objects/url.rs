@@ -36,8 +36,6 @@ use url::{Host, Url};
 pub struct SafeUrl {
     url: Url,
     /// Whether this URL was parsed as an operator-declared internal endpoint.
-    /// `false` for everything else, and never settable from a tenant-supplied
-    /// value.
     internal_endpoint: bool,
 }
 
@@ -58,8 +56,8 @@ impl SafeUrl {
     /// connector config, or anything a request can reach.
     ///
     /// The returned URL reports [`Self::is_internal_endpoint`], and the egress
-    /// policy refuses to contact it unless it was built with
-    /// internal endpoints enabled.
+    /// policy refuses to contact it unless it was built with internal
+    /// endpoints enabled.
     pub fn parse_internal_endpoint(raw: &str) -> Result<Self> {
         Self::parse_with(raw, true)
     }
@@ -115,7 +113,13 @@ impl SafeUrl {
                 if lowered == "localhost"
                     || lowered.ends_with(".localhost")
                     || lowered.ends_with(".internal")
-                    || lowered == "metadata.google.internal"
+                    || matches!(
+                        lowered.as_str(),
+                        "metadata"
+                            | "metadata.google.internal"
+                            | "metadata.azure.internal"
+                            | "instance-data"
+                    )
                 {
                     return Err(AppError::invalid_field(
                         "url",
@@ -158,12 +162,34 @@ impl SafeUrl {
             || ip.is_broadcast()
             || ip.is_documentation()
             || ip.is_multicast()
+            || ip.octets()[0] == 0
             // CGNAT / carrier-grade NAT range 100.64.0.0/10
             || (ip.octets()[0] == 100 && (ip.octets()[1] & 0xC0) == 64)
+            // Benchmarking and reserved/broadcast blocks.
+            || (ip.octets()[0] == 198 && (ip.octets()[1] == 18 || ip.octets()[1] == 19))
+            || ip.octets()[0] >= 240
     }
 
     fn ipv6_is_forbidden(ip: Ipv6Addr) -> bool {
-        ip.is_loopback() || ip.is_unspecified() || ip.is_multicast()
+        // IPv4-mapped IPv6 is rejected even when its embedded IPv4 address is
+        // public. Treating it as a second spelling of IPv4 would let callers
+        // bypass range validation that is intentionally applied to literals
+        // and DNS answers alike.
+        if ip.to_ipv4_mapped().is_some() {
+            return true;
+        }
+        let segments = ip.segments();
+        ip.is_loopback()
+            || ip.is_unspecified()
+            || ip.is_multicast()
+            // IPv4-compatible/unspecified-prefix addresses are not public
+            // IPv6 destinations.
+            || segments[..6].iter().all(|segment| *segment == 0)
+            // RFC4193 unique-local and RFC4291 link-local ranges.
+            || (segments[0] & 0xfe00) == 0xfc00
+            || (segments[0] & 0xffc0) == 0xfe80
+            // RFC3849 documentation range.
+            || (segments[0] == 0x2001 && segments[1] == 0x0db8)
     }
 
     /// The validated URL as a string.
@@ -222,5 +248,42 @@ impl TryFrom<String> for SafeUrl {
 impl From<SafeUrl> for String {
     fn from(url: SafeUrl) -> Self {
         url.url.into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SafeUrl;
+
+    #[test]
+    fn tenant_urls_reject_unsafe_literal_and_metadata_address_classes() {
+        for raw in [
+            "https://127.0.0.1/",
+            "https://10.0.0.1/",
+            "https://169.254.169.254/latest/meta-data/",
+            "https://[::1]/",
+            "https://[fd00::1]/",
+            "https://[fe80::1]/",
+            "https://[::ffff:8.8.8.8]/",
+            "https://[2001:db8::1]/",
+            "https://metadata.google.internal/",
+            "https://metadata/",
+        ] {
+            assert!(SafeUrl::parse(raw).is_err(), "{raw} must be rejected");
+        }
+    }
+
+    #[test]
+    fn public_hostname_and_ipv6_remain_usable_after_baseline_validation() {
+        assert!(SafeUrl::parse("https://api.example.com/v1").is_ok());
+        assert!(SafeUrl::parse("https://[2606:4700:4700::1111]/dns-query").is_ok());
+    }
+
+    #[test]
+    fn internal_parse_is_visible_and_not_available_to_normal_parse() {
+        assert!(SafeUrl::parse("http://10.0.0.8:8080/").is_err());
+        let internal = SafeUrl::parse_internal_endpoint("http://10.0.0.8:8080/")
+            .expect("operator-only parser permits explicitly declared internal endpoint");
+        assert!(internal.is_internal_endpoint());
     }
 }

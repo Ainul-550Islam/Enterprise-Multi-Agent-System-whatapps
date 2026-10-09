@@ -68,6 +68,7 @@ from mas_orchestrator.context.execution_context import build_execution_context
 from mas_orchestrator.contracts.errors import (
     AuthenticationError,
     AuthorizationError,
+    ConfigurationError,
     InvalidRequestError,
     OrchestratorError,
     TenantContextError,
@@ -85,6 +86,7 @@ from mas_orchestrator.observability.bridge_metrics import (
     BridgeTelemetry,
     NoopTelemetry,
 )
+from mas_orchestrator.security.internal_replay import InMemoryReplayGuard, InternalReplayGuard
 from mas_orchestrator.security.internal_service import (
     DEFAULT_ALLOWED_CALLERS,
     now_millis,
@@ -317,6 +319,10 @@ class AgentBridgeServicerConfig:
     internal_service_secret: str | None = None
     allowed_internal_callers: frozenset[str] = DEFAULT_ALLOWED_INTERNAL_CALLERS
     require_internal_signature: bool = False
+    #: Shared durable nonce consumer. Production composition supplies a
+    #: PostgreSQL-backed guard; a process-local guard is allowed only for
+    #: isolated unit/development use when strict production auth is off.
+    replay_guard: InternalReplayGuard | None = None
 
     def __post_init__(self) -> None:
         if self.max_input_bytes < 1:
@@ -348,6 +354,15 @@ class AgentBridgeServicer(mas_api_pb2_grpc.AgentBridgeApiServicer):
         self._service = execution_service
         self._resolver = identity_resolver
         self._config = config or AgentBridgeServicerConfig()
+        self._replay_guard = self._config.replay_guard
+        if (
+            self._replay_guard is None
+            and self._config.internal_service_secret
+            and not self._config.require_internal_signature
+        ):
+            # Test/development fallback only. Production composition sets
+            # require_internal_signature and supplies PostgreSQL explicitly.
+            self._replay_guard = InMemoryReplayGuard()
         self._telemetry: BridgeTelemetry | NoopTelemetry = telemetry or NoopTelemetry()
         self._logger = logger or _LOGGER
 
@@ -527,10 +542,12 @@ class AgentBridgeServicer(mas_api_pb2_grpc.AgentBridgeApiServicer):
     ) -> None:
         """Verifies the caller's body-bound signature, or refuses the call.
 
-        The signature is an HMAC over ``v1:<service>:<unix_millis>:<sha256(body)>``.
-        The body is re-serialized here from the message Python actually
-        received, which is what makes the check meaningful: a signature over
-        *a* request is not a signature over *this* request.
+        The v2 signature is ``v2:<service>:<unix_millis>:<nonce>:<hmac>``;
+        its HMAC binds the service, timestamp, nonce, and SHA-256 body digest.
+        A verified nonce is then atomically consumed before work begins. The
+        body is re-serialized here from the message Python actually received,
+        which is what makes the check meaningful: a signature over *a* request
+        is not a signature over *this* request.
 
         Two rules decide whether the check runs:
 
@@ -569,7 +586,16 @@ class AgentBridgeServicer(mas_api_pb2_grpc.AgentBridgeApiServicer):
                 _canonical_request_bytes(request),
                 self._config.allowed_internal_callers,
             )
-        except AuthenticationError:
+            # Authentication is not complete until the signed nonce has been
+            # atomically consumed in a store shared by replicas and restarts.
+            # A missing/unavailable store fails closed rather than reopening the
+            # one-minute replay window v2 is designed to close.
+            if self._replay_guard is None or not await self._replay_guard.consume(verified):
+                raise AuthenticationError(
+                    "invalid internal service signature",
+                    details={"reason": "unauthenticated"},
+                )
+        except (AuthenticationError, ConfigurationError):
             await self._refuse_signature(context, "invalid internal service signature")
 
         # The proven service id is recorded for the audit line. It is proof of

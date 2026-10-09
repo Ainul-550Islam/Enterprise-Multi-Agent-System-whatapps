@@ -21,6 +21,7 @@ from mas_orchestrator.contracts.errors import ConfigurationError, InvalidRequest
 from mas_orchestrator.rag.models import DocumentFormat
 
 MAX_PARSED_CHARS: Final[int] = 8_000_000
+MAX_RAW_INPUT_BYTES: Final[int] = 8 * 1024 * 1024
 MAX_PDF_PAGES: Final[int] = 500
 MAX_CSV_ROWS: Final[int] = 100_000
 MAX_CSV_COLUMNS: Final[int] = 2_000
@@ -72,8 +73,16 @@ class Parser:
         if isinstance(content, bytes):
             if not content:
                 return ""
-        elif not content.strip():
-            return ""
+            raw_size = len(content)
+        else:
+            if not content.strip():
+                return ""
+            raw_size = len(content.encode("utf-8"))
+        if raw_size > MAX_RAW_INPUT_BYTES:
+            raise InvalidRequestError(
+                "raw document exceeds the maximum parser input size",
+                details={"limit": MAX_RAW_INPUT_BYTES, "size": raw_size},
+            )
 
         if format is DocumentFormat.PDF:
             parsed = _parse_pdf(content)
@@ -160,11 +169,20 @@ def _parse_json(content: str) -> str:
 
 
 def _parse_csv(content: str) -> str:
-    """Flattens bounded CSV into labelled cells without spreadsheet execution."""
+    """Flattens bounded CSV without retaining every source row in memory."""
     try:
         reader = csv.reader(io.StringIO(content, newline=""), strict=True)
-        rows: list[list[str]] = []
-        for row_number, row in enumerate(reader, start=1):
+        header = next(reader, None)
+        if header is None:
+            return ""
+        if len(header) > MAX_CSV_COLUMNS:
+            raise InvalidRequestError(
+                "CSV row exceeds the maximum column count",
+                details={"limit": MAX_CSV_COLUMNS, "row": 1},
+            )
+        lines: list[str] = []
+        chars = 0
+        for row_number, row in enumerate(reader, start=2):
             if row_number > MAX_CSV_ROWS:
                 raise InvalidRequestError(
                     "CSV exceeds the maximum row count",
@@ -175,18 +193,14 @@ def _parse_csv(content: str) -> str:
                     "CSV row exceeds the maximum column count",
                     details={"limit": MAX_CSV_COLUMNS, "row": row_number},
                 )
-            rows.append(row)
+            for column, value in enumerate(row):
+                if not value.strip():
+                    continue
+                name = header[column].strip() if column < len(header) else f"column_{column + 1}"
+                line = f"row {row_number} {name}: {value}"
+                chars = _append_limited(lines, line, chars)
     except csv.Error as error:
         raise InvalidRequestError("document is not valid CSV") from error
-    if not rows:
-        return ""
-    header = rows[0]
-    lines: list[str] = []
-    for row_number, row in enumerate(rows[1:], start=2):
-        for column, value in enumerate(row):
-            name = header[column].strip() if column < len(header) else f"column_{column + 1}"
-            if value.strip():
-                lines.append(f"row {row_number} {name}: {value}")
     return _normalise("\n".join(lines))
 
 
@@ -202,7 +216,7 @@ def _parse_html(content: str) -> str:
 
 
 def _parse_pdf(content: str | bytes) -> str:
-    """Extracts bounded, text-only PDF pages using the optional pypdf parser."""
+    """Extracts bounded text-only PDF pages using the optional pypdf parser."""
     try:
         from pypdf import PdfReader
     except ImportError as error:
@@ -219,10 +233,10 @@ def _parse_pdf(content: str | bytes) -> str:
                 details={"limit": MAX_PDF_PAGES, "pages": len(reader.pages)},
             )
         pages: list[str] = []
+        chars = 0
         for page_number, page in enumerate(reader.pages, start=1):
-            if len("\n".join(pages)) > MAX_PARSED_CHARS:
-                break
-            pages.append(f"Page {page_number}\n{page.extract_text() or ''}")
+            page_text = page.extract_text() or ""
+            chars = _append_limited(pages, f"Page {page_number}\n{page_text}", chars)
         return _normalise("\n\n".join(pages))
     except InvalidRequestError:
         raise
@@ -263,15 +277,35 @@ def _parse_docx(content: str | bytes) -> str:
             if "word/document.xml" not in archive.namelist():
                 raise InvalidRequestError("DOCX package has no Word document part")
         document = Document(io.BytesIO(raw))
-        lines = [paragraph.text for paragraph in document.paragraphs if paragraph.text.strip()]
+        lines: list[str] = []
+        chars = 0
+        for paragraph in document.paragraphs:
+            if paragraph.text.strip():
+                chars = _append_limited(lines, paragraph.text, chars)
         for table in document.tables:
             for row in table.rows:
-                lines.append(" | ".join(cell.text.strip() for cell in row.cells))
+                chars = _append_limited(
+                    lines,
+                    " | ".join(cell.text.strip() for cell in row.cells),
+                    chars,
+                )
         return _normalise("\n".join(lines))
     except InvalidRequestError:
         raise
     except (zipfile.BadZipFile, OSError, ValueError) as error:
         raise InvalidRequestError("DOCX document is malformed or unreadable") from error
+
+
+def _append_limited(lines: list[str], value: str, chars: int) -> int:
+    """Appends one parser output unit or rejects before aggregate growth escapes."""
+    next_size = chars + len(value) + (1 if lines else 0)
+    if next_size > MAX_PARSED_CHARS:
+        raise InvalidRequestError(
+            "parsed document exceeds the maximum size",
+            details={"limit": MAX_PARSED_CHARS, "size": next_size},
+        )
+    lines.append(value)
+    return next_size
 
 
 def _normalise(text: str) -> str:

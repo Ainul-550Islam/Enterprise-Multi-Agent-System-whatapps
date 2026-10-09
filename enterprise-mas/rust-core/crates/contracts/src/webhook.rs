@@ -76,6 +76,59 @@ impl RegisterWebhookRequest {
     }
 }
 
+/// Keyset query for the current tenant's outbound endpoint catalogue.
+///
+/// The cursor is opaque and comes only from the preceding stable
+/// `created_at DESC, id DESC` page. It cannot name a tenant or signing secret.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WebhookListQuery {
+    /// Maximum number of endpoint metadata records to return.
+    pub limit: Option<u16>,
+    /// Opaque URL-safe base64 cursor from the preceding page.
+    pub cursor: Option<String>,
+}
+
+impl WebhookListQuery {
+    pub fn validate(&self) -> Result<()> {
+        if self.limit.is_some_and(|limit| !(1..=200).contains(&limit)) {
+            return Err(mas_common::error::AppError::invalid_field(
+                "limit",
+                "out_of_range",
+                "webhook page limit must be between 1 and 200",
+            ));
+        }
+        if let Some(cursor) = &self.cursor {
+            validation::validate_length("cursor", cursor, 1, 512)?;
+            if !cursor
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            {
+                return Err(mas_common::error::AppError::invalid_field(
+                    "cursor",
+                    "invalid_format",
+                    "webhook cursor must be URL-safe base64 without padding",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn page_limit(&self) -> u16 {
+        match self.limit {
+            Some(limit) => limit,
+            None => 50,
+        }
+    }
+}
+
+/// Stable tenant outbound-endpoint page.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebhookPageDto {
+    pub items: Vec<WebhookDto>,
+    pub next_cursor: Option<String>,
+}
+
 /// Safe endpoint metadata; the signing secret is never represented.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebhookDto {

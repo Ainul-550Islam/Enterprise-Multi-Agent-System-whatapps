@@ -23,6 +23,7 @@ from mas_orchestrator.rag.models import (
     IngestResult,
     SourceDocument,
 )
+from mas_orchestrator.rag.parser_pool import ParserPool, ParserPoolConfig
 from mas_orchestrator.rag.parsing import Parser, detect_format
 
 if TYPE_CHECKING:
@@ -53,10 +54,21 @@ class IngestConfig:
     batch_size: int = DEFAULT_BATCH_SIZE
     chunking: ChunkingConfig | None = None
     index_lexically: bool = True
+    #: Isolated parser child-process concurrency for untrusted rich documents.
+    parser_workers: int = 2
+    #: Wall-clock limit for one parser child.
+    parser_timeout_seconds: float = 30.0
+    #: Child address-space ceiling where the platform supports it.
+    parser_memory_bytes: int = 256 * 1024 * 1024
 
     def __post_init__(self) -> None:
         if self.batch_size < 1:
             raise ConfigurationError("batch_size must be positive", details={"field": "batch_size"})
+        ParserPoolConfig(
+            workers=self.parser_workers,
+            timeout_seconds=self.parser_timeout_seconds,
+            memory_bytes=self.parser_memory_bytes,
+        )
 
 
 class IngestionPipeline:
@@ -69,6 +81,7 @@ class IngestionPipeline:
         index: VectorIndex,
         lexical: LexicalIndex | None = None,
         parser: Parser | None = None,
+        parser_pool: ParserPool | None = None,
         chunker: Chunker | None = None,
         config: IngestConfig | None = None,
     ) -> None:
@@ -77,7 +90,24 @@ class IngestionPipeline:
         self._lexical = lexical
         self._parser = parser or Parser()
         self._config = config or IngestConfig()
+        # A custom parser is generally a deterministic test double. Production
+        # construction leaves `parser` unset and therefore uses the isolated
+        # pool for all untrusted parser implementations.
+        self._parser_pool = parser_pool if parser is None else None
+        if self._parser_pool is None and parser is None:
+            self._parser_pool = ParserPool(
+                ParserPoolConfig(
+                    workers=self._config.parser_workers,
+                    timeout_seconds=self._config.parser_timeout_seconds,
+                    memory_bytes=self._config.parser_memory_bytes,
+                )
+            )
         self._chunker = chunker or Chunker(self._config.chunking)
+
+    async def aclose(self) -> None:
+        """Closes the isolated parser facade before the service shuts down."""
+        if self._parser_pool is not None:
+            await self._parser_pool.aclose()
 
     async def ingest(
         self,
@@ -102,7 +132,11 @@ class IngestionPipeline:
         detected = detect_format(document.content, declared=format or document.format)
 
         try:
-            text = self._parser.parse(document.content, detected)
+            text = (
+                await self._parser_pool.parse(document.content, detected)
+                if self._parser_pool is not None
+                else self._parser.parse(document.content, detected)
+            )
         except Exception as error:
             raise RetrievalError(
                 "document parsing failed",

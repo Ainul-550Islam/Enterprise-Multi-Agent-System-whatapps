@@ -110,6 +110,14 @@ impl DataHubApplicationService {
         })
     }
 
+    /// Returns the configured byte ceiling used by the HTTP upload adapter to
+    /// reject oversized multipart fields before it retains them for bridge
+    /// transport. The service re-checks the same bound before ingestion.
+    #[must_use]
+    pub const fn max_upload_bytes(&self) -> u64 {
+        self.limits.max_upload_bytes
+    }
+
     /// Registers a project-scoped source using only non-secret configuration.
     pub async fn create_source(
         &self,

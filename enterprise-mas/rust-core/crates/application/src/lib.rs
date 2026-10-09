@@ -55,6 +55,14 @@ pub mod durable_events;
 pub mod durable_memory;
 pub mod execution_service;
 pub mod fingerprint;
+/// Authorized inbound-webhook endpoint management and keyset pagination.
+pub mod inbound_webhook_service;
+/// Canonical tenant-scoped connector and durable outbound-webhook use cases.
+pub mod integration_service;
+/// Durable recipient notification lifecycle and stable feed pagination.
+pub mod notification_service;
+/// Authenticated connector-bound OAuth authorization initiation.
+pub mod oauth_authorization_service;
 pub mod pipeline_log;
 pub mod pipeline_metrics;
 pub mod rollback_service;

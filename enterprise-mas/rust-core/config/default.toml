@@ -36,8 +36,12 @@ dev_tokens = ""
 
 # ── mas-scheduler (completion listener + tick driver) ───────────────────────
 [scheduler]
-# Completion listener bind. Env: MAS_SCHEDULER_ADDR
+# Completion listener bind. Production requires an explicit private-network
+# value. Env: MAS_SCHEDULER_COMPLETION_ADDR
 completion_addr = "127.0.0.1:8090"
+# Shared v2 signing secret. Set only through the secret manager/environment.
+# Env: MAS_INTERNAL_SERVICE_SECRET
+internal_service_secret = ""
 # Replica identity (lease holder name). Env: MAS_SCHEDULER_REPLICA_ID
 replica_id = "scheduler-1"
 # Tick interval. Env: MAS_SCHEDULER_INTERVAL_MS
@@ -106,8 +110,111 @@ max_response_bytes = 8388608
 # Empty is *deliberate*: it selects in-memory stores which binaries refuse
 # outside `--dev-inmemory`. Env: MAS_DATABASE_URL
 url = ""
+# Separate least-privilege machine-plane DSNs. Production scheduler/worker
+# composition refuses to fall back to `url` for these cross-tenant roles.
+# Env: MAS_DATABASE_SCHEDULER_URL / MAS_DATABASE_WORKER_URL
+scheduler_url = ""
+worker_url = ""
+# Public inbound-webhook callback and secret-reference relay pools. Production
+# requires dedicated role URLs; no callback falls back to mas_app.
+# Env: MAS_DATABASE_INBOUND_URL / MAS_DATABASE_INTEGRATIONS_URL /
+# MAS_DATABASE_NOTIFICATIONS_URL / MAS_DATABASE_OAUTH_URL /
+# MAS_DATABASE_OAUTH_REFRESH_URL
+inbound_url = ""
+integrations_url = ""
+# Durable cross-tenant notification delivery requires mas_notifications and
+# never falls back to mas_app or the integrations relay role.
+notifications_url = ""
+# OAuth callback state consumes before a tenant can be known, so this must be a
+# separate mas_oauth role URL and must never fall back to database.url.
+oauth_url = ""
+# OAuth refresh, external-token cleanup, and callback-materialization
+# reconciliation scan durable cross-tenant leases under an even narrower
+# mas_oauth_refresh role; it must never reuse a callback/request role URL.
+oauth_refresh_url = ""
 max_connections = 10
 connect_timeout_ms = 5000
+
+# ── external secret manager (inbound webhook signing keys) ─────────────────
+# Values remain empty in source control. The public callback process fails
+# closed until operator-supplied Vault configuration is present.
+[secrets.vault]
+# Env: MAS_VAULT_URL / MAS_VAULT_TOKEN / MAS_VAULT_NAMESPACE
+url = ""
+token = ""
+namespace = ""
+value_field = "value"
+# Operator-owned KV-v2 API path prefixes for deterministic OAuth material.
+# Env: MAS_VAULT_OAUTH_PKCE_PATH_PREFIX / MAS_VAULT_OAUTH_TOKEN_PATH_PREFIX
+# Token and PKCE bytes are never placed in this file or in PostgreSQL.
+oauth_pkce_path_prefix = "secret/data/mas/oauth-pkce"
+oauth_token_path_prefix = "secret/data/mas/oauth-tokens"
+
+[integrations.inbound_webhooks]
+# Two-sided signature replay tolerance. Production composition enforces 1..=3600.
+# Env: MAS_INBOUND_WEBHOOK_REPLAY_TOLERANCE_SECONDS
+replay_tolerance_seconds = 300
+
+# A dedicated mas_integrations relay claims/sends durable outbound webhook
+# deliveries. Customer domains are intentionally not host-allowlisted, but
+# public HTTPS, reviewed ports, pinned DNS, private/metadata blocking, bounded
+# response bodies, and redirect-hop revalidation are always enforced.
+[integrations.outbound_webhooks]
+# Env: MAS_OUTBOUND_WEBHOOK_POLL_SECONDS / MAS_OUTBOUND_WEBHOOK_BATCH_SIZE /
+# MAS_OUTBOUND_WEBHOOK_LEASE_SECONDS / MAS_OUTBOUND_WEBHOOK_WORKER_ID
+poll_seconds = 5
+batch_size = 32
+lease_seconds = 60
+worker_id = "api-outbound-webhook"
+# Env: MAS_OUTBOUND_WEBHOOK_ALLOWED_PORTS (comma-separated),
+# MAS_OUTBOUND_WEBHOOK_MAX_RESPONSE_BYTES, MAS_OUTBOUND_WEBHOOK_MAX_REDIRECTS
+allowed_ports = ["443"]
+max_response_bytes = 1048576
+max_redirects = 3
+
+# A separately privileged mas_notifications worker delivers only represented
+# channels. At present in_app is represented; unimplemented email/slack/webhook
+# rows remain durable retry/dead-letter evidence instead of fake successes.
+[integrations.notifications]
+# Env: MAS_NOTIFICATION_DELIVERY_POLL_SECONDS /
+# MAS_NOTIFICATION_DELIVERY_BATCH_SIZE / MAS_NOTIFICATION_DELIVERY_LEASE_SECONDS /
+# MAS_NOTIFICATION_DELIVERY_WORKER_ID
+poll_seconds = 5
+batch_size = 32
+lease_seconds = 60
+worker_id = "api-notification-delivery"
+
+[integrations.oauth]
+# Public HTTPS API origin/path prefix used to derive fixed provider callbacks.
+# Env: MAS_OAUTH_CALLBACK_BASE_URL. Empty source config is deliberate: a
+# durable production API refuses startup until an operator supplies it.
+callback_base_url = ""
+# Durable OAuth lifecycle worker settings. Each API replica may run refresh,
+# cleanup, and materialization reconciliation loops because PostgreSQL
+# leases/fences serialize settlement across replicas.
+# Env: MAS_OAUTH_REFRESH_POLL_SECONDS / MAS_OAUTH_REFRESH_BATCH_SIZE /
+# MAS_OAUTH_REFRESH_WORKER_ID
+refresh_poll_seconds = 30
+refresh_batch_size = 32
+refresh_worker_id = "api-oauth-refresh"
+# Callback materialization reconciliation uses a fixed five-minute durable
+# grace window before deleting an unbound deterministic OAuth token location.
+
+[integrations.oauth.slack]
+# Public OAuth client id only; client secrets are intentionally unsupported.
+# Env: MAS_OAUTH_SLACK_CLIENT_ID / MAS_OAUTH_SLACK_SCOPES
+client_id = ""
+scopes = ["channels:read", "chat:write"]
+
+[integrations.oauth.salesforce]
+# Env: MAS_OAUTH_SALESFORCE_CLIENT_ID / MAS_OAUTH_SALESFORCE_SCOPES
+client_id = ""
+scopes = ["api", "refresh_token"]
+
+[integrations.oauth.jira]
+# Env: MAS_OAUTH_JIRA_CLIENT_ID / MAS_OAUTH_JIRA_SCOPES
+client_id = ""
+scopes = ["offline_access", "read:jira-user"]
 
 # ── telemetry ───────────────────────────────────────────────────────────────
 [observability]
@@ -125,11 +232,15 @@ metrics_addr = ""
 # Issuer and JWKS endpoint for interactive-user JWTs. Development may use a
 # local IdP; production overrides both with the deployment's trusted HTTPS IdP.
 issuer = "http://127.0.0.1:8081/realms/mas"
+# Optional API audience pin. Env: MAS_OIDC_AUDIENCE
+audience = ""
 jwks_url = "http://127.0.0.1:8081/realms/mas/protocol/openid-connect/certs"
 # Asymmetric IdP algorithms only; HS256 remains reserved for internal tokens.
 algs = ["RS256", "ES256"]
 clock_skew_seconds = 60
 jwks_cache_ttl_seconds = 300
+# Bounded remote-key fetch; Env: MAS_OIDC_JWKS_TIMEOUT_MS
+jwks_request_timeout_ms = 5000
 
 # ── Server-sent event stream bounds ─────────────────────────────────────────
 [stream]

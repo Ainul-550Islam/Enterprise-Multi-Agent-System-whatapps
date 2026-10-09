@@ -35,10 +35,10 @@ mod tests;
 pub use error::{AppError, ValidationIssue};
 pub use ids::{
     AgentId, AgentVersionId, ApiKeyId, AuditEventId, BillingReceiptId, ConnectorId, CredentialId,
-    EventId, ExecutionId, ExecutionStepId, MembershipId, OrganizationId, OverrideId, PlanId,
-    PolicyId, ProjectId, QuotaId, ReservationId, ScheduleId, SecretReferenceId, SessionId,
-    SubscriptionEventId, SubscriptionId, TaskAttemptId, TaskId, TenantId, ToolId, TypedId,
-    UsageRecordId, UserId, WebhookId, WorkflowId, WorkflowNodeId, WorkflowVersionId,
+    EventId, ExecutionId, ExecutionStepId, InboundWebhookId, MembershipId, OrganizationId,
+    OverrideId, PlanId, PolicyId, ProjectId, QuotaId, ReservationId, ScheduleId, SecretReferenceId,
+    SessionId, SubscriptionEventId, SubscriptionId, TaskAttemptId, TaskId, TenantId, ToolId,
+    TypedId, UsageRecordId, UserId, WebhookId, WorkflowId, WorkflowNodeId, WorkflowVersionId,
 };
 pub use pagination::{
     Cursor, CursorPayload, PageRequest, PageResponse, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE,

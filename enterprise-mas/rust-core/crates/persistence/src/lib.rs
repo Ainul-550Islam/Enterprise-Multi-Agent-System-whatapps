@@ -39,9 +39,10 @@
 //!   ports defined by upstream crates (starting with the transactional
 //!   outbox and the append-only audit log).
 //!
-//! Connection strings never enter domain objects; raw secrets never persist
-//! (only [`mas_domain::secret_reference::SecretReference`] payloads are
-//! stored, e.g. in `credentials.secret_ref`).
+//! Connection strings never enter domain objects and raw secrets never persist.
+//! Generic legacy references may retain provider metadata, while OAuth records
+//! store only UUID-derived opaque locators plus canonical ids—never Vault API
+//! routes—in their dedicated lifecycle tables.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]

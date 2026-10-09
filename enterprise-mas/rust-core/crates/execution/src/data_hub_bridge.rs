@@ -7,7 +7,9 @@
 //! Python ingestion/RAG plane; it does not grant Python SQL access to any
 //! Rust-owned table. Production transport lives in `mas-ai-bridge`.
 
+use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::Mutex;
 
 use async_trait::async_trait;
 use mas_common::error::AppError;
@@ -16,6 +18,7 @@ use mas_common::result::Result;
 use mas_common::timestamps::Timestamp;
 use mas_orchestration::cancellation::CancellationToken;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 /// The source adapters implemented by the Python ingestion plane.
@@ -238,6 +241,118 @@ pub struct DataHubPurgeDocumentResult {
     pub document_id: Uuid,
     /// Number of derived chunk rows removed.
     pub removed_chunks: u64,
+}
+
+/// Deterministic in-memory bridge used only by the explicit in-memory API
+/// lane and tests. It validates authoritative scope and exact digests, keeps
+/// only derived chunk counts, and never pretends to be a production vector
+/// store. Durable composition always uses `mas-ai-bridge::GrpcDataHubBridge`.
+#[derive(Debug, Default)]
+pub struct InMemoryDataHubBridge {
+    chunks: Mutex<BTreeMap<(TenantId, Uuid), u32>>,
+}
+
+impl InMemoryDataHubBridge {
+    /// Creates an empty local bridge.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+#[async_trait]
+impl DataHubBridgePort for InMemoryDataHubBridge {
+    fn name(&self) -> &'static str {
+        "in-memory-data-hub"
+    }
+
+    async fn sync_source(
+        &self,
+        request: DataHubSyncSourceRequest,
+    ) -> Result<DataHubSyncSourceResult> {
+        request.context.require_authoritative_scope()?;
+        if request.source_id.is_nil() || request.source_name.trim().is_empty() {
+            return Err(AppError::validation(
+                "in-memory Data Hub sync requires a concrete source id and name",
+            ));
+        }
+        Ok(DataHubSyncSourceResult {
+            source_id: request.source_id,
+            discovered_count: 0,
+            changed_count: 0,
+            indexed_count: 0,
+            failed_count: 0,
+            next_cursor: request.cursor,
+            errors: Vec::new(),
+        })
+    }
+
+    async fn ingest_document(
+        &self,
+        request: DataHubIngestDocumentRequest,
+    ) -> Result<DataHubDocumentIngestionResult> {
+        request.context.require_authoritative_scope()?;
+        if request.source_id.is_nil() || request.document_id.is_nil() {
+            return Err(AppError::validation(
+                "in-memory Data Hub ingestion requires concrete source and document ids",
+            ));
+        }
+        let digest = hex::encode(Sha256::digest(&request.content));
+        if let Some(expected) = request.content_sha256.as_deref() {
+            if expected != digest {
+                return Err(AppError::invalid_field(
+                    "content_sha256",
+                    "digest_mismatch",
+                    "content does not match the declared SHA-256 digest",
+                ));
+            }
+        }
+        // A local bridge does not parse formats or fabricate vectors. It
+        // represents a successful accepted document as one opaque chunk when
+        // content is nonempty, enough for lifecycle/UI tests only.
+        let chunk_count = u32::from(!request.content.is_empty());
+        self.chunks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                (request.context.tenant_id, request.document_id),
+                chunk_count,
+            );
+        Ok(DataHubDocumentIngestionResult {
+            document_id: request.document_id,
+            sha256: digest,
+            byte_count: u64::try_from(request.content.len()).unwrap_or(u64::MAX),
+            chunk_count,
+            embedded_count: chunk_count,
+            skipped_reason: None,
+        })
+    }
+
+    async fn purge_document(
+        &self,
+        request: DataHubPurgeDocumentRequest,
+    ) -> Result<DataHubPurgeDocumentResult> {
+        request.context.require_authoritative_scope()?;
+        if request.source_id.is_nil() || request.document_id.is_nil() {
+            return Err(AppError::validation(
+                "in-memory Data Hub purge requires concrete source and document ids",
+            ));
+        }
+        let removed_chunks = self
+            .chunks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&(request.context.tenant_id, request.document_id))
+            .unwrap_or_default();
+        Ok(DataHubPurgeDocumentResult {
+            document_id: request.document_id,
+            removed_chunks: u64::from(removed_chunks),
+        })
+    }
+
+    async fn health(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Port for the Rust-to-Python Data Hub bridge.

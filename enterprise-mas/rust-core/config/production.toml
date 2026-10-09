@@ -52,8 +52,83 @@ retry_max_deliver = 10
 # Empty here on purpose: production reads MAS_DATABASE_URL from env; the
 # guardrail above stops boot without it.
 url = ""
+# Dedicated least-privilege role/session URLs. These are intentionally empty:
+# API startup refuses to compose public inbound webhooks, outbound relay,
+# notification delivery, or OAuth callbacks without separate least-privilege
+# role sessions. All values are supplied through MAS_DATABASE_*_URL at deploy.
+inbound_url = ""
+integrations_url = ""
+notifications_url = ""
+oauth_url = ""
+oauth_refresh_url = ""
 max_connections = 32
 connect_timeout_ms = 5000
+
+# Vault credentials are supplied through MAS_VAULT_URL and MAS_VAULT_TOKEN;
+# no secret belongs in this checked-in configuration. The configured endpoint
+# must be public HTTPS because the guarded client rejects private/metadata DNS.
+[secrets.vault]
+url = ""
+token = ""
+namespace = ""
+value_field = "value"
+# Operators may override deterministic Vault KV-v2 prefixes through env; no
+# raw OAuth material is stored in this file or in PostgreSQL.
+oauth_pkce_path_prefix = "secret/data/mas/oauth-pkce"
+oauth_token_path_prefix = "secret/data/mas/oauth-tokens"
+
+[integrations.inbound_webhooks]
+# Two-sided HMAC replay window. Production composition bounds this to 1..=3600.
+replay_tolerance_seconds = 300
+
+[integrations.outbound_webhooks]
+# mas_integrations durable relay settings. Customer endpoint hostnames are not
+# statically allowlisted, but only public HTTPS DNS answers and these reviewed
+# ports are allowed. Env list override is MAS_OUTBOUND_WEBHOOK_ALLOWED_PORTS.
+poll_seconds = 5
+batch_size = 32
+lease_seconds = 60
+worker_id = "api-outbound-webhook"
+allowed_ports = ["443"]
+max_response_bytes = 1048576
+max_redirects = 3
+
+[integrations.notifications]
+# mas_notifications durable delivery settings. Only the closed represented
+# in_app adapter is active; unsupported channels fail durably instead of being
+# marked delivered.
+poll_seconds = 5
+batch_size = 32
+lease_seconds = 60
+worker_id = "api-notification-delivery"
+
+[integrations.oauth]
+# Mandatory when any supported OAuth provider client id is configured.
+# Env: MAS_OAUTH_CALLBACK_BASE_URL. Must be a public HTTPS API base URL.
+callback_base_url = ""
+# Each API replica may run fenced cross-tenant refresh, cleanup, and
+# materialization-reconciliation loops under the separate mas_oauth_refresh
+# role URL. Env: MAS_OAUTH_REFRESH_*.
+refresh_poll_seconds = 30
+refresh_batch_size = 32
+refresh_worker_id = "api-oauth-refresh"
+# Callback materialization reconciliation uses a fixed five-minute durable
+# grace window before deleting an unbound deterministic OAuth token location.
+
+[integrations.oauth.slack]
+# Env: MAS_OAUTH_SLACK_CLIENT_ID / MAS_OAUTH_SLACK_SCOPES
+client_id = ""
+scopes = ["channels:read", "chat:write"]
+
+[integrations.oauth.salesforce]
+# Env: MAS_OAUTH_SALESFORCE_CLIENT_ID / MAS_OAUTH_SALESFORCE_SCOPES
+client_id = ""
+scopes = ["api", "refresh_token"]
+
+[integrations.oauth.jira]
+# Env: MAS_OAUTH_JIRA_CLIENT_ID / MAS_OAUTH_JIRA_SCOPES
+client_id = ""
+scopes = ["offline_access", "read:jira-user"]
 
 [observability]
 log_format = "json"
@@ -66,10 +141,14 @@ otlp_endpoint = ""
 # invalid example host intentionally fails closed until replaced at deploy time.
 [oidc]
 issuer = "https://identity.example.invalid/realms/mas"
+# MAS_OIDC_AUDIENCE may pin the access-token audience at deploy time.
+audience = ""
 jwks_url = "https://identity.example.invalid/realms/mas/protocol/openid-connect/certs"
 algs = ["RS256", "ES256"]
 clock_skew_seconds = 30
 jwks_cache_ttl_seconds = 300
+# Bounded remote-key fetch; Env: MAS_OIDC_JWKS_TIMEOUT_MS
+jwks_request_timeout_ms = 5000
 
 # SSE resources are bounded per connection and per tenant.
 [stream]

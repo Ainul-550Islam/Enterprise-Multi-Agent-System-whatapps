@@ -37,6 +37,10 @@ use super::usage::{PostgresUsageLedger, UsageWrite as LedgerWrite};
 /// adjusted. If the gate said to reserve 40, 40 is what is reserved.
 #[async_trait::async_trait]
 impl ReservationStorePort for PostgresReservationStore {
+    async fn lock_key(&self, tenant: TenantId, reservation_key: &str) -> Result<()> {
+        PostgresReservationStore::lock_key(self, tenant, reservation_key).await
+    }
+
     async fn reserve(
         &self,
         tenant: TenantId,

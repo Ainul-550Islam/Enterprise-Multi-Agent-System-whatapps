@@ -788,6 +788,7 @@ struct ProtectedRouteFixture {
     organization: OrganizationId,
     agent: AgentId,
     workflow: WorkflowId,
+    project: ProjectId,
     execution: ExecutionId,
 }
 
@@ -1024,6 +1025,7 @@ async fn protected_route_fixture() -> ProtectedRouteFixture {
         organization: organization.id,
         agent: agent.id,
         workflow: workflow.id,
+        project: project.id,
         execution,
     }
 }
@@ -1105,8 +1107,41 @@ fn protected_route_cases(
             Some(route_rollback_body("route-workflow-rollback-matrix")),
         ),
         (
+            Method::POST,
+            format!("/v1/projects/{}/executions", fixture.project),
+            Some(json!({
+                "workflow_id": fixture.workflow,
+                "input": {"source": "authorization-route-matrix"}
+            })),
+        ),
+        (
+            Method::GET,
+            format!("/v1/executions/{}", fixture.execution),
+            None,
+        ),
+        (
             Method::GET,
             format!("/v1/executions/{}/steps", fixture.execution),
+            None,
+        ),
+        (
+            Method::POST,
+            format!("/v1/executions/{}/start", fixture.execution),
+            None,
+        ),
+        (
+            Method::POST,
+            format!("/v1/executions/{}/pause", fixture.execution),
+            None,
+        ),
+        (
+            Method::POST,
+            format!("/v1/executions/{}/resume", fixture.execution),
+            None,
+        ),
+        (
+            Method::POST,
+            format!("/v1/executions/{}/cancel", fixture.execution),
             None,
         ),
         (Method::GET, "/v1/rollbacks?limit=10".to_owned(), None),

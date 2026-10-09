@@ -48,7 +48,7 @@ if TYPE_CHECKING:
 _LOGGER: Final[logging.Logger] = logging.getLogger(__name__)
 _DEFAULT_REGION: Final[str] = "us-east-1"
 _S3_DATE_FORMAT: Final[str] = "%Y%m%dT%H%M%SZ"
-_CURSOR_VERSION: Final[int] = 1
+_CURSOR_VERSION: Final[int] = 2
 _MAX_CURSOR_ENTRIES: Final[int] = 10_000
 _MAX_START_URLS: Final[int] = 25
 
@@ -104,6 +104,7 @@ class WebCrawlAdapter:
         max_depth: int,
         max_pages: int,
         max_document_bytes: int,
+        max_sync_bytes: int,
     ) -> None:
         hosts = frozenset(
             host.strip().rstrip(".").lower() for host in allowed_hosts if host.strip()
@@ -112,10 +113,13 @@ class WebCrawlAdapter:
             raise ConfigurationError("web crawler requires a non-empty egress allow-list")
         if max_depth < 0 or not 1 <= max_pages <= 10_000:
             raise ConfigurationError("web crawl bounds are invalid")
+        if max_document_bytes < 1024 or max_sync_bytes < max_document_bytes:
+            raise ConfigurationError("web crawl byte bounds are invalid")
         self._allowed_hosts = hosts
         self._max_depth = max_depth
         self._max_pages = max_pages
         self._max_document_bytes = max_document_bytes
+        self._max_sync_bytes = max_sync_bytes
         self._transport = HttpTransport(
             HttpPolicy(
                 allowed_hosts=hosts,
@@ -133,7 +137,7 @@ class WebCrawlAdapter:
         await self._transport.aclose()
 
     async def sync(self, source: DataHubSource) -> SourceSyncResult:
-        """Fetches approved pages and returns only changed content."""
+        """Fetches approved pages while retaining no more than one sync budget."""
         if source.kind is not DataSourceKind.WEB:
             raise InvalidRequestError("web crawler received a non-web source")
         roots = _start_urls(source.config)
@@ -149,36 +153,56 @@ class WebCrawlAdapter:
             source.config.get("max_pages"), self._max_pages, 1, self._max_pages
         )
         previous = _decode_cursor(source.cursor)
-        next_etags: dict[str, str] = {}
+        next_etags = dict(previous)
         queue: deque[tuple[str, int, str]] = deque()
+        scheduled: set[str] = set()
         for root in roots:
             canonical = _validate_https_url(root, self._allowed_hosts)
-            queue.append((canonical, 0, urlsplit(canonical).hostname or ""))
+            if canonical not in scheduled:
+                scheduled.add(canonical)
+                queue.append((canonical, 0, urlsplit(canonical).hostname or ""))
 
         visited: set[str] = set()
         changed: list[DiscoveredDocument] = []
+        fetched_bytes = 0
         discovered = 0
+        max_frontier = min(max_pages * 16, 20_000)
         while queue and len(visited) < max_pages:
             url, depth, root_host = queue.popleft()
             if url in visited:
                 continue
             visited.add(url)
-            response = await self._transport.request("GET", url)
+            remaining = self._max_sync_bytes - fetched_bytes
+            if remaining <= 0:
+                break
+            response = await self._transport.request(
+                "GET",
+                url,
+                max_response_bytes=min(self._max_document_bytes, remaining),
+            )
             if not 200 <= response.status_code < 300:
                 raise classify_status(response.status_code)
             if response.is_truncated:
                 raise ModelProviderError(
-                    "web source page exceeded the configured response limit",
-                    details={"limit_bytes": self._max_document_bytes},
+                    "web source page exceeded the configured sync byte limit",
+                    details={"limit_bytes": min(self._max_document_bytes, remaining)},
                 )
+            # Account for every response, including unmodified and unsupported
+            # pages. Otherwise a source with stable ETags can still consume an
+            # unbounded aggregate transfer budget on each synchronization.
+            fetched_bytes += len(response.body)
             mime_type = _content_type(response.headers.get("content-type", ""))
             if mime_type not in {"text/html", "text/plain", "text/markdown", "application/json"}:
                 continue
             discovered += 1
             etag = _header(response.headers, "etag")
+            before_cursor = _encode_cursor(next_etags)
             if etag:
                 next_etags[url] = etag[:512]
+            after_cursor = _encode_cursor(next_etags)
             if not etag or previous.get(url) != etag:
+                # The request's per-response ceiling is the remaining aggregate
+                # transfer budget, so retaining the body cannot cross the sync bound.
                 title = _header(response.headers, "x-document-title") or _title_from_html(
                     response.body
                 )
@@ -192,18 +216,22 @@ class WebCrawlAdapter:
                         content=response.body,
                         etag=etag,
                         last_modified=_http_date(_header(response.headers, "last-modified")),
+                        cursor_before=before_cursor,
+                        cursor_after=after_cursor,
                     )
                 )
 
             if depth < max_depth and mime_type == "text/html":
                 collector = _collect_links(response.body, max_links=max_pages * 8)
                 for target in collector.links:
+                    if len(queue) >= max_frontier:
+                        break
                     absolute = _validate_link(target, url, root_host, self._allowed_hosts)
-                    if absolute is not None and absolute not in visited:
+                    if absolute is not None and absolute not in scheduled:
+                        scheduled.add(absolute)
                         queue.append((absolute, depth + 1, root_host))
 
-        cursor = _encode_cursor(next_etags)
-        return SourceSyncResult(tuple(changed), cursor, discovered)
+        return SourceSyncResult(tuple(changed), _encode_cursor(next_etags), discovered)
 
 
 def _collect_links(body: bytes, *, max_links: int) -> _LinkCollector:
@@ -290,15 +318,23 @@ class S3CompatibleAdapter:
         allowed_hosts: Sequence[str],
         max_pages: int,
         max_document_bytes: int,
+        max_sync_bytes: int,
     ) -> None:
         hosts = frozenset(
             host.strip().rstrip(".").lower() for host in allowed_hosts if host.strip()
         )
         if not hosts:
             raise ConfigurationError("object storage requires a non-empty egress allow-list")
+        if (
+            not 1 <= max_pages <= 10_000
+            or max_document_bytes < 1024
+            or max_sync_bytes < max_document_bytes
+        ):
+            raise ConfigurationError("object-storage bounds are invalid")
         self._allowed_hosts = hosts
         self._max_pages = max_pages
         self._max_document_bytes = max_document_bytes
+        self._max_sync_bytes = max_sync_bytes
         self._transport = HttpTransport(
             HttpPolicy(
                 allowed_hosts=hosts,
@@ -316,7 +352,12 @@ class S3CompatibleAdapter:
         await self._transport.aclose()
 
     async def sync(self, source: DataHubSource) -> SourceSyncResult:
-        """Lists changed objects under an approved prefix and reads them safely."""
+        """Lists changed objects and checkpoints forward progress per object.
+
+        The checkpoint records both ETags and the last object key.  It is only
+        returned to Rust after indexing succeeds, so a failed object is retried
+        while successful earlier objects do not force a full-prefix restart.
+        """
         if source.kind is not DataSourceKind.OBJECT_STORAGE:
             raise InvalidRequestError("S3 adapter received a non-object-storage source")
         endpoint, bucket, prefix, region = _s3_config(source.config, self._allowed_hosts)
@@ -326,25 +367,55 @@ class S3CompatibleAdapter:
         secret_key = resolve_secret(secret_ref).reveal()
         previous = _decode_cursor(source.cursor)
         changed: list[DiscoveredDocument] = []
-        next_etags: dict[str, str] = {}
-        continuation: str | None = None
+        next_etags = dict(previous)
+        continuation = previous.continuation
+        start_after = previous.start_after
+        transfer_bytes = 0
         discovered = 0
 
         while discovered < self._max_pages:
+            remaining = self._max_sync_bytes - transfer_bytes
+            if remaining <= 0:
+                return SourceSyncResult(
+                    tuple(changed),
+                    _encode_cursor(
+                        next_etags,
+                        continuation=continuation,
+                        start_after=start_after,
+                    ),
+                    discovered,
+                )
             query: list[tuple[str, str]] = [("list-type", "2"), ("prefix", prefix)]
             if continuation:
                 query.append(("continuation-token", continuation))
+            elif start_after:
+                query.append(("start-after", start_after))
             url = _s3_url(endpoint, bucket, query)
             response = await self._request_signed(
-                "GET", url, region=region, access_key=access_key, secret_key=secret_key
+                "GET",
+                url,
+                region=region,
+                access_key=access_key,
+                secret_key=secret_key,
+                max_response_bytes=min(self._max_document_bytes, remaining),
             )
             if not 200 <= response.status_code < 300:
                 raise classify_status(response.status_code)
+            if response.is_truncated:
+                raise ModelProviderError(
+                    "object-storage listing exceeded the configured sync byte limit",
+                    details={"limit_bytes": min(self._max_document_bytes, remaining)},
+                )
+            # Listing pages are input too: account for them before parsing so a
+            # large sequence of unchanged listings cannot evade the aggregate
+            # budget that bounds a synchronization's network and memory work.
+            transfer_bytes += len(response.body)
             try:
                 root = ElementTree.fromstring(response.body)
             except ElementTree.ParseError as error:
                 raise ModelProviderError("object-storage listing is malformed") from error
 
+            exhausted_by_cap = False
             for item in _children(root, "Contents"):
                 key = _child_text(item, "Key")
                 if not key or not key.startswith(prefix):
@@ -357,20 +428,39 @@ class S3CompatibleAdapter:
                     raise ModelProviderError(
                         "object-storage listing has an invalid size"
                     ) from error
-                if size < 0 or size > self._max_document_bytes:
+                if size < 0:
+                    raise ModelProviderError("object-storage listing has a negative object size")
+                if discovered >= self._max_pages:
+                    exhausted_by_cap = True
+                    break
+
+                # This is the exact cursor to retain if this item cannot be
+                # indexed.  It resumes after every successful preceding item.
+                before_cursor = _encode_cursor(
+                    next_etags,
+                    continuation=None,
+                    start_after=start_after,
+                )
+                if size > self._max_document_bytes:
                     _LOGGER.warning(
                         "object skipped because it exceeds the configured byte cap",
                         extra={"event": "data_hub.object_skipped", "source_id": source.source_id},
                     )
+                    if etag:
+                        next_etags[key] = etag[:512]
+                    start_after = key
+                    discovered += 1
                     continue
-                discovered += 1
-                locator = f"{endpoint.rstrip('/')}/{quote(bucket, safe='')}/{quote(key, safe='/')}"
-                if etag:
-                    next_etags[key] = etag[:512]
                 if etag and previous.get(key) == etag:
-                    if discovered >= self._max_pages:
-                        break
+                    start_after = key
+                    discovered += 1
                     continue
+                if transfer_bytes + size > self._max_sync_bytes:
+                    # Do not issue the object GET. Returning the checkpoint
+                    # before this key gives the next sync deterministic work
+                    # without allowing listing bytes to escape the same cap.
+                    return SourceSyncResult(tuple(changed), before_cursor, discovered)
+
                 last_modified = _http_date(_child_text(item, "LastModified"))
                 object_url = _s3_url(endpoint, bucket, (), key=key)
                 content = await self._read_object(
@@ -379,30 +469,48 @@ class S3CompatibleAdapter:
                     region=region,
                     access_key=access_key,
                     secret_key=secret_key,
+                    max_response_bytes=min(
+                        self._max_document_bytes,
+                        self._max_sync_bytes - transfer_bytes,
+                    ),
                 )
-                mime_type = _mime_from_key(key)
+                if etag:
+                    next_etags[key] = etag[:512]
+                start_after = key
+                after_cursor = _encode_cursor(next_etags, continuation=None, start_after=key)
+                locator = f"{endpoint.rstrip('/')}/{quote(bucket, safe='')}/{quote(key, safe='/')}"
                 changed.append(
                     DiscoveredDocument(
                         locator=locator,
                         title=key.rsplit("/", 1)[-1] or key,
-                        mime_type=mime_type,
+                        mime_type=_mime_from_key(key),
                         content=content,
                         etag=etag or None,
                         last_modified=last_modified,
+                        cursor_before=before_cursor,
+                        cursor_after=after_cursor,
                     )
                 )
-                if discovered >= self._max_pages:
-                    break
+                transfer_bytes += len(content)
+                discovered += 1
 
-            if discovered >= self._max_pages:
-                break
+            if exhausted_by_cap or discovered >= self._max_pages:
+                return SourceSyncResult(
+                    tuple(changed),
+                    _encode_cursor(next_etags, continuation=None, start_after=start_after),
+                    discovered,
+                )
             is_truncated = _child_text(root, "IsTruncated").lower() == "true"
             continuation = _child_text(root, "NextContinuationToken") or None
+            start_after = None
             if not is_truncated or continuation is None:
                 break
 
-        cursor = _encode_cursor(next_etags)
-        return SourceSyncResult(tuple(changed), cursor, discovered)
+        return SourceSyncResult(
+            tuple(changed),
+            _encode_cursor(next_etags, continuation=continuation, start_after=start_after),
+            discovered,
+        )
 
     async def _read_object(
         self,
@@ -412,6 +520,7 @@ class S3CompatibleAdapter:
         region: str,
         access_key: str,
         secret_key: str,
+        max_response_bytes: int,
     ) -> bytes:
         """Uses a single bounded byte range and validates the server response."""
         end = max(0, min(size - 1, self._max_document_bytes - 1))
@@ -422,9 +531,15 @@ class S3CompatibleAdapter:
             access_key=access_key,
             secret_key=secret_key,
             extra_headers={"range": f"bytes=0-{end}"},
+            max_response_bytes=max_response_bytes,
         )
         if response.status_code not in (200, 206):
             raise classify_status(response.status_code)
+        if response.is_truncated:
+            raise ModelProviderError(
+                "object-storage response exceeded the configured sync byte limit",
+                details={"limit_bytes": max_response_bytes},
+            )
         if len(response.body) > self._max_document_bytes or len(response.body) != size:
             raise ModelProviderError(
                 "object-storage response length does not match the bounded listing",
@@ -446,6 +561,7 @@ class S3CompatibleAdapter:
         access_key: str,
         secret_key: str,
         extra_headers: Mapping[str, str] | None = None,
+        max_response_bytes: int | None = None,
     ) -> TransportResponse:
         """Signs one request using AWS Signature Version 4 and sends it guarded."""
         headers = _sigv4_headers(
@@ -456,7 +572,12 @@ class S3CompatibleAdapter:
             secret_key=secret_key,
             extra_headers=extra_headers,
         )
-        return await self._transport.request(method, url, headers=headers)
+        return await self._transport.request(
+            method,
+            url,
+            headers=headers,
+            max_response_bytes=max_response_bytes,
+        )
 
 
 def _s3_config(
@@ -572,34 +693,68 @@ def _hmac_sha256(key: bytes, value: str) -> bytes:
     return hmac.new(key, value.encode("utf-8"), hashlib.sha256).digest()
 
 
-def _decode_cursor(cursor: str | None) -> dict[str, str]:
-    """Decodes a bounded versioned ETag cursor; malformed state fails closed."""
+class _CursorEtags(dict[str, str]):
+    """ETag mapping plus opaque forward-progress state.
+
+    Subclassing ``dict`` preserves the small internal helper's historic mapping
+    behaviour while making the continuation state impossible to collide with a
+    real object key or web URL.
+    """
+
+    def __init__(
+        self,
+        etags: Mapping[str, str] | None = None,
+        *,
+        continuation: str | None = None,
+        start_after: str | None = None,
+    ) -> None:
+        super().__init__(etags or {})
+        self.continuation = continuation
+        self.start_after = start_after
+
+
+def _decode_cursor(cursor: str | None) -> _CursorEtags:
+    """Decodes a bounded versioned source cursor and restores Base64 padding."""
     if not cursor:
-        return {}
+        return _CursorEtags()
     if len(cursor) > 64 * 1024:
         raise InvalidRequestError("Data Hub source cursor exceeds its size limit")
     try:
-        payload = json.loads(base64.urlsafe_b64decode(cursor.encode("ascii")))
+        padded = cursor + "=" * (-len(cursor) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")))
     except (ValueError, UnicodeEncodeError, json.JSONDecodeError) as error:
         raise InvalidRequestError("Data Hub source cursor is malformed") from error
-    if (
-        not isinstance(payload, dict)
-        or payload.get("v") != _CURSOR_VERSION
-        or not isinstance(payload.get("etags"), dict)
-        or len(payload["etags"]) > _MAX_CURSOR_ENTRIES
-        or any(
-            not isinstance(key, str) or not isinstance(value, str)
-            for key, value in payload["etags"].items()
-        )
-    ):
+    if not isinstance(payload, dict) or not isinstance(payload.get("etags"), dict):
         raise InvalidRequestError("Data Hub source cursor has an unsupported shape")
-    return dict(payload["etags"])
+    version = payload.get("v")
+    if version not in (1, _CURSOR_VERSION) or len(payload["etags"]) > _MAX_CURSOR_ENTRIES:
+        raise InvalidRequestError("Data Hub source cursor has an unsupported shape")
+    etags = payload["etags"]
+    if any(not isinstance(key, str) or not isinstance(value, str) for key, value in etags.items()):
+        raise InvalidRequestError("Data Hub source cursor has an unsupported shape")
+    continuation = payload.get("continuation") if version == _CURSOR_VERSION else None
+    start_after = payload.get("start_after") if version == _CURSOR_VERSION else None
+    if continuation is not None and (not isinstance(continuation, str) or len(continuation) > 4096):
+        raise InvalidRequestError("Data Hub source cursor has an invalid continuation")
+    if start_after is not None and (not isinstance(start_after, str) or len(start_after) > 2048):
+        raise InvalidRequestError("Data Hub source cursor has an invalid resume key")
+    return _CursorEtags(dict(etags), continuation=continuation, start_after=start_after)
 
 
-def _encode_cursor(etags: Mapping[str, str]) -> str:
-    """Serializes the bounded ETag map without padding noise."""
-    selected = sorted(etags.items())[:_MAX_CURSOR_ENTRIES]
-    raw = json.dumps({"v": _CURSOR_VERSION, "etags": dict(selected)}, separators=(",", ":"))
+def _encode_cursor(
+    etags: Mapping[str, str],
+    *,
+    continuation: str | None = None,
+    start_after: str | None = None,
+) -> str:
+    """Serializes bounded ETags and resumable listing state without padding."""
+    selected = sorted(etags.items())[-_MAX_CURSOR_ENTRIES:]
+    payload: dict[str, object] = {"v": _CURSOR_VERSION, "etags": dict(selected)}
+    if continuation:
+        payload["continuation"] = continuation[:4096]
+    if start_after:
+        payload["start_after"] = start_after[:2048]
+    raw = json.dumps(payload, separators=(",", ":"), sort_keys=True)
     encoded = base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii").rstrip("=")
     if len(encoded) > 64 * 1024:
         raise InvalidRequestError("Data Hub source cursor exceeds its size limit")

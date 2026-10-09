@@ -154,6 +154,9 @@ pub struct OAuth2Config {
     pub token_endpoint: SafeUrl,
     pub redirect_uri: SafeUrl,
     pub scopes: BTreeSet<String>,
+    /// Provider-definition-owned authorization parameters (for example Jira's
+    /// required `audience`). Tenant requests cannot set or override these.
+    authorization_parameters: BTreeMap<String, String>,
 }
 
 impl OAuth2Config {
@@ -207,7 +210,46 @@ impl OAuth2Config {
             token_endpoint,
             redirect_uri,
             scopes,
+            authorization_parameters: BTreeMap::new(),
         })
+    }
+
+    /// Adds static provider-definition authorization parameters. Reserved
+    /// OAuth/PKCE keys are rejected so a provider profile cannot replace the
+    /// state, redirect URI, client identity, or proof-of-possession fields.
+    pub fn with_authorization_parameters(
+        mut self,
+        parameters: BTreeMap<String, String>,
+    ) -> Result<Self> {
+        for (key, value) in &parameters {
+            if key.is_empty()
+                || key.len() > 64
+                || !key
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+                || matches!(
+                    key.as_str(),
+                    "response_type"
+                        | "client_id"
+                        | "redirect_uri"
+                        | "state"
+                        | "scope"
+                        | "code_challenge"
+                        | "code_challenge_method"
+                )
+                || value.is_empty()
+                || value.len() > 512
+                || value.chars().any(char::is_control)
+            {
+                return Err(AppError::invalid_field(
+                    "authorization_parameters",
+                    "invalid_format",
+                    "OAuth provider authorization parameters are invalid or reserved",
+                ));
+            }
+        }
+        self.authorization_parameters = parameters;
+        Ok(self)
     }
 
     /// Builds the authorization URL for a fresh `state` + PKCE challenge.
@@ -215,8 +257,16 @@ impl OAuth2Config {
         let mut url = url::Url::parse(self.authorization_endpoint.as_str()).map_err(|err| {
             AppError::internal(format!("validated SafeUrl failed re-parse: {err}"))
         })?;
+        // Endpoint query/fragment input is never inherited into an OAuth
+        // request. Provider-specific static extras are added from the typed
+        // profile below, preventing query-parameter smuggling/overrides.
+        url.set_query(None);
+        url.set_fragment(None);
         {
             let mut query = url.query_pairs_mut();
+            for (key, value) in &self.authorization_parameters {
+                query.append_pair(key, value);
+            }
             query.append_pair("response_type", "code");
             query.append_pair("client_id", &self.client_id);
             query.append_pair("redirect_uri", self.redirect_uri.as_str());
@@ -414,10 +464,28 @@ impl TokenBundle {
         self.refresh_token.as_ref()
     }
 
+    /// Provider-issued absolute expiry. This metadata is safe to persist with
+    /// credential lifecycle records; token bytes remain private.
+    #[must_use]
+    pub const fn expires_at(&self) -> Option<Timestamp> {
+        self.expires_at
+    }
+
     /// Granted scopes.
     #[must_use]
     pub fn scopes(&self) -> &[String] {
         &self.scopes
+    }
+
+    /// Preserves a previously stored refresh token when a standards-compliant
+    /// provider refresh response omits `refresh_token`. The fallback is only
+    /// used when this bundle has no replacement; a rotated provider token
+    /// always wins. This method intentionally accepts a secret wrapper rather
+    /// than a string so callers cannot accidentally serialize it.
+    pub fn preserve_refresh_token_if_absent(&mut self, fallback: &TokenSecret) {
+        if self.refresh_token.is_none() {
+            self.refresh_token = Some(fallback.clone());
+        }
     }
 
     /// Whether the bundle should be treated as expired at `now`

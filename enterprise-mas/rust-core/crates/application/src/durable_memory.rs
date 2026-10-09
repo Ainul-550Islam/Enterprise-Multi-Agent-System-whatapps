@@ -46,8 +46,8 @@ use crate::durable::{
     idempotency_conflict, immutable_attempt_conflict, ownership_conflict, stale_worker_conflict,
     terminal_execution_conflict, CancellationReceipt, CancellationRequest, CancellationResult,
     ClaimQuery, DurableExecutionPort, ExecutionFinalization, ExecutionOutcome, PipelineCounters,
-    SettlementReceipt, SubmissionIntent, SubmissionKind, SubmissionReceipt, TaskClaim, TaskOutcome,
-    TaskSettlement, UsageObservation,
+    SettlementReceipt, SubmissionAdmission, SubmissionIntent, SubmissionKind, SubmissionReceipt,
+    TaskClaim, TaskOutcome, TaskSettlement, UsageObservation,
 };
 use crate::durable_events as events;
 use crate::durable_events::EventContext;
@@ -81,6 +81,11 @@ pub struct InMemoryDurableExecution {
     /// Named pipeline metrics. Emitted from the same code path as the durable
     /// writes, so the counters cannot drift from the state they describe.
     metrics: PipelineMetrics,
+    /// Unit-test fault injection at the same boundary a database transaction
+    /// would fail. It is compiled only into this crate's test builds and lets
+    /// service tests prove a rejected durable write cannot consume quota.
+    #[cfg(test)]
+    submit_failure: Mutex<Option<AppError>>,
 }
 
 impl InMemoryDurableExecution {
@@ -88,6 +93,16 @@ impl InMemoryDurableExecution {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Causes the next [`DurableExecutionPort::submit`] to fail before it
+    /// observes or changes durable state.
+    #[cfg(test)]
+    pub(crate) fn fail_next_submit(&self, error: AppError) {
+        *self
+            .submit_failure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error);
     }
 
     /// The metrics emitter this store writes to.
@@ -235,29 +250,39 @@ impl InMemoryDurableExecution {
         actor: &TransitionActor,
         query: &ClaimQuery,
     ) -> Result<bool> {
-        let Some(task) = state.tasks.get_mut(&task_id) else {
-            return Ok(false);
-        };
-        if task.status != TaskStatus::Running || task.is_owned_at(&query.now) {
-            return Ok(false);
+        {
+            let Some(task) = state.tasks.get_mut(&task_id) else {
+                return Ok(false);
+            };
+            if task.status != TaskStatus::Running || task.is_owned_at(&query.now) {
+                return Ok(false);
+            }
+            let failure = TransitionFailure::transient(
+                "lease_expired",
+                "the owning worker stopped renewing its lease",
+            )?;
+            // A task may only dead-letter from Failed, never directly from
+            // Running. Record the abandoned run as the classified failure
+            // first, then either requeue it or close it once the durable
+            // attempt budget is spent. This is the same state-machine path a
+            // handler failure uses; a worker crash must not bypass lifecycle
+            // validation.
+            task.fail(actor, failure)?;
         }
-        if !task.has_attempts_remaining() {
-            task.dead_letter(actor, "lease_expired_attempts_exhausted")?;
-            Self::close_attempt(state, task_id, actor, query)?;
-            return Ok(false);
-        }
-        let failure = TransitionFailure::transient(
-            "lease_expired",
-            "the owning worker stopped renewing its lease",
-        )?;
-        task.fail(actor, failure.clone())?;
-        Self::close_attempt(state, task_id, actor, query)?;
+        // The task-map borrow ended above, so the matching attempt can be
+        // closed in the same atomic in-memory unit.
+        Self::close_attempt(state, task_id, query)?;
         let task = state
             .tasks
             .get_mut(&task_id)
             .ok_or_else(|| AppError::not_found("task", task_id.to_string()))?;
-        task.retry(actor, Duration::ZERO)?;
-        task.not_before = Some(query.now);
+        let exhausted = !task.has_attempts_remaining();
+        if exhausted {
+            task.dead_letter(actor, "lease_expired_attempts_exhausted")?;
+        } else {
+            task.retry(actor, Duration::ZERO)?;
+            task.not_before = Some(query.now);
+        }
         let task_snapshot = task.clone();
         let context = EventContext {
             tenant_id: task_snapshot.tenant_id,
@@ -268,32 +293,36 @@ impl InMemoryDurableExecution {
             actor: actor.label(),
             occurred_at: query.now,
         };
-        let record = events::task_failed(
+        let mut records = vec![events::task_failed(
             &context,
             task_id,
             task_snapshot.last_attempt_id,
             "lease_expired",
             true,
             task_snapshot.version(),
-            true,
-        )?;
-        state.outbox.insert(record.event_id, record);
+            !exhausted,
+        )?];
+        if exhausted {
+            records.push(events::task_dead_lettered(
+                &context,
+                task_id,
+                task_snapshot.version(),
+            )?);
+        }
+        for record in records {
+            state.outbox.insert(record.event_id, record);
+        }
         if let Some(task) = state.tasks.get_mut(&task_id) {
             task.take_transitions();
         }
-        Ok(true)
+        Ok(!exhausted)
     }
 
-    /// Marks the still-open attempt of an abandoned task as failed.
+    /// Marks the still-open attempt of an abandoned task as lease-expired.
     ///
     /// An attempt that is never closed would keep `active_attempts` inflated
     /// forever, which in turn would pin the worker at its capacity ceiling.
-    fn close_attempt(
-        state: &mut MemoryState,
-        task_id: TaskId,
-        actor: &TransitionActor,
-        query: &ClaimQuery,
-    ) -> Result<()> {
+    fn close_attempt(state: &mut MemoryState, task_id: TaskId, query: &ClaimQuery) -> Result<()> {
         let attempt_id = state
             .tasks
             .get(&task_id)
@@ -307,20 +336,48 @@ impl InMemoryDurableExecution {
         if attempt.status.is_terminal() {
             return Ok(());
         }
-        let _ = actor;
-        attempt.fail(
-            "lease_expired",
-            "worker lease lapsed mid-run",
-            true,
-            &query.now,
-        )?;
+        attempt.expire(&query.now)?;
         Ok(())
     }
 }
 
 #[async_trait::async_trait]
 impl DurableExecutionPort for InMemoryDurableExecution {
+    fn requires_local_submission_gate(&self) -> bool {
+        true
+    }
+
+    async fn submission_admission(&self, intent: &SubmissionIntent) -> Result<SubmissionAdmission> {
+        let Some(key) = intent.idempotency_key.as_deref() else {
+            return Ok(SubmissionAdmission::New);
+        };
+        let state = self.lock();
+        let Some(existing) = state.idempotency.get(&(intent.tenant_id, key.to_owned())) else {
+            return Ok(SubmissionAdmission::New);
+        };
+        Ok(
+            match IdempotencyRecord::decide(Some(existing), &intent.fingerprint) {
+                mas_domain::IdempotencyDecision::New => {
+                    unreachable!("a stored idempotency record is never new")
+                },
+                mas_domain::IdempotencyDecision::Replay { .. } => SubmissionAdmission::Replayed,
+                mas_domain::IdempotencyDecision::Conflict { .. } => {
+                    SubmissionAdmission::Conflicting
+                },
+            },
+        )
+    }
+
     async fn submit(&self, intent: SubmissionIntent) -> Result<SubmissionReceipt> {
+        #[cfg(test)]
+        if let Some(error) = self
+            .submit_failure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            return Err(error);
+        }
         intent.validate()?;
         let mut state = self.lock();
 
@@ -715,6 +772,19 @@ impl DurableExecutionPort for InMemoryDurableExecution {
             .ok_or_else(|| {
                 AppError::not_found("task attempt", settlement.attempt_id.to_string())
             })?;
+        if observed_attempt.task_id != observed.id
+            || observed_attempt.tenant_id != observed.tenant_id
+            || observed.last_attempt_id != Some(observed_attempt.id)
+        {
+            return Err(AppError::conflict(
+                "stale settlement: the attempt is not the task's current durable attempt",
+            ));
+        }
+        if observed_attempt.worker_id.as_deref() != Some(settlement.worker.as_str()) {
+            return Err(AppError::conflict(
+                "stale settlement: the attempt belongs to another worker",
+            ));
+        }
         if observed_attempt.status.is_terminal() {
             return Err(immutable_attempt_conflict(
                 observed_attempt.id,
@@ -737,11 +807,12 @@ impl DurableExecutionPort for InMemoryDurableExecution {
 
         match &settlement.outcome {
             TaskOutcome::Succeeded {
+                result,
                 usage: observed_usage,
             } => {
                 attempt.started_at = attempt.started_at.min(settlement.now);
                 attempt.succeed(&settlement.now)?;
-                task.complete(&settlement.actor)?;
+                task.complete(&settlement.actor, Some(result.clone()))?;
                 // Usage is metered only on success, and only for what was
                 // actually consumed — never a synthetic counter.
                 usage = observed_usage.observations();
@@ -796,7 +867,11 @@ impl DurableExecutionPort for InMemoryDurableExecution {
                     })?;
                 match &finalization.outcome {
                     ExecutionOutcome::Completed => {
-                        execution.complete(&settlement.actor, None)?;
+                        let output = match &settlement.outcome {
+                            TaskOutcome::Succeeded { result, .. } => Some(result.clone()),
+                            _ => None,
+                        };
+                        execution.complete(&settlement.actor, output)?;
                     },
                     ExecutionOutcome::Failed { failure } => {
                         execution.fail(&settlement.actor, failure.clone())?;
@@ -825,6 +900,7 @@ impl DurableExecutionPort for InMemoryDurableExecution {
         match &settlement.outcome {
             TaskOutcome::Succeeded {
                 usage: observed_usage,
+                ..
             } => {
                 committed.push(events::task_succeeded(
                     &context,
@@ -1080,7 +1156,9 @@ impl DurableExecutionPort for InMemoryDurableExecution {
 
         // A cancellation request outranks completion: a run that was asked to
         // stop must end as cancelled, never as completed.
-        if matches!(request.action, ExecutionAction::Complete) && live.cancellation_requested() {
+        if matches!(request.action, ExecutionAction::Complete { .. })
+            && live.cancellation_requested()
+        {
             return Err(AppError::conflict(
                 "cancellation was requested; execution must end as cancelled",
             ));
@@ -1090,7 +1168,9 @@ impl DurableExecutionPort for InMemoryDurableExecution {
             ExecutionAction::Start => live.start(&request.actor)?,
             ExecutionAction::Pause => live.pause(&request.actor)?,
             ExecutionAction::Resume => live.resume(&request.actor)?,
-            ExecutionAction::Complete => live.complete(&request.actor, None)?,
+            ExecutionAction::Complete { output } => {
+                live.complete(&request.actor, output.clone())?
+            },
             ExecutionAction::Fail { failure } => live.fail(&request.actor, failure.clone())?,
         };
 
@@ -1107,7 +1187,7 @@ impl DurableExecutionPort for InMemoryDurableExecution {
         };
         let mut committed = Vec::new();
         match &request.action {
-            ExecutionAction::Complete => {
+            ExecutionAction::Complete { .. } => {
                 committed.push(events::execution_completed(&context, snapshot.version())?)
             },
             ExecutionAction::Fail { failure } => committed.push(events::execution_failed(
@@ -1487,6 +1567,7 @@ mod tests {
                 worker: worker.to_owned(),
                 expected_version: claim.task.version(),
                 outcome: TaskOutcome::Succeeded {
+                    result: serde_json::Value::Null,
                     usage: ExecutionUsage::default(),
                 },
                 execution: None,
@@ -1575,6 +1656,7 @@ mod tests {
                 worker: "w-1".to_owned(),
                 expected_version: claim.task.version(),
                 outcome: TaskOutcome::Succeeded {
+                    result: serde_json::json!({"answer": 42, "source": "handler"}),
                     usage: ExecutionUsage {
                         tokens_input: 10,
                         tokens_output: 20,
@@ -1595,10 +1677,23 @@ mod tests {
 
         assert_eq!(receipt.task.status, TaskStatus::Completed);
         assert_eq!(receipt.attempt.status, mas_domain::AttemptStatus::Succeeded);
+        assert_eq!(
+            receipt.task.result,
+            Some(serde_json::json!({"answer": 42, "source": "handler"})),
+            "the task retains the handler result"
+        );
         assert!(receipt.execution.is_some());
         assert_eq!(
             receipt.execution.as_ref().map(|e| e.status),
             Some(ExecutionStatus::Completed)
+        );
+        assert_eq!(
+            receipt
+                .execution
+                .as_ref()
+                .and_then(|execution| execution.output.clone()),
+            Some(serde_json::json!({"answer": 42, "source": "handler"})),
+            "the owning execution receives the exact successful handler result"
         );
         assert_eq!(receipt.usage.len(), 3, "tokens + tool calls + steps");
         assert_eq!(store.usage().len(), 3);
@@ -1640,6 +1735,7 @@ mod tests {
                 worker: "w-1".to_owned(),
                 expected_version: observed_version,
                 outcome: TaskOutcome::Succeeded {
+                    result: serde_json::Value::Null,
                     usage: ExecutionUsage::default(),
                 },
                 execution: None,
@@ -1769,6 +1865,7 @@ mod tests {
             worker: "w-1".to_owned(),
             expected_version: claim.task.version(),
             outcome: TaskOutcome::Succeeded {
+                result: serde_json::Value::Null,
                 usage: ExecutionUsage::default(),
             },
             execution: None,
@@ -1874,6 +1971,7 @@ mod tests {
                 worker: "w-1".to_owned(),
                 expected_version: claim.task.version(),
                 outcome: TaskOutcome::Succeeded {
+                    result: serde_json::Value::Null,
                     usage: ExecutionUsage::default(),
                 },
                 execution: Some(ExecutionFinalization {
@@ -2022,7 +2120,71 @@ mod tests {
             .await
             .expect("claim");
         assert_eq!(stolen.len(), 1, "w-2 reclaims the abandoned task");
-        assert_eq!(store.attempts().len(), 2, "each claim is its own attempt");
+        let attempts = store.attempts();
+        assert_eq!(attempts.len(), 2, "each claim is its own attempt");
+        assert_eq!(attempts[0].status, mas_domain::AttemptStatus::Expired);
+        assert_eq!(attempts[1].status, mas_domain::AttemptStatus::Running);
+        assert_eq!(
+            stolen[0].task.last_attempt_id,
+            Some(stolen[0].attempt.id),
+            "the replacement claim links the task fence to its own attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_final_attempt_fails_before_dead_lettering() {
+        let store = InMemoryDurableExecution::new();
+        let mut submission = intent("expired-final", A);
+        submission.max_attempts = 1;
+        let receipt = store.submit(submission).await.expect("submit");
+        let first_now = now();
+        let initial = store
+            .claim(ClaimQuery {
+                worker: "w-1".to_owned(),
+                capacity: 1,
+                lease_until: first_now.checked_add(Duration::from_secs(1)).expect("ts"),
+                now: first_now,
+                tenant_id: Some(receipt.task.tenant_id),
+                task_id: Some(receipt.task.id),
+            })
+            .await
+            .expect("initial claim");
+        assert_eq!(initial.len(), 1);
+
+        let recovery_now = first_now.checked_add(Duration::from_secs(10)).expect("ts");
+        let replacement = store
+            .claim(ClaimQuery {
+                worker: "w-2".to_owned(),
+                capacity: 1,
+                lease_until: recovery_now
+                    .checked_add(Duration::from_secs(30))
+                    .expect("ts"),
+                now: recovery_now,
+                tenant_id: Some(receipt.task.tenant_id),
+                task_id: Some(receipt.task.id),
+            })
+            .await
+            .expect("recovery claim");
+        assert!(replacement.is_empty(), "exhaustion creates no replacement");
+        let task = store.task(receipt.task.id).expect("terminal task");
+        assert_eq!(task.status, TaskStatus::DeadLettered);
+        assert_eq!(
+            store.attempts()[0].status,
+            mas_domain::AttemptStatus::Expired,
+            "the abandoned attempt is closed before terminal task recovery"
+        );
+        let event_types: Vec<String> = store
+            .outbox()
+            .into_iter()
+            .map(|record| record.envelope.event_type.as_str().to_owned())
+            .collect();
+        assert!(event_types.iter().any(|event| event == "task.failed"));
+        assert!(
+            event_types
+                .iter()
+                .any(|event| event == "task.dead_lettered"),
+            "legal recovery records failure before dead-letter"
+        );
     }
 
     #[tokio::test]

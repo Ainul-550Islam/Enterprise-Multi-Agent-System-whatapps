@@ -74,7 +74,7 @@ impl AgentUsage {
 /// Sanitized runtime settings extracted from one immutable Rust-published
 /// version. Only fields consumed by the Python runtime cross the bridge; the
 /// arbitrary domain metadata map is intentionally never serialized.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentRuntimeConfiguration {
     #[serde(default)]
@@ -89,19 +89,6 @@ pub struct AgentRuntimeConfiguration {
     pub tags: Vec<String>,
     #[serde(default)]
     pub allowed_tools: Vec<String>,
-}
-
-impl Default for AgentRuntimeConfiguration {
-    fn default() -> Self {
-        Self {
-            description: None,
-            model_hint: None,
-            system_prompt: String::new(),
-            limits: AgentRuntimeLimits::default(),
-            tags: Vec::new(),
-            allowed_tools: Vec::new(),
-        }
-    }
 }
 
 /// Per-agent runtime ceilings. Python applies the same platform hard caps.

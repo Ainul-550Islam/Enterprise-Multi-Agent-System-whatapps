@@ -53,9 +53,15 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use std::collections::HashSet;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 use mas_common::timestamps::Timestamp;
-use mas_security::internal_service::{verify, SERVICE_HEADER, SIGNATURE_HEADER};
+use mas_security::internal_service::{
+    verify, InternalServiceIdentity, SERVICE_HEADER, SIGNATURE_HEADER,
+};
+use sqlx::PgPool;
 
 use crate::dispatch::{CompletionNotice, InFlightLedger};
 
@@ -65,6 +71,18 @@ use crate::dispatch::{CompletionNotice, InFlightLedger};
 /// for executions it owns. Nobody else may clear a ledger entry.
 const ALLOWED_CALLERS: &[&str] = &["mas-api", "mas-worker"];
 
+/// Replay receipt authority for v2 internal signatures.
+///
+/// The volatile variant is deliberately confined to the explicit in-memory
+/// development lane and tests. Production constructors always require a shared
+/// PostgreSQL pool so a process restart or a sibling replica cannot replay a
+/// valid request.
+#[derive(Clone)]
+enum ReplayReceipts {
+    InMemory(Arc<Mutex<HashSet<(String, String)>>>),
+    Postgres(PgPool),
+}
+
 /// Shared secret for internal authentication, held zeroized.
 ///
 /// A process with no secret configured refuses every internal call instead of
@@ -73,13 +91,28 @@ const ALLOWED_CALLERS: &[&str] = &["mas-api", "mas-worker"];
 #[derive(Clone)]
 pub struct InternalAuth {
     secret: Option<mas_security::SecretString>,
+    receipts: ReplayReceipts,
 }
 
 impl InternalAuth {
-    /// Binds the shared secret. `None` means every internal call is refused.
+    /// Development/test constructor. It intentionally uses a process-local
+    /// receipt set and must not be used by the production composition.
     #[must_use]
-    pub const fn new(secret: Option<mas_security::SecretString>) -> Self {
-        Self { secret }
+    pub fn new(secret: Option<mas_security::SecretString>) -> Self {
+        Self {
+            secret,
+            receipts: ReplayReceipts::InMemory(Arc::new(Mutex::new(HashSet::new()))),
+        }
+    }
+
+    /// Production constructor. Every successfully verified nonce is consumed
+    /// by one atomic PostgreSQL insert before the request is acted on.
+    #[must_use]
+    pub fn with_postgres(secret: Option<mas_security::SecretString>, pool: PgPool) -> Self {
+        Self {
+            secret,
+            receipts: ReplayReceipts::Postgres(pool),
+        }
     }
 
     /// Whether internal calls can be authenticated at all.
@@ -88,13 +121,43 @@ impl InternalAuth {
         self.secret.is_some()
     }
 
-    /// Verifies an inbound internal request.
+    async fn consume(&self, identity: &InternalServiceIdentity) -> Result<(), ()> {
+        match &self.receipts {
+            ReplayReceipts::InMemory(receipts) => {
+                let mut receipts = receipts.lock().await;
+                receipts
+                    .insert((identity.service.clone(), identity.nonce.clone()))
+                    .then_some(())
+                    .ok_or(())
+            },
+            ReplayReceipts::Postgres(pool) => {
+                let expires_at =
+                    Timestamp::from_unix_ms(identity.expires_at_ms()).map_err(|_| ())?;
+                let result = sqlx::query(
+                    "INSERT INTO internal_request_receipts \
+                     (service_name, nonce, signed_at_ms, expires_at) \
+                     VALUES ($1, $2, $3, $4) \
+                     ON CONFLICT (service_name, nonce) DO NOTHING",
+                )
+                .bind(&identity.service)
+                .bind(&identity.nonce)
+                .bind(identity.signed_at.to_unix_ms())
+                .bind(expires_at.into_datetime())
+                .execute(pool)
+                .await
+                .map_err(|_| ())?;
+                (result.rows_affected() == 1).then_some(()).ok_or(())
+            },
+        }
+    }
+
+    /// Verifies and atomically consumes an inbound internal request nonce.
     ///
     /// # Errors
     /// `UNAUTHORIZED` for every failure mode — missing header, bad MAC, stale
-    /// timestamp, unexpected service, or no secret configured. They are
-    /// deliberately indistinguishable.
-    pub fn verify(
+    /// timestamp, unexpected service, replay, no secret, or receipt-store
+    /// failure. They are deliberately indistinguishable.
+    pub async fn verify(
         &self,
         headers: &HeaderMap,
         body: &[u8],
@@ -108,15 +171,17 @@ impl InternalAuth {
         let service = headers
             .get(SERVICE_HEADER)
             .and_then(|value| value.to_str().ok());
-        verify(
+        let identity = verify(
             secret.expose().as_bytes(),
             signature,
             service,
             &Timestamp::now(),
             body,
             ALLOWED_CALLERS,
-        )
-        .map(|_| ())
+        )?;
+        self.consume(&identity)
+            .await
+            .map_err(|()| mas_common::error::AppError::unauthorized("unauthenticated"))
     }
 }
 
@@ -152,7 +217,7 @@ async fn post_completion(
     // covers the body exactly as it arrived, so re-serializing it first would
     // break the MAC and, worse, would verify a different message than the one
     // that is about to be trusted.
-    if let Err(error) = auth.verify(&headers, &body) {
+    if let Err(error) = auth.verify(&headers, &body).await {
         tracing::warn!(
             code = %error.error_code(),
             "rejected an unauthenticated scheduler completion"
@@ -183,6 +248,7 @@ async fn get_stats(
     // An empty body still has to be signed; the MAC covers its digest, so an
     // unsigned probe cannot read operational state.
     auth.verify(&headers, &[])
+        .await
         .map_err(|_| StatusCode::UNAUTHORIZED)?;
     Ok(Json(serde_json::json!({
         "in_flight": ledger.len(),
@@ -260,13 +326,45 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         assert!(!ledger.is_running(schedule), "ledger cleared by the route");
 
-        // Replay of the same completion is still a success: delivery is
-        // at-least-once and the ledger write is idempotent.
+        // A separately signed at-least-once delivery is still a success: the
+        // nonce is fresh, and the ledger write is idempotent.
         let response = router
             .oneshot(signed_post(&notice, "mas-api", TEST_SECRET, 0))
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn a_captured_completion_signature_is_refused_on_second_use() {
+        let ledger = InFlightLedger::default();
+        let schedule = ScheduleId::new();
+        ledger.start(schedule);
+        let router = completion_router(ledger.clone(), test_auth());
+        let mut completion = notice();
+        completion.schedule_id = schedule;
+        let body = serde_json::to_vec(&completion).expect("json");
+        let signature = sign(TEST_SECRET, "mas-api", &Timestamp::now(), &body);
+        let request = |body: Vec<u8>, signature: String| {
+            axum::http::Request::post("/v1/scheduler/completions")
+                .header("content-type", "application/json")
+                .header(SIGNATURE_HEADER, signature)
+                .header(SERVICE_HEADER, "mas-api")
+                .body(axum::body::Body::from(body))
+                .expect("request")
+        };
+
+        let first = router
+            .clone()
+            .oneshot(request(body.clone(), signature.clone()))
+            .await
+            .expect("first response");
+        assert_eq!(first.status(), StatusCode::NO_CONTENT);
+        let replay = router
+            .oneshot(request(body, signature))
+            .await
+            .expect("replay response");
+        assert_eq!(replay.status(), StatusCode::UNAUTHORIZED);
     }
 
     /// The defect this module was written to fix: an unauthenticated POST used

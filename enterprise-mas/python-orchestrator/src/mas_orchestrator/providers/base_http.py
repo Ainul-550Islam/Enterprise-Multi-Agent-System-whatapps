@@ -1,32 +1,14 @@
 """Shared secure HTTP transport for provider and tool adapters.
 
-Every outbound HTTP call from the orchestrator goes through this module, so the
-security properties below hold everywhere rather than per-adapter:
+Every outbound HTTP call from the orchestrator goes through this module.  The
+transport does more than validate a URL before handing it to an HTTP client:
+it pins the TCP connection to the public address it validated.  That distinction
+matters for DNS-rebinding resistance: resolving a hostname once for a policy
+check and allowing a second resolver invocation while connecting leaves a race
+in which the second lookup can point at a private address.
 
-**SSRF protection**
-
-:class:`HttpPolicy` validates a target host before a request is made. Only
-explicitly allowlisted hosts may be contacted, private/loopback/link-local
-ranges are refused by default, and redirects are re-validated at every hop —
-a redirect is the classic way to turn an allowlisted host into an internal one.
-
-**No credential leakage**
-
-The ``Authorization`` header is set from a :class:`Secret` and is stripped from
-any error, log line or redacted dump via
-:mod:`mas_orchestrator.security.redaction`. Request bodies are never logged.
-
-**Bounded everything**
-
-Connect, read, write and pool timeouts are all explicit; response size is
-capped and read incrementally, so a hostile or broken endpoint cannot exhaust
-memory. There is no code path that reads an unbounded response.
-
-**Typed failures**
-
-HTTP status and transport errors become typed domain errors with correct
-retryability. Adapters never see a raw ``httpx`` exception, which means the
-retry layer has a single, uniform classification rule.
+The transport also has explicit response, redirect, timeout, and credential
+boundaries.  Request bodies and secret values are never logged.
 """
 
 from __future__ import annotations
@@ -35,9 +17,10 @@ import ipaddress
 import logging
 import socket
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Final, Self
-from urllib.parse import urlparse
+from typing import TYPE_CHECKING, Final, Self, cast
+from urllib.parse import urljoin, urlparse
 
+import httpcore
 import httpx
 
 from mas_orchestrator.contracts.errors import (
@@ -52,7 +35,7 @@ from mas_orchestrator.contracts.errors import (
 from mas_orchestrator.security.redaction import REDACTED
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import AsyncIterable, AsyncIterator, Iterable, Mapping
 
     from mas_orchestrator.security.credentials import Secret
 
@@ -69,7 +52,7 @@ __all__ = [
 
 #: Networks that must never be reachable through a policy-guarded client.
 #: Covers loopback, private RFC1918, link-local (incl. cloud metadata at
-#: 169.254.169.254), unique-local IPv6, and unspecified addresses.
+#: 169.254.169.254), unique-local IPv6, multicast and unspecified addresses.
 BLOCKED_NETWORKS: Final[tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]] = (
     ipaddress.ip_network("0.0.0.0/8"),
     ipaddress.ip_network("10.0.0.0/8"),
@@ -78,16 +61,17 @@ BLOCKED_NETWORKS: Final[tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...
     ipaddress.ip_network("169.254.0.0/16"),
     ipaddress.ip_network("172.16.0.0/12"),
     ipaddress.ip_network("192.0.0.0/24"),
+    ipaddress.ip_network("192.0.2.0/24"),
     ipaddress.ip_network("192.168.0.0/16"),
     ipaddress.ip_network("198.18.0.0/15"),
+    ipaddress.ip_network("198.51.100.0/24"),
+    ipaddress.ip_network("203.0.113.0/24"),
     ipaddress.ip_network("224.0.0.0/4"),
     ipaddress.ip_network("240.0.0.0/4"),
-    ipaddress.ip_network("::/128"),
-    ipaddress.ip_network("::1/128"),
-    # IPv4-mapped IPv6 (::ffff:127.0.0.1). These are IPv6 addresses as far as
-    # `ipaddress` is concerned, so they do NOT match the IPv4 ranges above —
-    # without this entry an attacker-controlled name resolving to
-    # ::ffff:127.0.0.1 reaches loopback while every name-based check passes.
+    # IPv4-compatible and IPv4-mapped IPv6 spellings are unsupported. They
+    # are rejected rather than being routed through a subtly different IPv4
+    # policy path.
+    ipaddress.ip_network("::/96"),
     ipaddress.ip_network("::ffff:0:0/96"),
     ipaddress.ip_network("fc00::/7"),
     ipaddress.ip_network("fe80::/10"),
@@ -106,17 +90,44 @@ DEFAULT_ALLOWED_HOSTS: Final[frozenset[str]] = frozenset(
     }
 )
 
+#: Request headers that must never be forwarded to a different origin.  A
+#: redirect can be controlled by an upstream service; stripping rather than
+#: forwarding is not sufficient for a configured bearer credential because the
+#: redirect itself is unexpected and is useful evidence of misconfiguration.
+_SENSITIVE_REQUEST_HEADERS: Final[frozenset[str]] = frozenset(
+    {
+        "authorization",
+        "cookie",
+        "proxy-authorization",
+        "x-api-key",
+        "x-amz-security-token",
+    }
+)
+
+#: Framing, routing, and proxy headers owned by the guarded transport. Letting
+#: a provider or tool override them would undermine URL/SNI pinning or create
+#: request-smuggling ambiguity between the client and an upstream proxy.
+_TRANSPORT_OWNED_HEADERS: Final[frozenset[str]] = frozenset(
+    {
+        "host",
+        "content-length",
+        "transfer-encoding",
+        "connection",
+        "keep-alive",
+        "proxy-authorization",
+        "proxy-connection",
+        "te",
+        "trailer",
+        "upgrade",
+    }
+)
+
 
 def is_blocked_address(address: str) -> bool:
     """Returns whether a literal IP address falls in a blocked range.
 
-    Args:
-        address: A literal IPv4 or IPv6 address (not a hostname).
-
-    Returns:
-        ``True`` when the address must not be contacted. Unparseable input is
-        treated as blocked: refusing is the safe direction for a guard whose
-        entire purpose is to say no.
+    Unparseable input is blocked.  Refusing is the safe direction for an egress
+    guard whose purpose is to prevent an unintended dial.
     """
     try:
         parsed = ipaddress.ip_address(address)
@@ -126,47 +137,27 @@ def is_blocked_address(address: str) -> bool:
     if any(parsed in network for network in BLOCKED_NETWORKS):
         return True
 
-    # Belt and braces: an IPv4-mapped address is also checked in its IPv4 form,
-    # so the guard holds even if the mapped range above is ever narrowed.
     mapped = getattr(parsed, "ipv4_mapped", None)
     if mapped is not None:
         return any(mapped in network for network in BLOCKED_NETWORKS)
-
     return False
 
 
 @dataclass(frozen=True, slots=True)
 class HttpPolicy:
-    """Rules governing outbound HTTP from a guarded client.
-
-    Attributes:
-        allowed_hosts: Hosts that may be contacted. Empty means "nothing is
-            allowed", which is the safe default for a client built without
-            configuration.
-        allow_private_networks: Exposes blocked ranges to the client. Only for
-            development against a local fake; there is no code path that turns
-            this on in production.
-        max_response_bytes: Response body ceiling.
-        max_redirects: Redirects followed, each re-validated. Zero disables
-            redirect following entirely.
-        require_https: Refuses plaintext URLs. Provider traffic carries
-            credentials and must never be plaintext.
-    """
+    """Rules governing outbound HTTP from a guarded client."""
 
     allowed_hosts: frozenset[str] = field(default_factory=frozenset)
+    # Compatibility field retained so an unsafe configuration fails loudly
+    # rather than becoming an ignored bypass. Tenant-facing tools, connectors,
+    # and provider adapters never get a private-network exception.
     allow_private_networks: bool = False
     max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES
     max_redirects: int = 3
     require_https: bool = True
 
     def __post_init__(self) -> None:
-        """Validates the policy.
-
-        Raises:
-            ConfigurationError: If the response ceiling is too small to be
-                usable, or if redirects are negative (which ``httpx`` would
-                interpret as "follow all").
-        """
+        """Rejects unsafe or unusable policy values."""
         if self.max_response_bytes < 1024:
             raise ConfigurationError(
                 "max_response_bytes is too small to carry a response",
@@ -177,76 +168,77 @@ class HttpPolicy:
                 "max_redirects must not be negative",
                 details={"max_redirects": self.max_redirects},
             )
+        if self.allow_private_networks:
+            raise ConfigurationError(
+                "private-network egress is not available to guarded HTTP clients",
+                details={"reason": "private_network_bypass_forbidden"},
+            )
+        if any(not host.strip() or not host.isascii() for host in self.allowed_hosts):
+            raise ConfigurationError(
+                "allowed hosts must be non-empty ASCII hostnames",
+                details={"field": "allowed_hosts"},
+            )
 
     def is_host_allowed(self, host: str) -> bool:
-        """Returns whether *host* may be contacted.
-
-        Host comparison is case-insensitive and ignores a trailing dot, so
-        ``API.OpenAI.com`` and ``api.openai.com.`` both match an allowlist
-        entry for ``api.openai.com``.
-        """
+        """Returns whether *host* matches the explicitly configured allowlist."""
         normalised = host.strip().rstrip(".").lower()
-        if normalised in self.allowed_hosts:
-            return True
         return any(
             normalised == allowed.strip().rstrip(".").lower() for allowed in self.allowed_hosts
         )
 
     def validate_url(self, url: str) -> str:
-        """Validates a URL before a request is made.
-
-        Args:
-            url: The absolute URL about to be requested.
-
-        Returns:
-            The normalised host, for logging.
-
-        Raises:
-            InvalidRequestError: If the URL is not absolute HTTP(S).
-            ToolPermissionDeniedError: If the scheme is plaintext while
-                ``require_https`` is set, or if the host is not allowlisted.
-                Using the permission error makes the refusal legible to the
-                tool layer, which is where user-influenced URLs originate.
-        """
+        """Validates an absolute URL before it is constructed as a request."""
         parsed = urlparse(url)
-        if parsed.scheme not in ("http", "https"):
+        scheme = parsed.scheme.lower()
+        if scheme not in ("http", "https"):
             raise InvalidRequestError(
                 "only http and https URLs are supported",
                 details={"scheme": parsed.scheme or "<none>"},
             )
-        if self.require_https and parsed.scheme != "https":
+        if self.require_https and scheme != "https":
             raise ToolPermissionDeniedError(
                 "plaintext URLs are not permitted",
-                details={"scheme": parsed.scheme},
+                details={"scheme": scheme},
             )
+        if parsed.username is not None or parsed.password is not None:
+            raise ToolPermissionDeniedError("URLs with user credentials are not permitted")
 
         host = parsed.hostname or ""
         if not host:
             raise InvalidRequestError("URL has no host", details={"url": "<redacted>"})
-
+        if not host.isascii():
+            raise ToolPermissionDeniedError(
+                "non-ASCII URL hosts are not permitted",
+                details={"reason": "non_ascii_host"},
+            )
+        normalised_host = host.rstrip(".").lower()
+        if (
+            normalised_host == "localhost"
+            or normalised_host.endswith(".localhost")
+            or normalised_host.endswith(".internal")
+            or normalised_host
+            in {"metadata", "metadata.google.internal", "metadata.azure.internal", "instance-data"}
+        ):
+            raise ToolPermissionDeniedError(
+                "local and metadata URL hosts are not permitted",
+                details={"reason": "forbidden_host"},
+            )
+        try:
+            port = parsed.port
+        except ValueError as error:
+            raise InvalidRequestError("URL has an invalid port") from error
+        default_port = 443 if scheme == "https" else 80
+        if port not in (None, default_port):
+            raise ToolPermissionDeniedError("URLs using non-standard ports are not permitted")
         if not self.is_host_allowed(host):
             raise ToolPermissionDeniedError(
                 "host is not in the allowed set",
                 details={"reason": "host_not_allowlisted"},
             )
-
         return host
 
     def validate_resolved_address(self, address: str) -> None:
-        """Refuses a resolved IP that lands in a blocked range.
-
-        This closes the DNS-rebinding gap left by hostname allowlisting: an
-        allowlisted name can resolve to ``127.0.0.1`` or to the cloud metadata
-        address, so the resolved address is checked as well as the name.
-
-        Args:
-            address: The IP the host resolved to.
-
-        Raises:
-            ToolPermissionDeniedError: If the address is blocked.
-        """
-        if self.allow_private_networks:
-            return
+        """Refuses a resolved address that belongs to a blocked range."""
         if is_blocked_address(address):
             raise ToolPermissionDeniedError(
                 "resolved address is in a blocked range",
@@ -255,16 +247,7 @@ class HttpPolicy:
 
     @classmethod
     def for_providers(cls, extra_hosts: frozenset[str] | set[str] | None = None) -> Self:
-        """Builds a policy permitting the known model provider hosts.
-
-        Args:
-            extra_hosts: Additional hosts, for example a private gateway or a
-                self-hosted compatible endpoint.
-
-        Returns:
-            A policy with HTTPS required and redirects followed but
-            re-validated.
-        """
+        """Builds the restrictive policy used by first-party providers."""
         hosts = set(DEFAULT_ALLOWED_HOSTS)
         if extra_hosts:
             hosts.update(extra_hosts)
@@ -273,14 +256,7 @@ class HttpPolicy:
 
 @dataclass(frozen=True, slots=True)
 class TransportResponse:
-    """A bounded, already-validated HTTP response.
-
-    Attributes:
-        status_code: HTTP status.
-        body: Response body, truncated at the configured ceiling.
-        headers: Response headers, with sensitive values redacted.
-        is_truncated: Whether the body hit the size ceiling.
-    """
+    """A bounded, already-validated HTTP response."""
 
     status_code: int
     body: bytes
@@ -288,14 +264,7 @@ class TransportResponse:
     is_truncated: bool = False
 
     def json(self) -> object:
-        """Decodes the body as JSON.
-
-        Raises:
-            ModelProviderError: If the body is not valid JSON. A provider that
-                returns HTML (an error page, a captive portal) must produce a
-                typed failure rather than an opaque decode error at the call
-                site.
-        """
+        """Decodes the body as JSON with a typed provider failure."""
         import json
 
         try:
@@ -307,16 +276,141 @@ class TransportResponse:
             ) from error
 
 
-class HttpTransport:
-    """A guarded HTTP client shared by provider and tool adapters.
+class _ValidatedNetworkBackend(httpcore.AsyncNetworkBackend):
+    """Pins each TCP dial to addresses checked by :class:`HttpPolicy`.
 
-    Args:
-        policy: The guard rules applied to every request.
-        connect_timeout_seconds: Connection establishment budget.
-        read_timeout_seconds: Per-read budget.
-        write_timeout_seconds: Request-body budget.
-        credential: Optional bearer credential applied to every request.
+    HTTP Core keeps the requested hostname as the TLS SNI and certificate name,
+    while this backend changes only the TCP destination to a validated literal
+    address.  Consequently a second DNS lookup cannot redirect a connection to
+    an internal service after the policy approved the hostname.
     """
+
+    def __init__(self, policy: HttpPolicy) -> None:
+        self._policy = policy
+        self._delegate = httpcore.AnyIOBackend()
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Iterable[httpcore.SOCKET_OPTION] | None = None,
+    ) -> httpcore.AsyncNetworkStream:
+        try:
+            addresses = await _resolve_host(host)
+        except OSError as error:
+            # The public transport maps HTTP Core connection failures onto a
+            # typed provider failure. Letting a raw `gaierror` escape here
+            # would bypass that boundary and turn a routine DNS outage into an
+            # unclassified RPC failure.
+            raise httpcore.ConnectError("host could not be resolved") from error
+        if not addresses:
+            raise httpcore.ConnectError("host resolved to no addresses")
+
+        # Reject mixed public/private answers rather than hoping address order
+        # remains stable.  DNS answers are attacker-controlled at this boundary.
+        for address in addresses:
+            try:
+                self._policy.validate_resolved_address(address)
+            except ToolPermissionDeniedError as error:
+                raise httpcore.ConnectError("resolved address is blocked") from error
+
+        # Stable de-duplication avoids retries oscillating due to resolver order
+        # while preserving the resolver's preferred address family/order.
+        address = next(iter(dict.fromkeys(addresses)))
+        return await self._delegate.connect_tcp(
+            address,
+            port,
+            timeout=timeout,
+            local_address=local_address,
+            socket_options=socket_options,
+        )
+
+    async def connect_unix_socket(
+        self,
+        path: str,
+        timeout: float | None = None,
+        socket_options: Iterable[httpcore.SOCKET_OPTION] | None = None,
+    ) -> httpcore.AsyncNetworkStream:
+        # Guarded egress never uses UDS.  Keeping this hard failure avoids a
+        # future caller accidentally bypassing hostname policy through a custom
+        # transport extension.
+        del path, timeout, socket_options
+        raise httpcore.ConnectError("unix sockets are not permitted for guarded HTTP")
+
+    async def sleep(self, seconds: float) -> None:
+        await self._delegate.sleep(seconds)
+
+
+class _CoreResponseStream(httpx.AsyncByteStream):
+    """Maps HTTP Core streaming errors onto public HTTPX exception classes."""
+
+    def __init__(self, stream: AsyncIterable[bytes]) -> None:
+        self._stream = stream
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        try:
+            async for chunk in self._stream:
+                yield chunk
+        except (httpcore.ConnectTimeout, httpcore.ReadTimeout, httpcore.WriteTimeout) as error:
+            raise httpx.TimeoutException(str(error)) from error
+        except httpcore.NetworkError as error:
+            raise httpx.NetworkError(str(error)) from error
+        except httpcore.ProtocolError as error:
+            raise httpx.ProtocolError(str(error)) from error
+
+    async def aclose(self) -> None:
+        close = getattr(self._stream, "aclose", None)
+        if close is not None:
+            await close()
+
+
+class _PinnedAsyncTransport(httpx.AsyncBaseTransport):
+    """Small HTTPX transport exposing HTTP Core's validated network backend."""
+
+    def __init__(self, policy: HttpPolicy) -> None:
+        self._pool = httpcore.AsyncConnectionPool(
+            network_backend=_ValidatedNetworkBackend(policy),
+            retries=0,
+        )
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        core_request = httpcore.Request(
+            method=request.method,
+            url=httpcore.URL(
+                scheme=request.url.raw_scheme,
+                host=request.url.raw_host,
+                port=request.url.port,
+                target=request.url.raw_path,
+            ),
+            headers=request.headers.raw,
+            content=request.stream,
+            extensions=request.extensions,
+        )
+        try:
+            core_response = await self._pool.handle_async_request(core_request)
+        except (httpcore.ConnectTimeout, httpcore.ReadTimeout, httpcore.WriteTimeout) as error:
+            raise httpx.TimeoutException(str(error), request=request) from error
+        except httpcore.NetworkError as error:
+            raise httpx.NetworkError(str(error), request=request) from error
+        except httpcore.ProtocolError as error:
+            raise httpx.ProtocolError(str(error), request=request) from error
+
+        return httpx.Response(
+            status_code=core_response.status,
+            headers=core_response.headers,
+            stream=_CoreResponseStream(cast("AsyncIterable[bytes]", core_response.stream)),
+            extensions=core_response.extensions,
+            request=request,
+        )
+
+    async def aclose(self) -> None:
+        await self._pool.aclose()
+
+
+class HttpTransport:
+    """A guarded HTTP client shared by provider and tool adapters."""
 
     def __init__(
         self,
@@ -343,11 +437,14 @@ class HttpTransport:
             write=write_timeout_seconds,
             pool=connect_timeout_seconds,
         )
-        # Redirects are handled manually so each hop is re-validated; letting
-        # httpx follow them would bypass the host allowlist after the first hop.
+        # `trust_env=False` refuses proxy variables such as HTTPS_PROXY.  A
+        # proxy is an egress path outside our DNS pinning and must be configured
+        # explicitly in a future, separately policy-checked transport.
         self._client = httpx.AsyncClient(
+            transport=_PinnedAsyncTransport(policy),
             timeout=self._timeout,
             follow_redirects=False,
+            trust_env=False,
         )
 
     @property
@@ -360,13 +457,59 @@ class HttpTransport:
         await self._client.aclose()
 
     def _headers(self, extra: Mapping[str, str] | None) -> dict[str, str]:
-        """Builds request headers, attaching the credential when configured."""
+        """Builds request headers, attaching the configured bearer credential.
+
+        Callers can add provider-specific headers but cannot override transport
+        framing/routing. A configured bearer credential also cannot be replaced
+        by a caller-supplied ``Authorization`` value.
+        """
         headers = {"accept": "application/json"}
         if self._credential is not None:
             headers["authorization"] = f"Bearer {self._credential.reveal()}"
         if extra:
-            headers.update(extra)
+            for raw_name, raw_value in extra.items():
+                name = str(raw_name)
+                value = str(raw_value)
+                normalised = name.lower()
+                if (
+                    not name
+                    or not name.isascii()
+                    or not all(character.isalnum() or character == "-" for character in name)
+                ):
+                    raise InvalidRequestError(
+                        "outbound request contains an invalid header name",
+                        details={"reason": "invalid_header_name"},
+                    )
+                if normalised in _TRANSPORT_OWNED_HEADERS:
+                    raise ToolPermissionDeniedError(
+                        "outbound request attempted to set a transport-owned header",
+                        details={"reason": "transport_owned_header"},
+                    )
+                if "\r" in value or "\n" in value or len(value) > 16 * 1024:
+                    raise InvalidRequestError(
+                        "outbound request contains an invalid header value",
+                        details={"reason": "invalid_header_value"},
+                    )
+                if self._credential is not None and normalised == "authorization":
+                    raise ToolPermissionDeniedError(
+                        "caller cannot override the configured authorization credential",
+                        details={"reason": "credential_override"},
+                    )
+                headers[name] = value
         return headers
+
+    @staticmethod
+    def _origin(url: str) -> tuple[str, str, int]:
+        """Returns a normalised URL origin after URL validation has succeeded."""
+        parsed = urlparse(url)
+        scheme = parsed.scheme.lower()
+        host = (parsed.hostname or "").rstrip(".").lower()
+        return scheme, host, parsed.port or (443 if scheme == "https" else 80)
+
+    def _has_sensitive_headers(self, headers: Mapping[str, str] | None) -> bool:
+        if self._credential is not None:
+            return True
+        return bool(headers and any(key.lower() in _SENSITIVE_REQUEST_HEADERS for key in headers))
 
     async def request(
         self,
@@ -374,39 +517,58 @@ class HttpTransport:
         url: str,
         *,
         json_body: object | None = None,
+        content: bytes | None = None,
         headers: Mapping[str, str] | None = None,
+        max_response_bytes: int | None = None,
     ) -> TransportResponse:
-        """Performs a guarded request, following redirects safely.
+        """Performs a guarded request, following only safe validated redirects.
 
-        Args:
-            method: HTTP method.
-            url: Absolute target URL.
-            json_body: JSON-serialisable request body, when any.
-            headers: Additional headers.
-
-        Returns:
-            The bounded response.
-
-        Raises:
-            ToolPermissionDeniedError: If the URL, host, or any redirect hop
-                is refused by the policy.
-            ModelRateLimitedError: On HTTP 429, with ``Retry-After`` honoured.
-            ModelTimeoutError: On timeout.
-            ModelProviderError: On any other transport failure or on a
-                response that exceeds the size ceiling.
+        ``max_response_bytes`` can lower (never raise) the policy ceiling for a
+        single request.  Source synchronizers use it to enforce an aggregate
+        byte budget before retaining another document in memory.
         """
+        if json_body is not None and content is not None:
+            raise ConfigurationError(
+                "guarded HTTP request cannot use json_body and raw content together",
+                details={"reason": "ambiguous_request_body"},
+            )
+        if content is not None and len(content) > self._policy.max_response_bytes:
+            raise InvalidRequestError(
+                "outbound request body exceeds the guarded transport limit",
+                details={"limit_bytes": self._policy.max_response_bytes},
+            )
+        if (
+            max_response_bytes is not None
+            and not 1 <= max_response_bytes <= self._policy.max_response_bytes
+        ):
+            raise ConfigurationError(
+                "per-request response limit must be within the transport policy limit",
+                details={"limit": max_response_bytes},
+            )
+        body_limit = max_response_bytes or self._policy.max_response_bytes
         current_url = url
+        request_method = method.upper()
+        request_body = json_body
+        initial_origin: tuple[str, str, int] | None = None
+
         for hop in range(self._policy.max_redirects + 1):
             self._policy.validate_url(current_url)
-            await self._validate_dns(current_url)
+            origin = self._origin(current_url)
+            if initial_origin is None:
+                initial_origin = origin
+            elif origin != initial_origin and self._has_sensitive_headers(headers):
+                raise ToolPermissionDeniedError(
+                    "cross-origin redirects are not permitted for credentialed requests",
+                    details={"reason": "credential_redirect"},
+                )
 
             request = self._client.build_request(
-                method,
+                request_method,
                 current_url,
-                json=json_body,
+                json=request_body,
+                content=content if request_body is None else None,
                 headers=self._headers(headers),
             )
-
             try:
                 response = await self._client.send(request, stream=True)
             except httpx.TimeoutException as error:
@@ -422,23 +584,31 @@ class HttpTransport:
 
             try:
                 location = response.headers.get("location")
-                if response.is_redirect and location and hop < self._policy.max_redirects:
-                    # Each hop is re-validated at the top of the loop; a
-                    # redirect must never reach a host the policy would refuse.
-                    if urlparse(location).netloc:
-                        current_url = location
-                    else:
-                        # Relative Location: resolve against the original URL.
-                        base = urlparse(url)
-                        current_url = f"{base.scheme}://{base.netloc}{location}"
+                if response.is_redirect and location:
+                    if hop >= self._policy.max_redirects:
+                        raise ModelProviderError(
+                            "too many redirects",
+                            details={"max_redirects": self._policy.max_redirects},
+                        )
+                    if request_method not in {"GET", "HEAD"}:
+                        raise ToolPermissionDeniedError(
+                            "redirects for non-idempotent requests are not permitted",
+                            details={"reason": "unsafe_redirect_method"},
+                        )
+                    # urljoin preserves relative-path semantics (unlike manual
+                    # scheme/netloc concatenation) and the next loop validates
+                    # the complete resolved target again.
+                    current_url = urljoin(current_url, location)
+                    request_body = None
+                    content = None
                     continue
 
-                body = await self._read_bounded(response)
+                body = await self._read_bounded(response, body_limit)
                 return TransportResponse(
                     status_code=response.status_code,
                     body=body,
                     headers=self._redact_headers(dict(response.headers)),
-                    is_truncated=len(body) >= self._policy.max_response_bytes,
+                    is_truncated=False,
                 )
             finally:
                 await response.aclose()
@@ -449,14 +619,12 @@ class HttpTransport:
         )
 
     async def _validate_dns(self, url: str) -> None:
-        """Resolves the host and refuses blocked addresses.
+        """Validates all current DNS answers for diagnostics and direct callers.
 
-        This is the DNS-rebinding guard: an allowlisted hostname is still
-        checked against blocked IP ranges after resolution.
-
-        Raises:
-            ToolPermissionDeniedError: If the host does not resolve, or
-                resolves into a blocked range.
+        Actual egress safety is enforced by :class:`_ValidatedNetworkBackend`,
+        which resolves immediately before and uses the TCP connection.  This
+        method remains useful to source validators and tests but must not be
+        mistaken for the connection-pinning boundary.
         """
         host = urlparse(url).hostname or ""
         try:
@@ -466,43 +634,52 @@ class HttpTransport:
                 "provider host could not be resolved",
                 details={"errno": error.errno},
             ) from error
-
         if not infos:
             raise ModelProviderError("provider host resolved to no addresses", details={})
-
         for address in infos:
             self._policy.validate_resolved_address(address)
 
-    async def _read_bounded(self, response: httpx.Response) -> bytes:
-        """Reads at most ``max_response_bytes``, then stops.
+    async def _read_bounded(self, response: httpx.Response, limit: int) -> bytes:
+        """Reads at most ``limit`` bytes and fails closed on overflow."""
+        declared_length = response.headers.get("content-length")
+        if declared_length is not None:
+            try:
+                if int(declared_length) > limit:
+                    raise ModelProviderError(
+                        "provider response exceeded the size limit",
+                        details={"limit_bytes": limit},
+                    )
+            except ValueError:
+                # A malformed Content-Length is handled by HTTPX's framing;
+                # preserve streaming enforcement below as defence in depth.
+                pass
 
-        Raises:
-            ModelProviderError: If the body exceeds the ceiling. A response
-                larger than the configured maximum is a protocol violation
-                from our perspective: silently truncating it would produce a
-                corrupt parse downstream.
-        """
-        limit = self._policy.max_response_bytes
         chunks: list[bytes] = []
         total = 0
-        async for chunk in response.aiter_bytes():
-            total += len(chunk)
-            if total > limit:
-                raise ModelProviderError(
-                    "provider response exceeded the size limit",
-                    details={"limit_bytes": limit},
-                )
-            chunks.append(chunk)
+        try:
+            async for chunk in response.aiter_bytes():
+                total += len(chunk)
+                if total > limit:
+                    raise ModelProviderError(
+                        "provider response exceeded the size limit",
+                        details={"limit_bytes": limit},
+                    )
+                chunks.append(chunk)
+        except httpx.TimeoutException as error:
+            raise ModelTimeoutError(
+                "provider response timed out",
+                details={"phase": "read"},
+            ) from error
+        except httpx.HTTPError as error:
+            raise ModelProviderError(
+                "provider response failed while reading",
+                details={"error_type": type(error).__name__},
+            ) from error
         return b"".join(chunks)
 
     @staticmethod
     def _redact_headers(headers: Mapping[str, str]) -> dict[str, str]:
-        """Redacts sensitive response headers before they are returned.
-
-        Response headers can carry ``set-cookie`` and other credential-bearing
-        values; nothing downstream needs them, so they are replaced rather than
-        risked.
-        """
+        """Redacts credential-bearing response headers."""
         sensitive = {"authorization", "set-cookie", "cookie", "proxy-authenticate"}
         return {
             key: (REDACTED if key.lower() in sensitive else value) for key, value in headers.items()
@@ -510,33 +687,19 @@ class HttpTransport:
 
 
 async def _resolve_host(host: str) -> list[str]:
-    """Resolves a hostname to literal addresses without blocking the loop.
-
-    ``socket.getaddrinfo`` blocks, and calling it inside the event loop would
-    stall every other execution being served by this process.
-    """
+    """Resolves a hostname without blocking the event loop."""
     import asyncio
 
     loop = asyncio.get_running_loop()
 
     def resolve() -> list[str]:
-        return [str(info[4][0]) for info in socket.getaddrinfo(host, None)]
+        return [str(info[4][0]) for info in socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)]
 
     return await loop.run_in_executor(None, resolve)
 
 
 def classify_status(status_code: int, retry_after: float | None = None) -> Exception:
-    """Maps an HTTP status onto a typed error.
-
-    Args:
-        status_code: The HTTP status.
-        retry_after: Parsed ``Retry-After`` in seconds, when supplied.
-
-    Returns:
-        A typed error with correct retryability: 429 becomes
-        :class:`ModelRateLimitedError`, 5xx becomes a retryable
-        :class:`ModelProviderError`, and 4xx becomes a non-retryable one.
-    """
+    """Maps an HTTP status onto a typed error."""
     if status_code == 429:
         return ModelRateLimitedError(
             "provider rate limited the request",
@@ -554,34 +717,20 @@ def classify_status(status_code: int, retry_after: float | None = None) -> Excep
 
 
 def parse_retry_after(raw: str | None) -> float | None:
-    """Parses a ``Retry-After`` header.
-
-    Supports both the delta-seconds form and the HTTP-date form. A malformed
-    or past date yields ``None`` rather than a guess, because a wrong delay is
-    worse than no delay: the caller falls back to backoff.
-
-    Args:
-        raw: Header value.
-
-    Returns:
-        Seconds to wait, or ``None``.
-    """
+    """Parses a ``Retry-After`` header in delta-seconds or HTTP-date form."""
     if not raw:
         return None
-
     value = raw.strip()
     if value.isdigit():
         return float(int(value))
 
+    import time as _time
     from email.utils import parsedate_to_datetime
 
     try:
         when = parsedate_to_datetime(value)
     except (TypeError, ValueError):
         return None
-
-    import time as _time
-
     if when.tzinfo is None:
         return None
     delta = when.timestamp() - _time.time()

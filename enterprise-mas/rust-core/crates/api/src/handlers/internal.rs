@@ -59,6 +59,7 @@ use mas_security::internal_service::{
     verify, InternalServiceIdentity, SERVICE_HEADER, SIGNATURE_HEADER,
 };
 use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
 use std::sync::Arc;
 
 use crate::context::RequestContext;
@@ -247,7 +248,13 @@ pub async fn schedule_runs(
         return error_response(failure.to_app_error(), &context).into_response();
     }
 
-    // 7. Submit inside the request's scoped transaction, exactly as a
+    // 7. This is the last point before any execution-side effect. Consume the
+    //    signed nonce atomically before creating/submitting work.
+    if let Err(error) = consume_authenticated_internal_nonce(&state, &identity, &headers).await {
+        return error.into_response();
+    }
+
+    // 8. Submit inside the request's scoped transaction, exactly as a
     //    tenant-facing call would. The template comes from the stored
     //    schedule, never from the caller's body.
     let idempotency_key = format!(
@@ -291,7 +298,36 @@ pub async fn schedule_runs(
     }
 }
 
-/// Verifies the internal signature, returning a `401` response on failure.
+/// Atomically records a one-time v2 signature nonce. A database failure is
+/// indistinguishable from a bad signature: accepting without this receipt
+/// would reintroduce the replay window.
+async fn consume_internal_nonce(
+    pool: &PgPool,
+    identity: &InternalServiceIdentity,
+) -> Result<(), ()> {
+    let expires_at = Timestamp::from_unix_ms(identity.expires_at_ms()).map_err(|_| ())?;
+    let receipt = sqlx::query(
+        "INSERT INTO internal_request_receipts \
+         (service_name, nonce, signed_at_ms, expires_at) \
+         VALUES ($1, $2, $3, $4) \
+         ON CONFLICT (service_name, nonce) DO NOTHING",
+    )
+    .bind(&identity.service)
+    .bind(&identity.nonce)
+    .bind(identity.signed_at.to_unix_ms())
+    .bind(expires_at.into_datetime())
+    .execute(pool)
+    .await
+    .map_err(|_| ())?;
+    (receipt.rows_affected() == 1).then_some(()).ok_or(())
+}
+
+/// Verifies the internal signature, returning a `401` response for failures.
+///
+/// The verified nonce is consumed immediately before the first side effect,
+/// after cheap request/scope validation has determined that the request is
+/// meaningful. Invalid JSON and unreachable resources perform no work and do
+/// not burn a valid caller nonce.
 async fn authenticate_internal(
     state: &AppState,
     headers: &HeaderMap,
@@ -312,7 +348,7 @@ async fn authenticate_internal(
     let service = headers
         .get(SERVICE_HEADER)
         .and_then(|value| value.to_str().ok());
-    verify(
+    let identity = verify(
         secret.expose().as_bytes(),
         signature,
         service,
@@ -320,7 +356,30 @@ async fn authenticate_internal(
         body,
         ALLOWED_CALLERS,
     )
-    .map_err(|error| ApiError::new(error, &fallback_context(headers)))
+    .map_err(|error| ApiError::new(error, &fallback_context(headers)))?;
+    Ok(identity)
+}
+
+/// Consumes a verified nonce before the route reaches its first side effect.
+/// A missing pool, duplicate nonce, or database failure is an indistinguishable
+/// unauthenticated response; proceeding would reopen the replay window.
+async fn consume_authenticated_internal_nonce(
+    state: &AppState,
+    identity: &InternalServiceIdentity,
+    headers: &HeaderMap,
+) -> Result<(), ApiError> {
+    let Some(pool) = state.runtime_pool.as_ref() else {
+        return Err(ApiError::new(
+            mas_common::error::AppError::unauthorized("unauthenticated"),
+            &fallback_context(headers),
+        ));
+    };
+    consume_internal_nonce(pool, identity).await.map_err(|()| {
+        ApiError::new(
+            mas_common::error::AppError::unauthorized("unauthenticated"),
+            &fallback_context(headers),
+        )
+    })
 }
 
 /// Every failure mode in `authenticate_internal` — missing header, malformed

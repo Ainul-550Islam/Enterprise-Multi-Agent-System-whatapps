@@ -23,6 +23,8 @@ base64 = { workspace = true }
 zeroize = { workspace = true }
 rand = { workspace = true }
 tracing = { workspace = true }
+ring = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

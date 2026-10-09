@@ -30,6 +30,9 @@ mas-contracts = { workspace = true }
 # transaction* as the state change. mas-events depends only on
 # common/domain/orchestration, so this adds no dependency cycle.
 mas-events = { workspace = true }
+# The application service composes the canonical provider/egress/webhook ports
+# declared by this lower-level integration crate; no persistence dependency.
+mas-integrations = { workspace = true }
 # mas-observability is pulled in for the named pipeline metrics: the durable
 # pipeline's counters must be declared once, in the crate every emitting layer
 # already depends on.
@@ -47,8 +50,10 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+base64 = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

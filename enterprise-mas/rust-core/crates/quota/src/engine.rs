@@ -163,6 +163,74 @@ impl<S: CounterStorePort, R: QuotaRegistryPort> QuotaEngine<S, R> {
         &self.registry
     }
 
+    /// Reads whether one consumption would fit without changing a counter.
+    ///
+    /// This is intentionally an *advisory* check: a distributed caller must
+    /// still use [`Self::consume`] as its linearizable authorization point.
+    /// It exists for in-memory composition, where the application holds its
+    /// local submission gate across this check, durable creation, and the
+    /// subsequent consume. That prevents a quota refusal from materialising a
+    /// runnable test/dev execution while preserving the production database
+    /// transaction as the authority across replicas.
+    pub async fn preflight(
+        &self,
+        tenant: TenantId,
+        dimension: QuotaDimension,
+        amount: u64,
+        now: &Timestamp,
+    ) -> Result<ConsumptionDecision> {
+        if amount == 0 {
+            return Err(AppError::validation(
+                "quota consumption amount must be positive",
+            ));
+        }
+        let quota = self.registry.find(tenant, dimension).await?;
+        let window = quota
+            .as_ref()
+            .map(|definition| window_seconds(definition.period))
+            .unwrap_or(Some(3_600));
+        let key = CounterKey::for_time(tenant, dimension, window, now);
+        let consumed = self.counters.get(key).await?;
+        let projected = consumed.saturating_add(amount);
+
+        let Some(quota) = quota else {
+            return Ok(ConsumptionDecision {
+                allowed: true,
+                enforcement: EnforcementMode::WarnOnly,
+                consumed: projected,
+                limit: u64::MAX,
+                remaining: u64::MAX,
+                over_limit: false,
+                overage_units: 0,
+                reset_at: None,
+                retry_after: None,
+            });
+        };
+
+        let over_limit = projected > quota.limit;
+        let reset_at = window.and_then(|seconds| key.window_end(seconds));
+        let retry_after = reset_at.and_then(|end| end.duration_since(now));
+        Ok(ConsumptionDecision {
+            allowed: quota.enforcement != EnforcementMode::Enforce || !over_limit,
+            enforcement: quota.enforcement,
+            consumed: projected,
+            limit: quota.limit,
+            remaining: quota.limit.saturating_sub(projected),
+            over_limit,
+            overage_units: if quota.enforcement == EnforcementMode::AllowWithOverage {
+                projected.saturating_sub(quota.limit)
+            } else {
+                0
+            },
+            reset_at,
+            retry_after: if over_limit && quota.enforcement == EnforcementMode::Enforce {
+                retry_after
+            } else {
+                None
+            },
+        })
+    }
+
     /// Checks and consumes `amount` for one tenant/dimension at `now`.
     ///
     /// Missing quota definition = **unlimited** (consumption is recorded for

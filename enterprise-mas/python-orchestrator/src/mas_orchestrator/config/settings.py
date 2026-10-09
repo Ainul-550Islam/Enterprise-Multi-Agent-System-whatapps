@@ -348,12 +348,18 @@ class DataHubSettings(_Frozen):
     """
 
     allowed_source_kinds: tuple[DataSourceKind, ...] = (DataSourceKind.UPLOAD,)
-    max_document_bytes: int = Field(default=32 * 1024 * 1024, ge=1, le=32 * 1024 * 1024)
-    max_upload_bytes: int = Field(default=32 * 1024 * 1024, ge=1, le=32 * 1024 * 1024)
-    max_sync_bytes: int = Field(default=64 * 1024 * 1024, ge=1, le=512 * 1024 * 1024)
-    max_pages_per_sync: int = Field(default=500, ge=1, le=10_000)
+    max_document_bytes: int = Field(default=8 * 1024 * 1024, ge=1, le=32 * 1024 * 1024)
+    max_upload_bytes: int = Field(default=8 * 1024 * 1024, ge=1, le=32 * 1024 * 1024)
+    max_sync_bytes: int = Field(default=32 * 1024 * 1024, ge=1, le=512 * 1024 * 1024)
+    max_pages_per_sync: int = Field(default=100, ge=1, le=10_000)
     max_crawl_depth: int = Field(default=3, ge=0, le=20)
     max_crawl_pages: int = Field(default=100, ge=1, le=10_000)
+    #: Process-isolated parser limits for untrusted rich documents.
+    parser_workers: int = Field(default=2, ge=1, le=32)
+    parser_timeout_seconds: float = Field(default=30.0, ge=0.1, le=300)
+    parser_memory_bytes: int = Field(
+        default=256 * 1024 * 1024, ge=64 * 1024 * 1024, le=2 * 1024 * 1024 * 1024
+    )
     allowed_mime_types: tuple[str, ...] = (
         "text/plain",
         "text/markdown",
@@ -608,6 +614,11 @@ class SecuritySettings(_Frozen):
     #: the bridge refuses unsigned calls rather than trusting the network for
     #: identity.
     internal_service_secret_ref: str | None = Field(default=None, max_length=256)
+
+    #: Secret reference for the PostgreSQL DSN used to atomically consume
+    #: internal-service signature nonces. It is required in production because
+    #: a process-local replay cache does not survive restarts or span replicas.
+    internal_replay_database_url_secret_ref: str | None = Field(default=None, max_length=512)
 
     #: Service ids permitted to call this process, in addition to the
     #: built-in default. A syntactically perfect signature from a service

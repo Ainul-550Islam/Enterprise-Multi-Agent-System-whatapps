@@ -137,133 +137,150 @@ impl JwtValidator {
         let payload_bytes = URL_SAFE_NO_PAD
             .decode(segments[1])
             .map_err(|_| Self::fail("token payload is not valid base64url"))?;
-        let payload: Value = serde_json::from_slice(&payload_bytes)
-            .map_err(|_| Self::fail("token payload is not valid JSON"))?;
-        let object = payload
-            .as_object()
-            .ok_or_else(|| Self::fail("token payload must be a JSON object"))?;
-
-        let get_str = |key: &str| object.get(key).and_then(Value::as_str).map(str::to_owned);
-
-        let subject = get_str("sub").ok_or_else(|| Self::fail("token payload is missing 'sub'"))?;
-        let expires_secs = object
-            .get("exp")
-            .and_then(Value::as_i64)
-            .ok_or_else(|| Self::fail("token payload is missing 'exp'"))?;
-        let expires_at = secs_to_timestamp(expires_secs)?;
-        let skew = self.skew;
-        let expiry_with_skew = expires_at
-            .checked_add(skew)
-            .ok_or_else(|| AppError::internal("expiry skew overflow"))?;
-        if !expiry_with_skew.is_future() {
-            return Err(Self::fail("token has expired"));
-        }
-        let not_before = object
-            .get("nbf")
-            .and_then(Value::as_i64)
-            .map(secs_to_timestamp)
-            .transpose()?;
-        if let Some(nbf) = not_before {
-            let nbf_minus_skew = nbf
-                .checked_sub(skew)
-                .ok_or_else(|| AppError::internal("nbf skew underflow"))?;
-            if nbf_minus_skew.is_future() {
-                return Err(Self::fail("token is not yet valid"));
-            }
-        }
-        let issued_at = object
-            .get("iat")
-            .and_then(Value::as_i64)
-            .map(secs_to_timestamp)
-            .transpose()?;
-
-        let issuer = get_str("iss");
-        if let Some(required) = &self.issuer {
-            match &issuer {
-                Some(held) if held == required => {},
-                _ => return Err(Self::fail("token issuer does not match")),
-            }
-        }
-        let audiences: Vec<String> = match object.get("aud") {
-            Some(Value::String(single)) => vec![single.clone()],
-            Some(Value::Array(items)) => items
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_owned)
-                .collect(),
-            _ => Vec::new(),
-        };
-        if let Some(required) = &self.audience {
-            if !audiences.iter().any(|held| held == required) {
-                return Err(Self::fail("token audience does not match"));
-            }
-        }
-        let roles: Vec<String> = object
-            .get("roles")
-            .and_then(Value::as_array)
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default();
-        // `scope` (space-separated, RFC8693-style) or `scopes` (array).
-        let scopes: Vec<String> = match (
-            object.get("scope").and_then(Value::as_str),
-            object.get("scopes").and_then(Value::as_array),
-        ) {
-            (Some(scope_str), _) => scope_str.split_whitespace().map(str::to_owned).collect(),
-            (None, Some(array)) => array
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_owned)
-                .collect(),
-            _ => Vec::new(),
-        };
-
-        const KNOWN: [&str; 12] = [
-            "sub",
-            "jti",
-            "iss",
-            "aud",
-            "exp",
-            "nbf",
-            "iat",
-            "tenant_id",
-            "org_id",
-            "roles",
-            "scope",
-            "scopes",
-        ];
-        let extras: Map<String, Value> = object
-            .iter()
-            .filter(|(key, _)| !KNOWN.contains(&key.as_str()))
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect();
-
-        Ok(TokenClaims {
-            subject,
-            jwt_id: get_str("jti"),
-            issuer,
-            audiences,
-            expires_at,
-            not_before,
-            issued_at,
-            tenant_id: object
-                .get("tenant_id")
-                .and_then(Value::as_str)
-                .and_then(|raw| std::str::FromStr::from_str(raw).ok()),
-            organization_id: object
-                .get("org_id")
-                .and_then(Value::as_str)
-                .and_then(|raw| std::str::FromStr::from_str(raw).ok()),
-            roles,
-            scopes,
-            extras,
-        })
+        validate_claims(
+            &payload_bytes,
+            self.issuer.as_deref(),
+            self.audience.as_deref(),
+            self.skew,
+        )
     }
+}
+
+/// Parses registered claims only after a caller has verified the compact-JWS
+/// signature. It is shared by the symmetric internal-token validator and the
+/// asymmetric JWKS validator so issuer/audience/time semantics cannot drift.
+pub(crate) fn validate_claims(
+    payload_bytes: &[u8],
+    required_issuer: Option<&str>,
+    required_audience: Option<&str>,
+    skew: Duration,
+) -> Result<TokenClaims> {
+    let payload: Value = serde_json::from_slice(payload_bytes)
+        .map_err(|_| AppError::unauthorized("token payload is not valid JSON"))?;
+    let object = payload
+        .as_object()
+        .ok_or_else(|| AppError::unauthorized("token payload must be a JSON object"))?;
+
+    let get_str = |key: &str| object.get(key).and_then(Value::as_str).map(str::to_owned);
+    let fail = |message: &str| AppError::unauthorized(message);
+
+    let subject = get_str("sub").ok_or_else(|| fail("token payload is missing 'sub'"))?;
+    let expires_secs = object
+        .get("exp")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| fail("token payload is missing 'exp'"))?;
+    let expires_at = secs_to_timestamp(expires_secs)?;
+    let expiry_with_skew = expires_at
+        .checked_add(skew)
+        .ok_or_else(|| AppError::internal("expiry skew overflow"))?;
+    if !expiry_with_skew.is_future() {
+        return Err(fail("token has expired"));
+    }
+    let not_before = object
+        .get("nbf")
+        .and_then(Value::as_i64)
+        .map(secs_to_timestamp)
+        .transpose()?;
+    if let Some(nbf) = not_before {
+        let nbf_minus_skew = nbf
+            .checked_sub(skew)
+            .ok_or_else(|| AppError::internal("nbf skew underflow"))?;
+        if nbf_minus_skew.is_future() {
+            return Err(fail("token is not yet valid"));
+        }
+    }
+    let issued_at = object
+        .get("iat")
+        .and_then(Value::as_i64)
+        .map(secs_to_timestamp)
+        .transpose()?;
+
+    let issuer = get_str("iss");
+    if let Some(required) = required_issuer {
+        match &issuer {
+            Some(held) if held == required => {},
+            _ => return Err(fail("token issuer does not match")),
+        }
+    }
+    let audiences: Vec<String> = match object.get("aud") {
+        Some(Value::String(single)) => vec![single.clone()],
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect(),
+        _ => Vec::new(),
+    };
+    if let Some(required) = required_audience {
+        if !audiences.iter().any(|held| held == required) {
+            return Err(fail("token audience does not match"));
+        }
+    }
+    let roles: Vec<String> = object
+        .get("roles")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    // `scope` (space-separated, RFC8693-style) or `scopes` (array).
+    let scopes: Vec<String> = match (
+        object.get("scope").and_then(Value::as_str),
+        object.get("scopes").and_then(Value::as_array),
+    ) {
+        (Some(scope_str), _) => scope_str.split_whitespace().map(str::to_owned).collect(),
+        (None, Some(array)) => array
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect(),
+        _ => Vec::new(),
+    };
+
+    const KNOWN: [&str; 12] = [
+        "sub",
+        "jti",
+        "iss",
+        "aud",
+        "exp",
+        "nbf",
+        "iat",
+        "tenant_id",
+        "org_id",
+        "roles",
+        "scope",
+        "scopes",
+    ];
+    let extras: Map<String, Value> = object
+        .iter()
+        .filter(|(key, _)| !KNOWN.contains(&key.as_str()))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+
+    Ok(TokenClaims {
+        subject,
+        jwt_id: get_str("jti"),
+        issuer,
+        audiences,
+        expires_at,
+        not_before,
+        issued_at,
+        tenant_id: object
+            .get("tenant_id")
+            .and_then(Value::as_str)
+            .and_then(|raw| std::str::FromStr::from_str(raw).ok()),
+        organization_id: object
+            .get("org_id")
+            .and_then(Value::as_str)
+            .and_then(|raw| std::str::FromStr::from_str(raw).ok()),
+        roles,
+        scopes,
+        extras,
+    })
 }
 
 fn secs_to_timestamp(secs: i64) -> Result<Timestamp> {

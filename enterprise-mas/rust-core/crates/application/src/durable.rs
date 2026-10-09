@@ -177,6 +177,25 @@ impl SubmissionKind {
     }
 }
 
+/// The idempotency fact an in-memory submission gate needs before it
+/// decides whether a quota-capacity check is required.
+///
+/// PostgreSQL intentionally reports [`Self::Unknown`]: its authoritative
+/// request transaction resolves the durable unique key and counter mutation
+/// together. The in-memory reference implementation reports a precise answer
+/// while the control plane's local submission gate is held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmissionAdmission {
+    /// The implementation has no safe non-mutating idempotency probe.
+    Unknown,
+    /// No prior idempotency record exists; this request may create work.
+    New,
+    /// The existing record has the same fingerprint and will replay.
+    Replayed,
+    /// The existing key has a different fingerprint and will conflict.
+    Conflicting,
+}
+
 /// What one atomic submission produced.
 #[derive(Debug, Clone)]
 pub struct SubmissionReceipt {
@@ -325,6 +344,9 @@ pub struct UsageObservation {
 pub enum TaskOutcome {
     /// The run produced a result.
     Succeeded {
+        /// The exact JSON value returned by the handler. JSON `null` is a
+        /// valid result and is distinct from a failed or uncompleted task.
+        result: Value,
         /// Usage actually observed. `None`/empty means "no metered
         /// consumption" and produces no usage records.
         usage: ExecutionUsage,
@@ -445,8 +467,9 @@ pub enum ExecutionAction {
     Pause,
     /// Paused → Running.
     Resume,
-    /// Running|Paused → Completed (terminal).
-    Complete,
+    /// Running|Paused → Completed (terminal), preserving an optional JSON
+    /// output in the same durable transition.
+    Complete { output: Option<Value> },
     /// Running|Paused → Failed (terminal), classified.
     Fail { failure: TransitionFailure },
 }
@@ -459,7 +482,7 @@ impl ExecutionAction {
             Self::Start => "execution.start",
             Self::Pause => "execution.pause",
             Self::Resume => "execution.resume",
-            Self::Complete => "execution.complete",
+            Self::Complete { .. } => "execution.complete",
             Self::Fail { .. } => "execution.fail",
         }
     }
@@ -511,6 +534,28 @@ pub struct PipelineCounters {
 /// either committed the whole unit or it returns `Err` and nothing changed.
 #[async_trait::async_trait]
 pub trait DurableExecutionPort: std::fmt::Debug + Send + Sync {
+    /// Whether callers must hold the control plane's local submission gate.
+    ///
+    /// Only the in-memory reference implementation returns `true`. Durable
+    /// PostgreSQL submission instead requires an authoritative transaction,
+    /// which is the cross-replica atomicity boundary.
+    fn requires_local_submission_gate(&self) -> bool {
+        false
+    }
+
+    /// Classifies a same-key request without creating work.
+    ///
+    /// This optional probe is used only together with
+    /// [`Self::requires_local_submission_gate`]. Returning `Unknown` is the
+    /// safe default for stores whose idempotency decision belongs inside their
+    /// transaction.
+    async fn submission_admission(
+        &self,
+        _intent: &SubmissionIntent,
+    ) -> Result<SubmissionAdmission> {
+        Ok(SubmissionAdmission::Unknown)
+    }
+
     /// Atomically submits one execution.
     ///
     /// Returns [`AppError::Conflict`] when the idempotency key was already

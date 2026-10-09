@@ -45,6 +45,10 @@ pub struct ApprovalVote {
     pub approver: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approver_role: Option<String>,
+    /// Operator justification, when the caller collected one. Older requests
+    /// deserialize without it so historic in-memory snapshots remain readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     pub at: Timestamp,
 }
 
@@ -231,12 +235,24 @@ impl ApprovalRequest {
         approver: impl Into<String>,
         role: Option<String>,
     ) -> Result<ApprovalStatus> {
+        self.approve_with_reason(approver, role, None)
+    }
+
+    /// Casts an approval vote with an operator-supplied justification.
+    pub fn approve_with_reason(
+        &mut self,
+        approver: impl Into<String>,
+        role: Option<String>,
+        reason: Option<String>,
+    ) -> Result<ApprovalStatus> {
         let approver = approver.into();
         validation::validate_non_empty("approver", &approver)?;
+        validate_vote_reason(reason.as_deref())?;
         self.ensure_votable(&approver, role.as_deref())?;
         self.approvals.push(ApprovalVote {
             approver,
             approver_role: role,
+            reason,
             at: Timestamp::now(),
         });
         self.updated_at = Timestamp::now();
@@ -252,12 +268,24 @@ impl ApprovalRequest {
         approver: impl Into<String>,
         role: Option<String>,
     ) -> Result<ApprovalStatus> {
+        self.reject_with_reason(approver, role, None)
+    }
+
+    /// Casts a rejection vote with its mandatory operator justification.
+    pub fn reject_with_reason(
+        &mut self,
+        approver: impl Into<String>,
+        role: Option<String>,
+        reason: Option<String>,
+    ) -> Result<ApprovalStatus> {
         let approver = approver.into();
         validation::validate_non_empty("approver", &approver)?;
+        validate_vote_reason(reason.as_deref())?;
         self.ensure_votable(&approver, role.as_deref())?;
         self.rejections.push(ApprovalVote {
             approver,
             approver_role: role,
+            reason,
             at: Timestamp::now(),
         });
         self.status = ApprovalStatus::Rejected;
@@ -289,6 +317,21 @@ impl ApprovalRequest {
         }
         false
     }
+}
+
+fn validate_vote_reason(reason: Option<&str>) -> Result<()> {
+    let Some(reason) = reason else {
+        return Ok(());
+    };
+    validation::validate_length("decision_reason", reason, 1, 1024)?;
+    if reason.trim().is_empty() || reason.chars().any(char::is_control) {
+        return Err(AppError::invalid_field(
+            "decision_reason",
+            "invalid_format",
+            "decision reason must be non-empty and contain no control characters",
+        ));
+    }
+    Ok(())
 }
 
 /// Persistence port for approval requests.
@@ -400,7 +443,19 @@ impl ApprovalService {
         approver: impl Into<String>,
         role: Option<String>,
     ) -> Result<ApprovalStatus> {
-        self.vote(id, approver, role, true).await
+        self.approve_with_reason(id, approver, role, None).await
+    }
+
+    /// Approves while preserving a validated operator justification in the
+    /// durable vote evidence.
+    pub async fn approve_with_reason(
+        &self,
+        id: ApprovalRequestId,
+        approver: impl Into<String>,
+        role: Option<String>,
+        reason: Option<String>,
+    ) -> Result<ApprovalStatus> {
+        self.vote(id, approver, role, reason, true).await
     }
 
     pub async fn reject(
@@ -409,7 +464,19 @@ impl ApprovalService {
         approver: impl Into<String>,
         role: Option<String>,
     ) -> Result<ApprovalStatus> {
-        self.vote(id, approver, role, false).await
+        self.reject_with_reason(id, approver, role, None).await
+    }
+
+    /// Rejects while preserving a validated operator justification in the
+    /// durable vote evidence.
+    pub async fn reject_with_reason(
+        &self,
+        id: ApprovalRequestId,
+        approver: impl Into<String>,
+        role: Option<String>,
+        reason: Option<String>,
+    ) -> Result<ApprovalStatus> {
+        self.vote(id, approver, role, reason, false).await
     }
 
     async fn vote(
@@ -417,6 +484,7 @@ impl ApprovalService {
         id: ApprovalRequestId,
         approver: impl Into<String>,
         role: Option<String>,
+        reason: Option<String>,
         approve: bool,
     ) -> Result<ApprovalStatus> {
         let mut request = self
@@ -424,11 +492,17 @@ impl ApprovalService {
             .get(id)
             .await?
             .ok_or_else(|| AppError::not_found("approval request", id.to_string()))?;
-        request.expire_if_due(); // expiry transition before voting
+        // Persist an expiry transition before returning a conflict. Otherwise a
+        // first vote after expiry would repeatedly observe a pending request,
+        // which makes an expired safety gate look undecided forever.
+        if request.expire_if_due() {
+            self.store.update(&request).await?;
+            return Err(AppError::conflict("approval request has expired"));
+        }
         let status = if approve {
-            request.approve(approver.into(), role)?
+            request.approve_with_reason(approver.into(), role, reason)?
         } else {
-            request.reject(approver.into(), role)?
+            request.reject_with_reason(approver.into(), role, reason)?
         };
         self.store.update(&request).await?;
         Ok(status)
@@ -504,6 +578,28 @@ mod tests {
             .reject(request.id, "dave", Some("approver".into()))
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn expired_vote_persists_expiry_before_returning_conflict() {
+        let tenant = TenantId::new();
+        let store = Arc::new(InMemoryApprovalStore::new());
+        let service = ApprovalService::new(store.clone());
+        let mut request = base_request(tenant);
+        request.expires_at = Some(Timestamp::epoch());
+        service.raise(request.clone()).await.expect("raise");
+
+        let error = service
+            .approve(request.id, "operator", Some("operator".to_owned()))
+            .await
+            .expect_err("expired requests cannot be voted on");
+        assert_eq!(error.error_code(), "CONFLICT");
+        let stored = store
+            .get(request.id)
+            .await
+            .expect("get")
+            .expect("stored request");
+        assert_eq!(stored.status, ApprovalStatus::Expired);
     }
 
     #[tokio::test]

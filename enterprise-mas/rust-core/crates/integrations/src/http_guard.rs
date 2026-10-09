@@ -106,8 +106,9 @@ impl EgressPolicy {
     /// A policy for one operator-declared internal service endpoint.
     ///
     /// `hosts` names the exact hosts the platform may reach over the cluster
-    /// network — `mas-api`, `127.0.0.1`, a Kubernetes service DNS name. Plain
-    /// HTTP is permitted for them because cluster traffic is commonly not TLS
+    /// network — a reviewed Kubernetes service DNS name. Loopback,
+    /// link-local, metadata, and multicast addresses remain forbidden even for
+    /// this operator-only policy. Plain HTTP is permitted because cluster traffic is commonly not TLS
     /// terminated, and every other restriction (redirect re-validation, body
     /// caps, redirect limits) stays in force.
     ///
@@ -162,7 +163,7 @@ impl EgressPolicy {
         let parsed = Url::parse(url.as_str()).map_err(|err| {
             AppError::internal(format!("validated SafeUrl failed re-parse: {err}"))
         })?;
-        let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
+        let host = normalize_host(parsed.host_str().unwrap_or_default());
 
         match parsed.scheme() {
             "https" => {},
@@ -171,7 +172,7 @@ impl EgressPolicy {
                     || self
                         .permitted_plain_http_hosts
                         .iter()
-                        .any(|allowed| host == *allowed || host.ends_with(&format!(".{allowed}")));
+                        .any(|allowed| host_matches(&host, allowed));
                 if !permitted {
                     return Err(AppError::invalid_field(
                         "url",
@@ -217,9 +218,7 @@ impl EgressPolicy {
         }
 
         if let Some(allowlist) = &self.hostname_allowlist {
-            let allowed = allowlist
-                .iter()
-                .any(|entry| host == *entry || host.ends_with(&format!(".{entry}")));
+            let allowed = allowlist.iter().any(|entry| host_matches(&host, entry));
             if !allowed {
                 return Err(AppError::invalid_field(
                     "url",
@@ -252,6 +251,12 @@ impl EgressPolicy {
         resolved: &[IpAddr],
         internal_endpoint: bool,
     ) -> Result<IpAddr> {
+        if resolved.is_empty() {
+            return Err(AppError::external_service(
+                "http-egress",
+                "destination resolved to no addresses",
+            ));
+        }
         if internal_endpoint && self.allow_internal_endpoints {
             for addr in resolved {
                 if is_metadata_or_link_local(addr) {
@@ -288,6 +293,31 @@ impl EgressPolicy {
     }
 }
 
+/// Canonicalizes a hostname for operator allowlist comparison. DNS names are
+/// case-insensitive and a trailing root dot is semantically irrelevant.
+fn normalize_host(host: &str) -> String {
+    host.trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// Returns whether a host matches an explicit allowlist entry.
+///
+/// Bare entries are exact hostnames. Operators who intentionally want a domain
+/// family must say so with `*.example.com`; accepting every subdomain of a
+/// bare tenant/provider hostname is an ambient authority expansion and makes
+/// a typo or delegated DNS zone an outbound exfiltration path.
+fn host_matches(host: &str, configured: &str) -> bool {
+    let host = normalize_host(host);
+    let configured = normalize_host(configured);
+    match configured.strip_prefix("*.") {
+        Some(parent) if !parent.is_empty() => {
+            host.len() > parent.len()
+                && host.ends_with(parent)
+                && host.as_bytes().get(host.len() - parent.len() - 1) == Some(&b'.')
+        },
+        _ => host == configured,
+    }
+}
+
 /// Whether an address is a link-local or cloud-metadata address.
 ///
 /// Never reachable, not even from an operator-declared internal endpoint:
@@ -297,33 +327,52 @@ impl EgressPolicy {
 #[must_use]
 pub fn is_metadata_or_link_local(addr: &IpAddr) -> bool {
     match addr {
-        IpAddr::V4(ip) => ip.is_link_local() || ip.is_unspecified() || ip.is_broadcast(),
+        IpAddr::V4(ip) => {
+            ip.is_link_local()
+                || ip.is_unspecified()
+                || ip.is_broadcast()
+                || ip.is_loopback()
+                || ip.is_multicast()
+        },
         IpAddr::V6(ip) => {
-            if let Some(mapped) = ip.to_ipv4_mapped() {
-                return mapped.is_link_local() || mapped.is_unspecified() || mapped.is_broadcast();
+            // IPv4-mapped IPv6 is never a supported egress address. Treating
+            // a mapped public address as a separate class from IPv4 lets
+            // callers sidestep literal and DNS range policy.
+            if ip.to_ipv4_mapped().is_some() {
+                return true;
             }
-            ip.is_unspecified() || (ip.segments()[0] & 0xffc0) == 0xfe80
+            ip.is_unspecified()
+                || ip.is_loopback()
+                || ip.is_multicast()
+                || (ip.segments()[0] & 0xffc0) == 0xfe80
         },
     }
 }
 
 /// Whether an address is safe to connect to from the platform. Complements
 /// `SafeUrl`'s literal-time checks with full IPv6 ranges: unique-local
-/// (`fc00::/7`), link-local (`fe80::/10`) and IPv4-mapped addresses are
-/// classified via their embedded IPv4 rules.
+/// (`fc00::/7`), link-local (`fe80::/10`), documentation space, and
+/// IPv4-mapped addresses are rejected outright.
 #[must_use]
 pub fn is_publicly_routable(addr: &IpAddr) -> bool {
     match addr {
         IpAddr::V4(ip) => ipv4_is_public(ip),
         IpAddr::V6(ip) => {
-            if let Some(mapped) = ip.to_ipv4_mapped() {
-                return ipv4_is_public(&mapped);
+            // Never permit IPv4-mapped IPv6 through the IPv6 code path. The
+            // direct-literal guard and the DNS gate must agree on this class.
+            if ip.to_ipv4_mapped().is_some() {
+                return false;
             }
+            let segments = ip.segments();
             !(ip.is_loopback()
                 || ip.is_unspecified()
                 || ip.is_multicast()
-                || (ip.segments()[0] & 0xfe00) == 0xfc00 // fc00::/7 unique-local
-                || (ip.segments()[0] & 0xffc0) == 0xfe80) // fe80::/10 link-local
+                // IPv4-compatible / unspecified-prefix addresses are not
+                // globally routable IPv6 destinations.
+                || segments[..6].iter().all(|segment| *segment == 0)
+                || (segments[0] & 0xfe00) == 0xfc00 // fc00::/7 unique-local
+                || (segments[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
+                || (segments[0] == 0x2001 && segments[1] == 0x0db8)) // documentation
         },
     }
 }
@@ -354,6 +403,8 @@ pub enum HttpMethod {
     Post,
     /// `PUT`.
     Put,
+    /// `DELETE`.
+    Delete,
 }
 
 impl HttpMethod {
@@ -364,6 +415,7 @@ impl HttpMethod {
             Self::Get => "GET",
             Self::Post => "POST",
             Self::Put => "PUT",
+            Self::Delete => "DELETE",
         }
     }
 }
@@ -401,6 +453,19 @@ impl HttpRequest {
             url,
             headers: Vec::new(),
             body,
+            timeout_ms: DEFAULT_TIMEOUT_MS,
+        }
+    }
+
+    /// A DELETE request. It has no body and, like every non-GET method,
+    /// cannot follow redirects through [`GuardedHttpClient`].
+    #[must_use]
+    pub fn delete(url: SafeUrl) -> Self {
+        Self {
+            method: HttpMethod::Delete,
+            url,
+            headers: Vec::new(),
+            body: Vec::new(),
             timeout_ms: DEFAULT_TIMEOUT_MS,
         }
     }
@@ -509,33 +574,45 @@ impl<S: HttpClientPort> GuardedHttpClient<S> {
     }
 
     /// Sends `request`, enforcing:
-    /// 1. destination policy (scheme/port/host),
-    /// 2. redirect re-validation of EVERY `Location` hop (relative or
-    ///    absolute), 303 → GET with an empty body,
-    /// 3. redirect and body caps.
+    /// 1. destination and header policy before every socket-owning send,
+    /// 2. redirect re-validation of EVERY `Location` hop,
+    /// 3. no redirect of a mutating request or credentialed cross-origin GET,
+    /// 4. body caps on both intermediate and terminal responses.
     pub async fn send(&self, request: &HttpRequest) -> Result<HttpResponse> {
+        validate_request_headers(&request.headers)?;
+        if request.timeout_ms == 0 {
+            return Err(AppError::invalid_field(
+                "timeout_ms",
+                "out_of_range",
+                "outbound HTTP timeout must be greater than zero",
+            ));
+        }
+
         let mut current = request.clone();
+        let initial_origin = origin(&current.url)?;
         let mut hops: u8 = 0;
         loop {
             self.policy.check_destination(&current.url)?;
             let response = self.inner.send(&current).await.map_err(|err| {
                 err.with_context(format!("egress call to {} failed", current.url.host_str()))
             })?;
+            ensure_response_is_bounded(&response, self.policy.max_body_bytes)?;
 
-            if !(response.is_redirect() && response.header("location").is_some()) {
-                if response.body.len() > self.policy.max_body_bytes {
-                    return Err(AppError::external_service(
-                        "http-egress",
-                        format!(
-                            "response body exceeded the {} byte cap",
-                            self.policy.max_body_bytes
-                        ),
-                    ));
-                }
+            let Some(location) = response.header("location") else {
+                return Ok(response);
+            };
+            if !response.is_redirect() {
                 return Ok(response);
             }
+            if current.method != HttpMethod::Get {
+                return Err(AppError::invalid_field(
+                    "url",
+                    "unsafe_redirect_method",
+                    "redirects are not permitted for mutating outbound HTTP requests",
+                ));
+            }
 
-            hops += 1;
+            hops = hops.saturating_add(1);
             if hops > self.policy.max_redirects {
                 return Err(AppError::external_service(
                     "http-egress",
@@ -545,7 +622,6 @@ impl<S: HttpClientPort> GuardedHttpClient<S> {
                     ),
                 ));
             }
-            let location = response.header("location").unwrap_or_default();
             let base = Url::parse(current.url.as_str()).map_err(|err| {
                 AppError::internal(format!("validated SafeUrl failed re-parse: {err}"))
             })?;
@@ -556,13 +632,109 @@ impl<S: HttpClientPort> GuardedHttpClient<S> {
                 )
             })?;
             let next_url = SafeUrl::parse(joined.as_str())?;
-            if response.status == 303 {
-                current.method = HttpMethod::Get;
-                current.body.clear();
+            if origin(&next_url)? != initial_origin && headers_are_sensitive(&current.headers) {
+                return Err(AppError::invalid_field(
+                    "url",
+                    "credential_redirect",
+                    "cross-origin redirects are not permitted for credentialed requests",
+                ));
             }
+            // The next iteration performs full scheme/host/port validation
+            // before the second request is handed to the concrete transport.
             current.url = next_url;
         }
     }
+}
+
+/// Returns `(scheme, hostname, effective port)` for redirect origin checks.
+fn origin(url: &SafeUrl) -> Result<(String, String, u16)> {
+    let parsed = url.as_url();
+    let port = parsed.port_or_known_default().ok_or_else(|| {
+        AppError::invalid_field("url", "missing_port", "outbound URL has no effective port")
+    })?;
+    Ok((
+        parsed.scheme().to_ascii_lowercase(),
+        normalize_host(parsed.host_str().unwrap_or_default()),
+        port,
+    ))
+}
+
+/// Enforces a small set of transport-owned headers that untrusted connector
+/// configuration must never override. Values also reject CR/LF so a future
+/// alternate HTTP adapter cannot turn a metadata string into header injection.
+pub(crate) fn validate_request_headers(headers: &[(String, String)]) -> Result<()> {
+    const FORBIDDEN: &[&str] = &[
+        "host",
+        "content-length",
+        "transfer-encoding",
+        "connection",
+        "keep-alive",
+        "proxy-authorization",
+        "proxy-connection",
+        "te",
+        "trailer",
+        "upgrade",
+    ];
+    for (name, value) in headers {
+        let normalized = name.to_ascii_lowercase();
+        if normalized.is_empty()
+            || !normalized
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return Err(AppError::invalid_field(
+                "headers",
+                "invalid_header_name",
+                "outbound HTTP header names must be non-empty ASCII tokens",
+            ));
+        }
+        if FORBIDDEN.contains(&normalized.as_str()) {
+            return Err(AppError::invalid_field(
+                "headers",
+                "forbidden_header",
+                format!("outbound HTTP header '{normalized}' is transport-owned"),
+            ));
+        }
+        if value.len() > 16 * 1024 || value.contains('\r') || value.contains('\n') {
+            return Err(AppError::invalid_field(
+                "headers",
+                "invalid_header_value",
+                "outbound HTTP header values must be bounded and contain no CR/LF",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Whether a redirect could carry a credential or browser/session authority to
+/// a different origin. The header values are deliberately not inspected or
+/// logged.
+fn headers_are_sensitive(headers: &[(String, String)]) -> bool {
+    const SENSITIVE: &[&str] = &[
+        "authorization",
+        "cookie",
+        "proxy-authorization",
+        "x-api-key",
+        "x-amz-security-token",
+        "x-vault-token",
+        "x-goog-api-key",
+        "x-ms-token-aad-access-token",
+    ];
+    headers
+        .iter()
+        .any(|(name, _)| SENSITIVE.contains(&name.to_ascii_lowercase().as_str()))
+}
+
+/// Checks a response at the guard boundary even when a custom test or future
+/// concrete client returned it without applying its own streaming cap.
+fn ensure_response_is_bounded(response: &HttpResponse, limit: usize) -> Result<()> {
+    if response.body.len() > limit {
+        return Err(AppError::external_service(
+            "http-egress",
+            format!("response body exceeded the {limit} byte cap"),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -597,9 +769,12 @@ mod tests {
         let mut dev = EgressPolicy::default();
         dev.permitted_plain_http_hosts
             .insert("local.test".to_owned());
-        assert!(dev
-            .check_destination(&safe("http://api.local.test/x"))
-            .is_ok());
+        assert!(dev.check_destination(&safe("http://local.test/x")).is_ok());
+        assert!(
+            dev.check_destination(&safe("http://api.local.test/x"))
+                .is_err(),
+            "a bare hostname allowlist entry is exact; wildcard is explicit"
+        );
 
         let ported = EgressPolicy {
             allowed_ports: Some(BTreeSet::from([8443_u16])),
@@ -616,7 +791,7 @@ mod tests {
         );
 
         let scoped = EgressPolicy {
-            hostname_allowlist: Some(BTreeSet::from(["example.com".to_owned()])),
+            hostname_allowlist: Some(BTreeSet::from(["*.example.com".to_owned()])),
             ..EgressPolicy::default()
         };
         assert!(scoped
@@ -748,10 +923,7 @@ mod tests {
 
         let guarded = GuardedHttpClient::new(client, EgressPolicy::default());
         let response = guarded
-            .send(&HttpRequest::post(
-                safe("https://hook.example.test/a"),
-                vec![1, 2, 3],
-            ))
+            .send(&HttpRequest::get(safe("https://hook.example.test/a")))
             .await
             .expect("valid chain allowed");
         assert_eq!(response.status, 200);

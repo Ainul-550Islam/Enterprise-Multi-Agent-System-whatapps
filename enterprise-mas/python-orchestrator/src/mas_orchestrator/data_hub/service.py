@@ -132,7 +132,7 @@ class DataHubService:
     async def aclose(self) -> None:
         """Closes all resources owned by the Data Hub plane."""
         owners = [getattr(adapter, "__self__", None) for adapter in self._adapters.values()]
-        owners.extend((self._embedder, self._index))
+        owners.extend((self._pipeline, self._embedder, self._index))
         errors: list[Exception] = []
         seen: set[int] = set()
         for owner in owners:
@@ -241,9 +241,10 @@ class DataHubService:
     async def sync_source(self, source: DataHubSource) -> SourceSyncReport:
         """Synchronizes a configured web/S3 source and indexes changed objects.
 
-        The cursor is advanced only if every changed document indexed
-        successfully. A partial failure returns the previous cursor so a later
-        call retries the failed content instead of losing it.
+        Production adapters attach an opaque checkpoint before and after every
+        discovered item. A partial failure returns the checkpoint before the
+        failed item, preserving the failed work while retaining progress through
+        preceding successful documents.
         """
         self._require_enabled()
         self._require_source_kind(source.kind)
@@ -294,6 +295,10 @@ class DataHubService:
 
         errors: list[str] = []
         indexed = 0
+        # A production adapter supplies a checkpoint after each discovered
+        # item.  Keep the last successful checkpoint so an outage retry starts
+        # at the failed item rather than re-fetching an already-indexed prefix.
+        progress_cursor = source.cursor or ""
         for item in batch.documents:
             document_id = str(
                 uuid.uuid5(
@@ -338,11 +343,19 @@ class DataHubService:
                         "error_type": type(error).__name__,
                     },
                 )
+                # Do not advance past a failed item.  Continuing with later
+                # items would make a successful later checkpoint silently skip
+                # the failed object on the next source run.
+                if item.cursor_before is not None:
+                    progress_cursor = item.cursor_before
+                break
             else:
                 indexed += 1
+                if item.cursor_after is not None:
+                    progress_cursor = item.cursor_after
 
         failed = len(errors)
-        next_cursor = batch.cursor if failed == 0 else (source.cursor or "")
+        next_cursor = batch.cursor if failed == 0 else progress_cursor
         return SourceSyncReport(
             source_id=source.source_id,
             discovered_count=batch.discovered_count,

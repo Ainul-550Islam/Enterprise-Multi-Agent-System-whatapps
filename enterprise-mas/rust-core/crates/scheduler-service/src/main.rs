@@ -40,7 +40,7 @@ use mas_common::ids::TenantId;
 use mas_domain::{Schedule, ScheduleKind};
 use mas_scheduler_service::dispatch::LoopbackDispatcher;
 use mas_scheduler_service::driver::{DriverConfig, TickDriver};
-use mas_scheduler_service::server::completion_router;
+use mas_scheduler_service::server::{completion_router, InternalAuth};
 use mas_scheduling::lease::InMemoryLeaseStore;
 use mas_scheduling::runner::{SchedulerConfig, SchedulerRuntime};
 use mas_scheduling::store::InMemoryScheduleStore;
@@ -195,6 +195,32 @@ fn load_internal_auth(
     )))
 }
 
+/// Loads production authentication and binds nonce receipt consumption to the
+/// scheduler plane database role. A production completion listener without a
+/// durable receipt authority would accept the same valid v2 request after a
+/// restart, so missing secret or pool is a startup failure.
+fn load_production_internal_auth(
+    merger: &mas_common::config::Merger<'_>,
+    receipt_pool: sqlx::PgPool,
+) -> Result<InternalAuth, String> {
+    let raw = merger.string(
+        "MAS_INTERNAL_SERVICE_SECRET",
+        "scheduler.internal_service_secret",
+        "",
+    );
+    if raw.trim().is_empty() {
+        return Err(
+            "mas-scheduler production requires MAS_INTERNAL_SERVICE_SECRET / \
+             scheduler.internal_service_secret for authenticated completion requests"
+                .to_owned(),
+        );
+    }
+    Ok(InternalAuth::with_postgres(
+        Some(mas_security::SecretString::new(raw)),
+        receipt_pool,
+    ))
+}
+
 /// Builds one machine-plane pool from that plane's own URL.
 ///
 /// Every plane is a separate database role with a separate credential, because
@@ -268,6 +294,18 @@ async fn run_production() -> Result<(), String> {
             30_000,
         )
         .map_err(|e| format!("config: {e}"))?;
+    let completion_addr = merger.string(
+        "MAS_SCHEDULER_COMPLETION_ADDR",
+        "scheduler.completion_addr",
+        "",
+    );
+    if completion_addr.trim().is_empty() {
+        return Err(
+            "mas-scheduler production requires MAS_SCHEDULER_COMPLETION_ADDR / \
+             scheduler.completion_addr; completion state must have an explicit listener"
+                .to_owned(),
+        );
+    }
 
     // Outbox relay: the scheduler drains the transactional event outbox
     // alongside its tick driver, because it is already the process running a
@@ -356,6 +394,13 @@ async fn run_production() -> Result<(), String> {
     let store = SchedulerPlaneStore::new(scheduler_plane.clone(), pool.clone());
     let leases = InMemoryLeaseStore::new();
 
+    // Completion state is separate from scheduling storage but must use the
+    // same durable nonce authority across scheduler replicas. The ledger is a
+    // local overlap optimization; the signature receipt is the actual replay
+    // security boundary.
+    let completion_ledger = InFlightLedger::default();
+    let completion_auth = load_production_internal_auth(&merger, scheduler_plane.clone())?;
+
     // ── Dispatcher selection ────────────────────────────────────────────
     //
     // `durable` (the default, and the only lane that uses the canonical
@@ -433,7 +478,7 @@ async fn run_production() -> Result<(), String> {
                 );
             }
             let http = HttpDispatcher::new(
-                InFlightLedger::default(),
+                completion_ledger.clone(),
                 &api_base_url,
                 internal_secret,
                 "mas-scheduler",
@@ -464,9 +509,31 @@ async fn run_production() -> Result<(), String> {
     .map_err(|e| format!("driver cfg: {e}"))?;
 
     let (handle, watch) = grace::channel();
-    tokio::spawn(mas_worker::grace::watch_signals(handle));
+    tokio::spawn(mas_worker::grace::watch_signals(handle.clone()));
+
+    // Production previously never started this listener even though the
+    // endpoint was implemented. Bind before the driver starts so a replica
+    // cannot dispatch work that has no authenticated completion path.
+    let completion_listener = tokio::net::TcpListener::bind(&completion_addr)
+        .await
+        .map_err(|error| format!("bind completion listener {completion_addr}: {error}"))?;
+    let completion_app = completion_router(completion_ledger, completion_auth);
+    let mut completion_shutdown = watch.clone();
+    let completion_failure_shutdown = handle.clone();
+    let completion_server = tokio::spawn(async move {
+        if let Err(error) = axum::serve(completion_listener, completion_app)
+            .with_graceful_shutdown(async move { completion_shutdown.changed().await })
+            .await
+        {
+            tracing::error!(%error, "scheduler completion listener stopped unexpectedly");
+            // This listener is part of the authenticated scheduling surface.
+            // Do not keep dispatching while its completion path is unhealthy.
+            completion_failure_shutdown.trigger();
+        }
+    });
     eprintln!(
-        "mas-scheduler production: replica={replica_id} tick={interval_ms}ms (journal-guarded fires)"
+        "mas-scheduler production: replica={replica_id} tick={interval_ms}ms \
+         completion_listener={completion_addr} (journal-guarded fires)"
     );
 
     // ── Outbox relay ───────────────────────────────────────────────────
@@ -496,6 +563,10 @@ async fn run_production() -> Result<(), String> {
         .run(&mut runtime, watch)
         .await
         .map_err(|e| format!("driver: {e}"))?;
+    handle.trigger();
+    completion_server
+        .await
+        .map_err(|error| format!("completion listener task: {error}"))?;
     eprintln!(
         "stopped: ticks={} dispatched={} errors={} clean={}",
         stats.ticks, stats.dispatched, stats.consecutive_errors, stats.stopped_by_shutdown,

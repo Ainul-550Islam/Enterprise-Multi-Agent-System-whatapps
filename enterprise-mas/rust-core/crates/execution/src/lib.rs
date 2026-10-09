@@ -53,7 +53,7 @@ pub use agent_bridge::{
 pub use data_hub_bridge::{
     DataHubBridgePort, DataHubCallContext, DataHubDocumentIngestionResult,
     DataHubIngestDocumentRequest, DataHubPurgeDocumentRequest, DataHubPurgeDocumentResult,
-    DataHubSourceKind, DataHubSyncSourceRequest, DataHubSyncSourceResult,
+    DataHubSourceKind, DataHubSyncSourceRequest, DataHubSyncSourceResult, InMemoryDataHubBridge,
 };
 pub use executor::{Executor, ExecutorConfig, RunOutcome, StepStorePort};
 pub use mas_orchestration::checkpoint::NodeExecutionState;

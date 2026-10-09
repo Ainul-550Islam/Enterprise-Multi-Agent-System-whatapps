@@ -8,7 +8,9 @@ layer already checked.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
+import logging
 
 import pytest
 
@@ -138,6 +140,33 @@ class TestAgentService:
             tool_count=0,
         )
         assert summary.runnable
+
+    async def test_background_lookup_telemetry_failure_is_observed(self, caplog) -> None:
+        class _FailingEmitter:
+            async def emit(self, event: object) -> bool:
+                raise InvalidRequestError("telemetry was rejected")
+
+        service = AgentService(AgentRegistry(), emitter=_FailingEmitter())  # type: ignore[arg-type]
+        service.register(_spec(), lambda: _Agent(_spec()))
+
+        with caplog.at_level(
+            logging.WARNING,
+            logger="mas_orchestrator.services.agent_service",
+        ):
+            assert service.spec(_context()).agent_id == "worker"
+            # The first yield runs the emission task; the second runs its
+            # done callback that retrieves the exception.
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+
+        failures = [
+            record
+            for record in caplog.records
+            if record.getMessage() == "agent lookup telemetry emission failed"
+        ]
+        assert len(failures) == 1
+        assert failures[0].event == "agent.lookup_emit_failed"
+        assert failures[0].error_type == "InvalidRequestError"
 
 
 class TestClassifyStatus:

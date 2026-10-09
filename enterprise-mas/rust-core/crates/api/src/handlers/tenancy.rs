@@ -189,9 +189,7 @@ pub async fn register_organization(
     Ctx(ctx): Ctx,
     Json(body): Json<RegisterOrganizationBody>,
 ) -> ApiResult<OrganizationResponse> {
-    let service_ctx = ctx
-        .service_context()
-        .map_err(|e| crate::response::ApiError::new(e, &ctx))?;
+    let service_ctx = platform_admin_context(&ctx)?;
     state
         .tenancy
         .register_organization(
@@ -210,9 +208,7 @@ pub async fn list_organizations(
     State(state): State<AppState>,
     Ctx(ctx): Ctx,
 ) -> ApiResult<Vec<OrganizationResponse>> {
-    let service_ctx = ctx
-        .service_context()
-        .map_err(|e| crate::response::ApiError::new(e, &ctx))?;
+    let service_ctx = platform_admin_context(&ctx)?;
     state
         .tenancy
         .list_organizations(&service_ctx)
@@ -231,9 +227,11 @@ pub async fn register_tenant(
         .map_err(|e| crate::response::ApiError::new(e, &ctx))?;
     let isolation: IsolationMode = wl_enum("isolation", &body.isolation)
         .map_err(|e| crate::response::ApiError::new(e, &ctx))?;
-    let service_ctx = ctx
-        .service_context()
-        .map_err(|e| crate::response::ApiError::new(e, &ctx))?;
+    let service_ctx = authorized_tenancy(
+        &ctx,
+        mas_security::ResourceKind::Tenant,
+        mas_security::Action::Administer,
+    )?;
     state
         .tenancy
         .register_tenant(&service_ctx, &body.name, &body.slug, environment, isolation)
@@ -247,9 +245,11 @@ pub async fn list_tenants(
     State(state): State<AppState>,
     Ctx(ctx): Ctx,
 ) -> ApiResult<Vec<TenantResponse>> {
-    let service_ctx = ctx
-        .service_context()
-        .map_err(|e| crate::response::ApiError::new(e, &ctx))?;
+    let service_ctx = authorized_tenancy(
+        &ctx,
+        mas_security::ResourceKind::Tenant,
+        mas_security::Action::Read,
+    )?;
     state
         .tenancy
         .list_tenants(&service_ctx)
@@ -264,10 +264,11 @@ pub async fn register_project(
     Ctx(ctx): Ctx,
     Json(body): Json<RegisterProjectBody>,
 ) -> ApiResult<ProjectResponse> {
-    scoped(&ctx)?;
-    let service_ctx = ctx
-        .service_context()
-        .map_err(|e| crate::response::ApiError::new(e, &ctx))?;
+    let service_ctx = authorized_tenancy(
+        &ctx,
+        mas_security::ResourceKind::Project,
+        mas_security::Action::Create,
+    )?;
     state
         .tenancy
         .register_project(&service_ctx, &body.name, &body.slug)
@@ -321,12 +322,13 @@ pub async fn invite_membership(
     Ctx(ctx): Ctx,
     Json(body): Json<InviteMembershipBody>,
 ) -> ApiResult<MembershipResponse> {
-    scoped(&ctx)?;
     let role: MembershipRole =
         wl_enum("role", &body.role).map_err(|e| crate::response::ApiError::new(e, &ctx))?;
-    let service_ctx = ctx
-        .service_context()
-        .map_err(|e| crate::response::ApiError::new(e, &ctx))?;
+    let service_ctx = authorized_tenancy(
+        &ctx,
+        mas_security::ResourceKind::Membership,
+        mas_security::Action::ManageMembers,
+    )?;
     state
         .tenancy
         .invite_membership(&service_ctx, body.user_id, role)
@@ -346,15 +348,18 @@ pub async fn invite_membership(
         .map_err(|e| crate::response::ApiError::new(e, &ctx))
 }
 
-/// Asserts that a scope was **resolved** for this request.
-///
-/// `require_scope` only ever returns a scope the middleware produced from the
-/// principal's identity, so this is the guard that makes a tenant-owned route
-/// unreachable without authentication and resolution. It is not a check that a
-/// header was present — that was the old behaviour, and it granted a scope to
-/// anyone who could spell one.
-fn scoped(ctx: &RequestContext) -> std::result::Result<(), crate::response::ApiError> {
-    ctx.require_scope()
-        .map(|_| ())
-        .map_err(|e| crate::response::ApiError::new(e, ctx))
+fn platform_admin_context(
+    ctx: &RequestContext,
+) -> std::result::Result<mas_application::context::ServiceContext, crate::response::ApiError> {
+    ctx.platform_service_context()
+        .map_err(|error| crate::response::ApiError::new(error, ctx))
+}
+
+fn authorized_tenancy(
+    ctx: &RequestContext,
+    resource: mas_security::ResourceKind,
+    action: mas_security::Action,
+) -> std::result::Result<mas_application::context::ServiceContext, crate::response::ApiError> {
+    crate::handlers::authorized_service_context(ctx, resource, action, None)
+        .map_err(|error| crate::response::ApiError::new(error, ctx))
 }

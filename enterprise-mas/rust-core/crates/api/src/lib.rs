@@ -33,6 +33,7 @@ pub mod grpc;
 pub mod handlers;
 pub mod inmemory_directory;
 pub mod middleware;
+pub mod oidc_auth;
 pub mod prod_auth;
 pub mod response;
 pub mod router;

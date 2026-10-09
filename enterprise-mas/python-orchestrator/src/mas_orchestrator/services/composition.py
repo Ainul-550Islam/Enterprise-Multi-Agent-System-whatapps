@@ -401,6 +401,7 @@ def build_data_hub_service(settings: Settings) -> DataHubService:
             max_depth=data_settings.max_crawl_depth,
             max_pages=min(data_settings.max_crawl_pages, data_settings.max_pages_per_sync),
             max_document_bytes=data_settings.max_document_bytes,
+            max_sync_bytes=data_settings.max_sync_bytes,
         )
         adapters[DataSourceKind.WEB] = web.sync
 
@@ -414,6 +415,7 @@ def build_data_hub_service(settings: Settings) -> DataHubService:
             allowed_hosts=data_settings.object_storage_egress_allowlist,
             max_pages=min(data_settings.max_pages_per_sync, 10_000),
             max_document_bytes=data_settings.max_document_bytes,
+            max_sync_bytes=data_settings.max_sync_bytes,
         )
         adapters[DataSourceKind.OBJECT_STORAGE] = object_storage.sync
 
@@ -503,6 +505,9 @@ def build_data_hub_service(settings: Settings) -> DataHubService:
             batch_size=64,
             chunking=chunking,
             index_lexically=False,
+            parser_workers=data_settings.parser_workers,
+            parser_timeout_seconds=data_settings.parser_timeout_seconds,
+            parser_memory_bytes=data_settings.parser_memory_bytes,
         ),
     )
     return DataHubService(

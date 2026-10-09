@@ -27,6 +27,7 @@ use mas_domain::webhook::{WebhookDelivery, WebhookEndpoint};
 use sha2::Sha256;
 use std::sync::Mutex;
 use std::time::Duration;
+use zeroize::Zeroizing;
 
 use crate::http_guard::{GuardedHttpClient, HttpClientPort, HttpRequest};
 
@@ -117,7 +118,20 @@ impl InboundSignature {
                     }
                     signature = Some(value.to_ascii_lowercase());
                 },
-                "kid" => key_version = Some(value.trim().chars().take(128).collect()),
+                "kid" => {
+                    if key_version.is_some() {
+                        return Err(AppError::unauthorized(
+                            "duplicate key version in signature header",
+                        ));
+                    }
+                    let value = value.trim();
+                    if !is_safe_key_version(value) {
+                        return Err(AppError::unauthorized(
+                            "signature key version must be a safe bounded token",
+                        ));
+                    }
+                    key_version = Some(value.to_owned());
+                },
                 _ => {},
             }
         }
@@ -135,10 +149,41 @@ impl InboundSignature {
 }
 
 /// Builds the outbound signature header for `payload` signed `at`.
+///
+/// Kept as the stable no-key-version form for existing callers. Production
+/// durable delivery uses [`sign_header_with_key_version`] so a receiver can
+/// select the current or previous verification key during rotation.
 #[must_use]
 pub fn sign_header(at: &Timestamp, payload: &[u8], secret: &[u8]) -> String {
+    sign_header_with_key_version(at, payload, secret, None)
+}
+
+/// Builds an outbound signature header and, when available, binds it to the
+/// captured secret key version. Key versions are constrained to HTTP-token
+/// characters before persistence, so this cannot inject a second header field.
+#[must_use]
+pub fn sign_header_with_key_version(
+    at: &Timestamp,
+    payload: &[u8],
+    secret: &[u8],
+    key_version: Option<&str>,
+) -> String {
     let ts = at.to_unix_seconds();
-    format!("t={ts},v1={}", compute_signature(ts, payload, secret))
+    let signature = compute_signature(ts, payload, secret);
+    match key_version {
+        Some(version) if is_safe_key_version(version) => {
+            format!("t={ts},v1={signature},kid={version}")
+        },
+        _ => format!("t={ts},v1={signature}"),
+    }
+}
+
+fn is_safe_key_version(version: &str) -> bool {
+    !version.is_empty()
+        && version.len() <= 128
+        && version
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 /// Verifies a parsed inbound signature against the raw `payload`:
@@ -177,12 +222,58 @@ pub struct StoredEvent {
     pub body: Vec<u8>,
 }
 
+/// Raw webhook secret bytes that zeroize when the worker drops them.
+///
+/// This wrapper prevents a production secret-manager adapter from returning a
+/// casually printable `Vec<u8>`. The only exposure point is the exact HMAC
+/// call site.
+pub struct ResolvedWebhookSecret(Zeroizing<Vec<u8>>);
+
+impl ResolvedWebhookSecret {
+    /// Wraps non-empty secret bytes.
+    pub fn new(bytes: Vec<u8>) -> Result<Self> {
+        if bytes.is_empty() {
+            return Err(AppError::invalid_field(
+                "secret",
+                "empty",
+                "webhook signing secrets must not be empty",
+            ));
+        }
+        Ok(Self(Zeroizing::new(bytes)))
+    }
+
+    /// The exact bytes passed to HMAC; callers must not retain this borrow.
+    #[must_use]
+    pub fn expose(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for ResolvedWebhookSecret {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ResolvedWebhookSecret([redacted])")
+    }
+}
+
 /// Resolves webhook signing secrets for endpoints.
 #[async_trait]
 pub trait WebhookSecretPort: std::fmt::Debug + Send + Sync {
-    /// Returns the raw bytes of the referenced secret. Resolution failures
-    /// are supported (unavailable store, retired version, …).
-    async fn resolve(&self, reference: SecretReferenceId) -> Result<Vec<u8>>;
+    /// Returns zeroizing bytes for the referenced secret's current version.
+    /// Resolution failures are supported (unavailable store, retired version,
+    /// and authorization failures). Material must never be cached by callers.
+    async fn resolve(&self, reference: SecretReferenceId) -> Result<ResolvedWebhookSecret>;
+
+    /// Resolves an explicit key version captured by a delivery at enqueue.
+    /// Legacy resolvers may only expose a current version, so the default
+    /// delegates to `resolve`; production secret-manager adapters override it
+    /// to make key rotation deterministic for retries.
+    async fn resolve_version(
+        &self,
+        reference: SecretReferenceId,
+        _key_version: Option<&str>,
+    ) -> Result<ResolvedWebhookSecret> {
+        self.resolve(reference).await
+    }
 }
 
 /// Persistence port for endpoints, deliveries and retained payloads.
@@ -371,13 +462,15 @@ impl InMemorySecretResolver {
 
 #[async_trait]
 impl WebhookSecretPort for InMemorySecretResolver {
-    async fn resolve(&self, reference: SecretReferenceId) -> Result<Vec<u8>> {
-        self.secrets
+    async fn resolve(&self, reference: SecretReferenceId) -> Result<ResolvedWebhookSecret> {
+        let material = self
+            .secrets
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(&reference)
             .cloned()
-            .ok_or_else(|| AppError::not_found("webhook signing secret", reference.to_string()))
+            .ok_or_else(|| AppError::not_found("webhook signing secret", reference.to_string()))?;
+        ResolvedWebhookSecret::new(material)
     }
 }
 
@@ -490,7 +583,12 @@ where
             if tracked {
                 continue;
             }
-            let delivery = WebhookDelivery::new(endpoint.id, event_id, payload_hash.clone())?;
+            let delivery = WebhookDelivery::new_with_key_version(
+                endpoint.id,
+                event_id,
+                payload_hash.clone(),
+                endpoint.signature.key_version.clone(),
+            )?;
             self.store.save_delivery(&delivery).await?;
             tracing::debug!(endpoint = %endpoint.id, event = %event_id, "webhook delivery enqueued");
             enqueued += 1;
@@ -523,15 +621,18 @@ where
 
             let secret = match self
                 .secrets
-                .resolve(endpoint.signature.secret_reference_id)
+                .resolve_version(
+                    endpoint.signature.secret_reference_id,
+                    delivery.signing_key_version.as_deref(),
+                )
                 .await
             {
                 Ok(secret) => secret,
-                Err(err) => {
+                Err(_) => {
                     delivery.record_attempt(
                         None,
                         &endpoint.retry_policy,
-                        Some(clean_error_fragment(&err.to_string())),
+                        Some("webhook signing secret unavailable".to_owned()),
                     );
                     if delivery.attempt_count < endpoint.retry_policy.max_attempts {
                         delivery.next_attempt_at = now.checked_add(policy_backoff(
@@ -548,7 +649,12 @@ where
                 },
             };
 
-            let signature = sign_header(now, &stored.body, &secret);
+            let signature = sign_header_with_key_version(
+                now,
+                &stored.body,
+                secret.expose(),
+                delivery.signing_key_version.as_deref(),
+            );
             let request = HttpRequest::post(endpoint.url.clone(), stored.body.clone())
                 .with_header("content-type", "application/json")
                 .with_header(SIGNATURE_HEADER, &signature)
@@ -591,11 +697,11 @@ where
                         tracing::warn!(delivery = %delivery.id, status = response.status, "webhook delivery failed");
                     }
                 },
-                Err(err) => {
+                Err(_) => {
                     delivery.record_attempt(
                         None,
                         &endpoint.retry_policy,
-                        Some(clean_error_fragment(&err.to_string())),
+                        Some("webhook transport failed".to_owned()),
                     );
                     if delivery.attempt_count < endpoint.retry_policy.max_attempts {
                         delivery.next_attempt_at = now.checked_add(policy_backoff(
@@ -642,12 +748,16 @@ fn policy_backoff(policy: &mas_domain::webhook::WebhookRetryPolicy, attempt: u32
 }
 
 /// Renders an error for durable storage: single-line, length-capped.
-fn clean_error_fragment(raw: &str) -> String {
-    let clean: String = raw
-        .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect();
-    clean.chars().take(256).collect()
+/// Renders an external error for durable storage without control characters.
+#[must_use]
+pub fn clean_error_fragment(raw: &str) -> String {
+    // External transports and providers are allowed to put request URLs,
+    // headers, recipient data, and even malformed token material in an error.
+    // A bounded substring is not redaction, so durable/public webhook state
+    // stores only this stable operational category. Detailed diagnostics stay
+    // at the provider boundary where they can be access-controlled.
+    let _ = raw;
+    "webhook delivery failed".to_owned()
 }
 
 fn count_failure(
@@ -655,9 +765,10 @@ fn count_failure(
     stats: &mut FlushStats,
     policy: &mas_domain::webhook::WebhookRetryPolicy,
 ) {
-    let exhausted = !delivery.state.is_terminal()
-        && delivery.attempt_count >= policy.max_attempts
-        && delivery.next_attempt_at.is_none();
+    let exhausted = delivery.state == DeliveryState::DeadLettered
+        || (delivery.attempt_count >= policy.max_attempts
+            && delivery.next_attempt_at.is_none()
+            && !delivery.state.is_terminal());
     if exhausted {
         stats.exhausted += 1;
     } else {
@@ -958,7 +1069,7 @@ mod tests {
         assert_eq!(second.attempted, 1);
         assert_eq!(second.exhausted, 1, "attempt budget exhausted");
         let delivery = dispatcher_deliveries_folded(&dispatcher, endpoint_id).await[0].clone();
-        assert_eq!(delivery.state, DeliveryState::Failed);
+        assert_eq!(delivery.state, DeliveryState::DeadLettered);
         assert!(delivery.next_attempt_at.is_none());
         assert_eq!(delivery.attempt_count, 2);
 

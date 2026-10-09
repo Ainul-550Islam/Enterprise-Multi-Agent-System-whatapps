@@ -274,7 +274,11 @@ fn hydrate_attempt(row: &sqlx::postgres::PgRow) -> Result<TaskAttempt> {
             .map_err(map_sqlx)?
             .map(ExecutionId::from_uuid),
         attempt_number: u32::try_from(attempt).unwrap_or(1),
-        status: AttemptStatus::from_str(&status).unwrap_or(AttemptStatus::Running),
+        status: AttemptStatus::from_str(&status).map_err(|_| {
+            AppError::database(format!(
+                "task_attempts row contains unknown status '{status}'"
+            ))
+        })?,
         worker_id: Some(row.try_get("worker_id").map_err(map_sqlx)?),
         lease_expires_at: row
             .try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("lease_expires")
@@ -304,8 +308,14 @@ fn hydrate_attempt(row: &sqlx::postgres::PgRow) -> Result<TaskAttempt> {
     })
 }
 
-/// Writes one attempt row (upsert on the natural key `(task_id, attempt)`).
-async fn write_attempt(conn: &mut PgConnection, attempt: &TaskAttempt) -> Result<()> {
+/// Inserts one newly started attempt.
+///
+/// A claim creates a new immutable ledger row. It must never use an upsert:
+/// an upsert would let a stale or duplicated claim rewrite an existing
+/// attempt's owner, lease or terminal outcome. The unique `(task_id, attempt)`
+/// key and the one-open-attempt partial index are therefore allowed to reject
+/// a duplicate claim rather than being converted into a destructive update.
+async fn insert_attempt(conn: &mut PgConnection, attempt: &TaskAttempt) -> Result<()> {
     let detail = json!({ "retry_reason": attempt.retry_reason });
     let error = attempt.error.as_ref().map(|message| {
         json!({
@@ -319,18 +329,7 @@ async fn write_attempt(conn: &mut PgConnection, attempt: &TaskAttempt) -> Result
             id, tenant_id, task_id, execution_id, attempt, worker_id, lease_expires,
             status, detail, error, error_code, error_retryable, result_metadata,
             started_at, finished_at, version
-         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
-         ON CONFLICT (task_id, attempt) DO UPDATE SET
-            status = EXCLUDED.status,
-            worker_id = EXCLUDED.worker_id,
-            lease_expires = EXCLUDED.lease_expires,
-            detail = EXCLUDED.detail,
-            error = EXCLUDED.error,
-            error_code = EXCLUDED.error_code,
-            error_retryable = EXCLUDED.error_retryable,
-            result_metadata = EXCLUDED.result_metadata,
-            finished_at = EXCLUDED.finished_at,
-            version = EXCLUDED.version",
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)",
     )
     .bind(attempt.id.into_uuid())
     .bind(attempt.tenant_id.into_uuid())
@@ -354,15 +353,102 @@ async fn write_attempt(conn: &mut PgConnection, attempt: &TaskAttempt) -> Result
     Ok(())
 }
 
+/// Persists a lifecycle update to an attempt that was already loaded under its
+/// task's row lock. A missing row, a non-running predecessor, or a version
+/// advance by somebody else is a stale-ownership conflict, never a new attempt
+/// created by accident.
+async fn update_attempt(conn: &mut PgConnection, attempt: &TaskAttempt) -> Result<()> {
+    let expected_version = attempt.version.checked_sub(1).ok_or_else(|| {
+        AppError::conflict(format!(
+            "attempt {} cannot be lifecycle-updated at version zero",
+            attempt.id
+        ))
+    })?;
+    let detail = json!({ "retry_reason": attempt.retry_reason });
+    let error = attempt.error.as_ref().map(|message| {
+        json!({
+            "code": attempt.error_code,
+            "message": message,
+            "retryable": attempt.error_retryable,
+        })
+    });
+    let result = sqlx::query(
+        "UPDATE task_attempts SET
+            worker_id = $4,
+            lease_expires = $5,
+            status = $6,
+            detail = $7,
+            error = $8,
+            error_code = $9,
+            error_retryable = $10,
+            result_metadata = $11,
+            finished_at = $12,
+            version = $13,
+            updated_at = now()
+         WHERE id = $1 AND tenant_id = $2 AND task_id = $3
+           AND status = 'running' AND version = $14",
+    )
+    .bind(attempt.id.into_uuid())
+    .bind(attempt.tenant_id.into_uuid())
+    .bind(attempt.task_id.into_uuid())
+    .bind(attempt.worker_id.clone().unwrap_or_default())
+    .bind(attempt.lease_expires_at.map(Timestamp::into_datetime))
+    .bind(attempt.status.as_str())
+    .bind(detail)
+    .bind(error)
+    .bind(attempt.error_code.clone())
+    .bind(attempt.error_retryable)
+    .bind(Value::Object(attempt.result_metadata.clone()))
+    .bind(attempt.finished_at.map(Timestamp::into_datetime))
+    .bind(i64::try_from(attempt.version).unwrap_or(1))
+    .bind(i64::try_from(expected_version).unwrap_or(i64::MAX))
+    .execute(&mut *conn)
+    .await
+    .map_err(map_sqlx)?;
+    if result.rows_affected() != 1 {
+        return Err(AppError::conflict(format!(
+            "attempt {} for task {} disappeared before its fenced update",
+            attempt.id, attempt.task_id
+        )));
+    }
+    Ok(())
+}
+
 /// Loads one attempt by id.
 async fn load_attempt(
     conn: &mut PgConnection,
     attempt_id: TaskAttemptId,
 ) -> Result<Option<TaskAttempt>> {
     let row = sqlx::query(&format!(
-        "SELECT {ATTEMPT_COLUMNS} FROM task_attempts WHERE id = $1"
+        "SELECT {ATTEMPT_COLUMNS} FROM task_attempts WHERE id = $1 FOR UPDATE"
     ))
     .bind(attempt_id.into_uuid())
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(map_sqlx)?;
+    row.as_ref().map(hydrate_attempt).transpose()
+}
+
+/// Loads and locks the one currently-running attempt for a task.
+///
+/// The `(task_id) WHERE status = 'running'` partial unique index makes this
+/// optional row singular. The tenant predicate is deliberate even on the
+/// worker plane: it keeps recovery tied to the tenant identity that was read
+/// from the locked task row, rather than letting an arbitrary task id bridge
+/// tenant boundaries.
+async fn load_running_attempt(
+    conn: &mut PgConnection,
+    tenant_id: TenantId,
+    task_id: TaskId,
+) -> Result<Option<TaskAttempt>> {
+    let row = sqlx::query(&format!(
+        "SELECT {ATTEMPT_COLUMNS}
+         FROM task_attempts
+         WHERE task_id = $1 AND tenant_id = $2 AND status = 'running'
+         FOR UPDATE"
+    ))
+    .bind(task_id.into_uuid())
+    .bind(tenant_id.into_uuid())
     .fetch_optional(&mut *conn)
     .await
     .map_err(map_sqlx)?;
@@ -594,7 +680,7 @@ async fn update_task_fence(conn: &mut PgConnection, task: &Task) -> Result<()> {
             version = $2, attempt_count = $3, max_attempts = $4, locked_by = $5,
             locked_until = $6, queued_at = $7, started_at = $8, finished_at = $9,
             last_attempt_id = $10, error = $11, status = $12, not_before = $13,
-            updated_at = $14
+            updated_at = $14, result = $15
          WHERE id = $1",
     )
     .bind(task.id.into_uuid())
@@ -611,6 +697,7 @@ async fn update_task_fence(conn: &mut PgConnection, task: &Task) -> Result<()> {
     .bind(task.status.as_str())
     .bind(task.available_at().into_datetime())
     .bind(task.updated_at.into_datetime())
+    .bind(task.result.clone())
     .execute(&mut *conn)
     .await
     .map_err(map_sqlx)?;
@@ -870,7 +957,7 @@ impl PgDurableExecution {
                 Some("initial".to_owned()),
                 &intent.now,
             )?;
-            write_attempt(&mut *conn, &created).await?;
+            insert_attempt(&mut *conn, &created).await?;
             task.last_attempt_id = Some(created.id);
             task.attempt_count = 1;
             update_task_fence(&mut *conn, &task).await?;
@@ -1036,14 +1123,121 @@ impl PgDurableExecution {
             .join(", ")
     }
 
+    /// Reconciles leases that lapsed before their owner could settle.
+    ///
+    /// A PostgreSQL broker emits an expired-running task only as a read-only
+    /// hint. Recovery belongs here, alongside the ownership fence and attempt
+    /// ledger: closing the abandoned attempt, returning the task to the queue
+    /// (or exhausting it), and creating its outbox records are one database
+    /// transaction. Without this step a partial unique index correctly blocks
+    /// the next running attempt forever, which is safety without recovery.
+    async fn reclaim_expired_in(connection: &mut PgConnection, query: &ClaimQuery) -> Result<()> {
+        let capacity = i64::try_from(query.capacity).unwrap_or(i64::MAX);
+        let rows = sqlx::query(&format!(
+            "SELECT {TASK_COLUMNS}, {TASK_FENCE_COLUMNS}
+             FROM tasks
+             WHERE status = 'running'
+               AND locked_until IS NOT NULL
+               AND locked_until <= $1
+               AND ($2::uuid IS NULL OR tenant_id = $2)
+               AND ($3::uuid IS NULL OR id = $3)
+             ORDER BY priority DESC, not_before ASC, id ASC
+             LIMIT $4
+             FOR UPDATE SKIP LOCKED"
+        ))
+        .bind(query.now.into_datetime())
+        .bind(query.tenant_id.map(TenantId::into_uuid))
+        .bind(query.task_id.map(TaskId::into_uuid))
+        .bind(capacity)
+        .fetch_all(&mut *connection)
+        .await
+        .map_err(map_sqlx)?;
+        let actor = TransitionActor::worker(&query.worker)?;
+
+        for row in rows {
+            let fence = read_task_fence(&row)?;
+            let mut task = hydrate_task(fetch_task_row(row)?, fence)?;
+            // The row lock plus the predicate above make this defensive check
+            // cheap and protect a future query edit from reviving live work.
+            if task.status != TaskStatus::Running || task.is_owned_at(&query.now) {
+                continue;
+            }
+
+            let failure = mas_domain::TransitionFailure::transient(
+                "lease_expired",
+                "the owning worker stopped renewing its lease",
+            )?;
+            let mut abandoned = load_running_attempt(connection, task.tenant_id, task.id).await?;
+
+            // Running → Failed is the only legal way into both retry and
+            // dead-letter. A crash follows the same state machine as a
+            // classified transient handler failure; it is not a privileged
+            // shortcut around it.
+            task.fail(&actor, failure.clone())?;
+            if let Some(attempt) = abandoned.as_mut() {
+                attempt.expire(&query.now)?;
+            }
+
+            let requeued = task.has_attempts_remaining();
+            if requeued {
+                task.retry(&actor, Duration::ZERO)?;
+                // Domain transitions use the wall clock for audit timestamps;
+                // availability must use the injected durable clock so a test
+                // or a caller never queues work into its own future.
+                task.not_before = Some(query.now);
+            } else {
+                task.dead_letter(&actor, "lease_expired_attempts_exhausted")?;
+            }
+
+            update_task_fence(connection, &task).await?;
+            if let Some(attempt) = abandoned.as_ref() {
+                update_attempt(connection, attempt).await?;
+            }
+
+            let context = durable_events::EventContext {
+                tenant_id: task.tenant_id,
+                organization_id: task.organization_id,
+                project_id: task.project_id,
+                execution_id: task.execution_id.unwrap_or_else(ExecutionId::new),
+                correlation_id: task.correlation_id.clone(),
+                actor: actor.label(),
+                occurred_at: query.now,
+            };
+            let mut events = vec![durable_events::task_failed(
+                &context,
+                task.id,
+                abandoned.as_ref().map(|attempt| attempt.id),
+                "lease_expired",
+                true,
+                task.version(),
+                requeued,
+            )?];
+            if !requeued {
+                events.push(durable_events::task_dead_lettered(
+                    &context,
+                    task.id,
+                    task.version(),
+                )?);
+            }
+            write_events(connection, &events, Some(task.id), task.execution_id).await?;
+            task.take_transitions();
+        }
+        Ok(())
+    }
+
     async fn claim_in(connection: &mut PgConnection, query: &ClaimQuery) -> Result<Vec<TaskClaim>> {
+        // First reconcile stale owners. The broker does not mutate lifecycle
+        // state, so the durable port is the only place allowed to turn an
+        // expired running task into a retry or a terminal dead letter.
+        Self::reclaim_expired_in(connection, query).await?;
+
         let conn = connection;
         let capacity = i64::try_from(query.capacity).unwrap_or(i64::MAX);
 
-        // The claim itself: row locks decide who wins, and SKIP LOCKED means a
-        // competitor is not blocked by us — it simply takes the next task. The
-        // UPDATE installs the fence in the same statement, so there is no
-        // instant where a task is selected but unowned.
+        // Row locks decide who wins, and SKIP LOCKED means a competitor is not
+        // blocked by us — it simply takes the next task. This statement claims
+        // only pending/queued work. Expired running work was reconciled above,
+        // so every newly-created running attempt has no live predecessor.
         // Two relations are in scope here (`tasks t` and `candidates c`), so
         // the projection must be qualified or PostgreSQL rejects `id` as
         // ambiguous.
@@ -1057,6 +1251,7 @@ impl PgDurableExecution {
                 SELECT id FROM tasks
                 WHERE status IN ('pending', 'queued')
                   AND not_before <= $1
+                  AND attempt_count < max_attempts
                   AND (deadline_at IS NULL OR deadline_at > $1)
                   AND ($2::uuid IS NULL OR tenant_id = $2)
                   AND ($3::uuid IS NULL OR id = $3)
@@ -1068,7 +1263,7 @@ impl PgDurableExecution {
                 status = 'running',
                 locked_by = $5,
                 locked_until = $6,
-                started_at = $1,
+                started_at = coalesce(t.started_at, $1),
                 attempt_count = t.attempt_count + 1,
                 version = t.version + 1,
                 updated_at = $1
@@ -1089,7 +1284,7 @@ impl PgDurableExecution {
         let mut claims = Vec::with_capacity(claimed.len());
         for row in claimed {
             let fence = read_task_fence(&row)?;
-            let task = hydrate_task(fetch_task_row(row)?, fence)?;
+            let mut task = hydrate_task(fetch_task_row(row)?, fence)?;
 
             // The attempt row is the durable proof of the claim. Its number
             // comes from the task, never from a broker delivery counter.
@@ -1110,7 +1305,33 @@ impl PgDurableExecution {
                 ),
                 &query.now,
             )?;
-            write_attempt(&mut *conn, &attempt).await?;
+            insert_attempt(&mut *conn, &attempt).await?;
+
+            // The task fence is committed by the claim CTE, but it cannot name
+            // the database-generated attempt until after the Rust aggregate
+            // has allocated it. Fill that link under the same task row lock;
+            // do not bump `version` a second time because callers settle using
+            // the version returned by the CTE.
+            let linked = sqlx::query(
+                "UPDATE tasks SET last_attempt_id = $2
+                 WHERE id = $1 AND tenant_id = $3
+                   AND status = 'running' AND locked_by = $4 AND version = $5",
+            )
+            .bind(task.id.into_uuid())
+            .bind(attempt.id.into_uuid())
+            .bind(task.tenant_id.into_uuid())
+            .bind(&query.worker)
+            .bind(i64::try_from(task.version()).unwrap_or(i64::MAX))
+            .execute(&mut *conn)
+            .await
+            .map_err(map_sqlx)?;
+            if linked.rows_affected() != 1 {
+                return Err(AppError::conflict(format!(
+                    "claim of task {} lost its ownership fence before attempt linkage",
+                    task.id
+                )));
+            }
+            task.last_attempt_id = Some(attempt.id);
 
             // Drive the execution to Running in the same unit: a running
             // execution whose task has started must say so.
@@ -1248,6 +1469,14 @@ impl PgDurableExecution {
                     settlement.attempt_id, settlement.task_id
                 ))
             })?;
+        if attempt.task_id != task.id
+            || attempt.tenant_id != tenant
+            || task.last_attempt_id != Some(attempt.id)
+        {
+            return Err(AppError::conflict(
+                "stale settlement: the attempt is not the task's current durable attempt",
+            ));
+        }
         if attempt.worker_id.as_deref() != Some(settlement.worker.as_str()) {
             return Err(AppError::conflict(
                 "stale settlement: the attempt belongs to another worker",
@@ -1259,8 +1488,8 @@ impl PgDurableExecution {
         let mut dead_lettered = false;
         let mut observed_usage: Option<ExecutionUsage> = None;
         match &settlement.outcome {
-            TaskOutcome::Succeeded { usage } => {
-                task.complete(&settlement.actor)?;
+            TaskOutcome::Succeeded { result, usage } => {
+                task.complete(&settlement.actor, Some(result.clone()))?;
                 attempt.succeed(&settlement.now)?;
                 observed_usage = Some(usage.clone());
             },
@@ -1311,7 +1540,11 @@ impl PgDurableExecution {
                 match &finalization.outcome {
                     ExecutionOutcome::Completed => {
                         if loaded.status != ExecutionStatus::Completed {
-                            loaded.complete(&settlement.actor, None)?;
+                            let output = match &settlement.outcome {
+                                TaskOutcome::Succeeded { result, .. } => Some(result.clone()),
+                                _ => None,
+                            };
+                            loaded.complete(&settlement.actor, output)?;
                         }
                     },
                     ExecutionOutcome::Failed { failure } => {
@@ -1332,7 +1565,7 @@ impl PgDurableExecution {
 
         // ── 5. Persist task, attempt, usage, events and audit. ────────────
         update_task_fence(&mut *conn, &task).await?;
-        write_attempt(&mut *conn, &attempt).await?;
+        update_attempt(&mut *conn, &attempt).await?;
 
         let usage = observed_usage.map_or_else(Vec::new, |usage| usage.observations());
         write_usage(
@@ -1358,7 +1591,7 @@ impl PgDurableExecution {
         };
         let mut events = Vec::new();
         match &settlement.outcome {
-            TaskOutcome::Succeeded { usage } => {
+            TaskOutcome::Succeeded { usage, .. } => {
                 events.push(durable_events::task_succeeded(
                     &ctx,
                     task.id,
@@ -1580,7 +1813,7 @@ impl PgDurableExecution {
             if let Some(mut attempt) = load_attempt(&mut *conn, attempt_id).await? {
                 if !attempt.status.is_terminal() {
                     attempt.cancel(now)?;
-                    write_attempt(&mut *conn, &attempt).await?;
+                    update_attempt(&mut *conn, &attempt).await?;
                 }
             }
         }
@@ -1608,8 +1841,8 @@ impl PgDurableExecution {
             ExecutionAction::Resume => {
                 execution.resume(&request.actor)?;
             },
-            ExecutionAction::Complete => {
-                execution.complete(&request.actor, None)?;
+            ExecutionAction::Complete { output } => {
+                execution.complete(&request.actor, output.clone())?;
             },
             ExecutionAction::Fail { failure } => {
                 execution.fail(&request.actor, failure.clone())?;
@@ -1638,7 +1871,7 @@ impl PgDurableExecution {
                     execution.version(),
                 )?]
             },
-            ExecutionAction::Complete => {
+            ExecutionAction::Complete { .. } => {
                 vec![durable_events::execution_completed(
                     &ctx,
                     execution.version(),
@@ -1768,14 +2001,16 @@ impl PgDurableExecution {
 impl DurableExecutionPort for PgDurableExecution {
     async fn submit(&self, intent: SubmissionIntent) -> Result<SubmissionReceipt> {
         intent.validate()?;
-        if Self::has_request_scope() {
-            let mut scoped = Self::request_connection().await?;
-            Self::submit_in(scoped.connection(), &intent, &self.metrics).await
-        } else {
-            let mut uow = UnitOfWork::begin(&self.pool).await?;
-            let outcome = Self::submit_in(uow.executor(), &intent, &self.metrics).await;
-            Self::finish(uow, outcome).await
+        if !Self::has_request_scope() {
+            return Err(AppError::internal(
+                "durable execution submission requires an authoritative request transaction",
+            ));
         }
+        // The caller's scope owns commit/rollback. In particular, execution
+        // creation and `ControlPlane::consume_created_execution` use this same
+        // connection, so a quota refusal cannot commit runnable work.
+        let mut scoped = Self::request_connection().await?;
+        Self::submit_in(scoped.connection(), &intent, &self.metrics).await
     }
 
     async fn claim(&self, query: ClaimQuery) -> Result<Vec<TaskClaim>> {

@@ -22,12 +22,22 @@
 //! method → wrap in the stable envelope. No business logic here.
 
 pub mod agents;
+pub mod analytics;
+pub mod api_keys;
+pub mod approvals;
 pub mod control_plane;
+pub mod data_hub;
 pub mod executions;
 pub mod health;
+pub mod inbound_webhooks;
+pub mod integrations;
 pub mod internal;
+pub mod notifications;
+/// OAuth authorization-code start/callback handlers.
+pub mod oauth;
 pub mod rollbacks;
 pub mod schedules;
+pub mod search;
 pub mod tenancy;
 pub mod workflows;
 

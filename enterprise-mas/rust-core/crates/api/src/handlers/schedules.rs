@@ -97,13 +97,10 @@ pub async fn register(
     Ctx(ctx): Ctx,
     Json(body): Json<RegisterScheduleBody>,
 ) -> ApiResult<ScheduleResponse> {
-    scoped(&ctx)?;
     let kind = body
         .kind()
         .map_err(|e| crate::response::ApiError::new(e, &ctx))?;
-    let service_ctx = ctx
-        .service_context()
-        .map_err(|e| crate::response::ApiError::new(e, &ctx))?;
+    let service_ctx = authorized_schedule(&ctx, mas_security::Action::Create, None)?;
     state
         .schedules
         .register(
@@ -151,10 +148,7 @@ pub async fn get(
     Path(schedule_id): Path<ScheduleId>,
     Ctx(ctx): Ctx,
 ) -> ApiResult<ScheduleResponse> {
-    scoped(&ctx)?;
-    let service_ctx = ctx
-        .service_context()
-        .map_err(|e| crate::response::ApiError::new(e, &ctx))?;
+    let service_ctx = authorized_schedule(&ctx, mas_security::Action::Read, None)?;
     state
         .schedules
         .get(&service_ctx, schedule_id)
@@ -168,10 +162,7 @@ pub async fn list(
     State(state): State<AppState>,
     Ctx(ctx): Ctx,
 ) -> ApiResult<Vec<ScheduleResponse>> {
-    scoped(&ctx)?;
-    let service_ctx = ctx
-        .service_context()
-        .map_err(|e| crate::response::ApiError::new(e, &ctx))?;
+    let service_ctx = authorized_schedule(&ctx, mas_security::Action::Read, None)?;
     state
         .schedules
         .list(&service_ctx)
@@ -193,10 +184,7 @@ async fn apply(
     schedule_id: ScheduleId,
     change: StateChange,
 ) -> ApiResult<ScheduleResponse> {
-    scoped(&ctx)?;
-    let service_ctx = ctx
-        .service_context()
-        .map_err(|e| crate::response::ApiError::new(e, &ctx))?;
+    let service_ctx = authorized_schedule(&ctx, mas_security::Action::Update, None)?;
     let result = match change {
         StateChange::Pause => state.schedules.pause(&service_ctx, schedule_id).await,
         StateChange::Resume => state.schedules.resume(&service_ctx, schedule_id).await,
@@ -207,10 +195,16 @@ async fn apply(
         .into_api(&ctx)
 }
 
-fn scoped(
+fn authorized_schedule(
     ctx: &crate::context::RequestContext,
-) -> std::result::Result<(), crate::response::ApiError> {
-    ctx.require_scope()
-        .map(|_| ())
-        .map_err(|e| crate::response::ApiError::new(e, ctx))
+    action: mas_security::Action,
+    project_id: Option<mas_common::ids::ProjectId>,
+) -> std::result::Result<mas_application::context::ServiceContext, crate::response::ApiError> {
+    crate::handlers::authorized_service_context(
+        ctx,
+        mas_security::ResourceKind::Schedule,
+        action,
+        project_id,
+    )
+    .map_err(|error| crate::response::ApiError::new(error, ctx))
 }

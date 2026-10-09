@@ -91,7 +91,7 @@ pub struct SecretGate {
     resolver: Arc<dyn SecretResolverPort>,
     audit: Arc<dyn AuditSinkPort>,
     ttl: Option<Duration>,
-    cache: Mutex<HashMap<(SecretReferenceId, String), CacheEntry>>,
+    cache: Mutex<HashMap<(SecretReferenceId, String, Option<String>), CacheEntry>>,
     max_cache: usize,
 }
 
@@ -158,7 +158,11 @@ impl SecretGate {
             )));
         }
         // 2. Cache — probe briefly and drop the lock BEFORE any await.
-        let key = (reference.id, reference.path.clone());
+        let key = (
+            reference.id,
+            reference.path.clone(),
+            reference.key_version.clone(),
+        );
         let cached = if self.ttl.is_some() {
             self.cache
                 .lock()
@@ -229,7 +233,44 @@ impl SecretGate {
         }
     }
 
-    fn insert_cache(&self, key: (SecretReferenceId, String), secret: SecretString, ttl: Duration) {
+    /// Resolves one explicit version of a readable reference.
+    ///
+    /// Durable webhook deliveries capture a key version at enqueue; this
+    /// method keeps their retries deterministic after a current-version
+    /// rotation. The version becomes part of the material-cache key, so a
+    /// cached current key can never be returned for a pinned historical read.
+    pub async fn resolve_for_version(
+        &self,
+        reference: &SecretReference,
+        key_version: Option<&str>,
+        purpose: &str,
+        tenant_id: Option<TenantId>,
+        actor: &AuditActor,
+        correlation_id: &str,
+    ) -> Result<SecretString> {
+        if key_version.is_some_and(|version| {
+            version.is_empty() || version.len() > 128 || version.chars().any(char::is_control)
+        }) {
+            return Err(AppError::invalid_field(
+                "key_version",
+                "invalid_format",
+                "secret key versions must be 1..=128 printable characters",
+            ));
+        }
+        let mut pinned = reference.clone();
+        if let Some(version) = key_version {
+            pinned.key_version = Some(version.to_owned());
+        }
+        self.resolve_for(&pinned, purpose, tenant_id, actor, correlation_id)
+            .await
+    }
+
+    fn insert_cache(
+        &self,
+        key: (SecretReferenceId, String, Option<String>),
+        secret: SecretString,
+        ttl: Duration,
+    ) {
         let Some(expiry) = mas_common::timestamps::Timestamp::now().checked_add(ttl) else {
             tracing::warn!("secret cache TTL overflow; skipping cache insert");
             return;
@@ -256,7 +297,7 @@ impl SecretGate {
         self.cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .retain(|(id, _), _| *id != reference_id);
+            .retain(|(id, _, _), _| *id != reference_id);
     }
 
     async fn audit_access(

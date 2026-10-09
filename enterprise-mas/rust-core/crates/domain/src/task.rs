@@ -90,6 +90,10 @@ pub struct Task {
     pub operation: String,
     #[serde(default)]
     pub input: serde_json::Value,
+    /// Terminal handler result. `None` means the task has not produced a
+    /// successful result; `Some(Value::Null)` is an intentional JSON result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
     pub priority: TaskPriority,
     pub status: TaskStatus,
     /// Client-supplied duplicate-submission guard (unique per tenant).
@@ -191,6 +195,7 @@ impl Task {
             correlation_id: id.to_string(),
             operation,
             input,
+            result: None,
             priority,
             status: TaskStatus::Pending,
             idempotency_key,
@@ -424,9 +429,15 @@ impl Task {
         Ok(transition)
     }
 
-    /// Running → Completed (terminal), clearing the fence.
-    pub fn complete(&mut self, actor: &TransitionActor) -> Result<StateTransition> {
+    /// Running → Completed (terminal), storing the handler result and
+    /// clearing the ownership fence. JSON `null` remains a real result.
+    pub fn complete(
+        &mut self,
+        actor: &TransitionActor,
+        result: Option<serde_json::Value>,
+    ) -> Result<StateTransition> {
         let transition = self.apply(TaskStatus::Completed, actor, None, "complete")?;
+        self.result = result;
         self.finished_at = Some(transition.occurred_at);
         self.last_error = None;
         self.last_error_code = None;
@@ -791,7 +802,7 @@ mod tests {
             .expect("retry");
         task.start(&actor(), "w-2", future(30), TaskAttemptId::new())
             .expect("start");
-        let completed = task.complete(&actor()).expect("complete");
+        let completed = task.complete(&actor(), None).expect("complete");
         assert_eq!(completed.to, "completed");
         assert!(task.last_error.is_none(), "success clears the last error");
         assert!(task.locked_by.is_none());
@@ -815,7 +826,7 @@ mod tests {
         completed_task
             .start(&actor(), "w-1", future(30), TaskAttemptId::new())
             .expect("start");
-        completed_task.complete(&actor()).expect("complete");
+        completed_task.complete(&actor(), None).expect("complete");
         let error = completed_task
             .cancel(&actor())
             .expect_err("a completed task must not be cancelled");
@@ -828,7 +839,7 @@ mod tests {
         let mut task = task();
         let version_before = task.version();
         assert!(matches!(
-            task.complete(&actor())
+            task.complete(&actor(), None)
                 .expect_err("pending cannot complete"),
             AppError::Conflict(_)
         ));
@@ -853,7 +864,7 @@ mod tests {
         task.queue(&actor()).expect("queue");
         task.start(&actor(), "w-1", future(30), TaskAttemptId::new())
             .expect("start");
-        task.complete(&actor()).expect("complete");
+        task.complete(&actor(), None).expect("complete");
         let log = task.take_transitions();
         assert_eq!(log.len(), 3);
         assert_eq!(log.first().map(|t| t.to.clone()), Some("queued".to_owned()));

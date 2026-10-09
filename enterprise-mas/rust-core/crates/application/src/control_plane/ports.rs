@@ -33,6 +33,15 @@ use std::fmt;
 /// Durable reservations: the recoverable half of a quota charge.
 #[async_trait::async_trait]
 pub trait ReservationStorePort: Send + Sync + fmt::Debug {
+    /// Serializes a reservation key before the control plane reads it and
+    /// charges quota. Production implementations hold this lock for the
+    /// authoritative request transaction; without it two replicas can both
+    /// miss a row, both charge, and only one can retain the reservation.
+    ///
+    /// In-memory test implementations may be a no-op because the control
+    /// plane also holds a process-local gate around the same critical section.
+    async fn lock_key(&self, tenant: TenantId, reservation_key: &str) -> Result<()>;
+
     /// Authorises `amount` units under `reservation_key`, idempotently.
     #[allow(clippy::too_many_arguments)]
     async fn reserve(

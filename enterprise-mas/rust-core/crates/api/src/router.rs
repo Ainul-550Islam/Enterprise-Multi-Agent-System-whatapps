@@ -29,8 +29,9 @@ use axum::routing::{get, post, put};
 use axum::Router;
 
 use crate::handlers::{
-    agents, control_plane, executions, health, internal, rollbacks, schedules, tenancy, workflows,
-    Ctx, MAX_BODY_BYTES,
+    agents, analytics, api_keys, approvals, control_plane, data_hub, executions, health,
+    inbound_webhooks, integrations, internal, notifications, oauth, rollbacks, schedules, search,
+    tenancy, workflows, Ctx, MAX_BODY_BYTES,
 };
 use crate::middleware::{authenticated_layer, request_context_layer};
 use crate::response::ApiError;
@@ -40,7 +41,21 @@ use crate::state::AppState;
 pub fn router(state: AppState) -> Router {
     let public = Router::new()
         .route("/v1/health/live", get(health::live))
-        .route("/v1/health/ready", get(health::ready));
+        .route("/v1/health/ready", get(health::ready))
+        // Public only in the narrow provider-callback sense: its route id
+        // selects server-owned metadata and its handler verifies an HMAC before
+        // receipt insertion. No user/API-key authentication is applicable.
+        .route(
+            "/v1/public/inbound-webhooks/{route_id}",
+            post(inbound_webhooks::ingest)
+                .layer(DefaultBodyLimit::max(mas_integrations::inbound_webhooks::MAX_INBOUND_WEBHOOK_BYTES)),
+        )
+        // OAuth callbacks carry an opaque one-shot state; they never accept a
+        // tenant, connector, redirect URI, or provider endpoint from query.
+        .route(
+            "/v1/public/oauth/{provider}/callback",
+            get(oauth::callback),
+        );
 
     let protected = Router::new()
         // ---- tenancy / identity ------------------------------------
@@ -59,6 +74,71 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/v1/agents/{agent_id}/versions/{version}/rollback",
             post(rollbacks::rollback_agent),
+        )
+        // ---- approvals -----------------------------------------------
+        .route("/v1/approvals", get(approvals::list))
+        .route("/v1/approvals/{id}/approve", post(approvals::approve))
+        .route("/v1/approvals/{id}/deny", post(approvals::deny))
+        // ---- API keys ------------------------------------------------
+        .route("/v1/api-keys", post(api_keys::create).get(api_keys::list))
+        .route("/v1/api-keys/{id}/revoke", post(api_keys::revoke))
+        .route("/v1/api-keys/{id}/rotate", post(api_keys::rotate))
+        // ---- recipient notifications --------------------------------
+        .route(
+            "/v1/notifications/recipients/{recipient_id}",
+            get(notifications::list),
+        )
+        .route(
+            "/v1/notifications/recipients/{recipient_id}/{notification_id}/read",
+            post(notifications::mark_read),
+        )
+        .route(
+            "/v1/notifications/recipients/{recipient_id}/{notification_id}/archive",
+            post(notifications::archive),
+        )
+        // ---- canonical connectors and outbound webhooks --------------
+        .route(
+            "/v1/connectors",
+            post(integrations::register_connector).get(integrations::list_connectors),
+        )
+        .route("/v1/connectors/test", post(integrations::test_connector))
+        .route(
+            "/v1/connectors/{connector_id}",
+            get(integrations::get_connector),
+        )
+        .route(
+            "/v1/webhooks",
+            post(integrations::register_webhook).get(integrations::list_webhooks),
+        )
+        .route(
+            "/v1/webhooks/{webhook_id}/enable",
+            post(integrations::enable_webhook),
+        )
+        .route(
+            "/v1/webhooks/{webhook_id}/disable",
+            post(integrations::disable_webhook),
+        )
+        // ---- connector-bound OAuth authorization ---------------------
+        .route(
+            "/v1/connectors/{connector_id}/oauth/authorize",
+            post(oauth::begin),
+        )
+        // ---- inbound webhook endpoint configuration -----------------
+        .route(
+            "/v1/inbound-webhooks",
+            post(inbound_webhooks::register).get(inbound_webhooks::list),
+        )
+        .route(
+            "/v1/inbound-webhooks/{endpoint_id}",
+            get(inbound_webhooks::get),
+        )
+        .route(
+            "/v1/inbound-webhooks/{endpoint_id}/enable",
+            post(inbound_webhooks::enable),
+        )
+        .route(
+            "/v1/inbound-webhooks/{endpoint_id}/disable",
+            post(inbound_webhooks::disable),
         )
         // ---- workflows ----------------------------------------------
         .route("/v1/workflows", post(workflows::create).get(workflows::list))
@@ -90,6 +170,37 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/schedules/{schedule_id}/pause", post(schedules::pause))
         .route("/v1/schedules/{schedule_id}/resume", post(schedules::resume))
         .route("/v1/schedules/{schedule_id}/disable", post(schedules::disable))
+        // ---- command palette search ---------------------------------
+        .route("/v1/search", get(search::search))
+        // ---- Data Hub -------------------------------------------------
+        .route(
+            "/v1/data-sources",
+            post(data_hub::create_source).get(data_hub::list_sources),
+        )
+        .route("/v1/data-sources/{id}", get(data_hub::get_source))
+        .route("/v1/data-sources/{id}/sync", post(data_hub::sync_source))
+        .route(
+            "/v1/data-sources/{id}/documents",
+            get(data_hub::list_documents),
+        )
+        // This endpoint has its own bounded 64 MiB extractor limit; the Data
+        // Hub application service applies the deployment-specific limit again
+        // before retaining content or calling the Python bridge.
+        .route(
+            "/v1/documents/upload",
+            post(data_hub::upload_document)
+                .layer(DefaultBodyLimit::max(data_hub::MAX_DATA_HUB_MULTIPART_BYTES)),
+        )
+        .route(
+            "/v1/documents/{id}",
+            get(data_hub::get_document).delete(data_hub::delete_document),
+        )
+        // ---- dashboard / deterministic insights ---------------------
+        .route("/v1/analytics/overview", get(analytics::overview))
+        .route("/v1/analytics/performance", get(analytics::performance))
+        .route("/v1/analytics/tasks-by-agent", get(analytics::tasks_by_agent))
+        .route("/v1/analytics/usage-cost", get(analytics::usage_cost))
+        .route("/v1/assistant/insights", get(analytics::insights))
         // ---- control plane (billing, entitlements, usage) -----------
         // Tenant-scoped: the tenant comes from the authenticated scope, never
         // from the path or the body, so no caller can read another tenant's
@@ -352,6 +463,83 @@ mod tests {
         assert_eq!(body["error"]["code"], "UNAUTHENTICATED");
         assert!(body["meta"]["request_id"].is_string());
         let _ = missing_auth;
+    }
+
+    #[tokio::test]
+    async fn platform_admin_can_reach_global_organization_catalog_without_forging_a_tenant() {
+        let mut state = inmemory_state();
+        state.verifier = Arc::new(
+            crate::auth::StaticTokenVerifier::new()
+                .with_token("platform-token", mas_security::SecurityPrincipal::system()),
+        );
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/v1/organizations")
+                    .header(header::AUTHORIZATION, "Bearer platform-token")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(json_body(response).await["data"].is_array());
+    }
+
+    #[tokio::test]
+    async fn search_route_validates_bounded_queries_and_uses_the_standard_envelope() {
+        let seeded = seeded().await;
+        let success = seeded
+            .router
+            .clone()
+            .oneshot(scoped_request(
+                &seeded,
+                Method::GET,
+                "/v1/search?q=route&limit=1&kinds=agents",
+                None,
+            ))
+            .await
+            .expect("search response");
+        assert_eq!(success.status(), StatusCode::OK);
+        let body = json_body(success).await;
+        assert!(body["data"]["items"].is_array());
+        assert_eq!(body["data"]["truncated"], false);
+        assert_eq!(body["meta"]["correlation_id"], "http-corr-9");
+
+        let too_short = seeded
+            .router
+            .clone()
+            .oneshot(scoped_request(
+                &seeded,
+                Method::GET,
+                "/v1/search?q=ab",
+                None,
+            ))
+            .await
+            .expect("validation response");
+        assert_eq!(too_short.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            json_body(too_short).await["error"]["code"],
+            "VALIDATION_FAILED"
+        );
+
+        let malformed = seeded
+            .router
+            .clone()
+            .oneshot(scoped_request(
+                &seeded,
+                Method::GET,
+                "/v1/search?q=route&limit=not-a-number",
+                None,
+            ))
+            .await
+            .expect("malformed-query response");
+        assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            json_body(malformed).await["error"]["code"],
+            "VALIDATION_FAILED"
+        );
     }
 
     #[tokio::test]

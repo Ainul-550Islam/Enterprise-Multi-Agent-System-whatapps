@@ -10,6 +10,7 @@
 use async_trait::async_trait;
 use mas_common::ids::{ConnectorId, TenantId};
 use mas_common::result::Result;
+use mas_common::timestamps::Timestamp;
 use mas_domain::Connector;
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -27,13 +28,32 @@ pub trait ProviderRegistryPort: std::fmt::Debug + Send + Sync {
     async fn register(&self, manifest: ProviderManifest) -> Result<()>;
 }
 
+/// Stable descending keyset position for tenant connector metadata.
+///
+/// Cursor state contains only ordering fields already visible in a connector
+/// response; the tenant remains server-side request authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectorCursor {
+    pub created_at: Timestamp,
+    pub id: ConnectorId,
+}
+
 /// Read/write port over installed tenant connectors.
 #[async_trait]
 pub trait ConnectorRegistryPort: std::fmt::Debug + Send + Sync {
     /// Tenant-scoped lookup; foreign ids return `Ok(None)`.
     async fn get(&self, tenant: TenantId, id: ConnectorId) -> Result<Option<Connector>>;
-    /// Lists all connectors installed by `tenant`, ordered by id.
+    /// Lists all connectors installed by `tenant`, ordered by id. This legacy
+    /// store-level helper is not suitable for public API listing; callers at
+    /// the API edge must use [`Self::list_page`].
     async fn list(&self, tenant: TenantId) -> Result<Vec<Connector>>;
+    /// Lists a bounded stable page ordered `created_at DESC, id DESC`.
+    async fn list_page(
+        &self,
+        tenant: TenantId,
+        after: Option<ConnectorCursor>,
+        limit: u16,
+    ) -> Result<Vec<Connector>>;
     /// Inserts or replaces a connector (keyed by (tenant, id)).
     async fn save(&self, connector: &Connector) -> Result<()>;
     /// Removes a tenant-scoped connector. Returns whether it existed.
@@ -186,6 +206,36 @@ impl ConnectorRegistryPort for InMemoryConnectorRegistry {
             .take_while(|((t, _), _)| *t == tenant)
             .map(|(_, c)| c.clone())
             .collect())
+    }
+
+    async fn list_page(
+        &self,
+        tenant: TenantId,
+        after: Option<ConnectorCursor>,
+        limit: u16,
+    ) -> Result<Vec<Connector>> {
+        let mut connectors = self
+            .connectors
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .range((tenant, ConnectorId::nil())..)
+            .take_while(|((stored_tenant, _), _)| *stored_tenant == tenant)
+            .map(|(_, connector)| connector.clone())
+            .filter(|connector| {
+                after.is_none_or(|cursor| {
+                    connector.created_at < cursor.created_at
+                        || (connector.created_at == cursor.created_at && connector.id < cursor.id)
+                })
+            })
+            .collect::<Vec<_>>();
+        connectors.sort_by(|left, right| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        connectors.truncate(usize::from(limit.clamp(1, 201)));
+        Ok(connectors)
     }
 
     async fn save(&self, connector: &Connector) -> Result<()> {

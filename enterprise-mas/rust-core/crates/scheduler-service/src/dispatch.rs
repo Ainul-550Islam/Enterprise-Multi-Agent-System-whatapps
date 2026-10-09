@@ -277,7 +277,7 @@ impl HttpDispatcher {
         let runs =
             SafeUrl::parse_internal_endpoint(&format!("{base_url}/v1/internal/schedule-runs"))?;
         policy.check_destination(&runs)?;
-        let client = GuardedHttpClient::new(ReqwestEgress::new(policy.clone())?, policy);
+        let client = GuardedHttpClient::new(ReqwestEgress::new(policy.clone()), policy);
         Ok(Self {
             ledger,
             client,

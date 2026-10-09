@@ -46,12 +46,9 @@ pub async fn create(
     Ctx(ctx): Ctx,
     Json(body): Json<CreateWorkflowRequest>,
 ) -> ApiResult<WorkflowResponse> {
-    scoped(&ctx)?;
     body.validate()
         .map_err(|e| crate::response::ApiError::new(e, &ctx))?;
-    let service_ctx = ctx
-        .service_context()
-        .map_err(|e| crate::response::ApiError::new(e, &ctx))?;
+    let service_ctx = authorized_workflow(&ctx, mas_security::Action::Create, None)?;
     state
         .workflows
         .create(&service_ctx, body.project_id, &body.name)
@@ -69,12 +66,9 @@ pub async fn update_graph(
     Ctx(ctx): Ctx,
     Json(body): Json<WorkflowGraphDto>,
 ) -> ApiResult<WorkflowGraphUpdateResponse> {
-    scoped(&ctx)?;
     let (nodes, edges) =
         dto_to_graph(&body).map_err(|e| crate::response::ApiError::new(e, &ctx))?;
-    let service_ctx = ctx
-        .service_context()
-        .map_err(|e| crate::response::ApiError::new(e, &ctx))?;
+    let service_ctx = authorized_workflow(&ctx, mas_security::Action::Update, None)?;
     let order = state
         .workflows
         .update_graph(&service_ctx, workflow_id, nodes, edges)
@@ -181,10 +175,7 @@ pub async fn get(
     Path(workflow_id): Path<WorkflowId>,
     Ctx(ctx): Ctx,
 ) -> ApiResult<WorkflowResponse> {
-    scoped(&ctx)?;
-    let service_ctx = ctx
-        .service_context()
-        .map_err(|e| crate::response::ApiError::new(e, &ctx))?;
+    let service_ctx = authorized_workflow(&ctx, mas_security::Action::Read, None)?;
     state
         .workflows
         .get(&service_ctx, workflow_id)
@@ -206,10 +197,7 @@ pub async fn list(
     Query(query): Query<ListQuery>,
     Ctx(ctx): Ctx,
 ) -> ApiResult<Vec<WorkflowResponse>> {
-    scoped(&ctx)?;
-    let service_ctx = ctx
-        .service_context()
-        .map_err(|e| crate::response::ApiError::new(e, &ctx))?;
+    let service_ctx = authorized_workflow(&ctx, mas_security::Action::Read, None)?;
     state
         .workflows
         .list(&service_ctx, query.project_id)
@@ -267,10 +255,16 @@ pub fn dto_to_graph(
     Ok((nodes, edges))
 }
 
-fn scoped(
+fn authorized_workflow(
     ctx: &crate::context::RequestContext,
-) -> std::result::Result<(), crate::response::ApiError> {
-    ctx.require_scope()
-        .map(|_| ())
-        .map_err(|e| crate::response::ApiError::new(e, ctx))
+    action: mas_security::Action,
+    project_id: Option<mas_common::ids::ProjectId>,
+) -> std::result::Result<mas_application::context::ServiceContext, crate::response::ApiError> {
+    crate::handlers::authorized_service_context(
+        ctx,
+        mas_security::ResourceKind::Workflow,
+        action,
+        project_id,
+    )
+    .map_err(|error| crate::response::ApiError::new(error, ctx))
 }

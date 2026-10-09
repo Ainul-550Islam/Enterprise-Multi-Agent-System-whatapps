@@ -27,6 +27,9 @@ mas-application = { workspace = true }
 mas-contracts = { workspace = true }
 mas-domain = { workspace = true }
 mas-events = { workspace = true }
+# Implements the durable webhook lease port declared by the integration layer;
+# integrations itself does not depend on persistence, so this edge is acyclic.
+mas-integrations = { workspace = true }
 mas-security = { workspace = true }
 mas-tenancy = { workspace = true }
 mas-messaging = { workspace = true }
@@ -48,6 +51,8 @@ async-trait = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 
 [dev-dependencies]

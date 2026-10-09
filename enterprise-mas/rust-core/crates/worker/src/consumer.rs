@@ -19,7 +19,8 @@
 //! protocol this implements; the code below is written so every outcome
 //! maps to exactly one broker instruction *and* one lifecycle record.
 
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use mas_application::durable::ExecutionUsage;
@@ -35,6 +36,12 @@ use mas_messaging::codec::{CodecConfig, JsonEventCodec};
 
 use crate::attempts::{AttemptCoordinator, ClaimOneOutcome};
 use crate::backoff::RetryPolicy;
+#[cfg(test)]
+use crate::delivery_receipts::InMemoryDeliveryReceiptStore;
+use crate::delivery_receipts::{
+    receipt_expiry, DeliveryReceipt, DeliveryReceiptPort, DeliveryReceiptSettlement,
+    DeliveryReservationRequest,
+};
 use crate::grace::ShutdownWatch;
 use crate::handler::TaskHandlerPort;
 use crate::run_slot::RunSlot;
@@ -53,7 +60,10 @@ pub struct ConsumerConfig {
     pub ack_wait: Duration,
     /// Idle sleep between empty fetches.
     pub poll_interval: Duration,
-    /// Fenced-task lease window (renewed with the heartbeat).
+    /// Expected fenced-task lease window. The heartbeat uses the shortest of
+    /// this value, the coordinator's actual lease, and the broker ack window,
+    /// so a configuration mismatch can only make renewal more frequent —
+    /// never less safe.
     pub lease_ttl: Duration,
     /// Max simultaneous in-flight tasks on this instance.
     pub max_in_flight: usize,
@@ -81,6 +91,42 @@ impl Default for ConsumerConfig {
             worker_name: "worker-0".to_owned(),
             retry: RetryPolicy::default(),
         }
+    }
+}
+
+impl ConsumerConfig {
+    /// Validates timing and capacity invariants before the consumer opens a
+    /// broker subscription. In particular, zero/near-zero heartbeat windows
+    /// would make `tokio::time::interval` panic or spin indefinitely.
+    pub fn validate(&self) -> Result<()> {
+        const MIN_HEARTBEAT_WINDOW: Duration = Duration::from_millis(2);
+        if self.consumer_name.trim().is_empty() {
+            return Err(AppError::validation("consumer_name must not be empty"));
+        }
+        if self.worker_name.trim().is_empty() {
+            return Err(AppError::validation("worker_name must not be empty"));
+        }
+        if self.batch_size == 0 {
+            return Err(AppError::validation("batch_size must be at least 1"));
+        }
+        if self.poll_interval.is_zero() {
+            return Err(AppError::validation("poll_interval must be positive"));
+        }
+        if self.drain_timeout.is_zero() {
+            return Err(AppError::validation("drain_timeout must be positive"));
+        }
+        if self.ack_wait < MIN_HEARTBEAT_WINDOW {
+            return Err(AppError::validation(
+                "ack_wait must be at least 2ms for a safe heartbeat",
+            ));
+        }
+        if self.lease_ttl < MIN_HEARTBEAT_WINDOW {
+            return Err(AppError::validation(
+                "lease_ttl must be at least 2ms for a safe heartbeat",
+            ));
+        }
+        self.retry.validated()?;
+        Ok(())
     }
 }
 
@@ -115,6 +161,7 @@ pub struct TaskConsumer {
     broker: Arc<dyn BrokerPort>,
     attempts: Arc<AttemptCoordinator>,
     handler: Arc<dyn TaskHandlerPort>,
+    receipts: Arc<dyn DeliveryReceiptPort>,
     config: ConsumerConfig,
 }
 
@@ -122,8 +169,17 @@ pub struct TaskConsumer {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Settlement {
     Ack,
-    Nak { delay: Duration, kind: NakKind },
-    Term { kind: TermKind },
+    Nak {
+        delay: Duration,
+        kind: NakKind,
+    },
+    Term {
+        kind: TermKind,
+    },
+    /// No broker instruction was sent. A competing live receipt owns this
+    /// delivery, so leaving the hint to expire is safer than changing the
+    /// queued task's redelivery schedule underneath that claimant.
+    DeferredToReceiptOwner,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,12 +206,18 @@ impl TaskConsumer {
         broker: Arc<dyn BrokerPort>,
         attempts: Arc<AttemptCoordinator>,
         handler: Arc<dyn TaskHandlerPort>,
+        receipts: Arc<dyn DeliveryReceiptPort>,
         config: ConsumerConfig,
     ) -> Self {
+        // Receipt storage is deliberately explicit. A process-local default
+        // would make a production call site compile while silently losing the
+        // cross-replica/restart duplicate-delivery guarantee this consumer
+        // relies on. Tests may pass `InMemoryDeliveryReceiptStore` explicitly.
         Self {
             broker,
             attempts,
             handler,
+            receipts,
             config,
         }
     }
@@ -164,6 +226,15 @@ impl TaskConsumer {
     /// then runs the fetch loop until `shutdown` flips, drains in-flight,
     /// and returns the accounting snapshot.
     pub async fn run(&self, mut shutdown: ShutdownWatch) -> Result<ConsumerOutcome> {
+        self.config.validate()?;
+        // The coordinator owns the actual durable lease. A sub-2ms lease
+        // cannot be renewed safely by an async heartbeat, even when a caller
+        // constructed the coordinator outside this type.
+        if self.attempts.lease_ttl() < Duration::from_millis(2) {
+            return Err(AppError::validation(
+                "attempt coordinator lease_ttl must be at least 2ms",
+            ));
+        }
         self.broker
             .ensure_consumer(BrokerConsumerConfig {
                 name: self.config.consumer_name.clone(),
@@ -295,6 +366,8 @@ impl TaskConsumer {
             broker: Arc::clone(&self.broker),
             attempts: Arc::clone(&self.attempts),
             handler: Arc::clone(&self.handler),
+            receipts: Arc::clone(&self.receipts),
+            receipt_flights: Arc::new(Mutex::new(BTreeMap::new())),
             codec: JsonEventCodec::new(CodecConfig::default()),
             config: self.config.clone(),
         }
@@ -313,6 +386,11 @@ struct Mediator {
     broker: Arc<dyn BrokerPort>,
     attempts: Arc<AttemptCoordinator>,
     handler: Arc<dyn TaskHandlerPort>,
+    receipts: Arc<dyn DeliveryReceiptPort>,
+    /// Maps the transport-local broker sequence to the database-generated
+    /// receipt identity for this delivery. It is process-local only as a
+    /// cache: the receipt itself lives in PostgreSQL in production.
+    receipt_flights: Arc<Mutex<BTreeMap<u64, DeliveryReceipt>>>,
     codec: JsonEventCodec,
     config: ConsumerConfig,
 }
@@ -363,7 +441,72 @@ impl Mediator {
         let task_id = task_msg.task_id;
         let tenant_id = task_msg.tenant_id;
 
-        // ── 2. Concurrency slot — taken BEFORE the durable claim. ─────
+        // ── 2. Durable delivery receipt — before a claim or handler. ───
+        //
+        // The broker's sequence is only a protocol handle. This reservation
+        // receives a database-generated identity and is the cross-replica
+        // proof that this worker owns this delivery. A live conflicting
+        // receipt means another delivery/worker is already in flight, so this
+        // delivery is deferred without touching task state.
+        let receipt_expiry_at = match receipt_expiry(Timestamp::now(), self.config.ack_wait) {
+            Ok(expiry) => expiry,
+            Err(error) => {
+                tracing::error!(%task_id, sequence, %error, "could not calculate delivery receipt expiry");
+                let settlement = self.nak_transient(sequence, deliveries).await;
+                return MessageOutcome {
+                    settlement,
+                    handler_failed: false,
+                    stale_ownership: false,
+                };
+            },
+        };
+        let receipt = match self
+            .receipts
+            .reserve(DeliveryReservationRequest {
+                consumer_name: self.config.consumer_name.clone(),
+                task_id: task_id.into_uuid(),
+                tenant_id: tenant_id.into_uuid(),
+                worker_id: self.config.worker_name.clone(),
+                delivery_count: deliveries.max(1),
+                lease_expires_at: receipt_expiry_at,
+            })
+            .await
+        {
+            Ok(Some(receipt)) => receipt,
+            Ok(None) => {
+                // Do not NAK this duplicate. The PostgreSQL broker turns a
+                // NAK into `tasks.not_before`, which can pace the still-queued
+                // task before the receipt owner reaches `claim_one`. Nor can
+                // this replica ACK a queued task: the receipt belongs to the
+                // other worker, not to this transport handle. Leave this hint
+                // unacknowledged; its normal ack window redelivers it if the
+                // owner dies, while a successful owner settles its own copy.
+                tracing::info!(%task_id, sequence, "live delivery receipt exists; leaving duplicate unacknowledged");
+                return MessageOutcome {
+                    settlement: Settlement::DeferredToReceiptOwner,
+                    handler_failed: false,
+                    stale_ownership: false,
+                };
+            },
+            Err(error) => {
+                // Fail closed: no durable receipt means no durable authority
+                // to execute, so let the transport redeliver after the store
+                // recovers rather than running work under a volatile claim.
+                tracing::error!(%task_id, sequence, %error, "delivery receipt reservation failed; deferring");
+                let settlement = self.nak_transient(sequence, deliveries).await;
+                return MessageOutcome {
+                    settlement,
+                    handler_failed: false,
+                    stale_ownership: false,
+                };
+            },
+        };
+        self.receipt_flights
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(sequence, receipt);
+
+        // ── 3. Concurrency slot — taken BEFORE the durable claim. ─────
         //
         // Ordering is the whole point. If the slot were taken after the
         // claim, a refusal would leave a durable attempt behind for work
@@ -529,6 +672,44 @@ impl Mediator {
             },
         };
         let attempt_number = claim.attempt.attempt_number;
+        let Some(receipt) = self.receipt_for(sequence) else {
+            // This should be unreachable: every decoded delivery reserves a
+            // receipt before entering this path. Refuse to execute if the
+            // local cache was lost rather than detaching work from its audit
+            // record.
+            tracing::error!(%task_id, sequence, "delivery receipt cache missing after claim; deferring");
+            let settlement = self.nak_transient(sequence, deliveries).await;
+            return MessageOutcome {
+                settlement,
+                handler_failed: false,
+                stale_ownership: false,
+            };
+        };
+        match self
+            .receipts
+            .attach_attempt(receipt, claim.attempt.id.into_uuid())
+            .await
+        {
+            Ok(true) => {},
+            Ok(false) => {
+                tracing::warn!(%task_id, sequence, receipt = receipt.sequence, "delivery receipt lost before attempt attach; deferring");
+                let settlement = self.nak_transient(sequence, deliveries).await;
+                return MessageOutcome {
+                    settlement,
+                    handler_failed: false,
+                    stale_ownership: false,
+                };
+            },
+            Err(error) => {
+                tracing::error!(%task_id, sequence, receipt = receipt.sequence, %error, "delivery receipt attach failed; deferring");
+                let settlement = self.nak_transient(sequence, deliveries).await;
+                return MessageOutcome {
+                    settlement,
+                    handler_failed: false,
+                    stale_ownership: false,
+                };
+            },
+        }
 
         // ── 3b. Deadline that lapsed before work could start. ─────────
         if let Some(deadline) = task_msg.deadline {
@@ -606,10 +787,22 @@ impl Mediator {
         task_msg: &TaskQueueMessage,
         sequence: u64,
     ) -> std::result::Result<serde_json::Value, AppError> {
-        let heartbeat_interval = self.config.ack_wait / 2;
+        // Renew before *every* independent expiry clock reaches its edge.
+        // Ack wait, configured lease TTL, and the durable coordinator lease
+        // may differ; use their shortest value and then halve it so scheduler
+        // jitter cannot routinely cross a lease boundary.
+        let heartbeat_window = self
+            .config
+            .ack_wait
+            .min(self.config.lease_ttl)
+            .min(self.attempts.lease_ttl());
+        let heartbeat_interval = heartbeat_window / 2;
         let broker = Arc::clone(&self.broker);
         let attempts = Arc::clone(&self.attempts);
+        let receipts = Arc::clone(&self.receipts);
+        let receipt = self.receipt_for(sequence);
         let consumer_name = self.config.consumer_name.clone();
+        let ack_wait = self.config.ack_wait;
         let task_id = claim.task.id;
         let slot_tenant = claim.task.tenant_id;
         let slot_organization = claim.task.organization_id;
@@ -643,11 +836,34 @@ impl Mediator {
                 {
                     tracing::warn!(%task_id, %err, "concurrency slot lease renew failed");
                 }
-                if let Err(err) = broker
+                let receipt_live = match receipt {
+                    Some(receipt) => match receipt_expiry(Timestamp::now(), ack_wait) {
+                        Ok(expires_at) => match receipts.renew(receipt, expires_at).await {
+                            Ok(live) => live,
+                            Err(error) => {
+                                tracing::warn!(receipt = receipt.sequence, %error, "delivery receipt renewal failed during heartbeat");
+                                false
+                            },
+                        },
+                        Err(error) => {
+                            tracing::warn!(%error, "delivery receipt expiry calculation failed during heartbeat");
+                            false
+                        },
+                    },
+                    None => false,
+                };
+                if !receipt_live {
+                    tracing::warn!(
+                        sequence,
+                        "delivery receipt is no longer live; withholding in-progress ack"
+                    );
+                    continue;
+                }
+                if let Err(error) = broker
                     .ack(&consumer_name, sequence, AckInstruction::InProgress)
                     .await
                 {
-                    tracing::warn!(%err, "in-progress ack failed during heartbeat");
+                    tracing::warn!(%error, "in-progress ack failed during heartbeat");
                 }
             }
         });
@@ -678,7 +894,13 @@ impl Mediator {
         let settled = match outcome {
             Ok(value) => {
                 self.attempts
-                    .succeed(claim, usage_from(value), finalize_execution, &now)
+                    .succeed(
+                        claim,
+                        value.clone(),
+                        usage_from(value),
+                        finalize_execution,
+                        &now,
+                    )
                     .await
             },
             Err(err) => {
@@ -767,15 +989,69 @@ impl Mediator {
         (self.nak_transient(sequence, deliveries).await, false)
     }
 
-    /// Best-effort broker acknowledgement. A failed ack is logged, never
-    /// treated as a task failure: the broker redelivers on its own schedule.
+    /// Looks up the durable identity for this process-local broker handle.
+    fn receipt_for(&self, sequence: u64) -> Option<DeliveryReceipt> {
+        self.receipt_flights
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&sequence)
+            .copied()
+    }
+
+    /// Persist a delivery state before matching a broker ACK/NAK/TERM.
+    async fn settle_receipt(&self, sequence: u64, settlement: DeliveryReceiptSettlement) -> bool {
+        let Some(receipt) = self.receipt_for(sequence) else {
+            // Undecodable frames have no trusted task id and therefore no
+            // receipt. Their transport TERM remains valid; all decoded work
+            // must have reached this branch with a receipt.
+            return true;
+        };
+        match self.receipts.settle(receipt, settlement).await {
+            Ok(true) => {
+                self.receipt_flights
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .remove(&sequence);
+                true
+            },
+            Ok(false) => {
+                tracing::warn!(
+                    sequence,
+                    receipt = receipt.sequence,
+                    "delivery receipt was no longer live; withholding broker settlement"
+                );
+                false
+            },
+            Err(error) => {
+                tracing::error!(sequence, receipt = receipt.sequence, %error, "delivery receipt settlement failed; withholding broker settlement");
+                false
+            },
+        }
+    }
+
+    /// Persists the receipt decision, then sends the matching broker signal.
+    ///
+    /// A receipt-store failure is not best effort: sending a broker ACK after
+    /// it would erase work from the transport without an auditable delivery
+    /// record. The message is deliberately left unacked for redelivery.
     async fn ack(&self, sequence: u64, instruction: AckInstruction) {
-        if let Err(err) = self
+        let receipt_state = match instruction {
+            AckInstruction::Ack => Some(DeliveryReceiptSettlement::Acked),
+            AckInstruction::Nak { .. } => Some(DeliveryReceiptSettlement::Nacked),
+            AckInstruction::Term => Some(DeliveryReceiptSettlement::Terminated),
+            AckInstruction::InProgress => None,
+        };
+        if let Some(receipt_state) = receipt_state {
+            if !self.settle_receipt(sequence, receipt_state).await {
+                return;
+            }
+        }
+        if let Err(error) = self
             .broker
             .ack(&self.config.consumer_name, sequence, instruction)
             .await
         {
-            tracing::error!(sequence, %err, "broker ack failed");
+            tracing::error!(sequence, %error, "broker ack failed");
         }
     }
 
@@ -890,13 +1166,14 @@ fn credits_to_counters(outcome: &MessageOutcome, counters: &mut ConsumerOutcome)
             counters.skipped += 1;
         },
         Settlement::Term { .. } => counters.terms += 1,
+        Settlement::DeferredToReceiptOwner => {},
     }
     if outcome.stale_ownership {
         counters.stale_ownership += 1;
     }
     if outcome.handler_failed {
         counters.failed += 1;
-    } else {
+    } else if !matches!(outcome.settlement, Settlement::DeferredToReceiptOwner) {
         counters.completed += 1;
     }
 }
@@ -908,6 +1185,10 @@ fn trace_result(sequence: u64, outcome: &MessageOutcome) {
             tracing::debug!(sequence, ?delay, ?kind, "message requeued");
         },
         Settlement::Term { kind } => tracing::debug!(sequence, ?kind, "message terminated"),
+        Settlement::DeferredToReceiptOwner => tracing::debug!(
+            sequence,
+            "duplicate delivery left for its live receipt owner"
+        ),
     }
 }
 
@@ -953,6 +1234,36 @@ mod tests {
         }
     }
 
+    #[test]
+    fn consumer_configuration_rejects_unsafe_heartbeat_windows() {
+        let config = ConsumerConfig {
+            ack_wait: Duration::ZERO,
+            ..ConsumerConfig::default()
+        };
+        assert!(
+            config.validate().is_err(),
+            "zero ack wait must fail before interval creation"
+        );
+
+        let config = ConsumerConfig {
+            lease_ttl: Duration::from_millis(1),
+            ..ConsumerConfig::default()
+        };
+        assert!(
+            config.validate().is_err(),
+            "near-zero lease must fail safely"
+        );
+
+        let config = ConsumerConfig {
+            batch_size: 0,
+            ..ConsumerConfig::default()
+        };
+        assert!(
+            config.validate().is_err(),
+            "zero fetch batch must not create a live-but-idle worker"
+        );
+    }
+
     fn consumer(rig: &Rig, dispatcher: OperationDispatcher, worker: &str) -> TaskConsumer {
         let attempts = Arc::new(
             AttemptCoordinator::new(rig.durable.clone(), worker, 4, Duration::from_secs(30))
@@ -962,6 +1273,7 @@ mod tests {
             rig.broker.clone(),
             attempts,
             Arc::new(dispatcher),
+            Arc::new(InMemoryDeliveryReceiptStore::default()),
             ConsumerConfig {
                 consumer_name: "c-test".to_owned(),
                 filter: mas_messaging::subjects::SubjectFilter::parse("mas.tasks.>").expect("f"),
@@ -1093,6 +1405,8 @@ mod tests {
             broker: rig.broker.clone(),
             attempts,
             handler: rig.handler.clone(),
+            receipts: Arc::new(InMemoryDeliveryReceiptStore::default()),
+            receipt_flights: Arc::new(Mutex::new(BTreeMap::new())),
             codec: JsonEventCodec::new(CodecConfig::default()),
             config: ConsumerConfig {
                 consumer_name: "c-test".to_owned(),
@@ -1580,6 +1894,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_live_receipt_loser_does_not_nak_pace_the_claimant() {
+        let rig = rig();
+        let task = seed(&rig, "idem-live-receipt").await;
+        let queue = queue_message(&task);
+        publish(&rig, &queue).await;
+        let consumer_name = "c-test";
+        rig.broker
+            .ensure_consumer(BrokerConsumerConfig {
+                name: consumer_name.to_owned(),
+                filter: mas_messaging::subjects::SubjectFilter::parse("mas.tasks.>")
+                    .expect("filter"),
+                ack_wait: Duration::from_secs(1),
+                max_deliver: 10,
+            })
+            .await
+            .expect("consumer registration");
+        let delivery = rig
+            .broker
+            .fetch(consumer_name, 1)
+            .await
+            .expect("delivery")
+            .into_iter()
+            .next()
+            .expect("one broker message");
+
+        let receipts = Arc::new(InMemoryDeliveryReceiptStore::default());
+        let owner = receipts
+            .reserve(DeliveryReservationRequest {
+                consumer_name: consumer_name.to_owned(),
+                task_id: task.id.into_uuid(),
+                tenant_id: task.tenant_id.into_uuid(),
+                worker_id: "w-owner".to_owned(),
+                delivery_count: delivery.deliveries,
+                lease_expires_at: receipt_expiry(Timestamp::now(), Duration::from_secs(30))
+                    .expect("receipt expiry"),
+            })
+            .await
+            .expect("receipt reserve");
+        assert!(owner.is_some(), "owner holds the competing receipt");
+
+        let mut loser = mediator(
+            &rig,
+            "w-loser",
+            Arc::new(ScriptedRunSlots::new(RunSlot::NotMetered)),
+        );
+        loser.receipts = receipts;
+        let outcome = loser.mediate(delivery).await;
+        assert!(matches!(
+            outcome.settlement,
+            Settlement::DeferredToReceiptOwner
+        ));
+        assert_eq!(rig.handler.invocations(), 0, "loser never runs work");
+
+        let stats = rig
+            .broker
+            .consumer_stats(consumer_name)
+            .await
+            .expect("broker stats");
+        assert_eq!(stats.nacked, 0, "loser must not mutate redelivery pacing");
+        assert_eq!(stats.pending, 1, "the live owner keeps its transport hint");
+    }
+
+    #[tokio::test]
     async fn capacity_zero_claims_nothing_and_runs_nothing() {
         // A worker configured to run nothing must run nothing — not "run it
         // anyway because the broker delivered it".
@@ -1595,6 +1972,7 @@ mod tests {
             rig.broker.clone(),
             attempts,
             Arc::new(dispatcher(rig.handler.clone())),
+            Arc::new(InMemoryDeliveryReceiptStore::default()),
             ConsumerConfig {
                 consumer_name: "c-test".to_owned(),
                 filter: mas_messaging::subjects::SubjectFilter::parse("mas.tasks.>").expect("f"),
@@ -1664,14 +2042,26 @@ mod tests {
 
         // A finishes late.
         let error = first
-            .succeed(&claim, Default::default(), true, &later)
+            .succeed(
+                &claim,
+                serde_json::Value::Null,
+                Default::default(),
+                true,
+                &later,
+            )
             .await
             .expect_err("a stale worker must not overwrite newer state");
         assert!(matches!(error, AppError::Conflict(_)), "{error:?}");
 
         assert!(
             first
-                .succeed(&claim, Default::default(), true, &later)
+                .succeed(
+                    &claim,
+                    serde_json::Value::Null,
+                    Default::default(),
+                    true,
+                    &later
+                )
                 .await
                 .is_err(),
             "the rejection is stable, not a one-off"

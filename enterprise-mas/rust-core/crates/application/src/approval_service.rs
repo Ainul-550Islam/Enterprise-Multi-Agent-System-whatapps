@@ -87,9 +87,13 @@ impl ApprovalApplicationService {
             ));
         }
         let status = if approve {
-            self.state_machine.approve(id, actor, approver_role).await?
+            self.state_machine
+                .approve_with_reason(id, actor, approver_role, Some(reason.to_owned()))
+                .await?
         } else {
-            self.state_machine.reject(id, actor, approver_role).await?
+            self.state_machine
+                .reject_with_reason(id, actor, approver_role, Some(reason.to_owned()))
+                .await?
         };
         let decided = self
             .store

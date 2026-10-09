@@ -1,10 +1,12 @@
 """Generic OpenAI-compatible endpoint adapter.
 
-Many deployments expose an OpenAI-shaped Chat Completions API on a private
-host: a corporate gateway, a self-hosted vLLM/Ollama front end, or a regional
-proxy. Rather than duplicating the OpenAI adapter (~400 lines of wire
-encoding), this module configures :class:`OpenAIProvider` for a caller-supplied
-endpoint.
+Many deployments expose an OpenAI-shaped Chat Completions API through a
+reviewed public gateway or regional proxy. Rather than duplicating the OpenAI
+adapter (~400 lines of wire encoding), this module configures
+:class:`OpenAIProvider` for a caller-supplied endpoint. Private-network model
+gateways are intentionally not reachable from this process: they must be
+exposed through a separately reviewed platform egress boundary rather than
+turning this tenant-adjacent adapter into a private-network exception.
 
 That reuse is deliberate (spec §4 forbids duplicate implementations where an
 existing one can be safely reused). What this module *adds* is the part the
@@ -168,7 +170,10 @@ class CompatibleProvider:
 
         policy = HttpPolicy(
             allowed_hosts=frozenset({host}),
-            allow_private_networks=not scheme_is_secure or config.allow_insecure_http,
+            # A configured compatible endpoint is still an outbound network
+            # destination, not an exception to SSRF policy. Private, metadata,
+            # loopback, and IPv4-mapped addresses remain blocked immediately
+            # before the TCP dial in every environment.
             require_https=scheme_is_secure,
         )
         if not policy.is_host_allowed(host):  # pragma: no cover - defensive

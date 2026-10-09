@@ -43,11 +43,16 @@ use mas_persistence::repositories::agents::{AgentStore, AgentVersionStore};
 use mas_persistence::repositories::api_keys::ApiKeyStore;
 use mas_persistence::repositories::audit::PostgresAuditLog;
 use mas_persistence::repositories::broker::PgTaskBroker;
+use mas_persistence::repositories::delivery_receipts::PostgresDeliveryReceiptStore;
 use mas_persistence::repositories::executions::ExecutionStore;
 use mas_persistence::repositories::schedules::ScheduleStore;
 use mas_persistence::repositories::tasks::TaskStore;
 use mas_persistence::repositories::tenancy::{OrganizationStore, ProjectStore, TenantStore};
 use mas_persistence::repositories::workflows::WorkflowStore;
+use mas_worker::delivery_receipts::{
+    receipt_expiry, DeliveryReceiptPort, DeliveryReservationRequest,
+};
+use std::time::Duration;
 
 /// The standard org → tenant → project fixture, seeded through the tenancy
 /// stores (the same code paths production uses).
@@ -632,17 +637,22 @@ async fn api_keys_prefix_lookup_and_touch() {
     scoped(pool.clone(), tenant, organization, |pool| async move {
         let store = ApiKeyStore::new(pool);
         store.touch_last_used(key_id, tenant).await.expect("touch");
-        let after = store.find_by_prefix(&prefix).await.expect("re-read");
-        let touched = after
-            .iter()
-            .find(|candidate| candidate.id == key_id)
-            .expect("row");
-        assert!(
-            touched.last_used_at.is_some(),
-            "touch_last_used writes the marker"
-        );
     })
     .await;
+
+    // `touch_last_used` correctly joins the request transaction. Its write is
+    // not visible to the pre-authentication lookup's separate connection until
+    // that request commits, so verify the durable marker after `scoped` has
+    // completed rather than making a false dirty-read assertion.
+    let after = auth_store.find_by_prefix(&prefix).await.expect("re-read");
+    let touched = after
+        .iter()
+        .find(|candidate| candidate.id == key_id)
+        .expect("row");
+    assert!(
+        touched.last_used_at.is_some(),
+        "touch_last_used writes the marker"
+    );
 }
 
 #[tokio::test]
@@ -786,19 +796,46 @@ async fn broker_publish_fetch_ack_round_trip() {
     assert_eq!(decoded.agent_id, Some(agent_id));
     assert_eq!(decoded.agent_version_id, Some(agent_version_id));
 
-    // Production settles the row through the lifecycle store BEFORE acking
-    // (worker/src/consumer.rs): `PgTaskBroker::ack(Ack)` only validates that
-    // the settlement happened. Mirror that order here.
-    let lifecycle = TaskStore::new(pool.clone());
-    let mut settled = lifecycle
-        .load(decoded.task_id)
+    // Production claims and settles through the durable execution port BEFORE
+    // acknowledging the broker hint (worker/src/consumer.rs). A queued task
+    // cannot legally complete: the durable claim is what installs its worker
+    // fence and attempt ledger entry. Mirror that real lifecycle rather than
+    // bypassing its state machine in this repository test.
+    let durable = PgDurableExecution::new(pool.clone());
+    let claim_now = Timestamp::now();
+    let claim = durable
+        .claim(ClaimQuery {
+            worker: "itest-worker".to_owned(),
+            capacity: 1,
+            lease_until: claim_now
+                .checked_add(Duration::from_secs(30))
+                .expect("claim lease"),
+            now: claim_now,
+            tenant_id: Some(scope.tenant_id()),
+            task_id: Some(decoded.task_id),
+        })
         .await
-        .expect("lifecycle load")
-        .expect("task row");
-    settled
-        .complete(&TransitionActor::worker("itest-worker").expect("actor"))
-        .expect("complete");
-    lifecycle.save(&settled).await.expect("lifecycle save");
+        .expect("durable claim")
+        .into_iter()
+        .next()
+        .expect("our task claim");
+    durable
+        .settle(TaskSettlement {
+            tenant_id: scope.tenant_id(),
+            task_id: decoded.task_id,
+            attempt_id: claim.attempt.id,
+            worker: "itest-worker".to_owned(),
+            expected_version: claim.task.version(),
+            outcome: TaskOutcome::Succeeded {
+                result: serde_json::Value::Null,
+                usage: ExecutionUsage::default(),
+            },
+            execution: None,
+            actor: TransitionActor::worker("itest-worker").expect("actor"),
+            now: Timestamp::now(),
+        })
+        .await
+        .expect("durable settle");
 
     broker
         .ack(&consumer, seq, AckInstruction::Ack)
@@ -809,6 +846,271 @@ async fn broker_publish_fetch_ack_round_trip() {
     assert!(
         !again.iter().any(|m| m.sequence == seq),
         "acked task is not re-delivered within the ack window"
+    );
+}
+
+/// Regression: an expired worker lease and receipt recover through a fresh
+/// broker process without producing a second live attempt.
+///
+/// This is deliberately a restart-shaped test, not a same-instance retry. A
+/// process-local flight ledger can hide an ownership bug within one process;
+/// constructing `fresh_broker` proves an expired `running` task is discoverable
+/// as a read-only hint and that `PgDurableExecution` alone closes/replaces the
+/// attempt ledger row.
+#[tokio::test]
+async fn expired_running_delivery_is_redelivered_as_one_replacement_attempt() {
+    let Some(pool) = support::live_pool("expired-running-redelivery").await else {
+        return;
+    };
+
+    use mas_messaging::broker::{AckInstruction, BrokerPort, ConsumerConfig, PublishRequest};
+    use mas_messaging::codec::{CodecConfig, JsonEventCodec};
+    use mas_messaging::headers::HeaderSet;
+    use mas_messaging::subjects::{Subject, SubjectFilter};
+
+    let scope = seed_scope(&pool, "expired-redelivery").await;
+    let task_id = TaskId::new();
+    let consumer = format!("recovery-{}", &task_id.to_string()[..8]);
+    let first_broker = PgTaskBroker::new(pool.clone());
+    first_broker
+        .ensure_consumer(
+            ConsumerConfig::new(
+                consumer.clone(),
+                SubjectFilter::parse("mas.tasks.>").expect("filter"),
+            )
+            .expect("consumer config"),
+        )
+        .await
+        .expect("consumer registration");
+
+    let queue_message = mas_contracts::task::TaskQueueMessage::staged(
+        task_id,
+        scope.tenant_id(),
+        scope.organization_id(),
+        scope.project_id(),
+        "execution.run".to_owned(),
+        serde_json::json!({"case": "expired-running-redelivery"}),
+        None,
+        None,
+        None,
+        format!("recovery-{}", uuid::Uuid::now_v7()),
+        TaskPriority::Normal,
+        1,
+        3,
+        None,
+        &format!("recovery-frame-{}", uuid::Uuid::now_v7()),
+    )
+    .expect("staged queue message");
+    let codec = JsonEventCodec::new(CodecConfig::default());
+    first_broker
+        .publish(PublishRequest {
+            subject: Subject::parse("mas.tasks.execution.run").expect("subject"),
+            headers: HeaderSet::default(),
+            payload: codec.encode_value(&queue_message).expect("frame"),
+            msg_id: Some(queue_message.idempotency_key.clone()),
+        })
+        .await
+        .expect("publish task");
+
+    let first_hint = first_broker
+        .fetch(&consumer, 4_096)
+        .await
+        .expect("first broker fetch")
+        .into_iter()
+        .find(|message| {
+            codec
+                .decode_value::<mas_contracts::task::TaskQueueMessage>(&message.payload)
+                .map(|decoded| decoded.task_id == task_id)
+                .unwrap_or(false)
+        })
+        .expect("first durable hint");
+
+    // A broker heartbeat only renews this process's transport hint. It must
+    // not claim the task, install a worker fence, or create/advance an
+    // attempt: the durable coordinator below is the sole lifecycle writer.
+    first_broker
+        .ack(&consumer, first_hint.sequence, AckInstruction::InProgress)
+        .await
+        .expect("heartbeat hint renewal");
+    let heartbeat_state: (
+        String,
+        Option<String>,
+        Option<chrono::DateTime<chrono::Utc>>,
+        i64,
+    ) = sqlx::query_as("SELECT status, locked_by, locked_until, version FROM tasks WHERE id = $1")
+        .bind(task_id.into_uuid())
+        .fetch_one(&pool)
+        .await
+        .expect("task state after broker heartbeat");
+    assert_eq!(heartbeat_state.0, "queued");
+    assert_eq!(heartbeat_state.1, None);
+    assert_eq!(heartbeat_state.2, None);
+    assert_eq!(heartbeat_state.3, 1);
+
+    let first_now = Timestamp::now();
+    let short_lease = first_now
+        .checked_add(Duration::from_millis(500))
+        .expect("short lease timestamp");
+    let receipt_store = PostgresDeliveryReceiptStore::new(pool.clone());
+    let first_receipt = receipt_store
+        .reserve(DeliveryReservationRequest {
+            consumer_name: consumer.clone(),
+            task_id: task_id.into_uuid(),
+            tenant_id: scope.tenant_id().into_uuid(),
+            worker_id: "expired-worker".to_owned(),
+            delivery_count: first_hint.deliveries.max(1),
+            lease_expires_at: short_lease,
+        })
+        .await
+        .expect("first receipt reserve")
+        .expect("first receipt wins");
+    let durable = PgDurableExecution::new(pool.clone());
+    let first_claim = durable
+        .claim(ClaimQuery {
+            worker: "expired-worker".to_owned(),
+            capacity: 1,
+            lease_until: short_lease,
+            now: first_now,
+            tenant_id: Some(scope.tenant_id()),
+            task_id: Some(task_id),
+        })
+        .await
+        .expect("first durable claim")
+        .into_iter()
+        .next()
+        .expect("first task claim");
+    assert!(
+        receipt_store
+            .attach_attempt(first_receipt, first_claim.attempt.id.into_uuid())
+            .await
+            .expect("first receipt attachment"),
+        "the predecessor receipt names its running attempt"
+    );
+
+    // Both the delivery receipt and durable owner are abandoned. This sleep is
+    // intentionally longer than the same short interval supplied to both
+    // stores, so the database's `now()` predicates—not wall-clock assumptions
+    // in the test—classify them as expired.
+    tokio::time::sleep(Duration::from_millis(700)).await;
+
+    let fresh_broker = PgTaskBroker::new(pool.clone());
+    fresh_broker
+        .ensure_consumer(
+            ConsumerConfig::new(
+                consumer.clone(),
+                SubjectFilter::parse("mas.tasks.>").expect("filter"),
+            )
+            .expect("same consumer config"),
+        )
+        .await
+        .expect("fresh broker consumer registration");
+    let recovery_hint = fresh_broker
+        .fetch(&consumer, 4_096)
+        .await
+        .expect("fresh broker fetch")
+        .into_iter()
+        .find(|message| {
+            codec
+                .decode_value::<mas_contracts::task::TaskQueueMessage>(&message.payload)
+                .map(|decoded| decoded.task_id == task_id)
+                .unwrap_or(false)
+        })
+        .expect("fresh broker sees expired-running recovery hint");
+    assert_eq!(
+        recovery_hint.sequence, first_hint.sequence,
+        "restart redelivery retains the stable message identity"
+    );
+
+    let recovery_now = Timestamp::now();
+    let replacement_lease =
+        receipt_expiry(recovery_now, Duration::from_secs(30)).expect("replacement lease timestamp");
+    let replacement_receipt = receipt_store
+        .reserve(DeliveryReservationRequest {
+            consumer_name: consumer,
+            task_id: task_id.into_uuid(),
+            tenant_id: scope.tenant_id().into_uuid(),
+            worker_id: "recovery-worker".to_owned(),
+            delivery_count: recovery_hint.deliveries.max(1),
+            lease_expires_at: replacement_lease,
+        })
+        .await
+        .expect("replacement receipt reserve")
+        .expect("expired predecessor receipt no longer owns task");
+    let replacement_claims = durable
+        .claim(ClaimQuery {
+            worker: "recovery-worker".to_owned(),
+            capacity: 1,
+            lease_until: replacement_lease,
+            now: recovery_now,
+            tenant_id: Some(scope.tenant_id()),
+            task_id: Some(task_id),
+        })
+        .await
+        .expect("recovery durable claim");
+    assert_eq!(
+        replacement_claims.len(),
+        1,
+        "recovery creates exactly one replacement claim"
+    );
+    let replacement = replacement_claims
+        .into_iter()
+        .next()
+        .expect("replacement claim");
+    assert_eq!(replacement.attempt.attempt_number, 2);
+    assert!(
+        receipt_store
+            .attach_attempt(replacement_receipt, replacement.attempt.id.into_uuid())
+            .await
+            .expect("replacement receipt attachment"),
+        "the replacement receipt can only attach to its matching task attempt"
+    );
+
+    let attempts: Vec<(i32, String)> = sqlx::query_as(
+        "SELECT attempt, status
+         FROM task_attempts
+         WHERE task_id = $1
+         ORDER BY attempt ASC",
+    )
+    .bind(task_id.into_uuid())
+    .fetch_all(&pool)
+    .await
+    .expect("attempt ledger query");
+    assert_eq!(
+        attempts,
+        vec![(1, "expired".to_owned()), (2, "running".to_owned())],
+        "predecessor is terminal before the sole replacement is inserted"
+    );
+    let linked_attempt: uuid::Uuid =
+        sqlx::query_scalar("SELECT last_attempt_id FROM tasks WHERE id = $1")
+            .bind(task_id.into_uuid())
+            .fetch_one(&pool)
+            .await
+            .expect("current attempt linkage");
+    assert_eq!(
+        linked_attempt,
+        replacement.attempt.id.into_uuid(),
+        "task fence points at the attempt its claimant must settle"
+    );
+
+    let stale = durable
+        .settle(TaskSettlement {
+            tenant_id: scope.tenant_id(),
+            task_id,
+            attempt_id: first_claim.attempt.id,
+            worker: "expired-worker".to_owned(),
+            expected_version: first_claim.task.version(),
+            outcome: TaskOutcome::Succeeded {
+                result: serde_json::json!({"late": true}),
+                usage: ExecutionUsage::default(),
+            },
+            execution: None,
+            actor: TransitionActor::worker("expired-worker").expect("actor"),
+            now: Timestamp::now(),
+        })
+        .await;
+    assert!(
+        stale.is_err(),
+        "a predecessor that lost lease recovery must never settle the replacement"
     );
 }
 
@@ -1083,6 +1385,7 @@ async fn tenant_b_cannot_read_claim_cancel_or_settle_tenant_a_execution() {
                 worker: "worker-b".to_owned(),
                 expected_version: claim.task.version,
                 outcome: TaskOutcome::Succeeded {
+                    result: serde_json::Value::Null,
                     usage: ExecutionUsage::default(),
                 },
                 execution: Some(ExecutionFinalization {

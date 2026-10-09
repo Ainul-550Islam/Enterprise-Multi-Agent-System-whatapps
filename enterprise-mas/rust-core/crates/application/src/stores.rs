@@ -26,6 +26,8 @@ use mas_domain::{
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
+use crate::notification_service::{NotificationCursor, NotificationLifecycleStorePort};
+
 #[async_trait]
 pub trait OrganizationStorePort: std::fmt::Debug + Send + Sync {
     async fn save(&self, organization: &Organization) -> Result<()>;
@@ -129,11 +131,27 @@ pub trait ConnectorStorePort: std::fmt::Debug + Send + Sync {
     async fn list(&self, tenant: TenantId) -> Result<Vec<Connector>>;
 }
 
+/// Stable descending keyset position for outbound endpoint metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WebhookEndpointCursor {
+    pub created_at: Timestamp,
+    pub id: WebhookId,
+}
+
 #[async_trait]
 pub trait WebhookStorePort: std::fmt::Debug + Send + Sync {
     async fn save(&self, endpoint: &WebhookEndpoint) -> Result<()>;
     async fn get(&self, id: WebhookId) -> Result<Option<WebhookEndpoint>>;
+    /// Legacy unbounded store helper. Public API handlers must use
+    /// [`Self::list_page`] instead of materializing a tenant's full catalogue.
     async fn list(&self, tenant: TenantId) -> Result<Vec<WebhookEndpoint>>;
+    /// Bounded stable page ordered `created_at DESC, id DESC`.
+    async fn list_page(
+        &self,
+        tenant: TenantId,
+        after: Option<WebhookEndpointCursor>,
+        limit: u16,
+    ) -> Result<Vec<WebhookEndpoint>>;
 }
 
 #[async_trait]
@@ -942,6 +960,37 @@ impl WebhookStorePort for InMemoryServices {
             .cloned()
             .collect())
     }
+
+    async fn list_page(
+        &self,
+        tenant: TenantId,
+        after: Option<WebhookEndpointCursor>,
+        limit: u16,
+    ) -> Result<Vec<WebhookEndpoint>> {
+        let mut endpoints = self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .webhooks
+            .values()
+            .filter(|endpoint| endpoint.tenant_id == tenant)
+            .filter(|endpoint| {
+                after.is_none_or(|cursor| {
+                    endpoint.created_at < cursor.created_at
+                        || (endpoint.created_at == cursor.created_at && endpoint.id < cursor.id)
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        endpoints.sort_by(|left, right| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        endpoints.truncate(usize::from(limit.clamp(1, 201)));
+        Ok(endpoints)
+    }
 }
 
 #[async_trait]
@@ -1023,6 +1072,102 @@ impl NotificationStorePort for InMemoryServices {
             .collect::<Vec<_>>();
         notifications.sort_by_key(|notification| notification.created_at);
         Ok(notifications)
+    }
+}
+
+/// In-memory implementation of the canonical notification lifecycle port.
+///
+/// This is test/dev-only state shared with the legacy notification store. It
+/// deliberately mirrors the durable unique key and descending keyset behavior
+/// so handler tests cannot accidentally rely on offset pagination semantics.
+#[async_trait]
+impl NotificationLifecycleStorePort for InMemoryServices {
+    async fn create_or_get(&self, notification: &Notification) -> Result<Notification> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(existing) = state.notifications.values().find(|existing| {
+            existing.tenant_id == notification.tenant_id
+                && existing.recipient_id == notification.recipient_id
+                && existing.channel == notification.channel
+                && existing.deduplication_key == notification.deduplication_key
+        }) {
+            return Ok(existing.clone());
+        }
+        state
+            .notifications
+            .insert(notification.id, notification.clone());
+        Ok(notification.clone())
+    }
+
+    async fn get(&self, tenant: TenantId, id: uuid::Uuid) -> Result<Option<Notification>> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .notifications
+            .get(&id)
+            .filter(|notification| notification.tenant_id == tenant)
+            .cloned())
+    }
+
+    async fn save(&self, notification: &Notification) -> Result<()> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        match state.notifications.get(&notification.id) {
+            Some(existing) if existing.tenant_id == notification.tenant_id => {
+                state
+                    .notifications
+                    .insert(notification.id, notification.clone());
+                Ok(())
+            },
+            _ => Err(mas_common::error::AppError::not_found(
+                "notification",
+                notification.id.to_string(),
+            )),
+        }
+    }
+
+    async fn list_page(
+        &self,
+        tenant: TenantId,
+        recipient: UserId,
+        include_archived: bool,
+        unread_only: bool,
+        after: Option<NotificationCursor>,
+        limit: u16,
+    ) -> Result<Vec<Notification>> {
+        if limit == 0 {
+            return Err(mas_common::error::AppError::invalid_field(
+                "limit",
+                "out_of_range",
+                "notification page limit must be positive",
+            ));
+        }
+        let mut page = self
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .notifications
+            .values()
+            .filter(|notification| {
+                notification.tenant_id == tenant
+                    && notification.recipient_id == recipient
+                    && (include_archived || notification.archived_at.is_none())
+                    && (!unread_only || notification.read_at.is_none())
+                    && after.is_none_or(|cursor| {
+                        notification.created_at < cursor.created_at
+                            || (notification.created_at == cursor.created_at
+                                && notification.id < cursor.id)
+                    })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        page.sort_by(|left, right| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        page.truncate(usize::from(limit));
+        Ok(page)
     }
 }
 
@@ -1490,7 +1635,7 @@ impl AnalyticsStorePort for InMemoryServices {
 // share one `Arc<InMemoryServices>` across every dependency slot.
 // ---------------------------------------------------------------------
 macro_rules! arc_delegate {
-    ($trait:ident => $inner:ty { $(fn $method:ident($($arg:ident: $ty:ty),*) -> $ret:ty;)* }) => {
+    ($trait:ident => $inner:ty { $(fn $method:ident($($arg:ident: $ty:ty),* $(,)?) -> $ret:ty;)* }) => {
         #[async_trait]
         impl $trait for std::sync::Arc<$inner> {
             $(async fn $method(&self, $($arg: $ty),*) -> $ret {
@@ -1575,6 +1720,7 @@ arc_delegate!(WebhookStorePort => InMemoryServices {
     fn save(endpoint: &WebhookEndpoint) -> Result<()>;
     fn get(id: WebhookId) -> Result<Option<WebhookEndpoint>>;
     fn list(tenant: TenantId) -> Result<Vec<WebhookEndpoint>>;
+    fn list_page(tenant: TenantId, after: Option<WebhookEndpointCursor>, limit: u16) -> Result<Vec<WebhookEndpoint>>;
 });
 arc_delegate!(UsageStorePort => InMemoryServices {
     fn append(record: &UsageRecord) -> Result<()>;
@@ -1585,6 +1731,19 @@ arc_delegate!(NotificationStorePort => InMemoryServices {
     fn save(notification: &Notification) -> Result<()>;
     fn get(id: uuid::Uuid) -> Result<Option<Notification>>;
     fn list(tenant: TenantId) -> Result<Vec<Notification>>;
+});
+arc_delegate!(NotificationLifecycleStorePort => InMemoryServices {
+    fn create_or_get(notification: &Notification) -> Result<Notification>;
+    fn get(tenant: TenantId, id: uuid::Uuid) -> Result<Option<Notification>>;
+    fn save(notification: &Notification) -> Result<()>;
+    fn list_page(
+        tenant: TenantId,
+        recipient: UserId,
+        include_archived: bool,
+        unread_only: bool,
+        after: Option<NotificationCursor>,
+        limit: u16,
+    ) -> Result<Vec<Notification>>;
 });
 arc_delegate!(WorkflowVersionStorePort => InMemoryServices {
     fn append(version: &WorkflowVersion) -> Result<()>;

@@ -19,12 +19,16 @@ Attack surface covered:
 
 from __future__ import annotations
 
+import socket
+
+import httpcore
 import pytest
 
 from mas_orchestrator.contracts.errors import (
     InvalidRequestError,
     ToolPermissionDeniedError,
 )
+from mas_orchestrator.providers import base_http
 from mas_orchestrator.providers.base_http import (
     BLOCKED_NETWORKS,
     HttpPolicy,
@@ -167,10 +171,12 @@ class TestBlockedAddressRanges:
     def test_policy_allows_public_resolution(self) -> None:
         _policy().validate_resolved_address("93.184.216.34")
 
-    def test_private_networks_can_be_opted_in(self) -> None:
-        """Only for development against a local fake."""
-        policy = _policy(allow_private_networks=True)
-        policy.validate_resolved_address("127.0.0.1")
+    def test_private_network_bypass_is_refused_at_policy_construction(self) -> None:
+        """Development fixtures must inject a fake transport, never weaken egress."""
+        from mas_orchestrator.contracts.errors import ConfigurationError
+
+        with pytest.raises(ConfigurationError):
+            _policy(allow_private_networks=True)
 
 
 class TestDnsRebinding:
@@ -188,6 +194,79 @@ class TestDnsRebinding:
     def test_allowlisted_name_resolving_to_metadata_is_refused(self) -> None:
         with pytest.raises(ToolPermissionDeniedError):
             _policy().validate_resolved_address("169.254.169.254")
+
+
+class _RecordingNetworkBackend:
+    """Test double that records the literal address HTTP Core was told to dial."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, int]] = []
+        self.stream = object()
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        *,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: object | None = None,
+    ) -> object:
+        del timeout, local_address, socket_options
+        self.calls.append((host, port))
+        return self.stream
+
+
+class TestPinnedNetworkBackend:
+    """The actual dial path, not merely a separate policy helper, is guarded."""
+
+    @pytest.mark.asyncio
+    async def test_dials_the_validated_literal_without_a_second_dns_lookup(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def resolve(host: str) -> list[str]:
+            assert host == "api.openai.com"
+            return ["93.184.216.34", "93.184.216.34"]
+
+        monkeypatch.setattr(base_http, "_resolve_host", resolve)
+        backend = base_http._ValidatedNetworkBackend(_policy())
+        recorder = _RecordingNetworkBackend()
+        backend._delegate = recorder  # type: ignore[assignment]
+
+        stream = await backend.connect_tcp("api.openai.com", 443)
+
+        assert stream is recorder.stream
+        assert recorder.calls == [("93.184.216.34", 443)]
+
+    @pytest.mark.asyncio
+    async def test_refuses_a_mixed_public_and_private_dns_answer_before_dialling(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def resolve(_host: str) -> list[str]:
+            return ["93.184.216.34", "127.0.0.1"]
+
+        monkeypatch.setattr(base_http, "_resolve_host", resolve)
+        backend = base_http._ValidatedNetworkBackend(_policy())
+        recorder = _RecordingNetworkBackend()
+        backend._delegate = recorder  # type: ignore[assignment]
+
+        with pytest.raises(httpcore.ConnectError):
+            await backend.connect_tcp("api.openai.com", 443)
+
+        assert recorder.calls == []
+
+    @pytest.mark.asyncio
+    async def test_dns_failure_is_mapped_to_an_httpcore_connection_failure(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def resolve(_host: str) -> list[str]:
+            raise socket.gaierror(socket.EAI_NONAME, "unresolvable")
+
+        monkeypatch.setattr(base_http, "_resolve_host", resolve)
+        backend = base_http._ValidatedNetworkBackend(_policy())
+
+        with pytest.raises(httpcore.ConnectError):
+            await backend.connect_tcp("api.openai.com", 443)
 
 
 class TestPolicyValidation:

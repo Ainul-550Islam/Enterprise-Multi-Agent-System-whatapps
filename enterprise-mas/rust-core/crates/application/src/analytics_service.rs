@@ -233,14 +233,34 @@ impl AnalyticsService {
                 tool_invocations = tool_invocations.saturating_add(record.quantity);
             }
             if dimension == "tokens" {
-                match record
+                let measured_input = record
                     .metadata
-                    .get("token_direction")
-                    .and_then(serde_json::Value::as_str)
-                {
-                    Some("input") => tokens_input = tokens_input.saturating_add(record.quantity),
-                    Some("output") => tokens_output = tokens_output.saturating_add(record.quantity),
-                    _ => {},
+                    .get("input_quantity")
+                    .and_then(serde_json::Value::as_i64)
+                    .and_then(|value| u64::try_from(value).ok());
+                let measured_output = record
+                    .metadata
+                    .get("output_quantity")
+                    .and_then(serde_json::Value::as_i64)
+                    .and_then(|value| u64::try_from(value).ok());
+                match (measured_input, measured_output) {
+                    (Some(input), Some(output)) => {
+                        tokens_input = tokens_input.saturating_add(input);
+                        tokens_output = tokens_output.saturating_add(output);
+                    },
+                    _ => match record
+                        .metadata
+                        .get("token_direction")
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        Some("input") => {
+                            tokens_input = tokens_input.saturating_add(record.quantity)
+                        },
+                        Some("output") => {
+                            tokens_output = tokens_output.saturating_add(record.quantity)
+                        },
+                        _ => {},
+                    },
                 }
             }
             let cost = record

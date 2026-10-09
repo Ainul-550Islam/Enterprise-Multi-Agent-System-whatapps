@@ -251,6 +251,8 @@ define_id!(/// Identifies a `Schedule`.
 ScheduleId);
 define_id!(/// Identifies a `WebhookEndpoint`.
 WebhookId);
+define_id!(/// Identifies a public inbound webhook endpoint route.
+InboundWebhookId);
 define_id!(/// Identifies API-key metadata (never the raw key).
 ApiKeyId);
 define_id!(/// Identifies an authenticated `Session`.

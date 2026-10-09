@@ -18,9 +18,9 @@ not to the storage layer.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
-from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final
 
@@ -64,6 +64,32 @@ class AgentSummary:
     runnable: bool
     status: str
     tool_count: int
+
+
+def _observe_lookup_telemetry(task: asyncio.Task[bool]) -> None:
+    """Retrieves and safely reports a failed background lookup emission.
+
+    ``AgentService.spec`` is deliberately synchronous, so lookup telemetry is
+    scheduled rather than awaited. A task that fails after the caller returns
+    must still have its exception retrieved; otherwise asyncio reports it only
+    later as an unobserved task exception and hides the useful operational
+    signal. Cancellation is expected while the event loop drains and is not a
+    telemetry delivery failure.
+    """
+    if task.cancelled():
+        return
+    try:
+        error = task.exception()
+    except asyncio.CancelledError:
+        return
+    if error is not None:
+        _LOGGER.warning(
+            "agent lookup telemetry emission failed",
+            extra={
+                "event": "agent.lookup_emit_failed",
+                "error_type": type(error).__name__,
+            },
+        )
 
 
 class AgentService:
@@ -118,8 +144,6 @@ class AgentService:
         finally:
             duration = int((time.monotonic() - started) * 1000)
             if self._emitter is not None:
-                import asyncio
-
                 coro = self._emitter.emit(
                     agent_lookup(
                         tenant_id=tenant_id,
@@ -131,9 +155,11 @@ class AgentService:
                     )
                 )
                 try:
-                    asyncio.get_running_loop().create_task(coro)
+                    task = asyncio.get_running_loop().create_task(coro)
                 except RuntimeError:
                     coro.close()
+                else:
+                    task.add_done_callback(_observe_lookup_telemetry)
         return spec
 
     def resolve(self, context: ExecutionContext) -> AgentSpec:

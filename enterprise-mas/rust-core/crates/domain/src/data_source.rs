@@ -118,7 +118,14 @@ impl DataSource {
 
     /// Revalidates persisted state after hydration.
     pub fn validate(&self) -> Result<()> {
-        if self.id.is_nil() || self.tenant_id.is_nil() || self.project_id.is_nil() {
+        if self.id.is_nil()
+            || self.tenant_id.is_nil()
+            || self.project_id.is_nil()
+            || self.created_by.is_nil()
+            || self
+                .credential_id
+                .is_some_and(|credential_id| credential_id.is_nil())
+        {
             return Err(AppError::database("data source contains a nil identifier"));
         }
         validation::validate_length("name", &self.name, 1, 200)

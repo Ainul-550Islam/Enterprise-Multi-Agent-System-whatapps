@@ -131,6 +131,30 @@ impl PostgresReservationStore {
         Self { pool }
     }
 
+    /// Acquires a transaction-scoped advisory lock for one tenant/key pair.
+    ///
+    /// `ControlPlane::reserve` holds this before its first read and keeps the
+    /// authoritative request transaction open through counter charging and the
+    /// reservation-row write. The unique row constraint alone cannot protect
+    /// that larger sequence: two replicas can both see no row and both charge
+    /// the counter before one discovers the other's row. PostgreSQL releases
+    /// this lock automatically on commit or rollback, including a quota
+    /// refusal, so it never needs a best-effort unlock path.
+    pub async fn lock_key(&self, tenant: TenantId, reservation_key: &str) -> Result<()> {
+        if !crate::scoped_request::has_scope() {
+            return Err(AppError::internal(
+                "quota reservation creation requires an authoritative request transaction",
+            ));
+        }
+        let key = format!("{tenant}/{reservation_key}");
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(key)
+            .execute(executor(&self.pool).await?.connection())
+            .await
+            .map_err(map_sqlx)?;
+        Ok(())
+    }
+
     /// Authorises `amount` units against a reservation key.
     ///
     /// Idempotent by `(tenant_id, reservation_key)`: a retry of the same

@@ -28,16 +28,19 @@
 //   → execution submit (+replay)      (via `MasApiClient` two-phase decode)
 //   → list/get/transitions            (scope guard + contract assertions)
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use mas_application::context::ServiceContext;
+use mas_application::stores::{InMemoryServices, MembershipStorePort};
 use mas_common::ids::TenantId;
 use mas_common::timestamps::Timestamp;
-use mas_domain::IsolationMode;
+use mas_domain::{IsolationMode, MembershipRole};
+use mas_security::{PrincipalKind, ScopeSet, SecurityPrincipal, TenantMembership};
 use uuid::Uuid;
 
 use mas_api::router::router;
-use mas_api::state::test_support::inmemory_state;
+use mas_api::state::test_support::{inmemory_state, inmemory_state_with_store};
 use mas_api::state::AppState;
 use mas_cli::client::{MasApiClient, Outcome};
 use mas_cli::{ClientConfig, Format};
@@ -50,7 +53,7 @@ struct FixtureScope {
 
 /// Seeds one org → tenant → project through the application services (the
 /// same calls `mas-api --dev-inmemory` makes) and returns the ids.
-async fn seed_scope(state: &AppState) -> FixtureScope {
+async fn seed_scope(state: &mut AppState, store: &Arc<InMemoryServices>) -> FixtureScope {
     let system =
         ServiceContext::for_service("root-it", "root-it-1", &Timestamp::now()).expect("ctx");
     let organization = state
@@ -83,6 +86,43 @@ async fn seed_scope(state: &AppState) -> FixtureScope {
         .register_project(&tenant_scoped, "Core", "core-root-it")
         .await
         .expect("project");
+
+    // The transport token must carry the membership the resolver can prove.
+    // Scope headers are only selectors; a random test principal must not be
+    // able to use them to enter the tenant we just seeded.
+    let owner = state
+        .tenancy
+        .register_user(&system, "root-it-owner@example.test", "Root Integration Owner")
+        .await
+        .expect("owner user");
+    let mut membership = state
+        .tenancy
+        .invite_membership(&tenant_scoped, owner.id, MembershipRole::Owner)
+        .await
+        .expect("owner membership");
+    membership
+        .accept_invitation()
+        .expect("accept owner invitation");
+    MembershipStorePort::save(store.as_ref(), &membership)
+        .await
+        .expect("activate owner membership");
+
+    let principal = SecurityPrincipal::new(
+        owner.id.to_string(),
+        PrincipalKind::User,
+        Some(tenant.id),
+        ScopeSet::denied(),
+    )
+    .with_organization(organization.id)
+    .with_memberships(vec![TenantMembership::new(
+        organization.id,
+        tenant.id,
+        MembershipRole::Owner,
+    )]);
+    state.verifier = Arc::new(
+        mas_api::auth::StaticTokenVerifier::new().with_token("test-token", principal),
+    );
+
     FixtureScope {
         tenant: Uuid::from(tenant.id),
         organization: Uuid::from(organization.id),
@@ -126,8 +166,8 @@ fn ok<T>(outcome: Outcome<T>) -> T {
 
 #[tokio::test]
 async fn full_stack_through_real_http_and_real_cli_client() {
-    let state = inmemory_state();
-    let scope = seed_scope(&state).await;
+    let (mut state, store) = inmemory_state_with_store();
+    let scope = seed_scope(&mut state, &store).await;
     let base_url = serve_test_api(state).await;
     let client = client_for(&base_url, Some(&scope));
 
@@ -251,8 +291,11 @@ async fn full_stack_through_real_http_and_real_cli_client() {
 
 #[tokio::test]
 async fn scope_headers_are_mandatory_from_the_client_side_too() {
+    // This fixture's default principal has no tenant binding. It proves that
+    // callers without either a claimed scope or an identity-bound scope are
+    // refused; a single bound tenant may intentionally resolve without a
+    // header (covered by scope-resolution tests).
     let state = inmemory_state();
-    let _scope = seed_scope(&state).await;
     let base_url = serve_test_api(state).await;
 
     // Server-side: no headers at all → 400/401 with a stable code.

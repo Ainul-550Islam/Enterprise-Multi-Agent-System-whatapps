@@ -127,6 +127,11 @@ class DiscoveredDocument:
     content: bytes
     etag: str | None = None
     last_modified: datetime | None = None
+    #: Opaque adapter cursor immediately before this item.  It lets the
+    #: service retry a failed item without advancing past it.
+    cursor_before: str | None = None
+    #: Opaque adapter cursor immediately after this item was discovered.
+    cursor_after: str | None = None
 
     def __post_init__(self) -> None:
         if not self.locator.strip() or not self.title.strip() or not self.mime_type.strip():
@@ -135,6 +140,15 @@ class DiscoveredDocument:
             raise InvalidRequestError("discovered document metadata exceeds its bound")
         if not self.content:
             raise InvalidRequestError("discovered document content is empty")
+        for field_name, cursor in (
+            ("cursor_before", self.cursor_before),
+            ("cursor_after", self.cursor_after),
+        ):
+            if cursor is not None and len(cursor.encode("utf-8")) > 64 * 1024:
+                raise InvalidRequestError(
+                    "discovered document checkpoint exceeds its size limit",
+                    details={"field": field_name},
+                )
 
 
 def _validate_uuid(value: str, field_name: str) -> None:

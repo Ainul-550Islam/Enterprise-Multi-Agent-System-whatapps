@@ -542,8 +542,11 @@ class TestExecutionService:
 
         service = self._service(_Cancelling())
         request = ExecutionRequest(request="hello", context=_context())
-        result = await service.execute(request)
-        assert result.termination is Termination.CANCELLED
+        # Native task cancellation must propagate to the gRPC/process edge so
+        # provider and tool work is actually interrupted. A synthetic normal
+        # result would let the caller continue after its cancellation scope.
+        with pytest.raises(asyncio.CancelledError):
+            await service.execute(request)
 
     @pytest.mark.asyncio
     async def test_logging_reporter_does_not_raise(self) -> None:

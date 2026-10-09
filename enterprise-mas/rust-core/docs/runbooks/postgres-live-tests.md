@@ -1,21 +1,32 @@
 # Runbook: live PostgreSQL integration suite
 
-**Location:** `crates/persistence/tests/live_pg.rs` (16 tests)
+**Location:** `crates/persistence/tests/live_pg.rs` (17 tests)
 **Cost:** one PostgreSQL 16+ instance you are allowed to mutate.
 **Never point at production.**
 
 ## 1. Bring up PostgreSQL
 
-Any PostgreSQL 16+ works. Fastest disposable instance:
+Use PostgreSQL 16+ **with the `pgvector` server extension installed**.
+Migration `0028_rag_pgvector_plane` executes `CREATE EXTENSION vector`, so a
+plain official `postgres` image is insufficient and will fail migration with
+`extension "vector" is not available`. Fastest disposable instance:
 
 ```bash
 docker run --name mas-itest-pg \
   -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=mas_itest \
-  -p 55432:5432 -d postgres:16-alpine
+  -p 55432:5432 -d pgvector/pgvector:pg16
+```
+
+For package-managed PostgreSQL, install the matching server package first (for
+example, `postgresql-17-pgvector` on Debian for PostgreSQL 17), then verify:
+
+```bash
+psql "$MAS_TEST_DATABASE_URL" -Atqc \
+  "SELECT default_version FROM pg_available_extensions WHERE name = 'vector';"
 ```
 
 (Matches the compose service in `.devcontainer/` when you're inside the dev
-container: the service `postgres` is already up; use
+container, provided that its PostgreSQL image also includes pgvector; use
 `postgres://postgres:postgres@postgres:5432/postgres`.)
 
 ## 1b. Two URLs, and why you need both

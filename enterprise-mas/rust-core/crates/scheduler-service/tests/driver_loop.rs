@@ -2,14 +2,14 @@
 //!
 //! Owning layer: integration tests for `mas-scheduler-service`.
 //!
-//! Production responsibility: exercise the real listener, the real
-//! dispatcher and the real SSRF policy on a loopback socket, so the wiring —
-//! not a mock — is what gets tested.
+//! Production responsibility: exercise the real completion listener and prove
+//! that the real dispatcher refuses loopback even when configuration names it,
+//! so test plumbing cannot weaken the egress boundary.
 //!
-//! Security boundary: the test proves the completion route refuses unsigned
-//! notices and that reaching a loopback endpoint still requires an explicit
-//! egress policy exemption. It signs its own requests with a test secret, so
-//! the authenticated path and the unauthenticated path are both covered.
+//! Security boundary: the test proves that an explicit internal-endpoint
+//! policy is not a loopback exemption. It signs inbound completion notices
+//! with a test secret, so the authenticated completion path is covered without
+//! using a production credential.
 //!
 //! It must NOT:
 //!   • disable the SSRF guard to make the test pass;
@@ -252,59 +252,48 @@ async fn failing_store_backs_off_and_recovers_on_repair() {
 }
 
 #[tokio::test]
-async fn http_dispatcher_round_trip_with_completion_listener() {
-    // ── Fake API downstream: accepts runs, returns an execution id ──
+async fn http_dispatcher_rejects_loopback_and_completion_listener_clears_ledger() {
     /// The shared secret the scheduler authenticates internal callers with.
     const SECRET: &str = "driver-loop-internal-secret";
 
-    let execution_id = ExecutionId::new();
-    let api = axum::Router::new().route(
-        "/v1/internal/schedule-runs",
-        axum::routing::post(move || async move {
-            axum::Json(serde_json::json!({ "execution_id": execution_id }))
-        }),
-    );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind");
-    let api_addr = listener.local_addr().expect("addr");
-    tokio::spawn(async move { axum::serve(listener, api).await });
-
-    // ── Scheduler side: dispatcher + completion listener on the loopback ──
     let ledger = InFlightLedger::default();
-    // The fake API is on loopback, so the dispatcher is configured with an
-    // internal-endpoint policy naming it explicitly. Reaching it still goes
-    // through the SSRF guard; only the "must be publicly routable" rule is
-    // relaxed, for this host alone.
-    let host = api_addr.ip().to_string();
-    let policy = mas_integrations::http_guard::EgressPolicy::for_internal_endpoints(
-        [host.as_str()],
-        Some([api_addr.port()].into_iter().collect()),
-    );
-    let dispatcher = HttpDispatcher::new(
-        ledger.clone(),
-        &format!("http://{api_addr}"),
-        None,
-        "mas-scheduler",
-        policy,
-    )
-    .expect("dispatcher");
     let work = DueWork {
         schedule_id: ScheduleId::new(),
         tenant_id: TenantId::new(),
         planned_at: Timestamp::now(),
         task_template: serde_json::json!({"operation": "heartbeat"}),
     };
-    let ack = DispatchPort::dispatch(&dispatcher, &work)
+
+    // An explicit internal-endpoint policy is not a loopback exemption. The
+    // scheduler's real API URL must use an operator-routed service address;
+    // a test must not weaken the SSRF boundary merely to contact a local fake.
+    let policy = mas_integrations::http_guard::EgressPolicy::for_internal_endpoints(
+        ["127.0.0.1"],
+        Some([8080].into_iter().collect()),
+    );
+    let dispatcher = HttpDispatcher::new(
+        ledger.clone(),
+        "http://127.0.0.1:8080",
+        None,
+        "mas-scheduler",
+        policy,
+    )
+    .expect("construction validates the explicit endpoint policy");
+    let error = DispatchPort::dispatch(&dispatcher, &work)
         .await
-        .expect("dispatched");
-    assert!(matches!(ack, DispatchAck::Started { .. }));
+        .expect_err("the guarded transport must refuse loopback before it dials");
     assert!(
-        ledger.is_running(work.schedule_id),
-        "acceptance inserts into the ledger",
+        error.to_string().contains("invalid value for field 'url'"),
+        "loopback refusal must retain the destination-validation classification: {error}"
+    );
+    assert!(
+        !ledger.is_running(work.schedule_id),
+        "a refused dispatch must not leave a ledger entry"
     );
 
-    // Completion listener bound for real (exercises the public route).
+    // Completion listener bound for real (inbound loopback is safe test
+    // plumbing; it does not exercise an outbound connector/service egress).
+    ledger.start(work.schedule_id);
     let completion_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
@@ -323,7 +312,7 @@ async fn http_dispatcher_round_trip_with_completion_listener() {
 
     let notice = CompletionNotice {
         schedule_id: work.schedule_id,
-        execution_id,
+        execution_id: ExecutionId::new(),
         outcome: "succeeded".to_owned(),
     };
     let body = serde_json::to_vec(&notice).expect("notice");

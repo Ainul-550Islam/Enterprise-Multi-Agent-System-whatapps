@@ -146,6 +146,21 @@ pub async fn authenticated_layer(
         project: None,
     };
 
+    // Global operations are an explicit platform-admin lane, not a fallback
+    // for ordinary callers without a tenant. Keep it untenanted: every
+    // tenant-owned handler still requires a resolved scope before use.
+    if claims.tenant.is_none()
+        && claims.organization.is_none()
+        && claims.project.is_none()
+        && principal.is_usable()
+        && principal.scopes.permits("platform:admin")
+    {
+        request
+            .extensions_mut()
+            .insert(existing.with_authenticated(principal));
+        return next.run(request).await;
+    }
+
     let resolved = match resolve_guarded(&state.scope_resolver, &principal, claims).await {
         Ok(resolved) => resolved,
         Err(err) => return crate::response::ApiError::new(err, &existing).into_response(),

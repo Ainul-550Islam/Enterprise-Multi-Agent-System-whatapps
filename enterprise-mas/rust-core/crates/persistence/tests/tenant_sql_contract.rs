@@ -304,8 +304,11 @@ fn the_claim_statement_scopes_by_tenant_before_it_locks_anything() {
         .expect("read crates/persistence/src/durable.rs");
     let claim = statements(&source)
         .into_iter()
-        .find(|statement| statement.sql.contains("FOR UPDATE SKIP LOCKED"))
-        .expect("the durable claim statement must exist");
+        .find(|statement| {
+            statement.sql.contains("FOR UPDATE SKIP LOCKED")
+                && statement.sql.contains("UPDATE tasks t SET")
+        })
+        .expect("the durable claim-and-fence statement must exist");
 
     assert!(
         claim.sql.contains("tenant_id = $2"),
@@ -475,4 +478,70 @@ fn no_migration_is_destructive() {
         checked >= 14,
         "expected to check the whole migration set, checked {checked}"
     );
+}
+
+#[test]
+fn oauth_lifecycle_jobs_are_fenced_rls_protected_and_path_blind() {
+    let refresh_migration = std::fs::read_to_string(workspace_file(
+        "../../migrations/0044_oauth_token_refresh_jobs/up.sql",
+    ))
+    .expect("read OAuth refresh migration");
+    let cleanup_migration = std::fs::read_to_string(workspace_file(
+        "../../migrations/0045_oauth_token_cleanup_jobs/up.sql",
+    ))
+    .expect("read OAuth cleanup migration");
+    let opaque_migration = std::fs::read_to_string(workspace_file(
+        "../../migrations/0046_oauth_opaque_secret_locators/up.sql",
+    ))
+    .expect("read OAuth opaque locator migration");
+    let materialization_migration = std::fs::read_to_string(workspace_file(
+        "../../migrations/0047_oauth_materialization_reconciliation/up.sql",
+    ))
+    .expect("read OAuth materialization migration");
+    let invariants_migration = std::fs::read_to_string(workspace_file(
+        "../../migrations/0048_oauth_reference_invariants/up.sql",
+    ))
+    .expect("read OAuth reference invariant migration");
+    let refresh_repository =
+        std::fs::read_to_string(workspace_file("src/repositories/oauth_refresh.rs"))
+            .expect("read OAuth refresh repository");
+    let cleanup_repository =
+        std::fs::read_to_string(workspace_file("src/repositories/oauth_cleanup.rs"))
+            .expect("read OAuth cleanup repository");
+    let materialization_repository =
+        std::fs::read_to_string(workspace_file("src/repositories/oauth_materialization.rs"))
+            .expect("read OAuth materialization repository");
+
+    for (migration, table) in [
+        (&refresh_migration, "oauth_token_refresh_jobs"),
+        (&cleanup_migration, "oauth_token_cleanup_jobs"),
+        (
+            &materialization_migration,
+            "oauth_token_materialization_jobs",
+        ),
+    ] {
+        assert!(migration.contains(&format!("ALTER TABLE {table} ENABLE ROW LEVEL SECURITY")));
+        assert!(migration.contains(&format!("ALTER TABLE {table} FORCE ROW LEVEL SECURITY")));
+        assert!(migration.contains("tenant_id::text = current_setting('app.current_tenant', true)"));
+        assert!(migration.contains("fence bigint NOT NULL DEFAULT 0"));
+    }
+    for repository in [
+        &refresh_repository,
+        &cleanup_repository,
+        &materialization_repository,
+    ] {
+        assert!(
+            repository.contains("FOR UPDATE OF job SKIP LOCKED"),
+            "each OAuth worker claim must lock only its job row with SKIP LOCKED"
+        );
+        assert!(repository.contains("lease_expires_at > now()"));
+        assert!(repository.contains("reap_expired_exhausted_leases"));
+    }
+    assert!(refresh_repository.contains("oauth_token_cleanup_jobs"));
+    assert!(cleanup_repository.contains("availability = 'deleted'"));
+    assert!(opaque_migration
+        .contains("REVOKE ALL PRIVILEGES ON secret_references FROM mas_oauth_refresh"));
+    assert!(opaque_migration.contains("oauth-token/' || reference.id::text"));
+    assert!(invariants_migration.contains("mas_assert_oauth_credential_reference"));
+    assert!(invariants_migration.contains("mas_assert_oauth_pkce_reference"));
 }

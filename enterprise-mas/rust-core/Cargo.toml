@@ -116,7 +116,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # --- http/grpc servers (api crate) ---
-axum = { version = "0.8", default-features = false, features = ["json", "http1", "tokio", "query"] }
+axum = { version = "0.8", default-features = false, features = ["json", "http1", "tokio", "query", "multipart"] }
 tonic = { version = "0.13", default-features = false, features = ["server", "router", "codegen", "prost", "transport"] }
 tower = "0.5"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
@@ -144,6 +144,7 @@ http = "1"
 
 # --- encoding helpers ---
 base64 = "0.22"
+ring = "0.17"
 
 # --- url parsing / validation ---
 url = "2"

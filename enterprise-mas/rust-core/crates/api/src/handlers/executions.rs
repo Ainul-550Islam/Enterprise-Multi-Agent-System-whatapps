@@ -21,7 +21,7 @@ pub async fn submit(
     headers: axum::http::HeaderMap,
     Json(body): Json<StartExecutionRequest>,
 ) -> ApiResult<ExecutionResponse> {
-    scoped(&ctx)?;
+    let service_ctx = authorized_execution(&ctx, mas_security::Action::Create)?;
     body.validate()
         .map_err(|e| crate::response::ApiError::new(e, &ctx))?;
     let header_key = headers
@@ -36,9 +36,6 @@ pub async fn submit(
             trimmed
         })
     });
-    let service_ctx = ctx
-        .service_context()
-        .map_err(|e| crate::response::ApiError::new(e, &ctx))?;
     let outcome = state
         .executions
         .submit(
@@ -95,10 +92,7 @@ pub async fn cancel(
     Path(execution_id): Path<ExecutionId>,
     Ctx(ctx): Ctx,
 ) -> ApiResult<ExecutionResponse> {
-    scoped(&ctx)?;
-    let service_ctx = ctx
-        .service_context()
-        .map_err(|e| crate::response::ApiError::new(e, &ctx))?;
+    let service_ctx = authorized_execution(&ctx, mas_security::Action::Cancel)?;
     let execution = state
         .executions
         .request_cancellation(&service_ctx, execution_id)
@@ -114,10 +108,7 @@ pub async fn get(
     Path(execution_id): Path<ExecutionId>,
     Ctx(ctx): Ctx,
 ) -> ApiResult<ExecutionResponse> {
-    scoped(&ctx)?;
-    let service_ctx = ctx
-        .service_context()
-        .map_err(|e| crate::response::ApiError::new(e, &ctx))?;
+    let service_ctx = authorized_execution(&ctx, mas_security::Action::Read)?;
     state
         .executions
         .get_response(&service_ctx, execution_id)
@@ -132,13 +123,7 @@ pub async fn steps(
     Path(execution_id): Path<ExecutionId>,
     Ctx(ctx): Ctx,
 ) -> ApiResult<Vec<mas_contracts::execution::ExecutionStepDto>> {
-    let service_ctx = crate::handlers::authorized_service_context(
-        &ctx,
-        mas_security::ResourceKind::Execution,
-        mas_security::Action::Read,
-        None,
-    )
-    .map_err(|error| crate::response::ApiError::new(error, &ctx))?;
+    let service_ctx = authorized_execution(&ctx, mas_security::Action::Read)?;
     let steps = state
         .executions
         .list_steps(&service_ctx, execution_id)
@@ -158,10 +143,7 @@ pub async fn list(
     State(state): State<AppState>,
     Ctx(ctx): Ctx,
 ) -> ApiResult<Vec<ExecutionResponse>> {
-    scoped(&ctx)?;
-    let service_ctx = ctx
-        .service_context()
-        .map_err(|e| crate::response::ApiError::new(e, &ctx))?;
+    let service_ctx = authorized_execution(&ctx, mas_security::Action::Read)?;
     let executions = state
         .executions
         .list(&service_ctx)
@@ -187,10 +169,11 @@ async fn transition(
     execution_id: ExecutionId,
     action: Transition,
 ) -> ApiResult<ExecutionResponse> {
-    scoped(&ctx)?;
-    let service_ctx = ctx
-        .service_context()
-        .map_err(|e| crate::response::ApiError::new(e, &ctx))?;
+    let permission = match action {
+        Transition::Start => mas_security::Action::Execute,
+        Transition::Pause | Transition::Resume => mas_security::Action::Update,
+    };
+    let service_ctx = authorized_execution(&ctx, permission)?;
     let result = match action {
         Transition::Start => state.executions.start(&service_ctx, execution_id).await,
         Transition::Pause => state.executions.pause(&service_ctx, execution_id).await,
@@ -201,10 +184,15 @@ async fn transition(
         .into_api(&ctx)
 }
 
-fn scoped(
+fn authorized_execution(
     ctx: &crate::context::RequestContext,
-) -> std::result::Result<(), crate::response::ApiError> {
-    ctx.require_scope()
-        .map(|_| ())
-        .map_err(|e| crate::response::ApiError::new(e, ctx))
+    action: mas_security::Action,
+) -> std::result::Result<mas_application::context::ServiceContext, crate::response::ApiError> {
+    crate::handlers::authorized_service_context(
+        ctx,
+        mas_security::ResourceKind::Execution,
+        action,
+        None,
+    )
+    .map_err(|error| crate::response::ApiError::new(error, ctx))
 }

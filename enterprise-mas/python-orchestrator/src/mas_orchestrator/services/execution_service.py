@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING, Any, Final, Protocol, runtime_checkable
 from mas_orchestrator.agents.base import AgentState, Termination
 from mas_orchestrator.agents.runtime import AgentRuntime, ExecutionResult
 from mas_orchestrator.contracts.errors import (
+    CancellationRequestedError,
     ConfigurationError,
     InvalidRequestError,
     ProtocolError,
@@ -275,7 +276,17 @@ class ExecutionService:
                 agent_id=request.agent_id,
                 agent_spec=request.agent_spec,
             )
-        except asyncio.CancelledError as error:
+        except asyncio.CancelledError:
+            # Task cancellation is a control-flow signal, not a normal result.
+            # Re-raising lets the gRPC bridge cancel in-flight provider/tool
+            # calls and prevents a cancelled RPC from being reported as a
+            # completed execution.
+            cancel_event.set()
+            raise
+        except CancellationRequestedError as error:
+            # Cooperative cancellation (for example a wire cancellation that
+            # arrived before the servicer task itself was cancelled) still has
+            # a durable, explicit cancellation outcome.
             result = ExecutionResult(
                 execution_id=context.execution_id,
                 agent_id=context.agent_id,

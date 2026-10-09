@@ -23,7 +23,10 @@ pub mod data_hub;
 pub mod errors;
 pub mod execution;
 pub mod health;
+pub mod inbound_webhook;
 pub mod notification;
+/// OAuth authorization initiation and callback wire DTOs.
+pub mod oauth;
 pub mod policy;
 pub mod rollback;
 pub mod search;
@@ -56,7 +59,8 @@ pub use auth::{
     AuthorizationContext, PermissionMatrixResponse, ServiceIdentityClaims,
 };
 pub use connector::{
-    ConnectorResponse, ConnectorStatusResponse, RegisterConnectorRequest, TestConnectorRequest,
+    ConnectorListQuery, ConnectorPageResponse, ConnectorResponse, ConnectorStatusResponse,
+    RegisterConnectorRequest, TestConnectorRequest,
 };
 pub use data_hub::{
     CreateDataSourceRequest, CreateDocumentRequest, DataSourceDto, DataSourceSyncDto, DocumentDto,
@@ -67,9 +71,15 @@ pub use execution::{
     ResumeExecutionRequest, StartExecutionRequest,
 };
 pub use health::{DependencyHealth, LivenessResponse, ReadinessResponse, SystemHealthResponse};
-pub use notification::{
-    MarkNotificationReadRequest, NotificationDto, NotificationPreferencesDto, NotificationQuery,
+pub use inbound_webhook::{
+    InboundWebhookDto, InboundWebhookIngestResponse, InboundWebhookPageDto, InboundWebhookQuery,
+    RegisterInboundWebhookRequest,
 };
+pub use notification::{
+    MarkNotificationReadRequest, NotificationDto, NotificationPageDto, NotificationPreferencesDto,
+    NotificationQuery,
+};
+pub use oauth::{OAuthAuthorizationUrlDto, OAuthCallbackAcknowledgement, OAuthCallbackQuery};
 pub use policy::{
     CreatePolicyRequest, EvaluatePolicyRequest, PolicyDecisionResponse, PolicyResponse,
     UpdatePolicyRequest,
@@ -83,7 +93,9 @@ pub use tool::{
 pub use usage::{
     Granularity, QuotaUtilizationDto, UsageQuery, UsageRecordResponse, UsageSummaryResponse,
 };
-pub use webhook::{RegisterWebhookRequest, WebhookDeliveryDto, WebhookDto};
+pub use webhook::{
+    RegisterWebhookRequest, WebhookDeliveryDto, WebhookDto, WebhookListQuery, WebhookPageDto,
+};
 pub use workflow::{
     CreateWorkflowRequest, PublishWorkflowRequest, UpdateWorkflowRequest, WorkflowEdgeDto,
     WorkflowGraphDto, WorkflowNodeDto, WorkflowResponse,

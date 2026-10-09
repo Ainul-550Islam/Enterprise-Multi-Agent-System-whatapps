@@ -88,7 +88,7 @@ async fn main() {
 /// if the operator can tell why.
 async fn run() -> Result<(), String> {
     use mas_persistence::pool::{Database, DatabaseUrl, PoolConfig};
-    use mas_persistence::repositories::PgDurableExecution;
+    use mas_persistence::repositories::{PgDurableExecution, PostgresDeliveryReceiptStore};
 
     let layered = mas_common::config::load_layered().map_err(|e| format!("config: {e}"))?;
     let merger = mas_common::config::Merger::new(&layered);
@@ -193,7 +193,12 @@ async fn run() -> Result<(), String> {
     // everything else from the database rather than from anything the broker
     // told it.
     let durable: Arc<dyn mas_application::durable::DurableExecutionPort> =
-        Arc::new(PgDurableExecution::new(worker_pool));
+        Arc::new(PgDurableExecution::new(worker_pool.clone()));
+    // Delivery receipts have their own database-generated identities and are
+    // shared by all replicas using this worker-plane role. A process-local
+    // broker sequence cannot safely identify a delivery across restarts.
+    let delivery_receipts: Arc<dyn mas_worker::DeliveryReceiptPort> =
+        Arc::new(PostgresDeliveryReceiptStore::new(worker_pool.clone()));
     // ── The concurrency slot a run holds for its duration ──────────────
     //
     // Built over the *runtime* pool, not the worker-plane pool. The slot is a
@@ -290,6 +295,7 @@ async fn run() -> Result<(), String> {
         broker,
         attempts,
         Arc::new(dispatcher),
+        delivery_receipts,
         ConsumerConfig {
             consumer_name,
             poll_interval: std::time::Duration::from_millis(poll_ms),

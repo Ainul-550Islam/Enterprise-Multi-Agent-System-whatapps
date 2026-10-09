@@ -19,11 +19,23 @@ impl SearchQuery {
     /// Validates text, kind names and result bounds.
     pub fn validate(&self) -> Result<()> {
         validation::validate_length("q", &self.q, 1, 256)?;
-        if self.q.trim().is_empty() {
+        let normalized = self.q.trim();
+        if normalized.is_empty() {
             return Err(mas_common::error::AppError::invalid_field(
                 "q",
                 "required",
                 "search query must not be blank",
+            ));
+        }
+        // `%term%` substring matching is intentionally literal and backed by
+        // pg_trgm. PostgreSQL cannot use that index selectively for one- or
+        // two-character patterns, so rejecting those queries prevents a
+        // command-palette keystroke from becoming a full tenant-table scan.
+        if normalized.chars().count() < 3 {
+            return Err(mas_common::error::AppError::invalid_field(
+                "q",
+                "too_short",
+                "search query must contain at least three characters",
             ));
         }
         if self.kinds.len() > 4 {
@@ -80,4 +92,30 @@ pub struct SearchResponseDto {
     pub items: Vec<SearchResultDto>,
     /// Whether additional results were omitted due to the result cap.
     pub truncated: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn search_requires_three_non_whitespace_characters() {
+        for q in [" ", "a", "ab", "  ab  "] {
+            let error = SearchQuery {
+                q: q.to_owned(),
+                kinds: Vec::new(),
+                limit: None,
+            }
+            .validate()
+            .expect_err("short palette input must not force a table scan");
+            assert_eq!(error.error_code(), "VALIDATION_FAILED");
+        }
+        SearchQuery {
+            q: "abc".to_owned(),
+            kinds: Vec::new(),
+            limit: Some(1),
+        }
+        .validate()
+        .expect("three-character query is valid");
+    }
 }

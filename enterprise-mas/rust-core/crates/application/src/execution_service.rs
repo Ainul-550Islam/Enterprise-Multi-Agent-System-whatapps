@@ -44,6 +44,7 @@ use mas_common::ids::{AgentId, ExecutionId, ProjectId, WorkflowId};
 use mas_common::result::Result;
 use mas_contracts::execution::ExecutionResponse;
 use mas_domain::entitlement::FeatureKey;
+#[cfg(test)]
 use mas_domain::quota::QuotaDimension;
 use mas_domain::{
     AuditOutcome, Execution, ExecutionStep, Task, TaskAttempt, TransitionActor, TransitionFailure,
@@ -56,7 +57,7 @@ use crate::control_plane::ControlPlane;
 use crate::dto;
 use crate::durable::{
     CancellationReceipt, CancellationRequest, DurableExecutionPort, ExecutionAction,
-    ExecutionTransitionRequest, SubmissionIntent, SubmissionKind,
+    ExecutionTransitionRequest, SubmissionAdmission, SubmissionIntent, SubmissionKind,
 };
 use crate::fingerprint::{FingerprintInput, RequestFingerprint};
 use crate::stores::{
@@ -238,33 +239,21 @@ impl ExecutionService {
             deadline: None,
         })?;
 
-        // ── Canonical gate: Entitlement → Policy → Quota reservation. ──────
+        // ── Canonical preflight: Entitlement → Policy. ────────────────────
         //
-        // This runs here, in the one submission path, because the order is a
-        // correctness property rather than a preference. Authentication and
-        // authorization already happened upstream (the context carries the
-        // authenticated actor); what remains is the part that decides whether
-        // this tenant may run this work at all.
+        // Quota is intentionally *not* charged yet. The durable submission
+        // transaction is the only linearizable authority for an idempotency
+        // key; charging before it resolves `Created` versus `Replayed` charged
+        // every retry. Entitlement and policy are side-effect free and still
+        // run first, so a denial cannot create work or consume quota.
         //
-        // Every branch of this gate fails closed. A lookup that errors is not
-        // reshaped into a grant, and a policy that cannot be evaluated is not
-        // treated as `allow`.
-        //
-        // This step *consumes* one execution rather than reserving it.
-        //
-        // A reservation is for a dimension whose final amount is not known
-        // when the work starts (tokens, or a concurrency slot held for the
-        // duration). An execution is a count, and the count is knowable right
-        // here: exactly one. Reserving instead would hold the unit until the
-        // lease lapsed, so a tenant on a daily ceiling of 100 could only
-        // submit a handful per day — the counter would be measuring the lease
-        // rather than the work.
-        //
-        // What the work actually consumes (tokens, tool calls, duration) is
-        // metered separately, at settlement, from what the worker observed.
-        let decision = self
-            .control_plane
-            .authorize_execution(
+        // Production transports wrap this entire service call in one
+        // authoritative request transaction. After a new durable receipt is
+        // returned, the execution charge below joins that same transaction:
+        // quota refusal rolls the new execution back, while a durable failure
+        // occurs before any quota mutation.
+        self.control_plane
+            .authorize_execution_preflight(
                 tenant_id,
                 Some(organization_id),
                 Some(project),
@@ -273,14 +262,9 @@ impl ExecutionService {
                 workflow.map(|_| &FeatureKey::WORKFLOWS),
                 operation,
                 "execution",
-                QuotaDimension::Executions,
-                1,
                 &serde_json::json!({"project_id": project.to_string()}),
-                None,
-                &ctx.requested_at,
             )
             .await?;
-        let _ = &decision;
 
         let intent = SubmissionIntent {
             tenant_id,
@@ -308,14 +292,54 @@ impl ExecutionService {
         };
         intent.validate()?;
 
-        // ── One transaction: idempotency + execution + task + outbox. ─────
+        // ── One request transaction: idempotency + execution + quota. ─────
         //
-        // Nothing here compensates a quota charge, because there is nothing to
-        // compensate: the charge above is a count of executions submitted, and
-        // on any failure below no execution exists. An execution that exists
-        // and then consumes resources is metered at settlement from what the
-        // worker actually observed — not from what was counted here.
-        let receipt = self.durable.submit(intent).await?;
+        // PostgreSQL is called inside the authoritative request transaction:
+        // the durable key decision and counter write share commit/rollback.
+        // The reference in-memory adapter has no cross-port transaction, so
+        // it advertises a local admission mode. In that mode one gate spans a
+        // non-mutating quota capacity check, exact idempotency inspection,
+        // durable creation, and the final counter mutation. A routine quota
+        // refusal therefore happens before a runnable task can exist — no
+        // cancellation-based compensation and no poisoned idempotency key.
+        let receipt = {
+            let _local_submission_gate = if self.durable.requires_local_submission_gate() {
+                Some(self.control_plane.lock_local_submission().await)
+            } else {
+                None
+            };
+
+            if self.durable.requires_local_submission_gate() {
+                match self.durable.submission_admission(&intent).await? {
+                    SubmissionAdmission::New => {
+                        self.control_plane
+                            .preflight_created_execution(tenant_id, 1, &ctx.requested_at)
+                            .await?;
+                    },
+                    // Both paths are read-only with respect to quota. Let the
+                    // durable submit return the canonical replay or conflict
+                    // result after this gate releases its transient probe.
+                    SubmissionAdmission::Replayed | SubmissionAdmission::Conflicting => {},
+                    SubmissionAdmission::Unknown => {
+                        return Err(AppError::internal(
+                            "local submission adapter did not provide an idempotency admission decision",
+                        ));
+                    },
+                }
+            }
+
+            // The durable receipt is examined before quota mutates. A replay
+            // has already paid for its original execution and must be a
+            // read-only response; only the single `Created` winner consumes
+            // one execution unit.
+            let receipt = self.durable.submit(intent).await?;
+            if receipt.kind == SubmissionKind::Created {
+                self.control_plane
+                    .consume_created_execution(tenant_id, 1, &ctx.requested_at)
+                    .await?;
+            }
+            receipt
+        };
 
         // Audit is derived from the transitions the unit reported, so there is
         // exactly one audit record per state change no matter which transport
@@ -381,11 +405,9 @@ impl ExecutionService {
         output: Option<serde_json::Value>,
     ) -> Result<Execution> {
         let receipt = self
-            .transition_action(ctx, execution_id, ExecutionAction::Complete)
+            .transition_action(ctx, execution_id, ExecutionAction::Complete { output })
             .await?;
-        let mut execution = receipt.execution;
-        execution.output = output;
-        Ok(execution)
+        Ok(receipt.execution)
     }
 
     /// Fails with a classified failure (terminal).
@@ -627,9 +649,10 @@ mod tests {
     use mas_common::enums::ExecutionStatus;
     use mas_common::ids::{OrganizationId, TenantId, UserId};
     use mas_common::timestamps::Timestamp;
+    use mas_domain::quota::{EnforcementMode, QuotaPeriod};
     use mas_domain::subscription::{Subscription, SubscriptionState};
     use mas_domain::value_objects::Slug;
-    use mas_domain::{Agent, AgentKind, AgentVersion, Project, Workflow};
+    use mas_domain::{Agent, AgentKind, AgentVersion, Project, Quota, Workflow};
     use std::sync::Arc;
 
     struct Fixture {
@@ -642,6 +665,7 @@ mod tests {
         project: ProjectId,
         audit: Arc<InMemoryAuditSink>,
         durable: Arc<InMemoryDurableExecution>,
+        control_plane: Arc<crate::control_plane::ControlPlane>,
     }
 
     async fn fixture() -> Fixture {
@@ -725,6 +749,7 @@ mod tests {
             project: project_row.id,
             audit,
             durable,
+            control_plane,
         }
     }
 
@@ -859,6 +884,20 @@ mod tests {
             1,
             "no duplicate rows"
         );
+        let charged = fixture
+            .control_plane
+            .quota()
+            .usage(
+                fixture.tenant_ctx.tenant_id.expect("tenant"),
+                QuotaDimension::Executions,
+                &fixture.tenant_ctx.requested_at,
+            )
+            .await
+            .expect("execution quota usage");
+        assert_eq!(
+            charged, 1,
+            "a same-key replay is read-only and must not consume quota twice"
+        );
 
         // Existence-hidden resources fail *before* anything is written.
         assert!(fixture
@@ -873,6 +912,199 @@ mod tests {
             )
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn quota_refusal_creates_no_work_and_does_not_bind_the_idempotency_key() {
+        let fixture = fixture().await;
+        let tenant = fixture.tenant_ctx.tenant_id.expect("fixture tenant");
+        let now = fixture.tenant_ctx.requested_at;
+        fixture
+            .control_plane
+            .quota()
+            .register(
+                &Quota::new(
+                    tenant,
+                    QuotaDimension::Executions,
+                    QuotaPeriod::Daily,
+                    1,
+                    EnforcementMode::Enforce,
+                )
+                .expect("quota"),
+            )
+            .await
+            .expect("register strict execution quota");
+        fixture
+            .control_plane
+            .consume_created_execution(tenant, 1, &now)
+            .await
+            .expect("consume the one available unit");
+
+        let denied = fixture
+            .service
+            .submit(
+                &fixture.tenant_ctx,
+                fixture.project,
+                Some(fixture.workflow),
+                None,
+                serde_json::json!({"job": "must-not-exist"}),
+                Some("quota-denied-key"),
+            )
+            .await
+            .expect_err("exhausted execution quota must refuse before durable creation");
+        assert!(
+            matches!(denied, AppError::QuotaExceeded { .. }),
+            "{denied:?}"
+        );
+        assert!(
+            fixture
+                .service
+                .list(&fixture.tenant_ctx)
+                .await
+                .expect("list")
+                .is_empty(),
+            "a rejected admission must not leave a runnable execution"
+        );
+        assert!(
+            fixture.durable.idempotency().is_empty(),
+            "a quota refusal must not poison a later legitimate retry key"
+        );
+        assert_eq!(
+            fixture
+                .control_plane
+                .quota()
+                .usage(tenant, QuotaDimension::Executions, &now)
+                .await
+                .expect("usage"),
+            1,
+            "the non-mutating local admission check cannot consume quota"
+        );
+
+        // After the tenant receives more capacity, the same key remains a new
+        // request rather than replaying a cancellation or phantom execution.
+        fixture
+            .control_plane
+            .quota()
+            .register(
+                &Quota::new(
+                    tenant,
+                    QuotaDimension::Executions,
+                    QuotaPeriod::Daily,
+                    2,
+                    EnforcementMode::Enforce,
+                )
+                .expect("expanded quota"),
+            )
+            .await
+            .expect("expand quota");
+        let accepted = fixture
+            .service
+            .submit(
+                &fixture.tenant_ctx,
+                fixture.project,
+                Some(fixture.workflow),
+                None,
+                serde_json::json!({"job": "must-not-exist"}),
+                Some("quota-denied-key"),
+            )
+            .await
+            .expect("same key becomes valid once capacity exists");
+        assert!(!accepted.replayed);
+        assert_eq!(
+            fixture
+                .service
+                .list(&fixture.tenant_ctx)
+                .await
+                .expect("list")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_submission_failure_does_not_consume_quota() {
+        let fixture = fixture().await;
+        fixture.durable.fail_next_submit(AppError::Database(
+            "simulated transaction failure".to_owned(),
+        ));
+
+        let error = fixture
+            .service
+            .submit(
+                &fixture.tenant_ctx,
+                fixture.project,
+                Some(fixture.workflow),
+                None,
+                serde_json::json!({"job": "durable-failure"}),
+                Some("durable-failure-key"),
+            )
+            .await
+            .expect_err("durable write failure");
+        assert!(matches!(error, AppError::Database(_)), "{error:?}");
+        assert!(fixture
+            .service
+            .list(&fixture.tenant_ctx)
+            .await
+            .expect("list")
+            .is_empty());
+        assert!(fixture.durable.idempotency().is_empty());
+        assert_eq!(
+            fixture
+                .control_plane
+                .quota()
+                .usage(
+                    fixture.tenant_ctx.tenant_id.expect("tenant"),
+                    QuotaDimension::Executions,
+                    &fixture.tenant_ctx.requested_at,
+                )
+                .await
+                .expect("usage"),
+            0,
+            "a failed durable transaction precedes every quota mutation"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_same_key_submissions_create_and_charge_once() {
+        let fixture = fixture().await;
+        let first = fixture.service.submit(
+            &fixture.tenant_ctx,
+            fixture.project,
+            Some(fixture.workflow),
+            None,
+            serde_json::json!({"job": "same-key"}),
+            Some("concurrent-key"),
+        );
+        let second = fixture.service.submit(
+            &fixture.tenant_ctx,
+            fixture.project,
+            Some(fixture.workflow),
+            None,
+            serde_json::json!({"job": "same-key"}),
+            Some("concurrent-key"),
+        );
+        let (first, second) = tokio::join!(first, second);
+        let first = first.expect("first submission");
+        let second = second.expect("same-key replay");
+        assert_ne!(
+            first.replayed, second.replayed,
+            "one caller creates, one replays"
+        );
+        assert_eq!(first.execution.id, second.execution.id);
+        assert_eq!(
+            fixture
+                .control_plane
+                .quota()
+                .usage(
+                    fixture.tenant_ctx.tenant_id.expect("tenant"),
+                    QuotaDimension::Executions,
+                    &fixture.tenant_ctx.requested_at,
+                )
+                .await
+                .expect("usage"),
+            1,
+            "same-key concurrency cannot duplicate an execution quota charge"
+        );
     }
 
     #[tokio::test]
@@ -910,6 +1142,20 @@ mod tests {
             fixture.service.list(ctx).await.expect("list").len(),
             1,
             "the rejected submission created nothing"
+        );
+        assert_eq!(
+            fixture
+                .control_plane
+                .quota()
+                .usage(
+                    fixture.tenant_ctx.tenant_id.expect("tenant"),
+                    QuotaDimension::Executions,
+                    &fixture.tenant_ctx.requested_at,
+                )
+                .await
+                .expect("usage"),
+            1,
+            "a conflicting fingerprint cannot consume a second execution unit"
         );
     }
 
@@ -1059,10 +1305,19 @@ mod tests {
             .expect("start");
         let completed = fixture
             .service
-            .complete(ctx, running.execution.id, None)
+            .complete(
+                ctx,
+                running.execution.id,
+                Some(serde_json::json!({"persisted": true})),
+            )
             .await
             .expect("complete");
         assert_eq!(completed.status, ExecutionStatus::Completed);
+        assert_eq!(
+            completed.output,
+            Some(serde_json::json!({"persisted": true})),
+            "a direct completion writes its output through the durable port"
+        );
         assert!(fixture
             .service
             .cancel(ctx, running.execution.id)

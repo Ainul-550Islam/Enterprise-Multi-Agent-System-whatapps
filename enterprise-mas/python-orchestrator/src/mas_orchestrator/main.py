@@ -69,6 +69,7 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Sequence
 
     from mas_orchestrator.config.settings import Settings
+    from mas_orchestrator.security.internal_replay import InternalReplayGuard
 
 _LOGGER: Final[logging.Logger] = logging.getLogger("mas_orchestrator.main")
 
@@ -198,6 +199,17 @@ def _internal_signing_secret(settings: Settings) -> str | None:
     return resolve_secret(reference).reveal()
 
 
+def _internal_replay_guard(settings: Settings) -> InternalReplayGuard | None:
+    """Builds the shared nonce consumer required by production bridge auth."""
+    reference = settings.security.internal_replay_database_url_secret_ref
+    if not reference:
+        return None
+    from mas_orchestrator.security.credentials import resolve_secret
+    from mas_orchestrator.security.internal_replay import PostgresReplayGuard
+
+    return PostgresReplayGuard(resolve_secret(reference).reveal())
+
+
 def build_bridge_server(
     settings: Settings,
     coordinator: ShutdownCoordinator,
@@ -242,6 +254,7 @@ def build_bridge_server(
             # that: a bridge that has not been provisioned must not quietly
             # start accepting traffic.
             require_internal_signature=settings.is_production,
+            replay_guard=_internal_replay_guard(settings),
         ),
     )
     data_hub_servicer = DataHubBridgeServicer(

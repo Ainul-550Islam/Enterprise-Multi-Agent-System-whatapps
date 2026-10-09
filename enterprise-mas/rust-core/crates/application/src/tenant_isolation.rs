@@ -345,6 +345,7 @@ async fn tenant_b_cannot_settle_tenant_a_task() {
             worker: "worker-b".to_owned(),
             expected_version: claim.task.version,
             outcome: TaskOutcome::Succeeded {
+                result: serde_json::Value::Null,
                 usage: ExecutionUsage {
                     provider: Some("openai".to_owned()),
                     model: Some("gpt-4o-mini".to_owned()),
@@ -429,7 +430,7 @@ async fn tenant_b_cannot_transition_tenant_a_execution() {
         .transition(crate::durable::ExecutionTransitionRequest {
             tenant_id: tenant_b(),
             execution_id: a.execution.id,
-            action: crate::durable::ExecutionAction::Complete,
+            action: crate::durable::ExecutionAction::Complete { output: None },
             actor: TransitionActor::principal("attacker", tenant_b()).expect("actor"),
             correlation_id: "corr-attack".to_owned(),
             now: now(1),
@@ -524,6 +525,7 @@ async fn usage_is_attributable_to_the_tenant_that_did_the_work() {
             worker: "worker-a".to_owned(),
             expected_version: claim.task.version,
             outcome: TaskOutcome::Succeeded {
+                result: serde_json::Value::Null,
                 usage: ExecutionUsage {
                     provider: Some("openai".to_owned()),
                     model: Some("gpt-4o-mini".to_owned()),
@@ -670,6 +672,7 @@ async fn a_task_never_outlives_its_tenant_scope_after_completion() {
             worker: "worker-a".to_owned(),
             expected_version: claim.task.version,
             outcome: TaskOutcome::Succeeded {
+                result: serde_json::Value::Null,
                 usage: ExecutionUsage::default(),
             },
             execution: Some(crate::durable::ExecutionFinalization {

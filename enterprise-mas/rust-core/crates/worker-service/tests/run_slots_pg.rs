@@ -477,23 +477,31 @@ async fn two_workers_asking_for_the_same_run_share_one_slot() {
     let execution = ExecutionId::new();
     let task = TaskId::new();
     let worker_one = ControlPlaneRunSlots::new(rig.app.clone(), Arc::clone(&rig.plane), "worker-1");
-    let worker_two = ControlPlaneRunSlots::new(rig.app.clone(), Arc::clone(&rig.plane), "worker-2");
+    // A separate plane instance models a second process: its local mutex cannot
+    // serialize this race, so this test exercises the PostgreSQL advisory lock
+    // installed by `ReservationStorePort::lock_key`.
+    let replica_two = Arc::new(
+        mas_persistence::repositories::control_plane::adapters::build_postgres_control_plane(
+            rig.app.clone(),
+        )
+        .with_lease(Duration::from_secs(30)),
+    );
+    let worker_two = ControlPlaneRunSlots::new(rig.app.clone(), replica_two, "worker-2");
+    let now = at(0);
 
-    assert!(matches!(
-        worker_one
-            .acquire(rig.tenant, rig.organization, Some(execution), task, &at(0))
-            .await
-            .expect("first"),
-        RunSlot::Acquired
-    ));
-    assert_eq!(
-        worker_two
-            .acquire(rig.tenant, rig.organization, Some(execution), task, &at(0))
-            .await
-            .expect("second"),
-        RunSlot::HeldElsewhere,
-        "the second caller is told the slot already exists and is not theirs, \
-         so it neither runs the task nor releases the hold"
+    let first = worker_one.acquire(rig.tenant, rig.organization, Some(execution), task, &now);
+    let second = worker_two.acquire(rig.tenant, rig.organization, Some(execution), task, &now);
+    let (first, second) = tokio::join!(first, second);
+    let first = first.expect("first result");
+    let second = second.expect("second result");
+    assert!(
+        matches!(first, RunSlot::Acquired) != matches!(second, RunSlot::Acquired),
+        "one replica establishes the row and the other must defer: first={first:?}, second={second:?}"
+    );
+    assert!(
+        matches!(first, RunSlot::Acquired | RunSlot::HeldElsewhere)
+            && matches!(second, RunSlot::Acquired | RunSlot::HeldElsewhere),
+        "same-key replicas neither over-admit nor turn the duplicate into a quota denial: first={first:?}, second={second:?}"
     );
     assert_eq!(
         gauge_value(&rig.migrator, rig.tenant).await,

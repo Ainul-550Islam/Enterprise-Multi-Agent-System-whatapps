@@ -61,6 +61,7 @@ pub mod backoff;
 pub mod capacity;
 pub mod classify;
 pub mod consumer;
+pub mod delivery_receipts;
 #[cfg(test)]
 mod failure_matrix;
 pub mod grace;
@@ -72,6 +73,10 @@ pub use attempts::{AttemptCoordinator, ClaimOneOutcome};
 pub use capacity::CapacityGate;
 pub use classify::{classify, ClassifiedFailure, FailureClass};
 pub use consumer::{ConsumerConfig, ConsumerOutcome, TaskConsumer};
+pub use delivery_receipts::{
+    DeliveryReceipt, DeliveryReceiptPort, DeliveryReceiptSettlement, DeliveryReservationRequest,
+    InMemoryDeliveryReceiptStore,
+};
 pub use handler::{OperationDispatcher, TaskHandlerPort};
 pub use lifecycle::{InMemoryTaskStore, TaskLifecyclePort};
 pub use run_slot::{NoRunSlots, RunSlot, RunSlotPort};

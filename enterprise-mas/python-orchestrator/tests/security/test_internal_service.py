@@ -28,9 +28,13 @@ SECRET = "s3cr3t"
 BODY = b'{"tenant_id": "t-1", "operation": "run"}'
 
 # The vector produced by the Rust implementation for
-# secret="s3cr3t", service="mas-api", millis=1700000000000, body={"a":1}.
+# secret="s3cr3t", service="mas-api", millis=1700000000000, body={"a":1},
+# nonce="0123456789abcdefghijklmnopqrstuv". Fixed nonce input is test-only;
+# real requests must use freshly generated randomness.
+RUST_VECTOR_NONCE = "0123456789abcdefghijklmnopqrstuv"
 RUST_VECTOR = (
-    "v1:mas-api:1700000000000:17985adfe11dbfd97835efc01270debe55c97e0131778e0f0d9099dc5a753b8e"
+    "v2:mas-api:1700000000000:0123456789abcdefghijklmnopqrstuv:"
+    "ad29671c18b6926ff5c86fa205004b7b9e8675b6324bef6459aedead1e775766"
 )
 RUST_VECTOR_BODY = b'{"a":1}'
 RUST_VECTOR_MILLIS = 1_700_000_000_000
@@ -69,11 +73,19 @@ def test_a_fresh_signature_verifies() -> None:
 
 
 def test_the_mac_is_independent_of_the_transport_encoding() -> None:
-    """The signature must be a pure function of the bytes, not of how the
-    body was produced — re-serializing the same payload yields the same MAC."""
-    first = signed_internal_signature(SECRET, "mas-api", 1_700_000_000_000, BODY)
-    again = signed_internal_signature(SECRET, "mas-api", 1_700_000_000_000, bytes(BODY))
+    """Given the same nonce, byte-equivalent payloads produce the same MAC."""
+    nonce = "0123456789abcdefghijklmnopqrstuv"
+    first = signed_internal_signature(SECRET, "mas-api", 1_700_000_000_000, BODY, nonce=nonce)
+    again = signed_internal_signature(
+        SECRET, "mas-api", 1_700_000_000_000, bytes(BODY), nonce=nonce
+    )
     assert first == again
+
+
+def test_fresh_signatures_have_distinct_nonces() -> None:
+    first = signed_internal_signature(SECRET, "mas-api", 1_700_000_000_000, BODY)
+    second = signed_internal_signature(SECRET, "mas-api", 1_700_000_000_000, BODY)
+    assert first != second
 
 
 # ---------------------------------------------------------------------------
@@ -106,8 +118,9 @@ def test_a_signature_outside_the_skew_window_is_refused() -> None:
 
 
 def test_a_signature_at_the_edge_of_the_window_is_accepted() -> None:
-    edge = _now_ms() - (MAX_SKEW_SECONDS * 1000)
-    identity = verify_internal_signature(SECRET, _sign(at_ms=edge), "mas-api", _now_ms(), BODY)
+    now = _now_ms()
+    edge = now - (MAX_SKEW_SECONDS * 1000)
+    identity = verify_internal_signature(SECRET, _sign(at_ms=edge), "mas-api", now, BODY)
     assert identity.service == "mas-api"
 
 
@@ -169,11 +182,11 @@ def test_a_spliced_service_header_is_refused() -> None:
         "v1:mas-api",
         "v1:mas-api:1700000000000",
         "v2:mas-api:1700000000000:" + "a" * 64,
-        "v1:mas-api:notanumber:" + "a" * 64,
-        "v1:mas-api:1700000000000:zzzz",
-        "v1:mas-api:1700000000000:" + "a" * 63,
-        "v1:mas-api:1700000000000:" + "a" * 65,
-        "v1::1700000000000:" + "a" * 64,
+        "v2:mas-api:notanumber:0123456789abcdefghijklmnopqrstuv:" + "a" * 64,
+        "v2:mas-api:1700000000000:too-short:zzzz",
+        "v2:mas-api:1700000000000:0123456789abcdefghijklmnopqrstuv:" + "a" * 63,
+        "v2:mas-api:1700000000000:0123456789abcdefghijklmnopqrstuv:" + "a" * 65,
+        "v2::1700000000000:0123456789abcdefghijklmnopqrstuv:" + "a" * 64,
     ],
 )
 def test_malformed_signatures_are_refused(signature: str | None) -> None:
@@ -212,13 +225,19 @@ def test_the_signed_message_format_matches_the_documented_layout() -> None:
     """Pins the exact bytes under the MAC, so a change to the format on either
     side is caught here rather than in production."""
     digest = hashlib.sha256(RUST_VECTOR_BODY).hexdigest()
-    message = f"v1:mas-api:{RUST_VECTOR_MILLIS}:{digest}".encode()
+    message = (f"v2:mas-api:{RUST_VECTOR_MILLIS}:{RUST_VECTOR_NONCE}:{digest}").encode()
     expected = hmac.new(SECRET.encode(), message, hashlib.sha256).hexdigest()
     assert RUST_VECTOR.endswith(expected)
 
 
 def test_python_produces_the_rust_vector() -> None:
-    produced = signed_internal_signature(SECRET, "mas-api", RUST_VECTOR_MILLIS, RUST_VECTOR_BODY)
+    produced = signed_internal_signature(
+        SECRET,
+        "mas-api",
+        RUST_VECTOR_MILLIS,
+        RUST_VECTOR_BODY,
+        nonce=RUST_VECTOR_NONCE,
+    )
     assert produced == RUST_VECTOR
 
 
@@ -228,6 +247,7 @@ def test_python_accepts_the_rust_vector() -> None:
     )
     assert identity.service == "mas-api"
     assert identity.signed_at_ms == RUST_VECTOR_MILLIS
+    assert identity.nonce == RUST_VECTOR_NONCE
 
 
 def test_python_rejects_the_rust_vector_over_a_tampered_body() -> None:

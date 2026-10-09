@@ -21,6 +21,7 @@ import json
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final
+from urllib.parse import urlsplit, urlunsplit
 
 from mas_orchestrator.contracts.errors import InvalidRequestError
 from mas_orchestrator.providers.base_http import HttpPolicy, HttpTransport
@@ -61,6 +62,12 @@ INPUT_SCHEMA: Final[dict[str, Any]] = {
     },
     "required": ["method", "url"],
 }
+
+
+def _safe_url_for_log(url: str) -> str:
+    """Returns a destination-safe URL without query/fragment credential risk."""
+    parsed = urlsplit(url)
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
 
 
 def _scrub_headers(headers: Mapping[str, str]) -> dict[str, str]:
@@ -221,7 +228,7 @@ class HttpTool:
                 "event": "tool.http.request",
                 "invocation_id": context.invocation_id,
                 "method": method,
-                "url": url,
+                "url": _safe_url_for_log(url),
             },
         )
 

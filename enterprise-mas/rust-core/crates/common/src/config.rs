@@ -161,6 +161,46 @@ impl<'a> Merger<'a> {
             .unwrap_or_else(|| default.to_owned())
     }
 
+    /// `env → file.path → default`, typed non-empty string list. Environment
+    /// values use a comma-separated representation so list-valued TOML keys
+    /// remain overrideable without a shell-specific array syntax.
+    pub fn string_list(&self, env_key: &str, path: &str, default: &[&str]) -> Result<Vec<String>> {
+        if let Ok(value) = std::env::var(env_key) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return parse_string_list(trimmed, env_key);
+            }
+        }
+        match lookup(self.merged, path) {
+            Some(toml::Value::Array(items)) => {
+                let mut values = Vec::with_capacity(items.len());
+                for item in items {
+                    let Some(value) = item.as_str() else {
+                        return Err(AppError::validation(format!(
+                            "config {path} must contain only strings"
+                        )));
+                    };
+                    if value.trim().is_empty() {
+                        return Err(AppError::validation(format!(
+                            "config {path} must not contain empty values"
+                        )));
+                    }
+                    values.push(value.to_owned());
+                }
+                if values.is_empty() {
+                    return Err(AppError::validation(format!(
+                        "config {path} must not be empty"
+                    )));
+                }
+                Ok(values)
+            },
+            Some(_) => Err(AppError::validation(format!(
+                "config {path} must be an array of strings"
+            ))),
+            None => Ok(default.iter().map(|item| (*item).to_owned()).collect()),
+        }
+    }
+
     /// Same precedence, `u64`.
     pub fn u64(&self, env_key: &str, path: &str, default: u64) -> Result<u64> {
         if let Ok(value) = std::env::var(env_key) {
@@ -205,6 +245,26 @@ impl<'a> Merger<'a> {
         let ms = self.u64(env_key, path, default.as_millis() as u64)?;
         Ok(std::time::Duration::from_millis(ms))
     }
+}
+
+fn parse_string_list(raw: &str, source: &str) -> Result<Vec<String>> {
+    let values: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if values.is_empty() {
+        return Err(AppError::validation(format!(
+            "{source} must contain at least one non-empty value"
+        )));
+    }
+    if raw.split(',').any(|value| value.trim().is_empty()) {
+        return Err(AppError::validation(format!(
+            "{source} must not contain empty list values"
+        )));
+    }
+    Ok(values)
 }
 
 /// Production guardrail: errors when `predicate(value)` holds — used for

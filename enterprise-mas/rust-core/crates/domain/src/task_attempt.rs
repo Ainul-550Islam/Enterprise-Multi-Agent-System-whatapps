@@ -43,6 +43,10 @@ string_enum! {
         Running => "running",
         Succeeded => "succeeded",
         Failed => "failed",
+        /// The owning worker stopped renewing its lease before settlement.
+        /// This is terminal for the abandoned attempt, while the task may be
+        /// retried by a later durable claim when its attempt budget permits.
+        Expired => "expired",
         Cancelled => "cancelled",
         TimedOut => "timed_out",
     }
@@ -53,14 +57,14 @@ impl AttemptStatus {
     pub const fn is_terminal(&self) -> bool {
         matches!(
             self,
-            Self::Succeeded | Self::Failed | Self::Cancelled | Self::TimedOut
+            Self::Succeeded | Self::Failed | Self::Expired | Self::Cancelled | Self::TimedOut
         )
     }
 
     /// Whether the attempt outcome permits another try of the task.
     #[must_use]
     pub const fn is_retryable(&self) -> bool {
-        matches!(self, Self::Failed | Self::TimedOut)
+        matches!(self, Self::Failed | Self::Expired | Self::TimedOut)
     }
 }
 
@@ -239,6 +243,21 @@ impl TaskAttempt {
         )
     }
 
+    /// Running → Expired after the owning worker's lease lapsed.
+    ///
+    /// An expired attempt is not a provider failure and did not necessarily
+    /// produce a result. It is nevertheless terminal: a later worker must
+    /// create a new attempt rather than reopen this one.
+    pub fn expire(&mut self, now: &Timestamp) -> Result<()> {
+        self.finalize(
+            AttemptStatus::Expired,
+            Some("lease_expired".to_owned()),
+            Some("worker lease lapsed before settlement".to_owned()),
+            true,
+            now,
+        )
+    }
+
     /// Running → TimedOut.
     pub fn time_out(&mut self, detail: impl Into<String>, now: &Timestamp) -> Result<()> {
         self.finalize(
@@ -386,6 +405,24 @@ mod tests {
     }
 
     #[test]
+    fn expiry_is_a_terminal_retryable_ledger_outcome() {
+        let later = now()
+            .checked_add(Duration::from_secs(2))
+            .expect("timestamp");
+        let mut expired = attempt();
+        expired.expire(&later).expect("expire");
+        assert_eq!(expired.status, AttemptStatus::Expired);
+        assert_eq!(expired.error_code.as_deref(), Some("lease_expired"));
+        assert!(expired.error_retryable);
+        assert_eq!(expired.finished_at, Some(later));
+        assert_eq!(expired.version(), 2);
+        assert!(
+            expired.succeed(&later).is_err(),
+            "a replacement must be a new attempt, never a reopened expired one"
+        );
+    }
+
+    #[test]
     fn lease_expiry_is_evaluated_against_durable_time() {
         let expiry = now();
         let mut attempt = attempt();
@@ -417,9 +454,12 @@ mod tests {
         assert_eq!(AttemptStatus::Running.as_str(), "running");
         assert_eq!(AttemptStatus::Succeeded.as_str(), "succeeded");
         assert_eq!(AttemptStatus::Failed.as_str(), "failed");
+        assert_eq!(AttemptStatus::Expired.as_str(), "expired");
         assert_eq!(AttemptStatus::Cancelled.as_str(), "cancelled");
         assert_eq!(AttemptStatus::TimedOut.as_str(), "timed_out");
         assert!(!AttemptStatus::Running.is_terminal());
+        assert!(AttemptStatus::Expired.is_terminal());
+        assert!(AttemptStatus::Expired.is_retryable());
         assert!(AttemptStatus::Succeeded.is_terminal());
     }
 }

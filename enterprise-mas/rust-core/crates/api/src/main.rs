@@ -40,14 +40,25 @@ use mas_api::auth::{PrincipalKind, StaticTokenVerifier};
 use mas_api::server::ServerConfig;
 use mas_api::state::AppState;
 use mas_application::agent_service::AgentService;
+use mas_application::analytics_service::AnalyticsService;
+use mas_application::api_key_service::ApiKeyApplicationService;
+use mas_application::approval_service::ApprovalApplicationService;
 use mas_application::audit::InMemoryAuditSink;
+use mas_application::data_hub_service::{DataHubApplicationService, DataHubLimits};
 use mas_application::execution_service::ExecutionService;
+use mas_application::notification_service::NotificationService;
+use mas_application::oauth_authorization_service::OAuthAuthorizationService;
 use mas_application::rollback_service::RollbackApplicationService;
 use mas_application::schedule_service::ScheduleService;
+use mas_application::search_service::SearchService;
 use mas_application::stores::InMemoryServices;
 use mas_application::tenancy_service::TenancyService;
 use mas_application::workflow_service::WorkflowService;
 use mas_observability::health::HealthRegistry;
+
+mod inbound_webhook_composition;
+mod integration_composition;
+mod oauth_composition;
 
 #[tokio::main]
 async fn main() {
@@ -97,6 +108,20 @@ async fn run() -> Result<i32, String> {
         rollbacks,
         executions,
         schedules,
+        notifications,
+        inbound_webhook_endpoints,
+        inbound_webhook_ingress,
+        integration_plane,
+        oauth_authorization,
+        oauth_callbacks,
+        oauth_refresh_worker,
+        oauth_cleanup_worker,
+        oauth_materialization_reconciler,
+        analytics,
+        api_keys,
+        approvals,
+        data_hub,
+        search,
         control_plane,
         audit,
         control_plane_stores,
@@ -139,7 +164,92 @@ async fn run() -> Result<i32, String> {
         // refuses, rather than trusting the network.
         internal_secret,
     )
-    .with_rollbacks(rollbacks);
+    .with_rollbacks(rollbacks)
+    .with_notifications(notifications)
+    .with_analytics(analytics)
+    .with_api_keys(api_keys)
+    .with_approvals(approvals)
+    .with_data_hub(data_hub)
+    .with_search(search);
+    let state = match (inbound_webhook_endpoints, inbound_webhook_ingress) {
+        (Some(endpoints), Some(ingress)) => state.with_inbound_webhooks(endpoints, ingress),
+        (None, None) if dev_inmemory => state,
+        (None, None) => {
+            return Err(
+                "production composition omitted the canonical inbound webhook plane; refusing to start"
+                    .to_owned(),
+            );
+        },
+        _ => {
+            return Err(
+                "inbound webhook endpoint and ingress composition must be installed together"
+                    .to_owned(),
+            );
+        },
+    };
+
+    let state = match integration_plane {
+        Some(integration_plane) => {
+            spawn_outbound_webhook_worker(
+                integration_plane.outbound_webhook_worker,
+                integration_plane.outbound_webhook_poll,
+            );
+            spawn_notification_delivery_worker(
+                integration_plane.notification_delivery_worker,
+                integration_plane.notification_delivery_poll,
+            );
+            state.with_integrations(integration_plane.service)
+        },
+        None if dev_inmemory => state,
+        None => {
+            return Err(
+                "production composition omitted the canonical connector/outbound-webhook service or durable delivery workers; refusing to start"
+                    .to_owned(),
+            );
+        },
+    };
+
+    let state = match (oauth_authorization, oauth_callbacks) {
+        (Some(authorization), Some(callbacks)) => state.with_oauth(authorization, callbacks),
+        (None, None) if dev_inmemory => state,
+        (None, None) => {
+            return Err(
+                "production composition omitted the canonical OAuth authorization/callback plane; refusing to start"
+                    .to_owned(),
+            );
+        },
+        _ => {
+            return Err(
+                "OAuth authorization and callback composition must be installed together"
+                    .to_owned(),
+            );
+        },
+    };
+
+    match (
+        oauth_refresh_worker,
+        oauth_cleanup_worker,
+        oauth_materialization_reconciler,
+    ) {
+        (Some(refresh_worker), Some(cleanup_worker), Some(materialization_reconciler)) => {
+            spawn_oauth_refresh_worker(&merger, refresh_worker)?;
+            spawn_oauth_token_cleanup_worker(&merger, cleanup_worker)?;
+            spawn_oauth_materialization_reconciler(&merger, materialization_reconciler)?;
+        },
+        (None, None, None) if dev_inmemory => {},
+        (None, None, None) => {
+            return Err(
+                "production composition omitted the durable OAuth lifecycle workers; refusing to start"
+                    .to_owned(),
+            );
+        },
+        _ => {
+            return Err(
+                "OAuth refresh, cleanup, and materialization reconciliation workers must be composed together"
+                    .to_owned(),
+            );
+        },
+    }
 
     let (http_addr, grpc_addr) = (
         parse_addr_value(
@@ -187,6 +297,20 @@ type ServiceSet = (
     Arc<RollbackApplicationService>,
     Arc<ExecutionService>,
     Arc<ScheduleService>,
+    Arc<NotificationService>,
+    Option<Arc<mas_application::inbound_webhook_service::InboundWebhookEndpointService>>,
+    Option<Arc<dyn mas_integrations::inbound_webhooks::InboundWebhookIngressPort>>,
+    Option<integration_composition::IntegrationComposition>,
+    Option<Arc<OAuthAuthorizationService>>,
+    Option<Arc<mas_integrations::durable_oauth::DurableOAuthAuthorizationService>>,
+    Option<Arc<mas_integrations::oauth_refresh::OAuthTokenRefreshWorker>>,
+    Option<Arc<mas_integrations::oauth_cleanup::OAuthTokenCleanupWorker>>,
+    Option<Arc<mas_integrations::oauth_materialization::OAuthMaterializationReconciler>>,
+    Arc<AnalyticsService>,
+    Arc<ApiKeyApplicationService>,
+    Arc<ApprovalApplicationService>,
+    Arc<DataHubApplicationService>,
+    Arc<SearchService>,
     // The canonical control plane, and the Postgres control-plane stores
     // (`None` in the in-memory lane, which has no database).
     Arc<mas_application::control_plane::ControlPlane>,
@@ -225,6 +349,354 @@ fn load_internal_secret(
         return Ok(None);
     }
     Ok(Some(mas_security::SecretString::new(raw)))
+}
+
+/// Opens a deliberately separate role-scoped database pool. Each dedicated
+/// callback/relay role needs its own credential/SET ROLE URL: reusing `mas_app`
+/// would either fail under RLS or silently widen request-plane authority.
+async fn connect_role_pool(
+    merger: &mas_common::config::Merger<'_>,
+    environment_key: &str,
+    config_key: &str,
+    application_name: &str,
+    max_connections: u64,
+) -> Result<sqlx::PgPool, String> {
+    use mas_persistence::pool::{Database, DatabaseUrl, PoolConfig};
+
+    let raw_url = merger.string(environment_key, config_key, "");
+    if raw_url.is_empty() {
+        return Err(format!(
+            "production mode requires {environment_key} ({config_key}) for {application_name}"
+        ));
+    }
+    let url = DatabaseUrl::new(raw_url)
+        .map_err(|error| format!("{application_name} database url: {error}"))?;
+    let mut config = PoolConfig::for_url(url, application_name)
+        .map_err(|error| format!("{application_name} database config: {error}"))?;
+    config.max_connections = u32::try_from(max_connections).unwrap_or(32).min(8);
+    let config = config
+        .validated()
+        .map_err(|error| format!("{application_name} database config: {error}"))?;
+    Database::connect(&config)
+        .await
+        .map(|database| database.pool().clone())
+        .map_err(|error| format!("{application_name} database: {error}"))
+}
+
+/// Starts the lease-fenced outbound webhook relay. The loop owns no queue
+/// state: PostgreSQL claims/fences make concurrent API replicas safe, while a
+/// shutdown during a bounded pass abandons its lease rather than risking a
+/// stale settlement. The next replica may reclaim it after expiry.
+fn spawn_outbound_webhook_worker(
+    worker: Arc<integration_composition::OutboundWebhookWorker>,
+    poll_interval: std::time::Duration,
+) {
+    tokio::spawn(async move {
+        let shutdown = mas_api::server::shutdown_signal();
+        tokio::pin!(shutdown);
+        loop {
+            let now = mas_common::timestamps::Timestamp::now();
+            tokio::select! {
+                () = &mut shutdown => {
+                    tracing::info!(worker = "outbound_webhook", "outbound webhook relay stopping on shutdown");
+                    break;
+                },
+                result = worker.run_once(&now) => {
+                    match result {
+                        Ok(cycle) => tracing::debug!(
+                            attempted = cycle.attempted,
+                            delivered = cycle.delivered,
+                            requeued = cycle.requeued,
+                            dead_lettered = cycle.dead_lettered,
+                            stale = cycle.stale,
+                            released = cycle.released,
+                            "outbound webhook relay pass completed"
+                        ),
+                        Err(error) => tracing::warn!(
+                            error = %error.public_message(),
+                            "outbound webhook relay pass failed"
+                        ),
+                    }
+                },
+            }
+            tokio::select! {
+                () = &mut shutdown => {
+                    tracing::info!(worker = "outbound_webhook", "outbound webhook relay stopped before next poll");
+                    break;
+                },
+                () = tokio::time::sleep(poll_interval) => {},
+            }
+        }
+    });
+}
+
+/// Starts the lease-fenced notification delivery loop. Only represented
+/// adapters can settle a row successfully; unsupported channels remain durable
+/// failure/dead-letter evidence rather than becoming a successful no-op.
+fn spawn_notification_delivery_worker(
+    worker: Arc<integration_composition::NotificationDeliveryWorker>,
+    poll_interval: std::time::Duration,
+) {
+    tokio::spawn(async move {
+        let shutdown = mas_api::server::shutdown_signal();
+        tokio::pin!(shutdown);
+        loop {
+            let now = mas_common::timestamps::Timestamp::now();
+            tokio::select! {
+                () = &mut shutdown => {
+                    tracing::info!(worker = "notification_delivery", "notification delivery worker stopping on shutdown");
+                    break;
+                },
+                result = worker.run_once(&now) => {
+                    match result {
+                        Ok(cycle) => tracing::debug!(
+                            attempted = cycle.attempted,
+                            delivered = cycle.delivered,
+                            requeued = cycle.requeued,
+                            dead_lettered = cycle.dead_lettered,
+                            stale = cycle.stale,
+                            released = cycle.released,
+                            "notification delivery pass completed"
+                        ),
+                        Err(error) => tracing::warn!(
+                            error = %error.public_message(),
+                            "notification delivery pass failed"
+                        ),
+                    }
+                },
+            }
+            tokio::select! {
+                () = &mut shutdown => {
+                    tracing::info!(worker = "notification_delivery", "notification delivery worker stopped before next poll");
+                    break;
+                },
+                () = tokio::time::sleep(poll_interval) => {},
+            }
+        }
+    });
+}
+
+/// Starts the independently fenced OAuth refresh loop. Every API replica may
+/// run this loop: PostgreSQL SKIP LOCKED leases and monotonic fences prevent
+/// duplicate durable settlement, and no process-local schedule is authoritative.
+fn spawn_oauth_refresh_worker(
+    merger: &mas_common::config::Merger<'_>,
+    worker: Arc<mas_integrations::oauth_refresh::OAuthTokenRefreshWorker>,
+) -> Result<(), String> {
+    let poll_seconds = merger
+        .u64(
+            "MAS_OAUTH_REFRESH_POLL_SECONDS",
+            "integrations.oauth.refresh_poll_seconds",
+            30,
+        )
+        .map_err(|error| format!("OAuth refresh poll configuration: {error}"))?;
+    if !(1..=3_600).contains(&poll_seconds) {
+        return Err("OAuth refresh poll interval must be between 1 and 3600 seconds".to_owned());
+    }
+    let batch = merger
+        .u64(
+            "MAS_OAUTH_REFRESH_BATCH_SIZE",
+            "integrations.oauth.refresh_batch_size",
+            32,
+        )
+        .map_err(|error| format!("OAuth refresh batch configuration: {error}"))?;
+    let batch = u16::try_from(batch)
+        .ok()
+        .filter(|value| {
+            (1..=mas_integrations::oauth_refresh::MAX_OAUTH_REFRESH_BATCH).contains(value)
+        })
+        .ok_or_else(|| "OAuth refresh batch size must be between 1 and 100".to_owned())?;
+    let configured_name = merger.string(
+        "MAS_OAUTH_REFRESH_WORKER_ID",
+        "integrations.oauth.refresh_worker_id",
+        "api-oauth-refresh",
+    );
+    if configured_name.is_empty()
+        || configured_name.len() > 100
+        || !configured_name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err("OAuth refresh worker id must be a bounded safe token".to_owned());
+    }
+    let worker_id = format!("{configured_name}-{}", std::process::id());
+    tokio::spawn(async move {
+        loop {
+            match worker
+                .run_once(&worker_id, &mas_common::timestamps::Timestamp::now(), batch)
+                .await
+            {
+                Ok(stats) => {
+                    tracing::debug!(
+                        claimed = stats.claimed,
+                        refreshed = stats.refreshed,
+                        retry_scheduled = stats.retry_scheduled,
+                        revoked_or_dead_lettered = stats.revoked_or_dead_lettered,
+                        "OAuth token refresh pass completed"
+                    );
+                },
+                Err(error) => {
+                    // The job row/lease remains durable for retry. Do not log
+                    // any provider/Vault response or material; AppError's
+                    // public message is intentionally bounded/redacted.
+                    tracing::warn!(error = %error.public_message(), "OAuth token refresh pass failed");
+                },
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(poll_seconds)).await;
+        }
+    });
+    Ok(())
+}
+
+/// Starts the independently fenced OAuth token-cleanup loop. It deliberately
+/// shares the refresh poll/batch configuration so operations has one bounded
+/// OAuth lifecycle cadence; queues remain independent and each has its own
+/// PostgreSQL lease/fence namespace.
+fn spawn_oauth_token_cleanup_worker(
+    merger: &mas_common::config::Merger<'_>,
+    worker: Arc<mas_integrations::oauth_cleanup::OAuthTokenCleanupWorker>,
+) -> Result<(), String> {
+    let poll_seconds = merger
+        .u64(
+            "MAS_OAUTH_REFRESH_POLL_SECONDS",
+            "integrations.oauth.refresh_poll_seconds",
+            30,
+        )
+        .map_err(|error| format!("OAuth token cleanup poll configuration: {error}"))?;
+    if !(1..=3_600).contains(&poll_seconds) {
+        return Err(
+            "OAuth token cleanup poll interval must be between 1 and 3600 seconds".to_owned(),
+        );
+    }
+    let batch = merger
+        .u64(
+            "MAS_OAUTH_REFRESH_BATCH_SIZE",
+            "integrations.oauth.refresh_batch_size",
+            32,
+        )
+        .map_err(|error| format!("OAuth token cleanup batch configuration: {error}"))?;
+    let batch = u16::try_from(batch)
+        .ok()
+        .filter(|value| {
+            (1..=mas_integrations::oauth_cleanup::MAX_OAUTH_TOKEN_CLEANUP_BATCH).contains(value)
+        })
+        .ok_or_else(|| "OAuth token cleanup batch size must be between 1 and 100".to_owned())?;
+    let configured_name = merger.string(
+        "MAS_OAUTH_REFRESH_WORKER_ID",
+        "integrations.oauth.refresh_worker_id",
+        "api-oauth-refresh",
+    );
+    if configured_name.is_empty()
+        || configured_name.len() > 100
+        || !configured_name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err("OAuth token cleanup worker id must be a bounded safe token".to_owned());
+    }
+    let worker_id = format!("{configured_name}-cleanup-{}", std::process::id());
+    tokio::spawn(async move {
+        loop {
+            match worker
+                .run_once(&worker_id, &mas_common::timestamps::Timestamp::now(), batch)
+                .await
+            {
+                Ok(stats) => {
+                    tracing::debug!(
+                        claimed = stats.claimed,
+                        cleaned = stats.cleaned,
+                        retry_scheduled = stats.retry_scheduled,
+                        dead_lettered = stats.dead_lettered,
+                        "OAuth token cleanup pass completed"
+                    );
+                },
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error.public_message(),
+                        "OAuth token cleanup pass failed"
+                    );
+                },
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(poll_seconds)).await;
+        }
+    });
+    Ok(())
+}
+
+/// Starts the fenced reconciler for uncertain callback materialization outcomes.
+/// It shares the bounded OAuth lifecycle cadence but owns a separate durable
+/// queue, so a failed secret-manager cleanup cannot stall token refreshes.
+fn spawn_oauth_materialization_reconciler(
+    merger: &mas_common::config::Merger<'_>,
+    worker: Arc<mas_integrations::oauth_materialization::OAuthMaterializationReconciler>,
+) -> Result<(), String> {
+    let poll_seconds = merger
+        .u64(
+            "MAS_OAUTH_REFRESH_POLL_SECONDS",
+            "integrations.oauth.refresh_poll_seconds",
+            30,
+        )
+        .map_err(|error| format!("OAuth materialization poll configuration: {error}"))?;
+    if !(1..=3_600).contains(&poll_seconds) {
+        return Err(
+            "OAuth materialization poll interval must be between 1 and 3600 seconds".to_owned(),
+        );
+    }
+    let batch = merger
+        .u64(
+            "MAS_OAUTH_REFRESH_BATCH_SIZE",
+            "integrations.oauth.refresh_batch_size",
+            32,
+        )
+        .map_err(|error| format!("OAuth materialization batch configuration: {error}"))?;
+    let batch = u16::try_from(batch)
+        .ok()
+        .filter(|value| {
+            (1..=mas_integrations::oauth_materialization::MAX_OAUTH_MATERIALIZATION_BATCH)
+                .contains(value)
+        })
+        .ok_or_else(|| "OAuth materialization batch size must be between 1 and 100".to_owned())?;
+    let configured_name = merger.string(
+        "MAS_OAUTH_REFRESH_WORKER_ID",
+        "integrations.oauth.refresh_worker_id",
+        "api-oauth-refresh",
+    );
+    if configured_name.is_empty()
+        || configured_name.len() > 100
+        || !configured_name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err("OAuth materialization worker id must be a bounded safe token".to_owned());
+    }
+    let worker_id = format!("{configured_name}-materialization-{}", std::process::id());
+    tokio::spawn(async move {
+        loop {
+            match worker
+                .run_once(&worker_id, &mas_common::timestamps::Timestamp::now(), batch)
+                .await
+            {
+                Ok(stats) => {
+                    tracing::debug!(
+                        claimed = stats.claimed,
+                        bindings_confirmed = stats.bindings_confirmed,
+                        orphan_material_deleted = stats.orphan_material_deleted,
+                        retry_scheduled = stats.retry_scheduled,
+                        dead_lettered = stats.dead_lettered,
+                        "OAuth materialization reconciliation pass completed"
+                    );
+                },
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error.public_message(),
+                        "OAuth materialization reconciliation pass failed"
+                    );
+                },
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(poll_seconds)).await;
+        }
+    });
+    Ok(())
 }
 
 fn compose_inmemory(merger: &mas_common::config::Merger<'_>) -> Result<ServiceSet, String> {
@@ -281,11 +753,46 @@ fn compose_inmemory(merger: &mas_common::config::Merger<'_>) -> Result<ServiceSe
         .with_step_store(Box::new(store.clone())),
     );
     let schedules = Arc::new(ScheduleService::new(
-        Box::new(store),
+        Box::new(store.clone()),
         Box::new(audit.clone()) as Box<dyn mas_application::audit::AuditSinkPort>,
     ));
-    let _ = merger;
+    let notifications = Arc::new(NotificationService::new(
+        Box::new(store.clone()),
+        Box::new(audit.clone()) as Box<dyn mas_application::audit::AuditSinkPort>,
+    ));
+    let analytics = Arc::new(AnalyticsService::new(Box::new(store.clone())));
+    let api_key_store = Arc::new(mas_security::InMemoryApiKeyStore::new());
+    let security_api_keys = Arc::new(mas_security::ApiKeyService::new(
+        api_key_store.clone(),
+        audit.clone(),
+    ));
+    let api_keys = Arc::new(ApiKeyApplicationService::new(
+        security_api_keys,
+        api_key_store,
+    ));
+    let approvals = Arc::new(ApprovalApplicationService::new(
+        store.clone(),
+        audit.clone(),
+    ));
+    let data_hub = Arc::new(
+        DataHubApplicationService::new(
+            store.clone(),
+            store.clone(),
+            store.clone(),
+            Arc::new(mas_execution::InMemoryDataHubBridge::new()),
+            audit.clone(),
+            data_hub_limits(merger)?,
+        )
+        .map_err(|error| format!("Data Hub configuration: {error}"))?,
+    );
 
+    let search = Arc::new(SearchService::new(
+        Box::new(store.clone()),
+        Box::new(store.clone()),
+        Box::new(store.clone()),
+        Box::new(store.clone()),
+        Box::new(store.clone()),
+    ));
     let verifier: Arc<dyn mas_api::auth::TokenVerifierPort> = Arc::new(dev_verifier()?);
     // The in-memory lane still resolves scope from identity — over an
     // in-memory directory rather than PostgreSQL. Resolving from a header here
@@ -304,6 +811,20 @@ fn compose_inmemory(merger: &mas_common::config::Merger<'_>) -> Result<ServiceSe
         rollbacks,
         executions,
         schedules,
+        notifications,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        analytics,
+        api_keys,
+        approvals,
+        data_hub,
+        search,
         // The ExecutionService owns one handle; this is a second handle to
         // the same control plane, not a second control plane.
         control_plane,
@@ -413,6 +934,61 @@ async fn compose_production(merger: &mas_common::config::Merger<'_>) -> Result<S
         .map_err(|err| format!("audit database: {err}"))?;
     let audit_pool = audit_database.pool().clone();
 
+    // Public callbacks cannot carry a user session/RLS GUC. They therefore
+    // receive separate minimal pools: one writes verified receipt/outbox facts
+    // as `mas_inbound`; one reads only secret-reference metadata through the
+    // pre-existing integrations relay boundary for audited Vault resolution.
+    let inbound_pool = connect_role_pool(
+        merger,
+        "MAS_DATABASE_INBOUND_URL",
+        "database.inbound_url",
+        "mas-api-inbound",
+        max_connections,
+    )
+    .await?;
+    let integrations_pool = connect_role_pool(
+        merger,
+        "MAS_DATABASE_INTEGRATIONS_URL",
+        "database.integrations_url",
+        "mas-api-integrations",
+        max_connections,
+    )
+    .await?;
+    // Durable recipient delivery reads only notification rows across tenants
+    // and therefore gets its own narrow mas_notifications role/pool. It must
+    // never borrow mas_app or the integrations relay role.
+    let notifications_pool = connect_role_pool(
+        merger,
+        "MAS_DATABASE_NOTIFICATIONS_URL",
+        "database.notifications_url",
+        "mas-api-notifications",
+        max_connections,
+    )
+    .await?;
+    // Retain probe handles before workers consume their role pools. Readiness
+    // must report loss of a delivery role rather than only the mas_app pool.
+    let integrations_health_pool = integrations_pool.clone();
+    let notifications_health_pool = notifications_pool.clone();
+    // OAuth state consumption intentionally precedes tenant resolution, so it
+    // uses its own narrowly granted mas_oauth callback pool rather than the
+    // request/RLS pool or broad integrations relay role.
+    let oauth_pool = connect_role_pool(
+        merger,
+        "MAS_DATABASE_OAUTH_URL",
+        "database.oauth_url",
+        "mas-api-oauth",
+        max_connections,
+    )
+    .await?;
+    let oauth_refresh_pool = connect_role_pool(
+        merger,
+        "MAS_DATABASE_OAUTH_REFRESH_URL",
+        "database.oauth_refresh_url",
+        "mas-api-oauth-refresh",
+        max_connections,
+    )
+    .await?;
+
     // ── Durable ports (each Box owns a cheap pool handle clone) ───────
     // The control plane runs on the same pool as the durable port, so a quota
     // reservation and the execution it authorises commit against one
@@ -456,6 +1032,34 @@ async fn compose_production(merger: &mas_common::config::Merger<'_>) -> Result<S
     // service that happened to write a line.
     let audit_log = Arc::new(PostgresAuditLog::new(audit_pool.clone()));
     let audit_sink: Arc<dyn mas_application::audit::AuditSinkPort> = audit_log.clone();
+    let (inbound_webhook_endpoints, inbound_webhook_ingress) =
+        inbound_webhook_composition::compose(
+            merger,
+            pool.clone(),
+            inbound_pool,
+            integrations_pool.clone(),
+            audit_log.clone(),
+        )?;
+    let (
+        oauth_authorization,
+        oauth_callbacks,
+        oauth_refresh_worker,
+        oauth_cleanup_worker,
+        oauth_materialization_reconciler,
+    ) = oauth_composition::compose(
+        merger,
+        pool.clone(),
+        oauth_pool,
+        oauth_refresh_pool,
+        audit_log.clone(),
+    )?;
+    let integration_plane = integration_composition::compose(
+        merger,
+        pool.clone(),
+        integrations_pool,
+        notifications_pool,
+        audit_log.clone(),
+    )?;
     let rollbacks = Arc::new(RollbackApplicationService::new(
         Arc::clone(&agents),
         Arc::clone(&workflows),
@@ -477,10 +1081,39 @@ async fn compose_production(merger: &mas_common::config::Merger<'_>) -> Result<S
         Box::new(PgServices::new(pool.clone())),
         Box::new(PostgresAuditLog::new(audit_pool.clone())),
     ));
+    let notifications = Arc::new(NotificationService::new(
+        Box::new(mas_persistence::repositories::PostgresNotificationStore::new(pool.clone())),
+        Box::new(PostgresAuditLog::new(audit_pool.clone())),
+    ));
 
-    let verifier: Arc<dyn mas_api::auth::TokenVerifierPort> = Arc::new(
-        mas_api::prod_auth::PostgresApiKeyVerifier::new(ApiKeyStore::new(pool.clone())),
-    );
+    let analytics = Arc::new(AnalyticsService::new(Box::new(
+        mas_persistence::repositories::analytics::PostgresAnalyticsStore::new(pool.clone()),
+    )));
+    let api_key_store = Arc::new(ApiKeyStore::new(pool.clone()));
+    let security_api_keys = Arc::new(mas_security::ApiKeyService::new(
+        api_key_store.clone(),
+        audit_log.clone(),
+    ));
+    let api_keys = Arc::new(ApiKeyApplicationService::new(
+        security_api_keys,
+        api_key_store,
+    ));
+    let approvals = Arc::new(ApprovalApplicationService::new(
+        Arc::new(mas_persistence::repositories::PostgresApprovalStore::new(
+            pool.clone(),
+        )),
+        audit_log.clone(),
+    ));
+    let data_hub = compose_production_data_hub(merger, pool.clone(), audit_log.clone()).await?;
+    let search = Arc::new(SearchService::with_catalog(Box::new(
+        mas_persistence::repositories::PostgresSearchCatalog::new(pool.clone()),
+    )));
+    let oidc = compose_oidc_verifier(merger)?;
+    let verifier: Arc<dyn mas_api::auth::TokenVerifierPort> =
+        Arc::new(mas_api::oidc_auth::ProductionTokenVerifier::new(
+            mas_api::prod_auth::PostgresApiKeyVerifier::new(ApiKeyStore::new(pool.clone())),
+            oidc,
+        ));
 
     // ── Tenancy directory (the one unscoped read path) ────────────────
     //
@@ -532,6 +1165,26 @@ async fn compose_production(merger: &mas_common::config::Merger<'_>) -> Result<S
             },
         )
         .map_err(|err| format!("health: {err}"))?;
+    health
+        .register(
+            mas_observability::health::ProbeKind::Readiness,
+            "postgres-integrations-relay",
+            PgPoolHealthCheck {
+                pool: integrations_health_pool,
+                component: "postgres-integrations-relay",
+            },
+        )
+        .map_err(|err| format!("integrations relay health: {err}"))?;
+    health
+        .register(
+            mas_observability::health::ProbeKind::Readiness,
+            "postgres-notifications-delivery",
+            PgPoolHealthCheck {
+                pool: notifications_health_pool,
+                component: "postgres-notifications-delivery",
+            },
+        )
+        .map_err(|err| format!("notification delivery health: {err}"))?;
 
     Ok((
         tenancy,
@@ -540,6 +1193,20 @@ async fn compose_production(merger: &mas_common::config::Merger<'_>) -> Result<S
         rollbacks,
         executions,
         schedules,
+        notifications,
+        Some(inbound_webhook_endpoints),
+        Some(inbound_webhook_ingress),
+        Some(integration_plane),
+        Some(oauth_authorization),
+        Some(oauth_callbacks),
+        Some(oauth_refresh_worker),
+        Some(oauth_cleanup_worker),
+        Some(oauth_materialization_reconciler),
+        analytics,
+        api_keys,
+        approvals,
+        data_hub,
+        search,
         // A second handle to the control plane the ExecutionService owns —
         // not a second control plane.
         control_plane,
@@ -553,6 +1220,268 @@ async fn compose_production(merger: &mas_common::config::Merger<'_>) -> Result<S
         load_internal_secret(merger)?,
         health,
     ))
+}
+
+/// Resolves bounded Data Hub request limits from the layered configuration.
+fn data_hub_limits(merger: &mas_common::config::Merger<'_>) -> Result<DataHubLimits, String> {
+    let max_upload_bytes = merger
+        .u64(
+            "MAS_DATA_HUB_MAX_UPLOAD_BYTES",
+            "data_hub.max_upload_bytes",
+            mas_application::data_hub_service::DEFAULT_MAX_UPLOAD_BYTES,
+        )
+        .map_err(|error| format!("Data Hub upload limit: {error}"))?;
+    let bridge_timeout_ms = merger
+        .u64(
+            "MAS_DATA_HUB_BRIDGE_TIMEOUT_MS",
+            "data_hub.bridge_timeout_ms",
+            300_000,
+        )
+        .map_err(|error| format!("Data Hub bridge timeout: {error}"))?;
+    DataHubLimits {
+        max_upload_bytes,
+        bridge_timeout: std::time::Duration::from_millis(bridge_timeout_ms),
+    }
+    .validate()
+    .map_err(|error| format!("Data Hub limits: {error}"))
+}
+
+/// Composes the real Rust-to-Python Data Hub path. A durable API process
+/// refuses startup when this authenticated dependency is absent instead of
+/// exposing catalogue mutations whose sync/upload operations can never work.
+async fn compose_production_data_hub(
+    merger: &mas_common::config::Merger<'_>,
+    pool: sqlx::PgPool,
+    audit: Arc<mas_persistence::repositories::PostgresAuditLog>,
+) -> Result<Arc<DataHubApplicationService>, String> {
+    let endpoint = merger.string("MAS_AI_BRIDGE_ENDPOINT", "ai_bridge.endpoint", "");
+    if endpoint.trim().is_empty() {
+        return Err(
+            "Data Hub requires ai_bridge.endpoint / MAS_AI_BRIDGE_ENDPOINT; \
+             production does not substitute an in-memory ingestion plane"
+                .to_owned(),
+        );
+    }
+    let production = environment_string(merger) == "production";
+    if production && !endpoint.starts_with("https://") {
+        return Err("production Data Hub bridge endpoint must use https://".to_owned());
+    }
+    let token = merger.string("MAS_AI_BRIDGE_TOKEN", "ai_bridge.token", "");
+    if token.trim().is_empty() {
+        return Err("Data Hub requires MAS_AI_BRIDGE_TOKEN / ai_bridge.token; \
+             the Python ingestion plane refuses unauthenticated requests"
+            .to_owned());
+    }
+    let signing_secret = merger.string(
+        "MAS_AI_BRIDGE_INTERNAL_SIGNING_SECRET",
+        "ai_bridge.internal_signing_secret",
+        "",
+    );
+    if production && signing_secret.trim().is_empty() {
+        return Err(
+            "production Data Hub requires MAS_AI_BRIDGE_INTERNAL_SIGNING_SECRET / \
+             ai_bridge.internal_signing_secret for body-bound RPC signatures"
+                .to_owned(),
+        );
+    }
+    let timeout_ms = merger
+        .u64("MAS_AI_BRIDGE_TIMEOUT_MS", "ai_bridge.timeout_ms", 120_000)
+        .map_err(|error| format!("Data Hub bridge timeout: {error}"))?;
+    let max_response_bytes = merger
+        .u64(
+            "MAS_AI_BRIDGE_MAX_RESPONSE_BYTES",
+            "ai_bridge.max_response_bytes",
+            8 * 1024 * 1024,
+        )
+        .map_err(|error| format!("Data Hub bridge response limit: {error}"))?;
+    let ca = optional_pem(
+        merger.string(
+            "MAS_AI_BRIDGE_TLS_CA_CERTIFICATE_PATH",
+            "ai_bridge.tls_ca_certificate_path",
+            "",
+        ),
+        "TLS CA certificate",
+    )?;
+    let certificate = optional_pem(
+        merger.string(
+            "MAS_AI_BRIDGE_TLS_CLIENT_CERTIFICATE_PATH",
+            "ai_bridge.tls_client_certificate_path",
+            "",
+        ),
+        "TLS client certificate",
+    )?;
+    let private_key_path = merger.string(
+        "MAS_AI_BRIDGE_TLS_CLIENT_PRIVATE_KEY_PATH",
+        "ai_bridge.tls_client_private_key_path",
+        "",
+    );
+    let private_key = if private_key_path.trim().is_empty() {
+        None
+    } else {
+        let contents = std::fs::read_to_string(&private_key_path).map_err(|error| {
+            format!("cannot read Data Hub TLS client private key at {private_key_path}: {error}")
+        })?;
+        if contents.trim().is_empty() {
+            return Err("configured Data Hub TLS client private key is empty".to_owned());
+        }
+        Some(mas_security::SecretString::new(contents))
+    };
+    if certificate.is_some() != private_key.is_some() {
+        return Err(
+            "Data Hub mutual TLS requires both ai_bridge.tls_client_certificate_path \
+             and ai_bridge.tls_client_private_key_path"
+                .to_owned(),
+        );
+    }
+    if !endpoint.starts_with("https://") && (ca.is_some() || certificate.is_some()) {
+        return Err("Data Hub TLS material requires an https:// endpoint".to_owned());
+    }
+    let limits = data_hub_limits(merger)?;
+    let agent_bridge = mas_ai_bridge::GrpcAgentBridgeConfig {
+        endpoint,
+        default_timeout: std::time::Duration::from_millis(timeout_ms.max(1)),
+        max_response_bytes: usize::try_from(max_response_bytes.max(1024))
+            .map_err(|_| "Data Hub bridge response limit does not fit usize".to_owned())?,
+        bearer_token: Some(mas_security::SecretString::new(token)),
+        service_subject: "mas-api-data-hub".to_owned(),
+        service_issuer: "platform-internal".to_owned(),
+        service_scopes: vec![
+            "data_hub_sync".to_owned(),
+            "data_hub_ingest".to_owned(),
+            "data_hub_purge".to_owned(),
+        ],
+        internal_signing_secret: (!signing_secret.trim().is_empty())
+            .then(|| mas_security::SecretString::new(signing_secret)),
+        internal_service_id: "mas-api".to_owned(),
+        tls_ca_certificate: ca,
+        tls_client_certificate: certificate,
+        tls_client_private_key: private_key,
+    };
+    let bridge = Arc::new(
+        mas_ai_bridge::GrpcDataHubBridge::connect(mas_ai_bridge::GrpcDataHubBridgeConfig {
+            agent_bridge,
+            max_request_bytes: usize::try_from(limits.max_upload_bytes)
+                .map_err(|_| "Data Hub upload limit does not fit usize".to_owned())?,
+        })
+        .await
+        .map_err(|error| format!("Data Hub bridge: {error}"))?,
+    );
+    let service = DataHubApplicationService::new(
+        Arc::new(mas_persistence::repositories::PostgresDataSourceStore::new(
+            pool.clone(),
+        )),
+        Arc::new(mas_persistence::repositories::PostgresDocumentStore::new(
+            pool.clone(),
+        )),
+        Arc::new(mas_persistence::repositories::services::PgServices::new(
+            pool,
+        )),
+        bridge,
+        audit,
+        limits,
+    )
+    .map_err(|error| format!("Data Hub composition: {error}"))?;
+    Ok(Arc::new(service))
+}
+
+/// Reads an optional nonempty PEM bundle without ever printing its contents.
+fn optional_pem(path: String, label: &str) -> Result<Option<Vec<u8>>, String> {
+    if path.trim().is_empty() {
+        return Ok(None);
+    }
+    let contents = std::fs::read(&path)
+        .map_err(|error| format!("cannot read Data Hub {label} at {path}: {error}"))?;
+    if contents.iter().all(u8::is_ascii_whitespace) {
+        return Err(format!("configured Data Hub {label} at {path} is empty"));
+    }
+    Ok(Some(contents))
+}
+
+/// Builds the production OIDC verifier from the explicit deployment pins.
+///
+/// In-memory development deliberately keeps a static fixture verifier; any
+/// durable API process must use TLS-pinned asymmetric JWT verification and
+/// cannot silently downgrade to static tokens or symmetric IdP secrets.
+fn compose_oidc_verifier(
+    merger: &mas_common::config::Merger<'_>,
+) -> Result<mas_api::oidc_auth::OidcJwksTokenVerifier, String> {
+    use std::str::FromStr;
+    use std::time::Duration;
+
+    let issuer = merger.string("MAS_OIDC_ISSUER", "oidc.issuer", "");
+    let jwks_url = merger.string("MAS_OIDC_JWKS_URL", "oidc.jwks_url", "");
+    validate_production_oidc_url("OIDC issuer", &issuer)?;
+    validate_production_oidc_url("OIDC JWKS URL", &jwks_url)?;
+
+    let audience = merger.string("MAS_OIDC_AUDIENCE", "oidc.audience", "");
+    let audience = (!audience.trim().is_empty()).then_some(audience);
+    let algorithms = merger
+        .string_list("MAS_OIDC_ALGS", "oidc.algs", &["RS256", "ES256"])
+        .map_err(|error| format!("OIDC algorithms: {error}"))?
+        .into_iter()
+        .map(|raw| {
+            mas_security::JwsAlgorithm::from_str(&raw)
+                .map_err(|_| format!("OIDC algorithm '{raw}' is not supported"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let clock_skew_seconds = merger
+        .u64("MAS_OIDC_CLOCK_SKEW_SECONDS", "oidc.clock_skew_seconds", 60)
+        .map_err(|error| format!("OIDC clock skew: {error}"))?;
+    let cache_ttl_seconds = merger
+        .u64(
+            "MAS_OIDC_JWKS_CACHE_TTL_SECONDS",
+            "oidc.jwks_cache_ttl_seconds",
+            300,
+        )
+        .map_err(|error| format!("JWKS cache TTL: {error}"))?;
+    let timeout_ms = merger
+        .u64(
+            "MAS_OIDC_JWKS_TIMEOUT_MS",
+            "oidc.jwks_request_timeout_ms",
+            5_000,
+        )
+        .map_err(|error| format!("JWKS timeout: {error}"))?;
+    if clock_skew_seconds > 300 {
+        return Err("OIDC clock skew must not exceed 300 seconds".to_owned());
+    }
+    if !(1..=86_400).contains(&cache_ttl_seconds) {
+        return Err("JWKS cache TTL must be between 1 and 86400 seconds".to_owned());
+    }
+    if !(1..=60_000).contains(&timeout_ms) {
+        return Err("JWKS request timeout must be between 1 and 60000 milliseconds".to_owned());
+    }
+    let config = mas_security::JwksConfig::new(
+        issuer,
+        audience,
+        algorithms,
+        Duration::from_secs(clock_skew_seconds),
+        Duration::from_secs(cache_ttl_seconds),
+    )
+    .map_err(|error| format!("OIDC configuration: {error}"))?;
+    let fetcher = mas_api::oidc_auth::HttpJwksFetcher::new(Duration::from_millis(timeout_ms))
+        .map_err(|error| format!("JWKS HTTP configuration: {error}"))?;
+    let validator = mas_security::RemoteJwksValidator::new(jwks_url, config, Arc::new(fetcher))
+        .map_err(|error| format!("JWKS verifier configuration: {error}"))?;
+    Ok(mas_api::oidc_auth::OidcJwksTokenVerifier::new(validator))
+}
+
+/// Refuses insecure or ambiguous OIDC endpoints in the durable production
+/// lane. Development's local HTTP IdP remains available only with the
+/// explicit `--dev-inmemory` fixture mode, which never composes this verifier.
+fn validate_production_oidc_url(label: &str, raw: &str) -> Result<(), String> {
+    let url = reqwest::Url::parse(raw)
+        .map_err(|_| format!("{label} must be a valid absolute HTTPS URL"))?;
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(format!(
+            "{label} must be an HTTPS URL with a host and no credentials or fragment"
+        ));
+    }
+    Ok(())
 }
 
 /// Readiness adapter over the pool's `SELECT 1` probe.
@@ -577,6 +1506,36 @@ impl mas_observability::health::HealthCheckPort for PgHealthCheck {
                 probe.message.as_deref().unwrap_or("database probe failed"),
             )
             .unwrap_or_else(|_| unreachable!("static name"))
+        }
+    }
+}
+
+/// Readiness adapter for narrowly privileged worker pools. The check exposes
+/// neither DSN nor database error detail: role/connection failures are useful
+/// as a binary readiness signal but may contain deployment metadata.
+struct PgPoolHealthCheck {
+    pool: sqlx::PgPool,
+    component: &'static str,
+}
+
+#[async_trait::async_trait]
+impl mas_observability::health::HealthCheckPort for PgPoolHealthCheck {
+    async fn check(
+        &self,
+        at: &mas_common::timestamps::Timestamp,
+    ) -> mas_observability::health::ComponentHealth {
+        let probe = sqlx::query_scalar::<_, i64>("SELECT 1")
+            .fetch_one(&self.pool)
+            .await;
+        match probe {
+            Ok(1) => mas_observability::health::ComponentHealth::up(self.component, at)
+                .unwrap_or_else(|_| unreachable!("static component name")),
+            Ok(_) | Err(_) => mas_observability::health::ComponentHealth::down(
+                self.component,
+                at,
+                "dedicated database role pool probe failed",
+            )
+            .unwrap_or_else(|_| unreachable!("static component name")),
         }
     }
 }

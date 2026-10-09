@@ -20,11 +20,22 @@
 use std::sync::Arc;
 
 use mas_application::agent_service::AgentService;
+use mas_application::analytics_service::AnalyticsService;
+use mas_application::api_key_service::ApiKeyApplicationService;
+use mas_application::approval_service::ApprovalApplicationService;
+use mas_application::data_hub_service::DataHubApplicationService;
 use mas_application::execution_service::ExecutionService;
+use mas_application::inbound_webhook_service::InboundWebhookEndpointService;
+use mas_application::integration_service::IntegrationService;
+use mas_application::notification_service::NotificationService;
+use mas_application::oauth_authorization_service::OAuthAuthorizationService;
 use mas_application::rollback_service::RollbackApplicationService;
 use mas_application::schedule_service::ScheduleService;
+use mas_application::search_service::SearchService;
 use mas_application::tenancy_service::TenancyService;
 use mas_application::workflow_service::WorkflowService;
+use mas_integrations::durable_oauth::DurableOAuthAuthorizationService;
+use mas_integrations::inbound_webhooks::InboundWebhookIngressPort;
 use mas_observability::health::HealthRegistry;
 use sqlx::PgPool;
 
@@ -59,6 +70,41 @@ pub struct AppState {
     pub executions: Arc<ExecutionService>,
     /// Schedule lifecycle use-cases.
     pub schedules: Arc<ScheduleService>,
+    /// API-key lifecycle service (hash-only persistence and security audit).
+    pub api_keys: Option<Arc<ApiKeyApplicationService>>,
+    /// Human-in-the-loop approval queue and policy decision facade.
+    pub approvals: Option<Arc<ApprovalApplicationService>>,
+    /// Rust-owned Data Hub metadata and authenticated Python bridge facade.
+    pub data_hub: Option<Arc<DataHubApplicationService>>,
+    /// Bounded cross-resource command-palette search facade.
+    pub search: Option<Arc<SearchService>>,
+    /// Durable recipient notification lifecycle facade.
+    ///
+    /// `None` means an embedding explicitly omitted the notification plane;
+    /// handlers fail loudly rather than returning a plausible empty inbox.
+    pub notifications: Option<Arc<NotificationService>>,
+    /// Authorized tenant configuration service for canonical public inbound
+    /// webhook endpoints. Omitted compositions fail loudly in its handlers.
+    pub inbound_webhook_endpoints: Option<Arc<InboundWebhookEndpointService>>,
+    /// Public signature-first ingress coordinator. It is intentionally distinct
+    /// from request services because public callbacks have no user RLS scope.
+    pub inbound_webhook_ingress: Option<Arc<dyn InboundWebhookIngressPort>>,
+    /// Authorized tenant connector and outbound-webhook management facade.
+    /// `None` is permitted only for a deliberately restricted embedding;
+    /// handlers fail loudly rather than pretending no connectors exist.
+    pub integrations: Option<Arc<IntegrationService>>,
+    /// Authenticated connector-bound OAuth authorization initiation service.
+    pub oauth_authorization: Option<Arc<OAuthAuthorizationService>>,
+    /// Public OAuth callback façade. It consumes opaque one-shot state and
+    /// persists only canonical credential references, never a request scope.
+    pub oauth_callbacks: Option<Arc<DurableOAuthAuthorizationService>>,
+    /// Tenant-scoped deterministic dashboard read models.
+    ///
+    /// `None` is only possible for a custom embedding that deliberately does
+    /// not compose dashboard dependencies; supported API compositions install
+    /// this service at bootstrap and handlers fail loudly rather than return
+    /// a plausible empty dashboard.
+    pub analytics: Option<Arc<AnalyticsService>>,
     /// The canonical control plane (entitlement → policy → quota).
     pub control_plane: Arc<mas_application::control_plane::ControlPlane>,
     /// Where control-plane mutations are recorded.
@@ -109,6 +155,260 @@ impl AppState {
     pub fn with_rollbacks(mut self, rollbacks: Arc<RollbackApplicationService>) -> Self {
         self.rollbacks = Some(rollbacks);
         self
+    }
+
+    /// Installs the bounded search service after its durable catalogue
+    /// adapter has been composed.
+    #[must_use]
+    pub fn with_search(mut self, search: Arc<SearchService>) -> Self {
+        self.search = Some(search);
+        self
+    }
+
+    /// Returns the search facade or a deterministic composition error.
+    pub fn search_service(
+        &self,
+        ctx: &crate::context::RequestContext,
+    ) -> std::result::Result<Arc<SearchService>, crate::response::ApiError> {
+        self.search.clone().ok_or_else(|| {
+            crate::response::ApiError::new(
+                mas_common::error::AppError::internal(
+                    "search service is not configured for this API deployment",
+                ),
+                ctx,
+            )
+        })
+    }
+
+    /// Installs the Data Hub service after the scoped catalogue stores and
+    /// authenticated bridge are composed.
+    #[must_use]
+    pub fn with_data_hub(mut self, data_hub: Arc<DataHubApplicationService>) -> Self {
+        self.data_hub = Some(data_hub);
+        self
+    }
+
+    /// Returns the Data Hub facade or a deterministic composition error.
+    pub fn data_hub_service(
+        &self,
+        ctx: &crate::context::RequestContext,
+    ) -> std::result::Result<Arc<DataHubApplicationService>, crate::response::ApiError> {
+        self.data_hub.clone().ok_or_else(|| {
+            crate::response::ApiError::new(
+                mas_common::error::AppError::internal(
+                    "Data Hub service is not configured for this API deployment",
+                ),
+                ctx,
+            )
+        })
+    }
+
+    /// Installs the durable approval service after its store and mandatory
+    /// audit sink are composed.
+    #[must_use]
+    pub fn with_approvals(mut self, approvals: Arc<ApprovalApplicationService>) -> Self {
+        self.approvals = Some(approvals);
+        self
+    }
+
+    /// Returns the approval queue service or fails loudly when a custom
+    /// embedding omitted the durable governance dependency.
+    pub fn approval_service(
+        &self,
+        ctx: &crate::context::RequestContext,
+    ) -> std::result::Result<Arc<ApprovalApplicationService>, crate::response::ApiError> {
+        self.approvals.clone().ok_or_else(|| {
+            crate::response::ApiError::new(
+                mas_common::error::AppError::internal(
+                    "approval service is not configured for this API deployment",
+                ),
+                ctx,
+            )
+        })
+    }
+
+    /// Installs the API-key lifecycle service after its security store and
+    /// mandatory audit sink are composed.
+    #[must_use]
+    pub fn with_api_keys(mut self, api_keys: Arc<ApiKeyApplicationService>) -> Self {
+        self.api_keys = Some(api_keys);
+        self
+    }
+
+    /// Returns the API-key lifecycle service or a deterministic composition
+    /// error instead of a plausible empty credential list.
+    pub fn api_key_service(
+        &self,
+        ctx: &crate::context::RequestContext,
+    ) -> std::result::Result<Arc<ApiKeyApplicationService>, crate::response::ApiError> {
+        self.api_keys.clone().ok_or_else(|| {
+            crate::response::ApiError::new(
+                mas_common::error::AppError::internal(
+                    "API-key service is not configured for this API deployment",
+                ),
+                ctx,
+            )
+        })
+    }
+
+    /// Installs the durable recipient-notification lifecycle service.
+    #[must_use]
+    pub fn with_notifications(mut self, notifications: Arc<NotificationService>) -> Self {
+        self.notifications = Some(notifications);
+        self
+    }
+
+    /// Returns notification lifecycle composition or a deterministic error.
+    pub fn notification_service(
+        &self,
+        ctx: &crate::context::RequestContext,
+    ) -> std::result::Result<Arc<NotificationService>, crate::response::ApiError> {
+        self.notifications.clone().ok_or_else(|| {
+            crate::response::ApiError::new(
+                mas_common::error::AppError::internal(
+                    "notification service is not configured for this API deployment",
+                ),
+                ctx,
+            )
+        })
+    }
+
+    /// Installs both sides of the canonical inbound-webhook plane. Public
+    /// ingestion and authenticated endpoint management remain separate because
+    /// the former intentionally has no request identity or RLS tenant scope.
+    #[must_use]
+    pub fn with_inbound_webhooks(
+        mut self,
+        endpoints: Arc<InboundWebhookEndpointService>,
+        ingress: Arc<dyn InboundWebhookIngressPort>,
+    ) -> Self {
+        self.inbound_webhook_endpoints = Some(endpoints);
+        self.inbound_webhook_ingress = Some(ingress);
+        self
+    }
+
+    /// Returns the authenticated endpoint-management service or fails loudly
+    /// when a custom embedding omitted the integration plane.
+    pub fn inbound_webhook_endpoint_service(
+        &self,
+        ctx: &crate::context::RequestContext,
+    ) -> std::result::Result<Arc<InboundWebhookEndpointService>, crate::response::ApiError> {
+        self.inbound_webhook_endpoints.clone().ok_or_else(|| {
+            crate::response::ApiError::new(
+                mas_common::error::AppError::internal(
+                    "inbound webhook endpoint service is not configured for this API deployment",
+                ),
+                ctx,
+            )
+        })
+    }
+
+    /// Returns the public ingress coordinator or fails loudly; no route ever
+    /// substitutes an in-memory verifier or accepts unsigned data.
+    pub fn inbound_webhook_ingress(
+        &self,
+        ctx: &crate::context::RequestContext,
+    ) -> std::result::Result<Arc<dyn InboundWebhookIngressPort>, crate::response::ApiError> {
+        self.inbound_webhook_ingress.clone().ok_or_else(|| {
+            crate::response::ApiError::new(
+                mas_common::error::AppError::internal(
+                    "inbound webhook ingress is not configured for this API deployment",
+                ),
+                ctx,
+            )
+        })
+    }
+
+    /// Installs canonical connector and outbound-webhook management after its
+    /// request-scoped stores and guarded runtime adapters are composed.
+    #[must_use]
+    pub fn with_integrations(mut self, integrations: Arc<IntegrationService>) -> Self {
+        self.integrations = Some(integrations);
+        self
+    }
+
+    /// Returns the canonical integration management service or fails loudly.
+    pub fn integration_service(
+        &self,
+        ctx: &crate::context::RequestContext,
+    ) -> std::result::Result<Arc<IntegrationService>, crate::response::ApiError> {
+        self.integrations.clone().ok_or_else(|| {
+            crate::response::ApiError::new(
+                mas_common::error::AppError::internal(
+                    "integration service is not configured for this API deployment",
+                ),
+                ctx,
+            )
+        })
+    }
+
+    /// Installs the paired OAuth initiation/callback plane. Production
+    /// bootstrap must install both halves together; neither has an in-memory
+    /// fallback because a callback without durable PKCE/token lifecycle is
+    /// unsafe.
+    #[must_use]
+    pub fn with_oauth(
+        mut self,
+        authorization: Arc<OAuthAuthorizationService>,
+        callbacks: Arc<DurableOAuthAuthorizationService>,
+    ) -> Self {
+        self.oauth_authorization = Some(authorization);
+        self.oauth_callbacks = Some(callbacks);
+        self
+    }
+
+    /// Returns the authenticated OAuth initiation service or fails loudly.
+    pub fn oauth_authorization_service(
+        &self,
+        ctx: &crate::context::RequestContext,
+    ) -> std::result::Result<Arc<OAuthAuthorizationService>, crate::response::ApiError> {
+        self.oauth_authorization.clone().ok_or_else(|| {
+            crate::response::ApiError::new(
+                mas_common::error::AppError::internal(
+                    "OAuth authorization service is not configured for this API deployment",
+                ),
+                ctx,
+            )
+        })
+    }
+
+    /// Returns the public callback façade or fails loudly; there is no
+    /// unsigned/in-memory callback compatibility path.
+    pub fn oauth_callback_service(
+        &self,
+        ctx: &crate::context::RequestContext,
+    ) -> std::result::Result<Arc<DurableOAuthAuthorizationService>, crate::response::ApiError> {
+        self.oauth_callbacks.clone().ok_or_else(|| {
+            crate::response::ApiError::new(
+                mas_common::error::AppError::internal(
+                    "OAuth callback service is not configured for this API deployment",
+                ),
+                ctx,
+            )
+        })
+    }
+
+    /// Installs the dashboard read-model service after its tenant-scoped
+    /// persistence dependencies have been composed.
+    #[must_use]
+    pub fn with_analytics(mut self, analytics: Arc<AnalyticsService>) -> Self {
+        self.analytics = Some(analytics);
+        self
+    }
+
+    /// Returns the dashboard service or a deterministic composition error.
+    pub fn analytics_service(
+        &self,
+        ctx: &crate::context::RequestContext,
+    ) -> std::result::Result<Arc<AnalyticsService>, crate::response::ApiError> {
+        self.analytics.clone().ok_or_else(|| {
+            crate::response::ApiError::new(
+                mas_common::error::AppError::internal(
+                    "analytics service is not configured for this API deployment",
+                ),
+                ctx,
+            )
+        })
     }
 
     /// The canonical control plane.
@@ -166,6 +466,17 @@ impl AppState {
             rollbacks: None,
             executions,
             schedules,
+            api_keys: None,
+            approvals: None,
+            data_hub: None,
+            search: None,
+            notifications: None,
+            inbound_webhook_endpoints: None,
+            inbound_webhook_ingress: None,
+            integrations: None,
+            oauth_authorization: None,
+            oauth_callbacks: None,
+            analytics: None,
             control_plane,
             audit,
             control_plane_stores,
@@ -184,10 +495,16 @@ pub mod test_support {
     use std::sync::Arc;
 
     use mas_application::agent_service::AgentService;
+    use mas_application::analytics_service::AnalyticsService;
+    use mas_application::api_key_service::ApiKeyApplicationService;
+    use mas_application::approval_service::ApprovalApplicationService;
     use mas_application::audit::InMemoryAuditSink;
+    use mas_application::data_hub_service::{DataHubApplicationService, DataHubLimits};
     use mas_application::durable_memory::InMemoryDurableExecution;
     use mas_application::execution_service::ExecutionService;
+    use mas_application::notification_service::NotificationService;
     use mas_application::schedule_service::ScheduleService;
+    use mas_application::search_service::SearchService;
     use mas_application::stores::InMemoryServices;
     use mas_application::tenancy_service::TenancyService;
     use mas_application::workflow_service::WorkflowService;
@@ -261,6 +578,42 @@ pub mod test_support {
             Box::new(store.clone()),
             Box::new(audit.clone()),
         ));
+        let notifications = Arc::new(NotificationService::new(
+            Box::new(store.clone()),
+            Box::new(audit.clone()),
+        ));
+        let analytics = Arc::new(AnalyticsService::new(Box::new(store.clone())));
+        let api_key_store = Arc::new(mas_security::InMemoryApiKeyStore::new());
+        let security_api_keys = Arc::new(mas_security::ApiKeyService::new(
+            api_key_store.clone(),
+            audit.clone(),
+        ));
+        let api_keys = Arc::new(ApiKeyApplicationService::new(
+            security_api_keys,
+            api_key_store,
+        ));
+        let approvals = Arc::new(ApprovalApplicationService::new(
+            store.clone(),
+            audit.clone(),
+        ));
+        let search = Arc::new(SearchService::new(
+            Box::new(store.clone()),
+            Box::new(store.clone()),
+            Box::new(store.clone()),
+            Box::new(store.clone()),
+            Box::new(store.clone()),
+        ));
+        let data_hub = Arc::new(
+            DataHubApplicationService::new(
+                store.clone(),
+                store.clone(),
+                store.clone(),
+                Arc::new(mas_execution::InMemoryDataHubBridge::new()),
+                audit.clone(),
+                DataHubLimits::default(),
+            )
+            .expect("default Data Hub limits are valid"),
+        );
         let verifier = Arc::new(StaticTokenVerifier::new().with_token(
             "test-token",
             SecurityPrincipal::new(
@@ -308,7 +661,13 @@ pub mod test_support {
                 "inmemory-internal-secret".to_owned(),
             )),
         )
-        .with_rollbacks(rollbacks);
+        .with_rollbacks(rollbacks)
+        .with_notifications(notifications)
+        .with_analytics(analytics)
+        .with_api_keys(api_keys)
+        .with_approvals(approvals)
+        .with_data_hub(data_hub)
+        .with_search(search);
         (state, store)
     }
 }

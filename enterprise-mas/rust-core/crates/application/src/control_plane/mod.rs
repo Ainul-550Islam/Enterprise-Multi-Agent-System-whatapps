@@ -60,6 +60,7 @@ use serde_json::Value;
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 /// How long a held reservation stays held before the sweeper may reclaim it.
 ///
@@ -111,6 +112,16 @@ pub struct ControlPlane {
     quota: Arc<QuotaEngine<Arc<dyn CounterStorePort>, Arc<dyn QuotaRegistryPort>>>,
     /// Reservation persistence (recoverability of a held charge).
     reservations: Arc<dyn ReservationStorePort>,
+    /// Serializes the full check → charge → reservation sequence inside one
+    /// process. The production reservation store takes a matching
+    /// transaction-scoped PostgreSQL advisory lock, so replicas serialize on
+    /// the same logical key too.
+    reservation_gate: Arc<AsyncMutex<()>>,
+    /// In-memory execution submissions hold this over quota preflight,
+    /// idempotency resolution, and consumption. PostgreSQL uses the
+    /// authoritative request transaction instead; this gate closes the only
+    /// non-transactional reference implementation's visibility gap.
+    local_submission_gate: Arc<AsyncMutex<()>>,
     /// The one usage write path.
     usage: Arc<dyn UsageLedgerPort>,
     /// Default lease length for a new reservation.
@@ -140,6 +151,8 @@ impl ControlPlane {
             policy,
             quota,
             reservations,
+            reservation_gate: Arc::new(AsyncMutex::new(())),
+            local_submission_gate: Arc::new(AsyncMutex::new(())),
             usage,
             lease: DEFAULT_RESERVATION_LEASE,
         }
@@ -422,6 +435,14 @@ impl ControlPlane {
         task_id: Option<TaskId>,
         now: &Timestamp,
     ) -> Result<ReservationCharge> {
+        // Keep the whole sequence together locally, then ask the backing store
+        // to hold its cross-replica transaction lock for this tenant/key. The
+        // lock must precede the existing-row read; taking it after the read
+        // leaves exactly the double-charge race this reservation API exists to
+        // prevent.
+        let _process_gate = self.reservation_gate.lock().await;
+        self.reservations.lock_key(tenant, reservation_key).await?;
+
         // Idempotency check first, before anything is charged.
         //
         // The row is the record of a charge, so if a live hold already exists
@@ -438,11 +459,19 @@ impl ControlPlane {
                 return Ok(ReservationCharge {
                     decision,
                     reservation: existing,
+                    created: false,
                 });
             }
-            // A hold whose lease has lapsed, or a hold already settled, is not
-            // this work's headroom — the charge below is a new one, and the
-            // store refreshes the row in place so the two stay in step.
+            if existing.state == ReservationState::Held {
+                // An expired live hold still has quota charged against it.
+                // Release that exact amount before refreshing the row; merely
+                // overwriting the reservation would make the next charge count
+                // the same crashed work twice.
+                self.release_reservation(tenant, reservation_key, now)
+                    .await?;
+            }
+            // A terminal reservation has already reconciled its charge. The
+            // store may refresh that row in place after the new charge lands.
         }
 
         // Charge first. If the charge is refused, no reservation row is
@@ -473,6 +502,7 @@ impl ControlPlane {
         Ok(ReservationCharge {
             decision,
             reservation,
+            created: true,
         })
     }
 
@@ -578,7 +608,12 @@ impl ControlPlane {
             .await?;
         Ok(Some(RunSlotHold {
             reservation: charge.reservation,
-            acquired: true,
+            // A caller may have missed the pre-read while a different
+            // replica was creating this same row. `reserve` is serialized on
+            // the key and tells us which side actually established the hold;
+            // inferring ownership from the earlier read would let both
+            // workers execute one task.
+            acquired: charge.created,
         }))
     }
 
@@ -765,6 +800,100 @@ impl ControlPlane {
     // The composed gate
     // ------------------------------------------------------------------
 
+    /// Authorizes the non-mutating portion of an execution submission.
+    ///
+    /// Idempotency is decided by the durable submission transaction, not by a
+    /// preliminary lookup. Consequently a caller that needs to avoid charging
+    /// an idempotent replay runs entitlement and policy first, submits, then
+    /// invokes the quota step only when the durable receipt says `Created`.
+    /// This method preserves the canonical order for the side-effect-free
+    /// portion: entitlement always precedes policy and neither can consume
+    /// quota.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn authorize_execution_preflight(
+        &self,
+        tenant: TenantId,
+        organization: Option<mas_common::ids::OrganizationId>,
+        project: Option<mas_common::ids::ProjectId>,
+        subject: &str,
+        feature: Option<&FeatureKey>,
+        action: &str,
+        resource: &str,
+        attributes: &Value,
+    ) -> Result<Evaluation> {
+        if let Some(feature) = feature {
+            self.require_feature(tenant, feature).await?;
+        }
+        self.require_policy(
+            tenant,
+            organization,
+            project,
+            subject,
+            action,
+            resource,
+            attributes,
+        )
+        .await
+    }
+
+    /// Charges one submission only after its durable idempotency transaction
+    /// has reported a newly created execution. Production callers run this in
+    /// the same authoritative request transaction as `durable.submit`, so a
+    /// quota refusal rolls back the provisional execution and a failed submit
+    /// cannot leave a charge behind.
+    pub async fn consume_created_execution(
+        &self,
+        tenant: TenantId,
+        amount: u64,
+        now: &Timestamp,
+    ) -> Result<ConsumptionDecision> {
+        self.require_quota(tenant, QuotaDimension::Executions, amount, now)
+            .await
+    }
+
+    /// Checks execution quota capacity without moving the counter.
+    ///
+    /// The result is advisory outside a transaction: only
+    /// [`Self::consume_created_execution`] authorizes distributed production
+    /// writes. The in-memory durable adapter holds
+    /// [`Self::lock_local_submission`] across this check and that consume, so
+    /// an ordinary quota refusal is discovered before it can create runnable
+    /// in-memory work.
+    pub(crate) async fn preflight_created_execution(
+        &self,
+        tenant: TenantId,
+        amount: u64,
+        now: &Timestamp,
+    ) -> Result<ConsumptionDecision> {
+        let decision = self
+            .quota
+            .preflight(tenant, QuotaDimension::Executions, amount, now)
+            .await?;
+        if !decision.allowed {
+            return Err(AppError::quota_exceeded(
+                QuotaDimension::Executions.as_str(),
+                decision.consumed.saturating_sub(amount),
+                decision.limit,
+                decision.retry_after,
+                format!(
+                    "{} quota exceeded ({}/{})",
+                    QuotaDimension::Executions,
+                    decision.consumed.saturating_sub(amount),
+                    decision.limit,
+                ),
+            ));
+        }
+        Ok(decision)
+    }
+
+    /// Acquires the in-memory execution-submission admission gate.
+    ///
+    /// This is deliberately crate-private: production composition must use an
+    /// authoritative database scope, not a process-local lock.
+    pub(crate) async fn lock_local_submission(&self) -> OwnedMutexGuard<()> {
+        self.local_submission_gate.clone().lock_owned().await
+    }
+
     /// The full pre-execution gate, in the canonical order.
     ///
     /// Callers that can express their intent as one feature, one policy check
@@ -802,17 +931,15 @@ impl ControlPlane {
         reservation: Option<&str>,
         now: &Timestamp,
     ) -> Result<ControlPlaneDecision> {
-        // 1. Entitlement — before anything is evaluated or charged.
-        if let Some(feature) = feature {
-            self.require_feature(tenant, feature).await?;
-        }
-        // 2. Policy — before anything is charged, so a denial costs nothing.
+        // 1–2. Entitlement and policy — before anything is charged, so a
+        // denial costs nothing.
         let evaluation = self
-            .require_policy(
+            .authorize_execution_preflight(
                 tenant,
                 organization,
                 project,
                 subject,
+                feature,
                 action,
                 resource,
                 attributes,
@@ -851,6 +978,9 @@ pub struct ReservationCharge {
     pub decision: ConsumptionDecision,
     /// The durable hold that records the charge.
     pub reservation: QuotaReservation,
+    /// Whether this call created or refreshed the hold and therefore owns its
+    /// work. `false` means another caller already holds the live row.
+    pub created: bool,
 }
 
 /// The result of taking a run's concurrency slot.
@@ -996,6 +1126,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ReservationStorePort for MemoryReservations {
+        async fn lock_key(&self, _tenant: TenantId, _reservation_key: &str) -> Result<()> {
+            Ok(())
+        }
+
         async fn reserve(
             &self,
             tenant: TenantId,
@@ -1363,6 +1497,86 @@ mod tests {
         assert!(
             !plane.record_usage(&write).await.expect("duplicate handled"),
             "duplicate work must not be metered twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_same_key_reservations_charge_once() {
+        // This is the in-process half of the invariant. Production adds the
+        // Postgres transaction advisory lock behind `lock_key`; this proof
+        // ensures the application sequence itself cannot reintroduce a race
+        // before that store boundary is reached.
+        let plane = build_in_memory_control_plane();
+        let tenant = TenantId::new();
+        let now = Timestamp::now();
+        let key = "same-logical-work";
+
+        let first = plane.reserve(tenant, QuotaDimension::Tokens, 7, key, None, None, &now);
+        let second = plane.reserve(tenant, QuotaDimension::Tokens, 7, key, None, None, &now);
+        let (first, second) = tokio::join!(first, second);
+        let first = first.expect("first reservation");
+        let second = second.expect("same-key reservation replay");
+        assert_eq!(first.reservation.id, second.reservation.id);
+        assert_ne!(
+            first.created, second.created,
+            "exactly one caller owns a newly created hold"
+        );
+        assert_eq!(
+            plane
+                .quota()
+                .usage(tenant, QuotaDimension::Tokens, &now)
+                .await
+                .expect("usage"),
+            7,
+            "two concurrent callers of one logical reservation may charge once"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_same_run_slots_assign_one_owner() {
+        // `reserve_run_slot` has an initial fast-path read. A concurrent
+        // caller can miss a row in that read, so ownership must ultimately
+        // come from the serialized `reserve` result, not from the stale miss.
+        let plane = build_in_memory_control_plane();
+        let tenant = TenantId::new();
+        let now = Timestamp::now();
+        plane
+            .quota()
+            .register(
+                &mas_domain::Quota::new(
+                    tenant,
+                    QuotaDimension::ConcurrentRuns,
+                    mas_domain::QuotaPeriod::Unbounded,
+                    1,
+                    EnforcementMode::Enforce,
+                )
+                .expect("quota"),
+            )
+            .await
+            .expect("register quota");
+        let execution = ExecutionId::new();
+        let task = TaskId::new();
+
+        let first = plane.reserve_run_slot(tenant, Some(execution), task, &now);
+        let second = plane.reserve_run_slot(tenant, Some(execution), task, &now);
+        let (first, second) = tokio::join!(first, second);
+        let first = first.expect("first run-slot result").expect("metered hold");
+        let second = second
+            .expect("second run-slot result")
+            .expect("metered hold");
+        assert_eq!(first.reservation.id, second.reservation.id);
+        assert_ne!(
+            first.acquired, second.acquired,
+            "only one duplicate delivery may run the task"
+        );
+        assert_eq!(
+            plane
+                .quota()
+                .usage(tenant, QuotaDimension::ConcurrentRuns, &now)
+                .await
+                .expect("usage"),
+            1,
+            "the same run holds one slot, even when both callers missed the fast path"
         );
     }
 

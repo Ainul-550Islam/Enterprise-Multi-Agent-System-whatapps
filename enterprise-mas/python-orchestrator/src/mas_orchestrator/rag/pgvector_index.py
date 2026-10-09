@@ -1,10 +1,13 @@
 """Tenant-isolated PostgreSQL/pgvector implementation of :class:`VectorIndex`.
 
-This adapter connects only with the dedicated ``mas_rag`` role and only
-queries ``document_chunks``. Rust-owned data-source/document metadata is never
-read or written here. Every transaction binds the authoritative tenant to the
-RLS GUC and repeats that tenant as a SQL predicate; the database policy and
-the query therefore enforce the same boundary independently.
+This adapter requires a non-privileged login that can assume the dedicated
+``mas_rag`` role and only queries ``document_chunks`` while that role is
+active. Rust-owned data-source/document metadata is never read or written
+here. Pool startup verifies the actual authenticated/session identity rather
+than trusting a configuration label; every RAG transaction then executes
+``SET LOCAL ROLE mas_rag`` and binds the authoritative tenant to the RLS GUC.
+The database policy and SQL predicate therefore enforce the tenant boundary
+independently.
 
 The optional ``pgvector`` package is imported only when this backend is
 constructed. A deployment that selects pgvector without installing the extra
@@ -28,7 +31,7 @@ from mas_orchestrator.contracts.errors import (
 from mas_orchestrator.rag.models import Chunk, DocumentAccess, EmbeddedChunk
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Awaitable, Callable, Sequence
 
     from mas_orchestrator.rag.models import SecurityContext
 
@@ -38,6 +41,32 @@ MAX_SEARCH_LIMIT: Final[int] = 200
 VECTOR_DIMENSION_MIN: Final[int] = 1536
 VECTOR_DIMENSION_MAX: Final[int] = 1536
 _REQUIRED_ROLE: Final[str] = "mas_rag"
+
+# The configured `database_role` string is not authority: a DSN could still
+# authenticate as a superuser or a broadly privileged runtime login. Validate
+# the server-side session identity before the service becomes ready. `SET` is
+# intentional: every data transaction uses `SET LOCAL ROLE mas_rag`, so a
+# login that merely inherits privileges but cannot assume the role is refused.
+# The final predicate catches an elevated role reachable through membership as
+# well as one that is directly authenticated: a login that can `SET ROLE` to a
+# superuser/BYPASSRLS role has that authority even when its own role flags are
+# false.
+_RAG_IDENTITY_SQL: Final[str] = """
+    SELECT
+        session_user::text,
+        current_user::text,
+        pg_has_role(session_user, 'mas_rag', 'SET'),
+        EXISTS (
+            SELECT 1
+            FROM pg_roles AS candidate
+            WHERE (candidate.rolsuper OR candidate.rolbypassrls)
+              AND (
+                  pg_has_role(session_user, candidate.oid, 'SET')
+                  OR pg_has_role(current_user, candidate.oid, 'SET')
+              )
+        )
+"""
+_SET_LOCAL_RAG_ROLE_SQL: Final[str] = "SET LOCAL ROLE mas_rag"
 
 
 _Connection = Any
@@ -66,6 +95,7 @@ class PgVectorIndex:
         dimensions: int,
         database_role: str = _REQUIRED_ROLE,
         batch_size: int = 128,
+        authority_probe: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         if not VECTOR_DIMENSION_MIN <= dimensions <= VECTOR_DIMENSION_MAX:
             raise ConfigurationError(
@@ -85,6 +115,7 @@ class PgVectorIndex:
         self._pool = pool
         self._dimensions = dimensions
         self._batch_size = batch_size
+        self._authority_probe = authority_probe
         self._opened = False
 
     @classmethod
@@ -121,6 +152,7 @@ class PgVectorIndex:
             )
         try:
             from pgvector.psycopg import register_vector_async
+            from psycopg import AsyncConnection
             from psycopg_pool import AsyncConnectionPool
         except ImportError as error:
             raise ConfigurationError(
@@ -129,7 +161,32 @@ class PgVectorIndex:
             ) from error
 
         async def configure(connection: Any) -> None:
-            await register_vector_async(connection)
+            # Psycopg invokes this for every newly-created pooled connection,
+            # not just the first startup probe. Each socket therefore verifies
+            # its authenticated authority before it can join the RAG pool.
+            # The pool requires configure hooks to leave the socket idle; the
+            # authority SELECT starts a transaction because normal RAG use has
+            # autocommit disabled, so roll it back before returning.
+            try:
+                await register_vector_async(connection)
+                await _assert_rag_session_authority(connection)
+            finally:
+                await connection.rollback()
+
+        async def authority_probe() -> None:
+            # A pool reports configure-hook failures as connection retries and
+            # eventually as PoolTimeout. Probe once directly first so an
+            # invalid DSN principal remains the typed ConfigurationError that
+            # operators can correct, rather than masquerading as downtime.
+            connection = await AsyncConnection.connect(
+                database_url,
+                autocommit=True,
+                application_name="mas-rag-plane-preflight",
+            )
+            try:
+                await _assert_rag_session_authority(connection)
+            finally:
+                await connection.close()
 
         try:
             pool: Any = AsyncConnectionPool(
@@ -150,6 +207,7 @@ class PgVectorIndex:
             dimensions=dimensions,
             database_role=database_role,
             batch_size=batch_size,
+            authority_probe=authority_probe,
         )
 
     @classmethod
@@ -176,15 +234,26 @@ class PgVectorIndex:
         return index
 
     async def open(self) -> None:
-        """Opens the pool and probes PostgreSQL before the service goes ready."""
+        """Opens the pool and verifies its effective database authority.
+
+        A value of ``data_hub.database_role='mas_rag'`` is only deployment
+        metadata; it does not constrain the login encoded in the DSN. The
+        startup probe therefore rejects a superuser, an RLS-bypass role, or a
+        login unable to assume ``mas_rag`` before this service accepts work.
+        """
         if self._opened:
             return
         try:
+            if self._authority_probe is not None:
+                await self._authority_probe()
             opener = getattr(self._pool, "open", None)
             if opener is not None:
                 await opener(wait=True)
             async with self._pool.connection() as connection:
+                await _assert_rag_session_authority(connection)
                 await connection.execute("SELECT 1")
+        except ConfigurationError:
+            raise
         except Exception as error:
             _LOGGER.error(
                 "RAG-plane PostgreSQL connection failed",
@@ -211,6 +280,7 @@ class PgVectorIndex:
         await self.open()
         try:
             async with self._pool.connection() as connection, connection.transaction():
+                await _enter_rag_tenant_scope(connection, None)
                 await connection.execute("SELECT 1 FROM document_chunks LIMIT 0")
             return True
         except Exception as error:
@@ -254,7 +324,7 @@ class PgVectorIndex:
             from psycopg.types.json import Jsonb
 
             async with self._pool.connection() as connection, connection.transaction():
-                await _set_tenant_scope(connection, tenant_id)
+                await _enter_rag_tenant_scope(connection, tenant_id)
                 for item in items:
                     await connection.execute(
                         """INSERT INTO document_chunks (
@@ -334,7 +404,7 @@ class PgVectorIndex:
             from pgvector import Vector
 
             async with self._pool.connection() as connection, connection.transaction():
-                await _set_tenant_scope(connection, tenant_id)
+                await _enter_rag_tenant_scope(connection, tenant_id)
                 cursor = await connection.execute(
                     """SELECT chunk_id, document_id, ordinal, start_char, end_char, chunk_text,
                               embedding, embedding_model, title, source_uri, metadata,
@@ -380,7 +450,7 @@ class PgVectorIndex:
         document_uuid = _uuid_text(document_id, "document_id")
         try:
             async with self._pool.connection() as connection, connection.transaction():
-                await _set_tenant_scope(connection, tenant_uuid)
+                await _enter_rag_tenant_scope(connection, tenant_uuid)
                 cursor = await connection.execute(
                     "DELETE FROM document_chunks WHERE tenant_id = %s AND document_id = %s",
                     (UUID(tenant_uuid), UUID(document_uuid)),
@@ -413,9 +483,51 @@ def _uuid_text(value: str, field: str) -> str:
         ) from error
 
 
-async def _set_tenant_scope(connection: _Connection, tenant_id: str) -> None:
-    """Arms transaction-local RLS context; never uses session-wide SET."""
-    await connection.execute("SELECT set_config('app.current_tenant', %s, true)", (tenant_id,))
+async def _assert_rag_session_authority(connection: _Connection) -> None:
+    """Refuses a DSN whose actual login can bypass the RAG-plane boundary.
+
+    ``database_role`` is a configuration assertion, not evidence of the
+    principal authenticated by PostgreSQL. This probe checks the session on
+    the server and requires an unprivileged login that can issue ``SET ROLE
+    mas_rag``. It rejects pre-selected roles, plus any superuser/BYPASSRLS
+    role directly active or reachable through ``SET ROLE`` membership.
+    """
+    cursor = await connection.execute(_RAG_IDENTITY_SQL)
+    row = await cursor.fetchone()
+    if row is None:
+        raise ConfigurationError(
+            "RAG database identity probe returned no result",
+            details={"required_role": _REQUIRED_ROLE},
+        )
+    try:
+        session_user, current_user, can_set_rag_role, elevated = row
+    except (TypeError, ValueError) as error:
+        raise ConfigurationError(
+            "RAG database identity probe returned an invalid result",
+            details={"required_role": _REQUIRED_ROLE},
+        ) from error
+    if (
+        not isinstance(session_user, str)
+        or not isinstance(current_user, str)
+        or session_user != current_user
+        or not bool(can_set_rag_role)
+        or bool(elevated)
+    ):
+        raise ConfigurationError(
+            "RAG database login must be non-privileged and able to assume mas_rag",
+            details={"required_role": _REQUIRED_ROLE},
+        )
+
+
+async def _enter_rag_tenant_scope(connection: _Connection, tenant_id: str | None) -> None:
+    """Narrows one transaction to the RAG role and, optionally, one tenant.
+
+    ``SET LOCAL`` expires with the surrounding transaction, so a pooled socket
+    cannot carry either RAG authority or tenant scope into a later request.
+    """
+    await connection.execute(_SET_LOCAL_RAG_ROLE_SQL)
+    if tenant_id is not None:
+        await connection.execute("SELECT set_config('app.current_tenant', %s, true)", (tenant_id,))
 
 
 def _validate_embedding(item: EmbeddedChunk, dimensions: int) -> None:

@@ -2091,6 +2091,9 @@ impl TaskRow {
         if let Some(input) = self.payload.get("input") {
             spec.insert("input".to_owned(), input.clone());
         }
+        if let Some(result) = self.result {
+            spec.insert("result".to_owned(), result);
+        }
         spec.insert("id".to_owned(), json!(self.id));
         spec.insert("tenant_id".to_owned(), json!(self.tenant_id));
         spec.insert("organization_id".to_owned(), json!(self.organization_id));
@@ -2121,8 +2124,17 @@ impl TaskRow {
     pub fn from_domain(task: &Task) -> Result<Self> {
         let (map, spec_value) = split_spec(&dehydrate("tasks", task)?, Self::MATERIALIZED)?;
         let mut spec = spec_value.as_object().cloned().unwrap_or_default();
-        spec.remove("input");
-        spec.remove("result");
+        // `input` and `result` are both intentionally pulled out of the
+        // non-materialized aggregate spec: the former lives in `payload.input`
+        // and the latter in `tasks.result`. Reading `input` from `map` here
+        // would always yield `None` because `map` contains materialized
+        // columns only, silently converting every persisted task input to
+        // JSON null on its next save.
+        let input = spec.remove("input");
+        // `result` is materialized onto its own JSONB column. Retain it while
+        // extracting the row so a completed task round-trips through memory,
+        // repository and PostgreSQL without silently dropping its output.
+        let result = spec.remove("result");
         // `not_before` is materialized onto the column, NOT dropped: it is the
         // retry backoff, and dropping it made every retry immediately
         // claimable again (a retry storm instead of a backoff).
@@ -2134,10 +2146,9 @@ impl TaskRow {
                 })?,
             _ => Timestamp::epoch().into_datetime(),
         };
-        let mut payload = map
-            .get("input")
-            .map(|i| json!({ "input": i.clone() }))
-            .and_then(|v| v.as_object().cloned())
+        let mut payload = input
+            .map(|input| json!({ "input": input }))
+            .and_then(|value| value.as_object().cloned())
             .unwrap_or_default();
         if !spec.is_empty() {
             payload.insert(SPEC_KEY.to_owned(), Value::Object(spec));
@@ -2153,7 +2164,7 @@ impl TaskRow {
             status: take_string(&map, "tasks", "status")?,
             priority: take_string(&map, "tasks", "priority")?,
             payload: Value::Object(payload),
-            result: map.get("result").cloned().filter(|v| !v.is_null()),
+            result,
             not_before,
             deadline_at: take_opt_ts(&map, "tasks", "deadline")?,
             correlation_id: map
@@ -2253,7 +2264,7 @@ mod spec_rows_tests {
         let request_id = Uuid::now_v7();
         let agent_version_id = mas_common::ids::AgentVersionId::new();
         let correlation_id = "corr-durable-task-roundtrip";
-        let task = mas_domain::Task::new(
+        let mut task = mas_domain::Task::new(
             tenant,
             organization,
             project,
@@ -2272,12 +2283,17 @@ mod spec_rows_tests {
         .with_correlation_id(correlation_id)
         .expect("correlation id");
 
+        task.result = Some(json!({"answer": 42, "safe": true}));
         let row = TaskRow::from_domain(&task).expect("row");
         assert_eq!(row.correlation_id, correlation_id);
+        assert_eq!(row.payload["input"], json!({"prompt": "safe test input"}));
+        assert_eq!(row.result, Some(json!({"answer": 42, "safe": true})));
         let restored = row.into_domain().expect("restored task");
         assert_eq!(restored.correlation_id, correlation_id);
         assert_eq!(restored.request_id, Some(request_id));
         assert_eq!(restored.agent_version_id, Some(agent_version_id));
+        assert_eq!(restored.input, json!({"prompt": "safe test input"}));
+        assert_eq!(restored.result, Some(json!({"answer": 42, "safe": true})));
     }
 
     #[test]

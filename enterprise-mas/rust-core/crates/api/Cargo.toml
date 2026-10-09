@@ -38,25 +38,30 @@ mas-common = { workspace = true }
 mas-domain = { workspace = true }
 mas-contracts = { workspace = true }
 mas-application = { workspace = true }
+mas-ai-bridge = { workspace = true }
+mas-execution = { workspace = true }
 mas-observability = { workspace = true }
 mas-persistence = { workspace = true }
 mas-security = { workspace = true }
 sqlx = { workspace = true }
 mas-tenancy = { workspace = true }
 mas-events = { workspace = true }
+mas-integrations = { workspace = true }
 chrono = { workspace = true }
 
 axum = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 tonic = { workspace = true }
 prost = { version = "0.13", features = ["prost-derive"] }
-tokio = { workspace = true, features = ["net", "signal", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["net", "signal", "rt-multi-thread", "time"] }
 serde = { workspace = true }
 serde_json = "1"
+toml = { workspace = true }
 uuid = { workspace = true }
 http = { workspace = true }
 tracing = { workspace = true }
 async-trait = { workspace = true }
+reqwest = { workspace = true }
 
 [build-dependencies]
 tonic-build = { version = "0.13", default-features = false, features = ["prost", "transport"] }

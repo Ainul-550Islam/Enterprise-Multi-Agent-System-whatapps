@@ -539,6 +539,21 @@ def _check_security(settings: Settings) -> list[ConfigViolation]:
             )
         )
 
+    if settings.is_production and not settings.security.internal_replay_database_url_secret_ref:
+        violations.append(
+            ConfigViolation(
+                field="security.internal_replay_database_url_secret_ref",
+                message=(
+                    "production internal authentication requires a durable shared "
+                    "replay receipt store"
+                ),
+                remediation=(
+                    "set security.internal_replay_database_url_secret_ref to a "
+                    "PostgreSQL DSN secret"
+                ),
+            )
+        )
+
     if settings.is_production and settings.security.trust_caller_tenant_header:
         violations.append(
             ConfigViolation(
@@ -684,6 +699,7 @@ def production_ready_settings(environment: Environment = Environment.PRODUCTION)
             # message that was sent now from one that was captured earlier,
             # so production validation refuses to boot.
             internal_service_secret_ref="rust_internal_signing_secret",  # noqa: S106
+            internal_replay_database_url_secret_ref="orchestrator_replay_database_url",  # noqa: S106
         ),
     )
     return validate_settings_or_raise(settings)

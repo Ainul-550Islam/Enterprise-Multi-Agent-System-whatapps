@@ -67,6 +67,7 @@ fn ids_roundtrip_display_fromstr_serde() {
     check!(AuditEventId);
     check!(ScheduleId);
     check!(WebhookId);
+    check!(InboundWebhookId);
     check!(ApiKeyId);
     check!(SessionId);
     check!(EventId);

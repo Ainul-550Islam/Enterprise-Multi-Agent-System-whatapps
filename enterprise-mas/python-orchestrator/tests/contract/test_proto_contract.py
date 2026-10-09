@@ -81,6 +81,7 @@ class TestAgentRunRequestShape:
             "idempotency_key",
             "identity",
             "task_attempt_id",
+            "agent_snapshot_json",
         ]
 
     def test_identity_fields_are_strings(self) -> None:

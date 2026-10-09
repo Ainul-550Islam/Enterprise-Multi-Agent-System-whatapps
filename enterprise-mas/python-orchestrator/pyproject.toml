@@ -52,9 +52,13 @@ dependencies = [
     # Runtime required by the checked-in protobuf modules.
     "protobuf>=7.35.1,<8",
     # Outbound HTTP for provider/tool adapters (SSRF-guarded by our own layer).
-    "httpx>=0.27",
+    "httpx>=0.27,<0.29",
+    # Public network-backend API used to pin validated DNS answers to the TCP dial.
+    "httpcore>=1.0,<2",
     # Safe parsing of untrusted S3 listing XML in the Data Hub source adapter.
     "defusedxml>=0.7.1,<1",
+    # Durable cross-replica replay receipts for internal service authentication.
+    "psycopg[binary,pool]>=3.2,<4",
 ]
 
 [project.optional-dependencies]
@@ -106,7 +110,7 @@ testpaths = ["tests"]
 pythonpath = ["src"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
-addopts = "-ra --strict-markers --strict-config"
+addopts = "-ra --strict-markers --strict-config --import-mode=importlib"
 markers = [
     "unit: fast deterministic unit tests",
     "integration: tests requiring external infrastructure (rust core, db, broker)",
@@ -203,3 +207,10 @@ exclude_lines = [
     "raise NotImplementedError",
     "@abstractmethod",
 ]
+
+# Optional ingestion/vector integrations are imported lazily. A bridge-only
+# installation deliberately does not install them, so static checking of the
+# base dependency set must not require their third-party stubs.
+[[tool.mypy.overrides]]
+module = ["pypdf", "pgvector", "pgvector.*"]
+ignore_missing_imports = true

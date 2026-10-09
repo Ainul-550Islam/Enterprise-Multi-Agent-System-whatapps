@@ -283,10 +283,10 @@ impl<P: ProviderRegistryPort, C: ConnectorRegistryPort> ConnectorFactory<P, C> {
                 connector.last_error = None;
                 tracing::debug!(connector = %id, "connection probe succeeded");
             },
-            Err(err) => {
+            Err(_) => {
                 connector.status = ConnectorStatus::Error;
-                connector.last_error = Some(clean_error_fragment(&err.to_string()));
-                tracing::warn!(connector = %id, "connection probe failed");
+                connector.last_error = Some("connector operation failed".to_owned());
+                tracing::warn!(connector = %id, outcome = "probe_failed", "connection probe failed");
             },
         }
         connector.updated_at = Timestamp::now();
@@ -295,14 +295,14 @@ impl<P: ProviderRegistryPort, C: ConnectorRegistryPort> ConnectorFactory<P, C> {
     }
 }
 
-/// Renders an error for durable storage: single-line, length-capped. The
-/// source error text is treated as untrusted (may embed provider payloads).
+/// Renders an error category for durable storage.
+///
+/// Provider/transport errors are untrusted and can contain credentials, tenant
+/// URLs, or response bodies. A bounded substring is still disclosure, so
+/// connector state carries a stable category rather than source text.
 pub fn clean_error_fragment(raw: &str) -> String {
-    let clean: String = raw
-        .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect();
-    clean.chars().take(MAX_STORED_ERROR_CHARS).collect()
+    let _ = raw;
+    "connector operation failed".to_owned()
 }
 
 #[cfg(test)]

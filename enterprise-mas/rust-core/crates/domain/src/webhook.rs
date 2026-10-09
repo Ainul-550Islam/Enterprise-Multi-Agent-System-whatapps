@@ -1,4 +1,4 @@
-//! Webhook endpoints and deliveries.
+//! Webhook endpoints and durable delivery aggregates.
 
 use mas_common::constants;
 use mas_common::error::AppError;
@@ -25,7 +25,9 @@ pub struct SignatureConfig {
     pub algorithm: SignatureAlgorithm,
     /// Reference to the shared signing secret.
     pub secret_reference_id: SecretReferenceId,
-    /// Key version used for signing (rotations verify old + new briefly).
+    /// Current key version used for newly enqueued deliveries. Existing jobs
+    /// capture this version so rotation cannot change a retry's signature
+    /// unexpectedly midway through a delivery stream.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_version: Option<String>,
 }
@@ -52,6 +54,8 @@ impl Default for WebhookRetryPolicy {
 pub struct WebhookEndpoint {
     pub id: WebhookId,
     pub tenant_id: TenantId,
+    /// Tenant-influenced endpoint URLs are always parsed with `SafeUrl::parse`,
+    /// never the operator-only internal endpoint parser.
     pub url: SafeUrl,
     pub description: Option<String>,
     /// Event type names (e.g. `execution.completed`) this endpoint receives.
@@ -67,12 +71,34 @@ pub struct WebhookEndpoint {
 }
 
 impl WebhookEndpoint {
+    /// Registers a tenant-owned outbound endpoint after its URL has passed the
+    /// tenant-safe `SafeUrl` parser and its secret has been created elsewhere.
     pub fn register(
         tenant_id: TenantId,
         url: SafeUrl,
         subscribed_events: BTreeSet<String>,
         signature: SignatureConfig,
     ) -> Result<Self> {
+        if url.is_internal_endpoint() {
+            return Err(AppError::invalid_field(
+                "url",
+                "internal_endpoint_forbidden",
+                "tenant webhook endpoints cannot target operator-only internal endpoints",
+            ));
+        }
+        if signature.key_version.as_deref().is_some_and(|version| {
+            version.is_empty()
+                || version.len() > 128
+                || !version
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        }) {
+            return Err(AppError::invalid_field(
+                "signature.key_version",
+                "invalid_format",
+                "signing key versions must be 1..=128 ASCII token characters",
+            ));
+        }
         if subscribed_events.is_empty() {
             return Err(AppError::invalid_field(
                 "subscribed_events",
@@ -141,7 +167,7 @@ impl WebhookEndpoint {
     }
 }
 
-/// One delivery attempt stream of an event to an endpoint.
+/// One durable delivery stream of an event to an endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebhookDelivery {
     pub id: uuid::Uuid,
@@ -155,6 +181,10 @@ pub struct WebhookDelivery {
     pub next_attempt_at: Option<Timestamp>,
     /// SHA-256 (hex) of the signed payload body, for replay integrity.
     pub payload_hash: String,
+    /// Version captured at enqueue. `None` means the secret manager's current
+    /// version only for legacy data; new delivery creation captures explicitly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signing_key_version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
     pub created_at: Timestamp,
@@ -162,10 +192,22 @@ pub struct WebhookDelivery {
 }
 
 impl WebhookDelivery {
+    /// Creates a delivery without a key version for backwards-compatible
+    /// callers. New production enqueue paths use [`Self::new_with_key_version`].
     pub fn new(
         endpoint_id: WebhookId,
         event_id: EventId,
         payload_hash: impl Into<String>,
+    ) -> Result<Self> {
+        Self::new_with_key_version(endpoint_id, event_id, payload_hash, None)
+    }
+
+    /// Creates a delivery and captures the endpoint's signing key version.
+    pub fn new_with_key_version(
+        endpoint_id: WebhookId,
+        event_id: EventId,
+        payload_hash: impl Into<String>,
+        signing_key_version: Option<String>,
     ) -> Result<Self> {
         let payload_hash = payload_hash.into();
         if payload_hash.len() != 64 || !payload_hash.chars().all(|ch| ch.is_ascii_hexdigit()) {
@@ -173,6 +215,19 @@ impl WebhookDelivery {
                 "payload_hash",
                 "invalid_format",
                 "payload hash must be 64 hex characters (SHA-256)",
+            ));
+        }
+        if signing_key_version.as_deref().is_some_and(|version| {
+            version.is_empty()
+                || version.len() > 128
+                || !version
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        }) {
+            return Err(AppError::invalid_field(
+                "signing_key_version",
+                "invalid_format",
+                "signing key versions must be 1..=128 ASCII token characters",
             ));
         }
         let now = Timestamp::now();
@@ -185,6 +240,7 @@ impl WebhookDelivery {
             last_status_code: None,
             next_attempt_at: None,
             payload_hash,
+            signing_key_version,
             last_error: None,
             created_at: now,
             updated_at: now,
@@ -198,14 +254,14 @@ impl WebhookDelivery {
             && self.attempt_count < policy.max_attempts
     }
 
-    /// Records a completed HTTP attempt and updates retry state.
+    /// Records one completed HTTP attempt and updates retry/dead-letter state.
     pub fn record_attempt(
         &mut self,
         status_code: Option<u16>,
         policy: &WebhookRetryPolicy,
         error: Option<String>,
     ) {
-        self.attempt_count += 1;
+        self.attempt_count = self.attempt_count.saturating_add(1);
         self.last_status_code = status_code;
         let delivered = status_code.is_some_and(|code| (200..300).contains(&code));
         if delivered {
@@ -231,10 +287,56 @@ impl WebhookDelivery {
             self.next_attempt_at =
                 Timestamp::now().checked_add(std::time::Duration::from_millis(backoff));
         } else {
-            self.state = DeliveryState::Failed;
+            self.state = DeliveryState::DeadLettered;
             self.next_attempt_at = None;
             self.last_error = Some("delivery attempts exhausted".to_owned());
         }
         self.updated_at = Timestamp::now();
+    }
+
+    /// Marks work cancelled only before a terminal outcome. Worker ownership
+    /// fencing is enforced by persistence; this aggregate enforces lifecycle.
+    pub fn cancel(&mut self, reason: impl Into<String>) -> Result<()> {
+        if self.state.is_terminal() {
+            return Err(AppError::conflict(
+                "terminal webhook deliveries cannot be cancelled",
+            ));
+        }
+        let mut reason = reason.into();
+        reason.truncate(1024);
+        self.state = DeliveryState::Cancelled;
+        self.next_attempt_at = None;
+        self.last_error = Some(reason);
+        self.updated_at = Timestamp::now();
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hash() -> String {
+        "a".repeat(64)
+    }
+
+    #[test]
+    fn retries_end_in_explicit_dead_letter_state() {
+        let endpoint = WebhookId::new();
+        let event = EventId::new();
+        let mut delivery =
+            WebhookDelivery::new_with_key_version(endpoint, event, hash(), Some("v2".to_owned()))
+                .expect("delivery");
+        delivery.record_attempt(
+            Some(500),
+            &WebhookRetryPolicy {
+                max_attempts: 1,
+                initial_backoff_ms: 1,
+            },
+            None,
+        );
+        assert_eq!(delivery.state, DeliveryState::DeadLettered);
+        assert!(delivery.next_attempt_at.is_none());
+        assert_eq!(delivery.signing_key_version.as_deref(), Some("v2"));
     }
 }

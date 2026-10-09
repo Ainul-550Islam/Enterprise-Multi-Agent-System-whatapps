@@ -59,6 +59,12 @@ impl InMemoryReservationStore {
 
 #[async_trait::async_trait]
 impl ReservationStorePort for InMemoryReservationStore {
+    async fn lock_key(&self, _tenant: TenantId, _reservation_key: &str) -> Result<()> {
+        // `ControlPlane` holds its process-local async gate across the full
+        // check → charge → row write sequence for this in-memory adapter.
+        Ok(())
+    }
+
     async fn reserve(
         &self,
         tenant: TenantId,

@@ -47,6 +47,7 @@ pub mod audit;
 pub mod auth_failure;
 pub mod authorization;
 pub mod internal_service;
+pub mod jwks;
 pub mod principal;
 pub mod scope;
 pub mod scopes;
@@ -66,6 +67,7 @@ pub use authorization::{
 pub use internal_service::{
     sign, verify, InternalServiceIdentity, SERVICE_HEADER, SIGNATURE_HEADER,
 };
+pub use jwks::{JwksConfig, JwksFetchPort, JwsAlgorithm, RemoteJwksValidator};
 pub use principal::{PrincipalKind, SecurityPrincipal, TenantMembership};
 pub use scope::{machine_plane_scope, AuthoritativeScope};
 pub use scopes::ScopeSet;

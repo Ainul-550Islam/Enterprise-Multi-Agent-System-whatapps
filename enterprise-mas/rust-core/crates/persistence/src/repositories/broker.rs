@@ -3,27 +3,28 @@
 //!
 //! Owning layer: `mas-persistence`.
 //!
-//! Production responsibility: make rows the truth. `fetch` claims queued task
-//! rows atomically (`FOR UPDATE SKIP LOCKED`) and `ack`/`nack` are row
-//! transitions, so a crashed consumer's work is recovered by the database
-//! rather than by broker metadata.
+//! Production responsibility: make rows the truth. `fetch` discovers queued
+//! task rows but never changes their lifecycle state; the worker's durable
+//! attempt claim owns the only queued → running transition. `ack`/`nack` only
+//! pace or settle already-authoritative work, so a broker delivery cannot race
+//! a task attempt into an incompatible state.
 //!
 //! It must NOT:
 //!   • derive attempt counts from delivery metadata (they come from
 //!     `task_attempts`);
 //!   • delete a message row on completion — the row is the audit trail;
-//!   • hand the same task to two workers.
+//!   • grant task ownership: duplicate transport hints are resolved only by
+//!     the durable attempt claim.
 
 //! `PgTaskBroker` — the durability-first broker for Pg-only deployments.
 //!
 //! Doctrine (recorded in `docs/production-wiring.md` §3):
 //!
-//! * Rows are truth. `fetch` claims `queued` task rows atomically
-//!   (`FOR UPDATE SKIP LOCKED`), `ack(Ack|Nak|Term)` settles them, and
-//!   crash-recovery works by policy, not hope: a claimed-but-never-settled
-//!   row is *reaped* at the next fetch after its claim window expires (the
-//!   same `not_before` column carries backoff and claim expiry — a claim
-//!   sets it to `now + ack_wait`, an explicit Nak sets it to `now + delay`).
+//! * Rows are truth. `fetch` discovers `queued` task rows and maintains only
+//!   a process-local duplicate-suppression flight map. The durable attempt
+//!   coordinator performs the queued → running transition, records the owner
+//!   lease and creates the attempt in one transaction. A restart may redeliver
+//!   a hint, but it can never create a second durable owner.
 //! * Task subjects (`mas.tasks.>`, see `mas_messaging::subjects`) are
 //!   durable over the `tasks` table.
 //!   Event subjects (`mas.events.>`) are routed to an embedded volatile
@@ -31,9 +32,10 @@
 //!   is the outbox relay's job (state change + outbox row commit
 //!   atomically, then publish), so the wake-up lane does not carry the
 //!   persistence burden.
-//! * Sequence numbers are surrogates: (uuid v7 → first 8 bytes) → u64. The
-//!   survivor's ledger maps them to row ids while claims are in flight;
-//!   restarts re-derive via the reaper.
+//! * Sequence numbers are database-generated transport identities. The local
+//!   flight ledger maps them to row ids while delivery hints are outstanding;
+//!   after a restart a fresh fetch may re-emit a hint, and durable claiming
+//!   resolves the duplicate safely.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -55,60 +57,135 @@ use uuid::Uuid;
 
 use crate::error::map_sqlx;
 
-/// Default ack window when the consumer config isn't re-registered first.
-const DEFAULT_ACK_WINDOW: Duration = Duration::from_secs(30);
 /// Task lanes (the durable quarter of the subject space).
 const TASK_SUBJECT_PREFIX: &str = "mas.tasks.";
 
-/// Atomic claim: pick queued rows past their `not_before`, flip them to
-/// `running` with an extended claim window, return full rows.
-const CLAIM_SQL: &str = "WITH claimable AS (
-    SELECT id FROM tasks
-    WHERE status = 'queued' AND not_before <= now()
-    ORDER BY priority DESC, created_at ASC
-    LIMIT $1
-    FOR UPDATE SKIP LOCKED
-    )
-    UPDATE tasks t
-    SET status = 'running', not_before = now() + make_interval(secs => $2), updated_at = now()
-    FROM claimable WHERE t.id = claimable.id
-    RETURNING t.id, t.tenant_id, t.organization_id, t.project_id, t.execution_id,
+/// Finds task rows that are ready for durable ownership or lease recovery.
+/// This statement is deliberately read-only: `PgDurableExecution::claim_in`
+/// is the sole writer of `queued → running`, worker ownership and
+/// task-attempt rows. An expired `running` row is emitted as a recovery *hint*
+/// rather than being rewritten here; the durable claim closes the old attempt
+/// and either requeues or exhausts it atomically. Splitting those transitions
+/// across the broker and the attempt coordinator previously left a
+/// broker-fetched task in `running` before the coordinator could claim it, so
+/// no attempt was ever created.
+const FETCH_SQL: &str = "SELECT t.id, t.tenant_id, t.organization_id, t.project_id, t.execution_id,
               t.idempotency_key, t.kind, t.priority, t.deadline_at,
-              t.payload, t.created_at, t.correlation_id";
+              t.payload, t.created_at, t.correlation_id,
+              coalesce((
+                  SELECT max(r.delivery_count)::bigint
+                  FROM broker_delivery_receipts r
+                  WHERE r.consumer_name = $1 AND r.task_id = t.id
+              ), 0::bigint) AS prior_deliveries
+    FROM tasks t
+    WHERE (t.status = 'queued' AND t.not_before <= now())
+       OR (t.status = 'running' AND t.locked_until IS NOT NULL AND t.locked_until <= now())
+    ORDER BY t.priority DESC, t.created_at ASC
+    LIMIT $2";
 
-/// Return overdue claims to the queue (lease-expired 'running' rows).
-const REAP_SQL: &str = "UPDATE tasks SET status = 'queued', not_before = now(), updated_at = now()
-    WHERE status = 'running' AND not_before <= now()";
+/// A NAK only paces a still-unowned queued task. A task that has already been
+/// claimed is governed by its durable ownership lease and settlement path. A
+/// live receipt is proof another replica is about to claim the queued row, so
+/// a duplicate transport hint must not push that owner's `not_before` into the
+/// future before it gets there.
+const NAK_SQL: &str = "UPDATE tasks AS t SET not_before = $2, updated_at = now()
+    WHERE t.id = $1 AND t.status = 'queued' AND t.locked_by IS NULL
+      AND NOT EXISTS (
+          SELECT 1 FROM broker_delivery_receipts r
+          WHERE r.task_id = t.id
+            AND r.status IN ('reserved', 'in_flight')
+            AND r.lease_expires_at > now()
+      )";
 
-const NAK_SQL: &str = "UPDATE tasks SET status = 'queued', not_before = $2, updated_at = now()
-    WHERE id = $1 AND status = 'running'";
-
-const TERM_SQL: &str = "UPDATE tasks SET status = 'dead_lettered', updated_at = now()
-    WHERE id = $1 AND status = 'running'";
+/// An explicit poison TERM is the one transport-only exception to durable
+/// task settlement. It is used solely when a task frame cannot be decoded, so
+/// no coordinator can identify its operation or construct a claim. Automatic
+/// delivery-count exhaustion never calls this query: attempt budgeting belongs
+/// to `PgDurableExecution`. The live-receipt predicate prevents one replica's
+/// corrupt/stale hint from terminating work another replica has reserved.
+const POISON_QUARANTINE_SQL: &str =
+    "UPDATE tasks AS t SET status = 'dead_lettered', updated_at = now()
+    WHERE t.id = $1 AND t.status = 'queued' AND t.locked_by IS NULL
+      AND NOT EXISTS (
+          SELECT 1 FROM broker_delivery_receipts r
+          WHERE r.task_id = t.id
+            AND r.status IN ('reserved', 'in_flight')
+            AND r.lease_expires_at > now()
+      )";
 
 const DEAD_LETTERS_SQL: &str = "SELECT id, payload, created_at FROM tasks
     WHERE status = 'dead_lettered' ORDER BY updated_at ASC LIMIT $1";
 
-/// Task ids are UUIDs; uuid-v7 first 8 bytes → timestamp-bearing u64 seq.
-fn sequence_of(id: Uuid) -> u64 {
-    let bytes = id.as_bytes();
-    u64::from_be_bytes([
-        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-    ])
+/// One process-local broker hint. This is only duplicate suppression, never
+/// ownership: a durable receipt and task attempt decide who may run the task.
+#[derive(Debug, Clone, Copy)]
+struct FlightEntry {
+    task_id: Uuid,
+    redeliver_after: Timestamp,
 }
 
-/// In-flight claims (sequence ↔ row id), drained by settlement/reaping.
+/// Outstanding local delivery hints (sequence ↔ row id), drained by broker
+/// settlement or naturally reopened after the durable consumer's ack window.
 #[derive(Debug, Default)]
 struct FlightLedger {
-    by_sequence: Mutex<BTreeMap<u64, Uuid>>,
+    by_sequence: Mutex<BTreeMap<u64, FlightEntry>>,
 }
 
 impl FlightLedger {
-    fn record(&self, sequence: u64, row: Uuid) {
+    /// Records one process-local delivery hint only while its ack window is
+    /// live. A no-signal duplicate (because another replica owns a live
+    /// receipt) must be eligible for redelivery after that window; otherwise a
+    /// local process map turns a temporary competing receipt into permanent
+    /// recovery starvation.
+    fn record_if_absent(
+        &self,
+        sequence: u64,
+        task_id: Uuid,
+        redeliver_after: Timestamp,
+        now: &Timestamp,
+    ) -> bool {
+        let mut flights = self.by_sequence.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = flights.get(&sequence) {
+            if existing.task_id == task_id && existing.redeliver_after.is_after(now) {
+                return false;
+            }
+        }
+        flights.insert(
+            sequence,
+            FlightEntry {
+                task_id,
+                redeliver_after,
+            },
+        );
+        true
+    }
+
+    fn len(&self) -> usize {
+        let now = Timestamp::now();
+        let mut flights = self.by_sequence.lock().unwrap_or_else(|e| e.into_inner());
+        flights.retain(|_, entry| entry.redeliver_after.is_after(&now));
+        flights.len()
+    }
+
+    fn get(&self, sequence: u64) -> Option<Uuid> {
         self.by_sequence
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(sequence, row);
+            .get(&sequence)
+            .map(|entry| entry.task_id)
+    }
+
+    /// Extends only process-local duplicate suppression for a healthy worker
+    /// heartbeat. The durable task lease remains owned by the coordinator;
+    /// this merely gives the broker hint the same ack-window behaviour as a
+    /// real transport so it is not re-emitted while that owner is alive.
+    fn extend(&self, sequence: u64, redeliver_after: Timestamp) -> bool {
+        let mut flights = self.by_sequence.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(entry) = flights.get_mut(&sequence) else {
+            return false;
+        };
+        entry.redeliver_after = redeliver_after;
+        true
     }
 
     fn take(&self, sequence: u64) -> Option<Uuid> {
@@ -116,6 +193,7 @@ impl FlightLedger {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&sequence)
+            .map(|entry| entry.task_id)
     }
 }
 
@@ -125,7 +203,6 @@ pub struct PgTaskBroker {
     pool: PgPool,
     events: InMemoryBroker,
     flight: FlightLedger,
-    ack_window_seconds: i64,
 }
 
 impl PgTaskBroker {
@@ -143,15 +220,7 @@ impl PgTaskBroker {
             pool,
             events,
             flight: FlightLedger::default(),
-            ack_window_seconds: DEFAULT_ACK_WINDOW.as_secs() as i64,
         }
-    }
-
-    /// Overrides the ack window (from the consumer's config on registration).
-    #[must_use]
-    pub fn with_ack_window(mut self, window: Duration) -> Self {
-        self.ack_window_seconds = window.as_secs() as i64;
-        self
     }
 
     /// Whether the subject belongs to the durable (tasks) lane.
@@ -160,20 +229,99 @@ impl PgTaskBroker {
         subject.as_str().starts_with(TASK_SUBJECT_PREFIX)
     }
 
-    async fn fetch_durable(&self, max: usize) -> Result<Vec<BrokerMessage>> {
-        // Recovery-first: expired claims return before fresh claims hand out.
-        sqlx::query(REAP_SQL)
-            .execute(&self.pool)
-            .await
-            .map_err(map_sqlx)?;
-        let rows = sqlx::query(CLAIM_SQL)
-            .bind(i64::try_from(max).unwrap_or(i64::MAX))
-            .bind(self.ack_window_seconds)
+    /// Allocates or retrieves the database-generated transport identity for a
+    /// task message. It is stable across process restarts and cannot collide
+    /// like a truncated UUID timestamp prefix.
+    async fn durable_message_sequence(&self, task_id: Uuid) -> Result<u64> {
+        // The normal path is a read after the first delivery. Avoid a
+        // conflicting INSERT on every fetch: a busy worker repeatedly polling
+        // a queued row should not turn an immutable message identity into a
+        // write hot spot. On the rare first-delivery race, the unique key is
+        // still the arbiter and the second SELECT observes its winner.
+        let existing: Option<i64> = sqlx::query_scalar(
+            "SELECT message_sequence FROM broker_task_messages WHERE task_id = $1",
+        )
+        .bind(task_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        let sequence = match existing {
+            Some(sequence) => sequence,
+            None => {
+                sqlx::query(
+                    "INSERT INTO broker_task_messages (task_id)
+                     VALUES ($1)
+                     ON CONFLICT (task_id) DO NOTHING",
+                )
+                .bind(task_id)
+                .execute(&self.pool)
+                .await
+                .map_err(map_sqlx)?;
+                sqlx::query_scalar(
+                    "SELECT message_sequence FROM broker_task_messages WHERE task_id = $1",
+                )
+                .bind(task_id)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(map_sqlx)?
+            },
+        };
+        u64::try_from(sequence).map_err(|_| {
+            AppError::database("broker message sequence must be a non-negative bigint")
+        })
+    }
+
+    /// Reads the persisted delivery policy rather than trusting process-local
+    /// defaults. Every replica must agree on these values or an ack window can
+    /// silently shrink after a restart.
+    async fn durable_policy(&self, consumer: &str) -> Result<(i64, u32)> {
+        let row = sqlx::query(
+            "SELECT ack_wait_ms, max_deliver FROM broker_consumers WHERE consumer_name = $1",
+        )
+        .bind(consumer)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        let Some(row) = row else {
+            return Err(AppError::not_found("broker consumer", consumer));
+        };
+        let ack_wait_ms: i32 = row.try_get("ack_wait_ms").map_err(map_sqlx)?;
+        let max_deliver: i32 = row.try_get("max_deliver").map_err(map_sqlx)?;
+        Ok((
+            i64::from(ack_wait_ms),
+            u32::try_from(max_deliver).unwrap_or(1),
+        ))
+    }
+
+    async fn fetch_durable(&self, consumer: &str, max: usize) -> Result<Vec<BrokerMessage>> {
+        let (ack_wait_ms, max_deliver) = self.durable_policy(consumer).await?;
+        if max == 0 {
+            return Ok(Vec::new());
+        }
+        let now = Timestamp::now();
+        let ack_wait = Duration::from_millis(u64::try_from(ack_wait_ms).unwrap_or(30_000));
+        let redeliver_after = now.checked_add(ack_wait).ok_or_else(|| {
+            AppError::validation("durable consumer ack_wait overflows receipt hint timestamp")
+        })?;
+        // Fetching is intentionally read-only. The next component, the durable
+        // attempt coordinator, atomically installs status, worker fence and
+        // attempt row together. That keeps the database lifecycle singular.
+        // The query deliberately over-scans the local number of outstanding
+        // hints. Otherwise a high-priority row already in this process's
+        // flight ledger could occupy every SQL result slot and starve a later
+        // ready row even though the consumer has capacity for it.
+        let scan_limit = max.saturating_add(self.flight.len());
+        let rows = sqlx::query(FETCH_SQL)
+            .bind(consumer)
+            .bind(i64::try_from(scan_limit).unwrap_or(i64::MAX))
             .fetch_all(&self.pool)
             .await
             .map_err(map_sqlx)?;
-        let mut messages = Vec::with_capacity(rows.len());
+        let mut messages = Vec::with_capacity(max);
         for row in rows {
+            if messages.len() >= max {
+                break;
+            }
             let id: Uuid = row.try_get("id").map_err(map_sqlx)?;
             let payload: serde_json::Value = row.try_get("payload").map_err(map_sqlx)?;
             let created_at: chrono::DateTime<chrono::Utc> =
@@ -256,8 +404,29 @@ impl PgTaskBroker {
             frame.insert("enqueued_at".to_owned(), json!(enqueued_at));
             let payload = serde_json::Value::Object(frame);
 
-            let sequence = sequence_of(id);
-            self.flight.record(sequence, id);
+            // Delivery count is persisted by the worker's receipt port, not
+            // inferred from this process's memory. It is transport telemetry
+            // and backoff input only: `task_attempts` is the authoritative
+            // attempt budget, so a burst of duplicate hints must never
+            // dead-letter a task before a durable claim decides its outcome.
+            // Keep the persisted counter within the configured broker bound;
+            // saturation is intentionally non-terminal.
+            let prior_deliveries: i64 = row.try_get("prior_deliveries").map_err(map_sqlx)?;
+            let deliveries = u32::try_from(prior_deliveries.saturating_add(1))
+                .unwrap_or(max_deliver)
+                .clamp(1, max_deliver);
+            // This sequence identifies the broker message, while the worker
+            // allocates a separate receipt for every delivery before work.
+            // Do not emit the same unacknowledged hint repeatedly from this
+            // process; cross-replica duplicates remain safe because the
+            // durable attempt claim is the ownership boundary.
+            let sequence = self.durable_message_sequence(id).await?;
+            if !self
+                .flight
+                .record_if_absent(sequence, id, redeliver_after, &now)
+            {
+                continue;
+            }
             let mut headers = HeaderSet::new();
             headers
                 .insert("x-correlation-id", correlation_id.clone())
@@ -276,7 +445,7 @@ impl PgTaskBroker {
                 payload: serde_json::to_vec(&payload)
                     .map_err(|e| AppError::serialization(format!("frame: {e}")))?,
                 published_at: Timestamp::from_datetime(created_at),
-                deliveries: 1,
+                deliveries,
             });
         }
         Ok(messages)
@@ -360,34 +529,61 @@ impl BrokerPort for PgTaskBroker {
         .execute(&self.pool)
         .await
         .map_err(map_sqlx)?;
-        if result.rows_affected() == 0 {
+        let task_id = if result.rows_affected() == 0 {
             // Duplicate publish: idempotent collapse to the original row.
-            let existing: Option<Uuid> = sqlx::query_scalar(
-                "SELECT id FROM tasks WHERE tenant_id = $1 AND idempotency_key = $2",
-            )
-            .bind(Uuid::from(message.tenant_id))
-            .bind(&message.idempotency_key)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(map_sqlx)?;
-            return existing
-                .map(sequence_of)
-                .ok_or_else(|| AppError::database("idempotency conflict without surviving row"));
-        }
-        Ok(sequence_of(Uuid::from(message.task_id)))
+            sqlx::query_scalar("SELECT id FROM tasks WHERE tenant_id = $1 AND idempotency_key = $2")
+                .bind(Uuid::from(message.tenant_id))
+                .bind(&message.idempotency_key)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(map_sqlx)?
+                .ok_or_else(|| AppError::database("idempotency conflict without surviving row"))?
+        } else {
+            Uuid::from(message.task_id)
+        };
+        self.durable_message_sequence(task_id).await
     }
 
     async fn ensure_consumer(&self, config: ConsumerConfig) -> Result<()> {
-        // The durable lane is configless (claim/reap is global), but `fetch`,
-        // `ack`, `consumer_stats` and `dead_letters` all fan out to the event
-        // lane too — so the consumer MUST exist there as well, or every one of
-        // those calls fails with "broker consumer not found".
-        self.events.ensure_consumer(config).await?;
-        Ok(())
+        let config = config.validated()?;
+        let ack_wait_ms = i32::try_from(config.ack_wait.as_millis()).map_err(|_| {
+            AppError::validation("ack_wait is too large for durable consumer storage")
+        })?;
+        let max_deliver = i32::try_from(config.max_deliver).map_err(|_| {
+            AppError::validation("max_deliver is too large for durable consumer storage")
+        })?;
+        // Insert once, then compare every registered field. Updating an
+        // existing durable consumer would change recovery behavior underneath
+        // live workers, so disagreement is a boot failure rather than a
+        // last-writer-wins configuration change.
+        sqlx::query(
+            "INSERT INTO broker_consumers (consumer_name, ack_wait_ms, max_deliver)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (consumer_name) DO NOTHING",
+        )
+        .bind(&config.name)
+        .bind(ack_wait_ms)
+        .bind(max_deliver)
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        let (stored_ack_wait_ms, stored_max_deliver) = self.durable_policy(&config.name).await?;
+        if stored_ack_wait_ms != i64::from(ack_wait_ms)
+            || stored_max_deliver != u32::try_from(max_deliver).unwrap_or_default()
+        {
+            return Err(AppError::conflict(format!(
+                "durable consumer '{}' exists with ack_wait_ms={} and max_deliver={}, \
+                 not requested ack_wait_ms={} and max_deliver={}",
+                config.name, stored_ack_wait_ms, stored_max_deliver, ack_wait_ms, max_deliver
+            )));
+        }
+        // Event subjects still use the in-memory adapter in the PostgreSQL
+        // task lane, so register the same validated policy there too.
+        self.events.ensure_consumer(config).await
     }
 
     async fn fetch(&self, consumer: &str, max: usize) -> Result<Vec<BrokerMessage>> {
-        let mut messages = self.fetch_durable(max).await?;
+        let mut messages = self.fetch_durable(consumer, max).await?;
         if messages.len() < max {
             let remainder = self.events.fetch(consumer, max - messages.len()).await?;
             messages.extend(remainder);
@@ -396,14 +592,22 @@ impl BrokerPort for PgTaskBroker {
     }
 
     async fn ack(&self, consumer: &str, sequence: u64, instruction: AckInstruction) -> Result<()> {
-        let Some(row_id) = self.flight.take(sequence) else {
+        // Read the shared persisted policy before changing local flight state.
+        // A database outage must leave the mapping intact so the worker can
+        // retry the same settlement or let the durable claim expire safely.
+        let (ack_wait_ms, _max_deliver) = self.durable_policy(consumer).await?;
+        let ack_wait = Duration::from_millis(u64::try_from(ack_wait_ms).unwrap_or(30_000));
+        let Some(row_id) = self.flight.get(sequence) else {
             // Not a durable-lane claim: route to the event lane.
             return self.events.ack(consumer, sequence, instruction).await;
         };
-        match instruction {
+        let terminal = !matches!(instruction, AckInstruction::InProgress);
+        let result = match instruction {
             AckInstruction::Ack => {
-                // Settlement of truth happened via the lifecycle (status was
-                // already updated); ack only validates protocol consistency.
+                // A terminal lifecycle is the usual ACK case. `running` is
+                // also valid here: another replica may have won the durable
+                // claim for the same read-only delivery hint, and acknowledging
+                // this losing hint must not interfere with the real owner.
                 let status: Option<String> =
                     sqlx::query_scalar("SELECT status FROM tasks WHERE id = $1")
                         .bind(row_id)
@@ -411,17 +615,18 @@ impl BrokerPort for PgTaskBroker {
                         .await
                         .map_err(map_sqlx)?;
                 match status.as_deref() {
-                    Some("completed" | "failed" | "cancelled" | "dead_lettered") => Ok(()),
+                    Some("completed" | "failed" | "cancelled" | "dead_lettered" | "running") => {
+                        Ok(())
+                    },
                     Some(other) => Err(AppError::conflict(format!(
-                        "task {} acknowledged but is '{}' (lifecycle settlement was skipped)",
+                        "task {} acknowledged while still '{}' without durable ownership",
                         row_id, other
                     ))),
                     None => Err(AppError::not_found("task", row_id.to_string())),
                 }
             },
             AckInstruction::Nak { delay } => {
-                let not_before = chrono::Utc::now()
-                    + delay.unwrap_or_else(|| Duration::from_secs(self.ack_window_seconds as u64));
+                let not_before = chrono::Utc::now() + delay.unwrap_or(ack_wait);
                 sqlx::query(NAK_SQL)
                     .bind(row_id)
                     .bind(not_before)
@@ -431,28 +636,53 @@ impl BrokerPort for PgTaskBroker {
                 Ok(())
             },
             AckInstruction::Term => {
-                sqlx::query(TERM_SQL)
+                // Normal worker TERM follows a durable terminal settlement and
+                // this is a no-op. The guarded update only covers a poisoned,
+                // undecodable queued frame: there is no usable payload from
+                // which the coordinator can form a task claim. Crucially it is
+                // never used for `max_deliver`; delivery count is telemetry,
+                // not the durable retry budget.
+                sqlx::query(POISON_QUARANTINE_SQL)
                     .bind(row_id)
                     .execute(&self.pool)
                     .await
                     .map_err(map_sqlx)?;
-                Ok(())
+                let status: Option<String> =
+                    sqlx::query_scalar("SELECT status FROM tasks WHERE id = $1")
+                        .bind(row_id)
+                        .fetch_optional(&self.pool)
+                        .await
+                        .map_err(map_sqlx)?;
+                match status.as_deref() {
+                    Some("completed" | "failed" | "cancelled" | "dead_lettered" | "running") => {
+                        Ok(())
+                    },
+                    Some(other) => Err(AppError::conflict(format!(
+                        "task {} terminated while still '{}' without durable lifecycle settlement",
+                        row_id, other
+                    ))),
+                    None => Err(AppError::not_found("task", row_id.to_string())),
+                }
             },
             AckInstruction::InProgress => {
-                // Lease extension: slide the claim window forward. The row
-                // stays 'running'; the reaper only touches expired windows.
-                sqlx::query(
-                    "UPDATE tasks SET not_before = $2, updated_at = now()
-                     WHERE id = $1 AND status = 'running'",
-                )
-                .bind(row_id)
-                .bind(chrono::Utc::now() + Duration::from_secs(self.ack_window_seconds as u64))
-                .execute(&self.pool)
-                .await
-                .map_err(map_sqlx)?;
+                // The task attempt heartbeat renews `locked_until` through the
+                // durable execution port. The broker has no independent claim
+                // lease to extend, so changing task state here would recreate
+                // the split-ownership bug this adapter avoids. It does renew
+                // this *process-local hint* window, matching normal broker
+                // ack-wait semantics without mutating lifecycle state.
+                let redeliver_after = Timestamp::now().checked_add(ack_wait).ok_or_else(|| {
+                    AppError::validation("durable consumer ack_wait overflows hint timestamp")
+                })?;
+                let _ = self.flight.extend(sequence, redeliver_after);
+                let _ = row_id;
                 Ok(())
             },
+        };
+        if result.is_ok() && terminal {
+            let _ = self.flight.take(sequence);
         }
+        result
     }
 
     async fn consumer_stats(&self, consumer: &str) -> Result<ConsumerStats> {
@@ -491,7 +721,7 @@ impl BrokerPort for PgTaskBroker {
             let created_at: chrono::DateTime<chrono::Utc> =
                 row.try_get("created_at").map_err(map_sqlx)?;
             out.push(BrokerMessage {
-                sequence: sequence_of(id),
+                sequence: self.durable_message_sequence(id).await?,
                 subject: Subject::parse("mas.tasks.dlq").expect("static"),
                 headers: HeaderSet::new(),
                 payload: serde_json::to_vec(&payload)
@@ -528,34 +758,62 @@ mod tests {
     use mas_messaging::subjects::SubjectFilter;
 
     #[test]
-    fn v7_uuids_monotone_surrogate_sequences() {
-        let a = Uuid::now_v7();
-        std::thread::sleep(std::time::Duration::from_millis(2));
-        let b = Uuid::now_v7();
+    fn local_hint_expiry_recovers_an_unsettled_duplicate_without_reemitting_a_heartbeat() {
+        let ledger = FlightLedger::default();
+        let task = Uuid::now_v7();
+        let now = Timestamp::from_unix_seconds(1_700_000_000).expect("timestamp");
+        let initial_expiry = now.checked_add(Duration::from_secs(10)).expect("timestamp");
+        assert!(ledger.record_if_absent(17, task, initial_expiry, &now));
         assert!(
-            sequence_of(b) >= sequence_of(a),
-            "uuid-v7 ordering must lift"
+            !ledger.record_if_absent(17, task, initial_expiry, &now),
+            "a live local hint is suppressed"
+        );
+
+        let renewed_expiry = now.checked_add(Duration::from_secs(20)).expect("timestamp");
+        assert!(ledger.extend(17, renewed_expiry));
+        let after_original_window = now.checked_add(Duration::from_secs(11)).expect("timestamp");
+        assert!(
+            !ledger.record_if_absent(17, task, renewed_expiry, &after_original_window),
+            "a heartbeat extends only the local hint window"
+        );
+        let after_renewal = now.checked_add(Duration::from_secs(21)).expect("timestamp");
+        assert!(
+            ledger.record_if_absent(17, task, renewed_expiry, &after_renewal),
+            "an unacknowledged duplicate becomes recoverable after its window"
         );
     }
 
     #[test]
-    fn claim_sql_has_all_safety_guards() {
+    fn durable_message_ids_are_database_allocated() {
+        let source =
+            include_str!("../../../../migrations/0033_delivery_and_replay_receipts/up.sql");
+        assert!(source.contains("broker_task_messages"));
+        assert!(source.contains("message_sequence bigint GENERATED ALWAYS AS IDENTITY"));
+        assert!(!source.contains("uuid-v7 first 8 bytes"));
+    }
+
+    #[test]
+    fn fetch_sql_leaves_lifecycle_claiming_to_the_attempt_coordinator() {
         for token in [
-            "FOR UPDATE SKIP LOCKED",
             "status = 'queued'",
             "not_before <= now()",
-            "make_interval(secs => $2)",
-            "RETURNING",
+            "ORDER BY",
+            "LIMIT $2",
         ] {
-            assert!(CLAIM_SQL.contains(token), "claim SQL missing {token}");
+            assert!(FETCH_SQL.contains(token), "fetch SQL missing {token}");
         }
         assert!(
-            REAP_SQL.contains("status = 'running'"),
-            "reaper must target claims only"
+            !FETCH_SQL.contains("UPDATE tasks"),
+            "the broker must not transition a task before the durable attempt claim"
         );
         assert!(
-            NAK_SQL.contains("status = 'running'"),
-            "nak guards against double claims"
+            NAK_SQL.contains("t.status = 'queued' AND t.locked_by IS NULL"),
+            "nak may pace only an unowned queued task"
+        );
+        assert!(
+            POISON_QUARANTINE_SQL.contains("t.status = 'queued' AND t.locked_by IS NULL")
+                && POISON_QUARANTINE_SQL.contains("broker_delivery_receipts"),
+            "the explicit poison path must not overwrite owned or receipt-reserved work"
         );
     }
 

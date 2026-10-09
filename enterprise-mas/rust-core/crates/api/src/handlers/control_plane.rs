@@ -1039,7 +1039,7 @@ async fn authorize_admin(
     resource_type: &str,
     resource_id: Option<String>,
 ) -> Result<mas_application::context::ServiceContext> {
-    match require_platform_admin(ctx).and_then(|()| ctx.service_context()) {
+    match ctx.platform_service_context() {
         Ok(service_ctx) => Ok(service_ctx),
         Err(error) => {
             audit_refusal(state, ctx, action, resource_type, resource_id).await;
@@ -1057,7 +1057,7 @@ async fn authorize_admin(
 /// Control-plane operations change what tenants are allowed to do and what
 /// they are billed. A tenant-scoped principal must never reach them, however
 /// valid its token.
-fn require_platform_admin(ctx: &crate::context::RequestContext) -> Result<()> {
+pub(crate) fn require_platform_admin(ctx: &crate::context::RequestContext) -> Result<()> {
     let Some(principal) = ctx.principal.as_ref() else {
         return Err(mas_common::error::AppError::unauthorized(
             "authentication required",

@@ -152,6 +152,19 @@ async fn context_from(
 
     let context = RequestContext::with_claims(claims, correlation_id);
 
+    // Match the HTTP edge's narrowly-scoped global lane. Only a verified
+    // platform administrator with no caller-provided scope claim can reach an
+    // untenanted bootstrap/catalog handler; every tenant-owned RPC still
+    // requires a resolved scope through `authorized`.
+    if claims.tenant.is_none()
+        && claims.organization.is_none()
+        && claims.project.is_none()
+        && principal.is_usable()
+        && principal.scopes.permits("platform:admin")
+    {
+        return Ok(context.with_authenticated(principal));
+    }
+
     // Scope comes from identity. A gRPC caller has no more authority over it
     // than an HTTP one.
     let resolver = state.scope_resolver.as_ref().ok_or_else(|| {
@@ -176,16 +189,19 @@ async fn verify(
 }
 
 #[allow(clippy::result_large_err)]
-fn scoped(ctx: &RequestContext) -> Result<ServiceContext, Status> {
-    // `require_scope` only ever hands out a scope the resolver produced, so
-    // this fails closed for any route reached without resolution.
-    let _ = ctx.require_scope().map_err(to_status)?;
-    ctx.service_context().map_err(to_status)
+fn authorized(
+    ctx: &RequestContext,
+    resource: mas_security::ResourceKind,
+    action: mas_security::Action,
+    project_id: Option<ProjectId>,
+) -> Result<ServiceContext, Status> {
+    crate::handlers::authorized_service_context(ctx, resource, action, project_id)
+        .map_err(to_status)
 }
 
 #[allow(clippy::result_large_err)]
-fn unscoped(ctx: &RequestContext) -> Result<ServiceContext, Status> {
-    ctx.service_context().map_err(to_status)
+fn platform_admin_context(ctx: &RequestContext) -> Result<ServiceContext, Status> {
+    ctx.platform_service_context().map_err(to_status)
 }
 
 #[allow(clippy::result_large_err)]
@@ -193,6 +209,26 @@ fn parse_str_id(field: &'static str, raw: &str) -> Result<uuid::Uuid, Status> {
     uuid::Uuid::parse_str(raw)
         .map_err(|_| Status::new(Code::InvalidArgument, format!("{field}: not a valid uuid")))
 }
+#[allow(clippy::result_large_err)]
+fn authenticated_user_id(ctx: &RequestContext) -> Result<UserId, Status> {
+    let principal = ctx
+        .principal
+        .as_ref()
+        .ok_or_else(|| Status::new(Code::Unauthenticated, "authentication required"))?;
+    if principal.kind != mas_security::PrincipalKind::User {
+        return Err(Status::new(
+            Code::PermissionDenied,
+            "agent version publication requires an authenticated user",
+        ));
+    }
+    UserId::parse_str(&principal.actor_id).map_err(|_| {
+        Status::new(
+            Code::PermissionDenied,
+            "authenticated user id is not a valid user identifier",
+        )
+    })
+}
+
 fn execution_reply(execution: &mas_domain::Execution, replayed: bool) -> gen::ExecutionReply {
     gen::ExecutionReply {
         execution_id: execution.id.to_string(),
@@ -284,7 +320,7 @@ impl gen::tenancy_api_server::TenancyApi for GrpcServices {
         request: Request<gen::RegisterOrganizationRequest>,
     ) -> Result<Response<gen::OrganizationReply>, Status> {
         let ctx = context_from(&self.state, request.metadata()).await?;
-        let service_ctx = unscoped(&ctx)?;
+        let service_ctx = platform_admin_context(&ctx)?;
         let msg = request.into_inner();
         let organization = self
             .state
@@ -305,7 +341,7 @@ impl gen::tenancy_api_server::TenancyApi for GrpcServices {
         request: Request<gen::Empty>,
     ) -> Result<Response<gen::ListOrganizationsReply>, Status> {
         let ctx = context_from(&self.state, request.metadata()).await?;
-        let service_ctx = unscoped(&ctx)?;
+        let service_ctx = platform_admin_context(&ctx)?;
         let organizations = self
             .state
             .tenancy
@@ -330,7 +366,12 @@ impl gen::tenancy_api_server::TenancyApi for GrpcServices {
         request: Request<gen::RegisterTenantRequest>,
     ) -> Result<Response<gen::TenantReply>, Status> {
         let ctx = context_from(&self.state, request.metadata()).await?;
-        let service_ctx = unscoped(&ctx)?;
+        let service_ctx = authorized(
+            &ctx,
+            mas_security::ResourceKind::Tenant,
+            mas_security::Action::Administer,
+            None,
+        )?;
         let msg = request.into_inner();
         let environment = serde_json::from_value::<mas_common::enums::Environment>(
             serde_json::Value::String(msg.environment.clone()),
@@ -350,12 +391,18 @@ impl gen::tenancy_api_server::TenancyApi for GrpcServices {
                 "isolation: shared_rls | schema_per_tenant | dedicated_database",
             )
         })?;
-        let tenant = self
-            .state
-            .tenancy
-            .register_tenant(&service_ctx, &msg.name, &msg.slug, environment, isolation)
-            .await
-            .map_err(to_status)?;
+        let tenant = scoped_call(
+            &self.state,
+            &ctx,
+            self.state.tenancy.register_tenant(
+                &service_ctx,
+                &msg.name,
+                &msg.slug,
+                environment,
+                isolation,
+            ),
+        )
+        .await?;
         Ok(Response::new(gen::TenantReply {
             id: tenant.id.to_string(),
             name: tenant.name.clone(),
@@ -370,13 +417,18 @@ impl gen::tenancy_api_server::TenancyApi for GrpcServices {
         request: Request<gen::Empty>,
     ) -> Result<Response<gen::ListTenantsReply>, Status> {
         let ctx = context_from(&self.state, request.metadata()).await?;
-        let service_ctx = unscoped(&ctx)?;
-        let tenants = self
-            .state
-            .tenancy
-            .list_tenants(&service_ctx)
-            .await
-            .map_err(to_status)?;
+        let service_ctx = authorized(
+            &ctx,
+            mas_security::ResourceKind::Tenant,
+            mas_security::Action::Read,
+            None,
+        )?;
+        let tenants = scoped_call(
+            &self.state,
+            &ctx,
+            self.state.tenancy.list_tenants(&service_ctx),
+        )
+        .await?;
         Ok(Response::new(gen::ListTenantsReply {
             tenants: tenants
                 .iter()
@@ -396,7 +448,12 @@ impl gen::tenancy_api_server::TenancyApi for GrpcServices {
         request: Request<gen::RegisterProjectRequest>,
     ) -> Result<Response<gen::ProjectReply>, Status> {
         let ctx = context_from(&self.state, request.metadata()).await?;
-        let service_ctx = scoped(&ctx)?;
+        let service_ctx = authorized(
+            &ctx,
+            mas_security::ResourceKind::Project,
+            mas_security::Action::Create,
+            None,
+        )?;
         let msg = request.into_inner();
         let project = scoped_call(
             &self.state,
@@ -418,7 +475,12 @@ impl gen::tenancy_api_server::TenancyApi for GrpcServices {
         request: Request<gen::InviteMembershipRequest>,
     ) -> Result<Response<gen::MembershipReply>, Status> {
         let ctx = context_from(&self.state, request.metadata()).await?;
-        let service_ctx = scoped(&ctx)?;
+        let service_ctx = authorized(
+            &ctx,
+            mas_security::ResourceKind::Membership,
+            mas_security::Action::ManageMembers,
+            None,
+        )?;
         let msg = request.into_inner();
         let user_id: UserId = parse_id("user_id", &msg.user_id)?;
         let role = serde_json::from_value::<mas_domain::MembershipRole>(serde_json::Value::String(
@@ -462,7 +524,12 @@ impl gen::agent_api_server::AgentApi for GrpcServices {
         request: Request<gen::RegisterAgentRequest>,
     ) -> Result<Response<gen::AgentReply>, Status> {
         let ctx = context_from(&self.state, request.metadata()).await?;
-        let service_ctx = scoped(&ctx)?;
+        let service_ctx = authorized(
+            &ctx,
+            mas_security::ResourceKind::Agent,
+            mas_security::Action::Create,
+            None,
+        )?;
         let msg = request.into_inner();
         let project_id: ProjectId = parse_id("project_id", &msg.project_id)?;
         let kind = serde_json::from_value::<mas_domain::AgentKind>(serde_json::Value::String(
@@ -490,10 +557,22 @@ impl gen::agent_api_server::AgentApi for GrpcServices {
         request: Request<gen::PublishAgentVersionRequest>,
     ) -> Result<Response<gen::AgentVersionReply>, Status> {
         let ctx = context_from(&self.state, request.metadata()).await?;
-        let service_ctx = scoped(&ctx)?;
+        let service_ctx = authorized(
+            &ctx,
+            mas_security::ResourceKind::Agent,
+            mas_security::Action::Publish,
+            None,
+        )?;
         let msg = request.into_inner();
         let agent_id: AgentId = parse_id("agent_id", &msg.agent_id)?;
-        let user_id: UserId = parse_id("published_by", &msg.published_by)?;
+        let user_id = authenticated_user_id(&ctx)?;
+        let claimed_publisher: UserId = parse_id("published_by", &msg.published_by)?;
+        if claimed_publisher != user_id {
+            return Err(Status::new(
+                Code::PermissionDenied,
+                "published_by must match the authenticated user",
+            ));
+        }
         let snapshot: serde_json::Value = serde_json::from_str(&msg.configuration_snapshot_json)
             .map_err(|_| {
                 Status::new(
@@ -525,7 +604,12 @@ impl gen::agent_api_server::AgentApi for GrpcServices {
         request: Request<gen::GetAgentRequest>,
     ) -> Result<Response<gen::AgentReply>, Status> {
         let ctx = context_from(&self.state, request.metadata()).await?;
-        let service_ctx = scoped(&ctx)?;
+        let service_ctx = authorized(
+            &ctx,
+            mas_security::ResourceKind::Agent,
+            mas_security::Action::Read,
+            None,
+        )?;
         let agent_id: AgentId = parse_id("agent_id", &request.into_inner().agent_id)?;
         let agent = scoped_call(
             &self.state,
@@ -541,7 +625,12 @@ impl gen::agent_api_server::AgentApi for GrpcServices {
         request: Request<gen::ListAgentsRequest>,
     ) -> Result<Response<gen::ListAgentsReply>, Status> {
         let ctx = context_from(&self.state, request.metadata()).await?;
-        let service_ctx = scoped(&ctx)?;
+        let service_ctx = authorized(
+            &ctx,
+            mas_security::ResourceKind::Agent,
+            mas_security::Action::Read,
+            None,
+        )?;
         let project_id: ProjectId = parse_id("project_id", &request.into_inner().project_id)?;
         let agents = scoped_call(
             &self.state,
@@ -565,7 +654,12 @@ impl gen::workflow_api_server::WorkflowApi for GrpcServices {
         request: Request<gen::CreateWorkflowRequest>,
     ) -> Result<Response<gen::WorkflowReply>, Status> {
         let ctx = context_from(&self.state, request.metadata()).await?;
-        let service_ctx = scoped(&ctx)?;
+        let service_ctx = authorized(
+            &ctx,
+            mas_security::ResourceKind::Workflow,
+            mas_security::Action::Create,
+            None,
+        )?;
         let msg = request.into_inner();
         let project_id: ProjectId = parse_id("project_id", &msg.project_id)?;
         let workflow = scoped_call(
@@ -590,7 +684,12 @@ impl gen::workflow_api_server::WorkflowApi for GrpcServices {
         request: Request<gen::UpdateWorkflowGraphRequest>,
     ) -> Result<Response<gen::UpdateWorkflowGraphReply>, Status> {
         let ctx = context_from(&self.state, request.metadata()).await?;
-        let service_ctx = scoped(&ctx)?;
+        let service_ctx = authorized(
+            &ctx,
+            mas_security::ResourceKind::Workflow,
+            mas_security::Action::Update,
+            None,
+        )?;
         let msg = request.into_inner();
         let workflow_id: WorkflowId = parse_id("workflow_id", &msg.workflow_id)?;
         let mut nodes = Vec::with_capacity(msg.nodes.len());
@@ -638,7 +737,12 @@ impl gen::workflow_api_server::WorkflowApi for GrpcServices {
         request: Request<gen::GetWorkflowRequest>,
     ) -> Result<Response<gen::WorkflowReply>, Status> {
         let ctx = context_from(&self.state, request.metadata()).await?;
-        let service_ctx = scoped(&ctx)?;
+        let service_ctx = authorized(
+            &ctx,
+            mas_security::ResourceKind::Workflow,
+            mas_security::Action::Read,
+            None,
+        )?;
         let workflow_id: WorkflowId = parse_id("workflow_id", &request.into_inner().workflow_id)?;
         let workflow = scoped_call(
             &self.state,
@@ -660,7 +764,12 @@ impl gen::workflow_api_server::WorkflowApi for GrpcServices {
         request: Request<gen::ListWorkflowsRequest>,
     ) -> Result<Response<gen::ListWorkflowsReply>, Status> {
         let ctx = context_from(&self.state, request.metadata()).await?;
-        let service_ctx = scoped(&ctx)?;
+        let service_ctx = authorized(
+            &ctx,
+            mas_security::ResourceKind::Workflow,
+            mas_security::Action::Read,
+            None,
+        )?;
         let project_id: ProjectId = parse_id("project_id", &request.into_inner().project_id)?;
         let workflows = scoped_call(
             &self.state,
@@ -697,7 +806,12 @@ impl gen::execution_api_server::ExecutionApi for GrpcServices {
             .map(str::trim)
             .filter(|v| !v.is_empty())
             .map(str::to_owned);
-        let service_ctx = scoped(&ctx)?;
+        let service_ctx = authorized(
+            &ctx,
+            mas_security::ResourceKind::Execution,
+            mas_security::Action::Create,
+            None,
+        )?;
         let msg = request.into_inner();
         let project_id: ProjectId = parse_id("project_id", &msg.project_id)?;
         let workflow_id: Option<WorkflowId> = match msg.workflow_id {
@@ -734,12 +848,27 @@ impl gen::execution_api_server::ExecutionApi for GrpcServices {
         request: Request<gen::TransitionExecutionRequest>,
     ) -> Result<Response<gen::ExecutionReply>, Status> {
         let ctx = context_from(&self.state, request.metadata()).await?;
-        let service_ctx = scoped(&ctx)?;
         let msg = request.into_inner();
         let execution_id: mas_common::ids::ExecutionId =
             parse_id("execution_id", &msg.execution_id)?;
         let action = gen::TransitionAction::try_from(msg.action)
             .unwrap_or(gen::TransitionAction::Unspecified);
+        let permission = match action {
+            gen::TransitionAction::Start => mas_security::Action::Execute,
+            gen::TransitionAction::Pause | gen::TransitionAction::Resume => {
+                mas_security::Action::Update
+            },
+            gen::TransitionAction::Cancel => mas_security::Action::Cancel,
+            gen::TransitionAction::Unspecified => {
+                return Err(Status::new(Code::InvalidArgument, "action is required"));
+            },
+        };
+        let service_ctx = authorized(
+            &ctx,
+            mas_security::ResourceKind::Execution,
+            permission,
+            None,
+        )?;
         let execution = match action {
             gen::TransitionAction::Start => {
                 self.state
@@ -778,7 +907,12 @@ impl gen::execution_api_server::ExecutionApi for GrpcServices {
         request: Request<gen::GetExecutionRequest>,
     ) -> Result<Response<gen::ExecutionReply>, Status> {
         let ctx = context_from(&self.state, request.metadata()).await?;
-        let service_ctx = scoped(&ctx)?;
+        let service_ctx = authorized(
+            &ctx,
+            mas_security::ResourceKind::Execution,
+            mas_security::Action::Read,
+            None,
+        )?;
         let execution_id: mas_common::ids::ExecutionId =
             parse_id("execution_id", &request.into_inner().execution_id)?;
         let execution = scoped_call(
@@ -795,7 +929,12 @@ impl gen::execution_api_server::ExecutionApi for GrpcServices {
         request: Request<gen::Empty>,
     ) -> Result<Response<gen::ListExecutionsReply>, Status> {
         let ctx = context_from(&self.state, request.metadata()).await?;
-        let service_ctx = scoped(&ctx)?;
+        let service_ctx = authorized(
+            &ctx,
+            mas_security::ResourceKind::Execution,
+            mas_security::Action::Read,
+            None,
+        )?;
         let executions =
             scoped_call(&self.state, &ctx, self.state.executions.list(&service_ctx)).await?;
         Ok(Response::new(gen::ListExecutionsReply {
@@ -817,7 +956,12 @@ impl gen::schedule_api_server::ScheduleApi for GrpcServices {
         request: Request<gen::RegisterScheduleRequest>,
     ) -> Result<Response<gen::ScheduleReply>, Status> {
         let ctx = context_from(&self.state, request.metadata()).await?;
-        let service_ctx = scoped(&ctx)?;
+        let service_ctx = authorized(
+            &ctx,
+            mas_security::ResourceKind::Schedule,
+            mas_security::Action::Create,
+            None,
+        )?;
         let msg = request.into_inner();
         let project_id = match msg.project_id {
             Some(raw) => Some(parse_id::<ProjectId>("project_id", &raw)?),
@@ -858,7 +1002,12 @@ impl gen::schedule_api_server::ScheduleApi for GrpcServices {
         request: Request<gen::SetScheduleStateRequest>,
     ) -> Result<Response<gen::ScheduleReply>, Status> {
         let ctx = context_from(&self.state, request.metadata()).await?;
-        let service_ctx = scoped(&ctx)?;
+        let service_ctx = authorized(
+            &ctx,
+            mas_security::ResourceKind::Schedule,
+            mas_security::Action::Update,
+            None,
+        )?;
         let msg = request.into_inner();
         let schedule_id = parse_str_id("schedule_id", &msg.schedule_id)
             .map(mas_common::ids::ScheduleId::from_uuid)?;
@@ -890,7 +1039,12 @@ impl gen::schedule_api_server::ScheduleApi for GrpcServices {
         request: Request<gen::Empty>,
     ) -> Result<Response<gen::ListSchedulesReply>, Status> {
         let ctx = context_from(&self.state, request.metadata()).await?;
-        let service_ctx = scoped(&ctx)?;
+        let service_ctx = authorized(
+            &ctx,
+            mas_security::ResourceKind::Schedule,
+            mas_security::Action::Read,
+            None,
+        )?;
         let schedules =
             scoped_call(&self.state, &ctx, self.state.schedules.list(&service_ctx)).await?;
         Ok(Response::new(gen::ListSchedulesReply {
@@ -912,8 +1066,11 @@ impl gen::schedule_api_server::ScheduleApi for GrpcServices {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::test_support::inmemory_state;
+    use crate::state::test_support::inmemory_state_with_store;
+    use mas_application::stores::{InMemoryServices, MembershipStorePort};
     use mas_common::timestamps::Timestamp;
+    use mas_security::{PrincipalKind, ScopeSet, SecurityPrincipal, TenantMembership};
+    use std::sync::Arc;
     use tonic::metadata::MetadataMap;
 
     fn authed_metadata(tenant: TenantId, organization: OrganizationId) -> MetadataMap {
@@ -931,8 +1088,14 @@ mod tests {
         metadata
     }
 
-    async fn seed() -> (AppState, TenantId, OrganizationId, ProjectId) {
-        let state = inmemory_state();
+    async fn seed() -> (
+        AppState,
+        Arc<InMemoryServices>,
+        TenantId,
+        OrganizationId,
+        ProjectId,
+    ) {
+        let (mut state, store) = inmemory_state_with_store();
         let system =
             ServiceContext::for_service("seed", "grpc-seed-1", &Timestamp::now()).expect("ctx");
         let organization = state
@@ -965,12 +1128,68 @@ mod tests {
             .register_project(&tenant_scoped, "Core", "core-grpc")
             .await
             .expect("project");
-        (state, tenant.id, organization.id, project.id)
+        let owner = state
+            .tenancy
+            .register_user(&system, "grpc-owner@example.test", "gRPC Owner")
+            .await
+            .expect("owner user");
+        let mut membership = state
+            .tenancy
+            .invite_membership(&tenant_scoped, owner.id, mas_domain::MembershipRole::Owner)
+            .await
+            .expect("owner membership");
+        membership.accept_invitation().expect("accept membership");
+        MembershipStorePort::save(store.as_ref(), &membership)
+            .await
+            .expect("persist membership");
+        state.verifier = Arc::new(
+            crate::auth::StaticTokenVerifier::new().with_token(
+                "test-token",
+                SecurityPrincipal::new(
+                    owner.id.to_string(),
+                    PrincipalKind::User,
+                    Some(tenant.id),
+                    ScopeSet::denied(),
+                )
+                .with_organization(organization.id)
+                .with_memberships(vec![TenantMembership::new(
+                    organization.id,
+                    tenant.id,
+                    mas_domain::MembershipRole::Owner,
+                )]),
+            ),
+        );
+        (state, store, tenant.id, organization.id, project.id)
+    }
+
+    #[tokio::test]
+    async fn platform_admin_can_use_global_grpc_catalog_without_a_tenant_hint() {
+        let mut state = crate::state::test_support::inmemory_state();
+        state.verifier = Arc::new(
+            crate::auth::StaticTokenVerifier::new()
+                .with_token("platform-token", SecurityPrincipal::system()),
+        );
+        let services = GrpcServices::new(state);
+        let mut metadata = MetadataMap::new();
+        metadata.insert(
+            tonic::metadata::MetadataKey::from_static("authorization"),
+            tonic::metadata::MetadataValue::from_static("Bearer platform-token"),
+        );
+        use gen::tenancy_api_server::TenancyApi;
+        let response = services
+            .list_organizations(Request::from_parts(
+                metadata,
+                tonic::Extensions::default(),
+                gen::Empty {},
+            ))
+            .await
+            .expect("platform catalog response");
+        assert!(response.get_ref().organizations.is_empty());
     }
 
     #[tokio::test]
     async fn unauthenticated_calls_fail_closed() {
-        let (state, tenant, organization, _project) = seed().await;
+        let (state, _store, tenant, organization, _project) = seed().await;
         let services = GrpcServices::new(state);
 
         let mut metadata = authed_metadata(tenant, organization);
@@ -993,7 +1212,7 @@ mod tests {
 
     #[tokio::test]
     async fn foreign_scope_hides_existence() {
-        let (state, tenant, organization, _project) = seed().await;
+        let (state, _store, tenant, organization, _project) = seed().await;
         let tenant_scoped = ServiceContext::for_service("seed", "grpc-seed-2", &Timestamp::now())
             .expect("ctx")
             .with_scope(tenant, organization);
@@ -1027,8 +1246,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn grpc_execution_mutations_enforce_the_canonical_role_matrix() {
+        let (mut state, store, tenant, organization, project) = seed().await;
+        let system = ServiceContext::for_service("seed", "grpc-viewer", &Timestamp::now())
+            .expect("system context");
+        let tenant_scope = system.clone().with_scope(tenant, organization);
+        let viewer = state
+            .tenancy
+            .register_user(&system, "grpc-viewer@example.test", "gRPC Viewer")
+            .await
+            .expect("viewer user");
+        let mut membership = state
+            .tenancy
+            .invite_membership(&tenant_scope, viewer.id, mas_domain::MembershipRole::Viewer)
+            .await
+            .expect("viewer membership");
+        membership
+            .accept_invitation()
+            .expect("accept viewer membership");
+        MembershipStorePort::save(store.as_ref(), &membership)
+            .await
+            .expect("persist viewer membership");
+        state.verifier = Arc::new(
+            crate::auth::StaticTokenVerifier::new().with_token(
+                "test-token",
+                SecurityPrincipal::new(
+                    viewer.id.to_string(),
+                    PrincipalKind::User,
+                    Some(tenant),
+                    ScopeSet::denied(),
+                )
+                .with_organization(organization)
+                .with_memberships(vec![TenantMembership::new(
+                    organization,
+                    tenant,
+                    mas_domain::MembershipRole::Viewer,
+                )]),
+            ),
+        );
+        let services = GrpcServices::new(state);
+        use gen::execution_api_server::ExecutionApi;
+
+        let denied = services
+            .submit_execution(Request::from_parts(
+                authed_metadata(tenant, organization),
+                tonic::Extensions::default(),
+                gen::SubmitExecutionRequest {
+                    project_id: project.to_string(),
+                    workflow_id: None,
+                    agent_id: None,
+                    input_json: "{}".to_owned(),
+                },
+            ))
+            .await
+            .expect_err("viewer must not create executions");
+        assert_eq!(denied.code(), Code::PermissionDenied);
+
+        let readable = services
+            .list_executions(Request::from_parts(
+                authed_metadata(tenant, organization),
+                tonic::Extensions::default(),
+                gen::Empty {},
+            ))
+            .await
+            .expect("viewer retains execution read access");
+        assert!(readable.get_ref().executions.is_empty());
+    }
+
+    #[tokio::test]
     async fn execution_submit_honors_metadata_idempotency() {
-        let (state, tenant, organization, project) = seed().await;
+        let (state, _store, tenant, organization, project) = seed().await;
         let tenant_scoped = ServiceContext::for_service("seed", "grpc-seed-3", &Timestamp::now())
             .expect("ctx")
             .with_scope(tenant, organization);

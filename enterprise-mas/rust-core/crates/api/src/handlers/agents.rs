@@ -18,7 +18,6 @@ pub async fn register(
     Ctx(ctx): Ctx,
     Json(body): Json<CreateAgentRequest>,
 ) -> ApiResult<serde_json::Value> {
-    scoped(&ctx)?;
     body.validate()
         .map_err(|e| crate::response::ApiError::new(e, &ctx))?;
     let kind = serde_json::from_value::<AgentKind>(serde_json::Value::String(body.kind.clone()))
@@ -32,9 +31,7 @@ pub async fn register(
                 &ctx,
             )
         })?;
-    let service_ctx = ctx
-        .service_context()
-        .map_err(|e| crate::response::ApiError::new(e, &ctx))?;
+    let service_ctx = authorized_agent(&ctx, mas_security::Action::Create, None)?;
     state
         .agents
         .register(&service_ctx, body.project_id, &body.name, &body.slug, kind)
@@ -67,7 +64,6 @@ pub async fn publish_version(
     Ctx(ctx): Ctx,
     Json(body): Json<PublishVersionBody>,
 ) -> ApiResult<serde_json::Value> {
-    scoped(&ctx)?;
     let principal = ctx.principal.as_ref().ok_or_else(|| {
         crate::response::ApiError::new(
             mas_common::error::AppError::unauthorized("unauthenticated"),
@@ -157,10 +153,7 @@ pub async fn get(
     Path(agent_id): Path<AgentId>,
     Ctx(ctx): Ctx,
 ) -> ApiResult<AgentResponse> {
-    scoped(&ctx)?;
-    let service_ctx = ctx
-        .service_context()
-        .map_err(|e| crate::response::ApiError::new(e, &ctx))?;
+    let service_ctx = authorized_agent(&ctx, mas_security::Action::Read, None)?;
     state
         .agents
         .get_response(&service_ctx, agent_id)
@@ -181,10 +174,7 @@ pub async fn list(
     Query(query): Query<ListQuery>,
     Ctx(ctx): Ctx,
 ) -> ApiResult<Vec<AgentResponse>> {
-    scoped(&ctx)?;
-    let service_ctx = ctx
-        .service_context()
-        .map_err(|e| crate::response::ApiError::new(e, &ctx))?;
+    let service_ctx = authorized_agent(&ctx, mas_security::Action::Read, None)?;
     let agents = state
         .agents
         .list(&service_ctx, query.project_id)
@@ -197,10 +187,16 @@ pub async fn list(
     Ok(crate::response::ok(&ctx, responses))
 }
 
-fn scoped(
+fn authorized_agent(
     ctx: &crate::context::RequestContext,
-) -> std::result::Result<(), crate::response::ApiError> {
-    ctx.require_scope()
-        .map(|_| ())
-        .map_err(|e| crate::response::ApiError::new(e, ctx))
+    action: mas_security::Action,
+    project_id: Option<mas_common::ids::ProjectId>,
+) -> std::result::Result<mas_application::context::ServiceContext, crate::response::ApiError> {
+    crate::handlers::authorized_service_context(
+        ctx,
+        mas_security::ResourceKind::Agent,
+        action,
+        project_id,
+    )
+    .map_err(|error| crate::response::ApiError::new(error, ctx))
 }

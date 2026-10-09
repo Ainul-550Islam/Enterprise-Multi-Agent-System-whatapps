@@ -36,8 +36,35 @@
 //! domain objects, connector configs, or errors.
 
 pub mod connectors;
+/// Durable lease/fence-safe notification delivery worker and channel ports.
+pub mod durable_notifications;
+/// Durable OAuth authorization-code state and PKCE orchestration.
+pub mod durable_oauth;
+/// Durable lease/fence-safe outbound webhook worker; production relay wiring
+/// uses this module instead of the in-memory reference dispatcher.
+pub mod durable_webhooks;
 pub mod http_guard;
+/// Signature-first public ingress and durable receipt/outbox boundary.
+pub mod inbound_webhooks;
 pub mod manifest;
 pub mod oauth;
+/// Durable fenced OAuth token-material cleanup worker and settlement ports.
+pub mod oauth_cleanup;
+/// Real guarded OAuth token endpoint adapter.
+pub mod oauth_http;
+/// Durable callback materialization-intent reconciliation worker and ports.
+pub mod oauth_materialization;
+/// Static allowlisted OAuth provider profiles and runtime catalog.
+pub mod oauth_providers;
+/// Durable leased OAuth token refresh worker and settlement ports.
+pub mod oauth_refresh;
+/// Real guarded HTTP probes for supported provider adapters.
+pub mod provider_adapters;
 pub mod registry;
+/// Canonical concrete Reqwest adapter used beneath the guarded egress port.
+pub mod reqwest_egress;
+/// Production secret-manager adapters and version-aware webhook secret bridge.
+pub mod secrets;
 pub mod webhooks;
+
+pub use reqwest_egress::ReqwestEgress;

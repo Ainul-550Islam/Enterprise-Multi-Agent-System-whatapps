@@ -1,4 +1,10 @@
-"""Webhook tool.
+"""Development-only webhook tool.
+
+Production webhook delivery is owned by Rust's durable integration plane:
+transactional receipt/outbox persistence, worker leases, signed delivery,
+retry/dead-letter state, and replay-safe audit records cannot be recreated by
+an in-process Python tool invocation. This module remains solely for explicit
+unit/development fixtures and refuses construction unless its caller opts in.
 
 A webhook is an outbound call to a URL the platform chose, carrying a payload a
 model composed. The danger is not the payload, it is the destination: a model
@@ -122,11 +128,11 @@ class WebhookTransport(Protocol):
         self,
         url: str,
         *,
-        json_body: dict[str, object],
+        body: bytes,
         headers: dict[str, str],
         timeout_seconds: float,
     ) -> int:
-        """Posts and returns the HTTP status code."""
+        """Posts exact signed bytes and returns the HTTP status code."""
         ...
 
 
@@ -140,14 +146,19 @@ class WebhookToolConfig:
         timeout_seconds: Delivery budget.
         sign_payloads: Whether to sign. Leave enabled: an unsigned webhook
             cannot be distinguished from a forgery by the receiver.
-        read_status_codes: Status codes treated as delivery failure rather than
-            success. Defaults to the 5xx range.
+        failure_status_threshold: Legacy compatibility value. Direct fixture
+            delivery treats only 2xx as success regardless of this field.
+        direct_delivery_enabled: Explicit opt-in for test/development fixtures.
+            Production must use the Rust durable delivery worker instead.
     """
 
     targets: frozenset[WebhookTarget]
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
     sign_payloads: bool = True
     failure_status_threshold: int = 500
+    #: Explicitly permits the non-durable helper for unit/development fixtures.
+    #: Production composition must never set this; use the Rust delivery plane.
+    direct_delivery_enabled: bool = False
 
     def __post_init__(self) -> None:
         if not self.targets:
@@ -172,6 +183,11 @@ class WebhookTool:
         secret: SigningSecret | None = None,
         transport: WebhookTransport | None = None,
     ) -> None:
+        if not config.direct_delivery_enabled:
+            raise InvalidRequestError(
+                "direct Python webhook delivery is disabled; use the durable Rust integration plane",
+                details={"reason": "durable_webhook_required"},
+            )
         if config.sign_payloads and secret is None:
             raise InvalidRequestError(
                 "signing is enabled but no signing secret was supplied",
@@ -186,6 +202,12 @@ class WebhookTool:
     def config(self) -> WebhookToolConfig:
         """The configuration in force."""
         return self._config
+
+    async def aclose(self) -> None:
+        """Closes the guarded fixture transport when it owns one."""
+        close = getattr(self._transport, "aclose", None)
+        if close is not None:
+            await close()
 
     def target_ids(self) -> tuple[str, ...]:
         """The target ids the model may name."""
@@ -259,7 +281,7 @@ class WebhookTool:
         try:
             status = await self._transport.post(
                 target.url,
-                json_body=envelope,
+                body=body,
                 headers=headers,
                 timeout_seconds=self._config.timeout_seconds,
             )
@@ -272,7 +294,15 @@ class WebhookTool:
                 },
             ) from error
 
-        delivered = status < self._config.failure_status_threshold
+        if not 200 <= status < 300:
+            # A 4xx means the receiver rejected the delivery; reporting it as
+            # success is a fake-success path that loses the event. The durable
+            # Rust plane owns retriable settlement in production; this fixture
+            # helper deliberately reports the failed invocation honestly.
+            raise ToolFailedError(
+                "webhook receiver rejected the delivery",
+                details={"target_id": target_id, "status_code": status},
+            )
         _LOGGER.info(
             "webhook delivered",
             extra={
@@ -285,7 +315,7 @@ class WebhookTool:
         return {
             "target_id": target_id,
             "status_code": status,
-            "delivered": delivered,
+            "delivered": True,
         }
 
     def _sign(self, body: bytes, timestamp: str) -> str:
@@ -336,17 +366,21 @@ class _GuardedTransport:
             )
         )
 
+    async def aclose(self) -> None:
+        """Closes the pooled guarded HTTP transport."""
+        await self._transport.aclose()
+
     async def post(
         self,
         url: str,
         *,
-        json_body: dict[str, object],
+        body: bytes,
         headers: dict[str, str],
         timeout_seconds: float,
     ) -> int:
-        """Posts and returns the status code."""
+        """Posts the exact HMAC-signed bytes and returns the status code."""
         del timeout_seconds  # bounded by the transport's own policy
-        response = await self._transport.request("POST", url, json_body=json_body, headers=headers)
+        response = await self._transport.request("POST", url, content=body, headers=headers)
         return int(response.status_code)
 
 
@@ -367,13 +401,16 @@ def build_webhook_tool(
     description: str | None = None,
     version: int = 1,
     config: WebhookToolConfig | None = None,
+    direct_delivery_enabled: bool = False,
 ) -> tuple[ToolDefinition, WebhookTool]:
     """Builds a definition/handler pair ready for registration.
 
     Declared non-idempotent: two identical posts are two deliveries, and a
     receiver that is not deduplicating will process both.
     """
-    settings = config or WebhookToolConfig(targets=frozenset(targets))
+    settings = config or WebhookToolConfig(
+        targets=frozenset(targets), direct_delivery_enabled=direct_delivery_enabled
+    )
     definition = ToolDefinition(
         tool_id=tool_id,
         name=name,

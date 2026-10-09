@@ -9,11 +9,15 @@ publish = false
 [dependencies]
 mas-common = { workspace = true }
 mas-domain = { workspace = true }
+# Secret-manager resolver adapters implement the canonical gated security port;
+# security does not depend on integrations, so this remains acyclic.
+mas-security = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
 hex = { workspace = true }
 hmac = { workspace = true }
 rand = { workspace = true }
+reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
@@ -21,6 +25,7 @@ tracing = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
 zeroize = { workspace = true }
+tokio = { workspace = true, features = ["net"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "time"] }

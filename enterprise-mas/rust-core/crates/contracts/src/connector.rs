@@ -77,6 +77,60 @@ impl TestConnectorRequest {
     }
 }
 
+/// Keyset query for the current tenant's connector catalogue.
+///
+/// `cursor` is opaque and originates only from a preceding page; it is never a
+/// tenant selector. Offset pagination is intentionally absent because inserts
+/// and connector tests can otherwise shift a long-running listing.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ConnectorListQuery {
+    /// Maximum number of connector metadata records to return.
+    pub limit: Option<u16>,
+    /// Opaque URL-safe base64 cursor returned by the preceding page.
+    pub cursor: Option<String>,
+}
+
+impl ConnectorListQuery {
+    pub fn validate(&self) -> Result<()> {
+        if self.limit.is_some_and(|limit| !(1..=200).contains(&limit)) {
+            return Err(mas_common::error::AppError::invalid_field(
+                "limit",
+                "out_of_range",
+                "connector page limit must be between 1 and 200",
+            ));
+        }
+        if let Some(cursor) = &self.cursor {
+            validation::validate_length("cursor", cursor, 1, 512)?;
+            if !cursor
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            {
+                return Err(mas_common::error::AppError::invalid_field(
+                    "cursor",
+                    "invalid_format",
+                    "connector cursor must be URL-safe base64 without padding",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn page_limit(&self) -> u16 {
+        match self.limit {
+            Some(limit) => limit,
+            None => 50,
+        }
+    }
+}
+
+/// Stable tenant connector page.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnectorPageResponse {
+    pub items: Vec<ConnectorResponse>,
+    pub next_cursor: Option<String>,
+}
+
 /// Wire representation of a connector (never contains secrets).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectorResponse {

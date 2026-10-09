@@ -8,6 +8,7 @@ do something it was not configured to do?
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import pytest
@@ -289,11 +290,11 @@ class _Transport:
         self,
         url: str,
         *,
-        json_body: dict[str, Any],
+        body: bytes,
         headers: dict[str, str],
         timeout_seconds: float,
     ) -> int:
-        self.posts.append({"url": url, "json_body": json_body, "headers": headers})
+        self.posts.append({"url": url, "body": body, "headers": headers})
         return self._status
 
 
@@ -306,6 +307,7 @@ def _webhook_config(**overrides: Any) -> WebhookToolConfig:
     defaults: dict[str, Any] = {
         "targets": frozenset({target}),
         "sign_payloads": False,
+        "direct_delivery_enabled": True,
     }
     defaults.update(overrides)
     return WebhookToolConfig(**defaults)
@@ -352,7 +354,7 @@ class TestWebhook:
             _context(),
         )
         assert result["delivered"] is True
-        assert transport.posts[0]["json_body"]["tenant_id"] == TENANT
+        assert json.loads(transport.posts[0]["body"])["tenant_id"] == TENANT
 
     async def test_signed_payload_carries_a_signature(self) -> None:
         transport = _Transport()
