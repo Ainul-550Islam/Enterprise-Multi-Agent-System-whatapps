@@ -247,6 +247,10 @@ jwks_request_timeout_ms = 5000
 heartbeat_ms = 15000
 buffer_size = 256
 max_connections_per_tenant = 100
+# Typed SSE bounds consumed by mas-common::config::StreamConfig.
+heartbeat_secs = 15
+channel_buffer = 256
+max_connections_per_principal = 8
 
 # ── Analytics rollup refresh ─────────────────────────────────────────────────
 [analytics]

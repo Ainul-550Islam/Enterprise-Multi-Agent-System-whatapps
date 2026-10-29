@@ -110,11 +110,46 @@ pub trait ScheduleStorePort: std::fmt::Debug + Send + Sync {
     async fn list(&self, tenant: TenantId) -> Result<Vec<Schedule>>;
 }
 
+/// Stable descending keyset position for tool catalogues.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolCursor {
+    pub created_at: Timestamp,
+    pub id: ToolId,
+}
+
 #[async_trait]
 pub trait ToolStorePort: std::fmt::Debug + Send + Sync {
     async fn save(&self, tool: &Tool) -> Result<()>;
     async fn get(&self, id: ToolId) -> Result<Option<Tool>>;
     async fn list(&self, tenant: TenantId, project: Option<ProjectId>) -> Result<Vec<Tool>>;
+    /// Bounded tenant/project keyset page ordered `created_at DESC, id DESC`.
+    async fn list_page(
+        &self,
+        tenant: TenantId,
+        project: Option<ProjectId>,
+        after: Option<ToolCursor>,
+        limit: u16,
+    ) -> Result<Vec<Tool>>;
+    /// Reads the complete permission set for one tenant-owned tool.
+    async fn permissions(
+        &self,
+        tenant: TenantId,
+        tool: ToolId,
+    ) -> Result<Vec<mas_domain::ToolPermission>>;
+    /// Atomically replaces the permission set for one tenant-owned tool.
+    async fn replace_permissions(
+        &self,
+        tenant: TenantId,
+        tool: ToolId,
+        permissions: &[mas_domain::ToolPermission],
+    ) -> Result<()>;
+    /// Atomically replaces all grants attached to one agent across its tools.
+    async fn replace_agent_permissions(
+        &self,
+        tenant: TenantId,
+        agent: AgentId,
+        permissions: &[mas_domain::ToolPermission],
+    ) -> Result<()>;
 }
 
 #[async_trait]
@@ -276,6 +311,7 @@ struct StoreState {
     execution_idempotency: BTreeMap<(TenantId, String), ExecutionId>,
     schedules: BTreeMap<ScheduleId, Schedule>,
     tools: BTreeMap<ToolId, Tool>,
+    tool_permissions: BTreeMap<ToolId, Vec<mas_domain::ToolPermission>>,
     policies: BTreeMap<PolicyId, Policy>,
     approval_requests: BTreeMap<ApprovalRequestId, mas_policy::approval::ApprovalRequest>,
     connectors: BTreeMap<ConnectorId, Connector>,
@@ -319,6 +355,7 @@ impl InMemoryServices {
             + state.executions.len()
             + state.schedules.len()
             + state.tools.len()
+            + state.tool_permissions.values().map(Vec::len).sum::<usize>()
             + state.policies.len()
             + state.approval_requests.len()
             + state.connectors.len()
@@ -772,7 +809,7 @@ impl ToolStorePort for InMemoryServices {
     }
 
     async fn list(&self, tenant: TenantId, project: Option<ProjectId>) -> Result<Vec<Tool>> {
-        Ok(self
+        let mut tools = self
             .state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -783,7 +820,162 @@ impl ToolStorePort for InMemoryServices {
                     && project.is_none_or(|project| tool.project_id == Some(project))
             })
             .cloned()
-            .collect())
+            .collect::<Vec<_>>();
+        tools.sort_by(|left, right| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        tools.truncate(1_001);
+        Ok(tools)
+    }
+
+    async fn list_page(
+        &self,
+        tenant: TenantId,
+        project: Option<ProjectId>,
+        after: Option<ToolCursor>,
+        limit: u16,
+    ) -> Result<Vec<Tool>> {
+        let mut tools = self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .tools
+            .values()
+            .filter(|tool| {
+                tool.tenant_id == tenant
+                    && project.is_none_or(|project| tool.project_id == Some(project))
+                    && after.is_none_or(|cursor| {
+                        tool.created_at < cursor.created_at
+                            || (tool.created_at == cursor.created_at && tool.id < cursor.id)
+                    })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        tools.sort_by(|left, right| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        tools.truncate(usize::from(limit.clamp(1, 201)));
+        Ok(tools)
+    }
+
+    async fn permissions(
+        &self,
+        tenant: TenantId,
+        tool: ToolId,
+    ) -> Result<Vec<mas_domain::ToolPermission>> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !state
+            .tools
+            .get(&tool)
+            .is_some_and(|stored| stored.tenant_id == tenant)
+        {
+            return Err(mas_common::error::AppError::not_found(
+                "tool",
+                tool.to_string(),
+            ));
+        }
+        Ok(state
+            .tool_permissions
+            .get(&tool)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    async fn replace_permissions(
+        &self,
+        tenant: TenantId,
+        tool: ToolId,
+        permissions: &[mas_domain::ToolPermission],
+    ) -> Result<()> {
+        if permissions
+            .iter()
+            .any(|permission| permission.tool_id != tool || permission.tenant_id != tenant)
+        {
+            return Err(mas_common::error::AppError::not_found(
+                "tool",
+                tool.to_string(),
+            ));
+        }
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !state
+            .tools
+            .get(&tool)
+            .is_some_and(|stored| stored.tenant_id == tenant)
+        {
+            return Err(mas_common::error::AppError::not_found(
+                "tool",
+                tool.to_string(),
+            ));
+        }
+        if permissions.is_empty() {
+            state.tool_permissions.remove(&tool);
+        } else {
+            state.tool_permissions.insert(tool, permissions.to_vec());
+        }
+        Ok(())
+    }
+
+    async fn replace_agent_permissions(
+        &self,
+        tenant: TenantId,
+        agent: AgentId,
+        permissions: &[mas_domain::ToolPermission],
+    ) -> Result<()> {
+        if permissions
+            .iter()
+            .any(|permission| permission.tenant_id != tenant || permission.agent_id != Some(agent))
+        {
+            return Err(mas_common::error::AppError::invalid_field(
+                "permissions",
+                "scope_mismatch",
+                "all grants must match the target tenant and agent",
+            ));
+        }
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !state
+            .agents
+            .get(&agent)
+            .is_some_and(|record| record.tenant_id == tenant)
+        {
+            return Err(mas_common::error::AppError::not_found(
+                "agent",
+                agent.to_string(),
+            ));
+        }
+        for permission in permissions {
+            if !state
+                .tools
+                .get(&permission.tool_id)
+                .is_some_and(|tool| tool.tenant_id == tenant)
+            {
+                return Err(mas_common::error::AppError::not_found(
+                    "tool",
+                    permission.tool_id.to_string(),
+                ));
+            }
+        }
+        for stored in state.tool_permissions.values_mut() {
+            stored.retain(|permission| {
+                !(permission.tenant_id == tenant && permission.agent_id == Some(agent))
+            });
+        }
+        state
+            .tool_permissions
+            .retain(|_, stored| !stored.is_empty());
+        for permission in permissions {
+            state
+                .tool_permissions
+                .entry(permission.tool_id)
+                .or_default()
+                .push(permission.clone());
+        }
+        Ok(())
     }
 }
 
@@ -1705,6 +1897,10 @@ arc_delegate!(ToolStorePort => InMemoryServices {
     fn save(tool: &Tool) -> Result<()>;
     fn get(id: ToolId) -> Result<Option<Tool>>;
     fn list(tenant: TenantId, project: Option<ProjectId>) -> Result<Vec<Tool>>;
+    fn list_page(tenant: TenantId, project: Option<ProjectId>, after: Option<ToolCursor>, limit: u16) -> Result<Vec<Tool>>;
+    fn permissions(tenant: TenantId, tool: ToolId) -> Result<Vec<mas_domain::ToolPermission>>;
+    fn replace_permissions(tenant: TenantId, tool: ToolId, permissions: &[mas_domain::ToolPermission]) -> Result<()>;
+    fn replace_agent_permissions(tenant: TenantId, agent: AgentId, permissions: &[mas_domain::ToolPermission]) -> Result<()>;
 });
 arc_delegate!(PolicyStorePort => InMemoryServices {
     fn save(policy: &Policy) -> Result<()>;

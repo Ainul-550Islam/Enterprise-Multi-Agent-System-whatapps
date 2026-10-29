@@ -164,6 +164,56 @@ impl PostgresAuditLog {
             .collect()
     }
 
+    /// Filtered descending keyset page inside the authenticated request transaction.
+    ///
+    /// Every filter is a bound parameter and the tenant predicate is explicit in addition to FORCE RLS.
+    pub async fn filtered_keyset_read(
+        &self,
+        tenant: TenantId,
+        filter: &mas_application::audit_query_service::AuditReadFilter,
+        after: Option<&mas_application::audit_query_service::AuditPosition>,
+        limit: u16,
+    ) -> Result<Vec<AuditEvent>> {
+        let limit = i64::from(limit.clamp(1, 201));
+        let (cursor_time, cursor_id) = match after {
+            Some(position) => {
+                let time =
+                    mas_common::timestamps::Timestamp::from_unix_ms(position.occurred_at_ms)?;
+                (Some(time.into_datetime()), position.id.clone())
+            },
+            None => (None, String::new()),
+        };
+        let mut executor = crate::scoped_request::connection().await?;
+        let rows = sqlx::query(&format!(
+            "SELECT {AUDIT_COLUMNS} FROM audit_events
+             WHERE tenant_id = $1
+               AND ($2::text IS NULL OR actor->>'id' = $2)
+               AND ($3::text IS NULL OR action LIKE $3 || '%')
+               AND ($4::text IS NULL OR resource_type = $4)
+               AND ($5::text IS NULL OR outcome = $5)
+               AND ($6::timestamptz IS NULL OR occurred_at >= $6)
+               AND ($7::timestamptz IS NULL OR occurred_at < $7)
+               AND ($8::timestamptz IS NULL OR (occurred_at, id::text) < ($8, $9))
+             ORDER BY occurred_at DESC, id DESC LIMIT $10"
+        ))
+        .bind(tenant.into_uuid())
+        .bind(&filter.actor)
+        .bind(&filter.action)
+        .bind(&filter.resource)
+        .bind(&filter.outcome)
+        .bind(filter.from.map(|value| value.into_datetime()))
+        .bind(filter.to.map(|value| value.into_datetime()))
+        .bind(cursor_time)
+        .bind(cursor_id)
+        .bind(limit)
+        .fetch_all(executor.connection().as_mut())
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter()
+            .map(|row| row_from_sqlx(row).and_then(AuditRow::into_domain))
+            .collect()
+    }
+
     /// Counts events by outcome for a tenant (security dashboards).
     pub async fn outcome_counts(&self, tenant: TenantId) -> Result<Vec<(String, i64)>> {
         let rows = sqlx::query(
@@ -206,6 +256,20 @@ fn row_from_sqlx(row: &sqlx::postgres::PgRow) -> Result<AuditRow> {
         metadata: row.try_get("metadata").map_err(map_sqlx)?,
         occurred_at: row.try_get("occurred_at").map_err(map_sqlx)?,
     })
+}
+
+#[async_trait::async_trait]
+impl mas_application::audit_query_service::AuditReadPort for PostgresAuditLog {
+    async fn read_page(
+        &self,
+        tenant: TenantId,
+        filter: &mas_application::audit_query_service::AuditReadFilter,
+        after: Option<&mas_application::audit_query_service::AuditPosition>,
+        limit: u16,
+    ) -> Result<Vec<AuditEvent>> {
+        self.filtered_keyset_read(tenant, filter, after, limit)
+            .await
+    }
 }
 
 #[async_trait::async_trait]

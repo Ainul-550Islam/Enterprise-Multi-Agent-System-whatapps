@@ -155,6 +155,10 @@ jwks_request_timeout_ms = 5000
 heartbeat_ms = 15000
 buffer_size = 256
 max_connections_per_tenant = 100
+# Production SSE bounds: positive heartbeat, finite buffer and per-principal cap.
+heartbeat_secs = 15
+channel_buffer = 256
+max_connections_per_principal = 8
 
 # Dashboard refresh is an operator-controlled background cadence.
 [analytics]
