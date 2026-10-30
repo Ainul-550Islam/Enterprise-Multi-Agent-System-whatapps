@@ -1,0 +1,83 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "enterprise-mas.fullname" . }}-default-deny
+  labels:
+    {{- include "enterprise-mas.labels" . | nindent 4 }}
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+  # Default deny all ingress/egress; specific allow rules below.
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "enterprise-mas.fullname" . }}-allow-ingress-api
+  labels:
+    {{- include "enterprise-mas.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "enterprise-mas.selectorLabels" . | nindent 8 }}
+      component: api
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector: {}   # ingress gateway (when enabled)
+      ports:
+        - port: 8080
+          protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "enterprise-mas.fullname" . }}-allow-to-postgres-nats
+  labels:
+    {{- include "enterprise-mas.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      component: api
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              component: postgres
+      ports:
+        - port: 5432
+          protocol: TCP
+    - to:
+        - podSelector:
+            matchLabels:
+              component: nats
+      ports:
+        - port: 4222
+          protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "enterprise-mas.fullname" . }}-allow-to-orchestrator
+  labels:
+    {{- include "enterprise-mas.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "enterprise-mas.selectorLabels" . | nindent 8 }}
+      component: api
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "enterprise-mas.selectorLabels" $ | nindent 14 }}
+              component: orchestrator
+      ports:
+        - port: 9100
+          protocol: TCP

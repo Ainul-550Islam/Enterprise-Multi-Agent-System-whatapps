@@ -1,0 +1,1776 @@
+openapi: 3.1.0
+info:
+  title: Enterprise MAS API
+  description: |
+    Tenant-facing HTTP v1 API for enterprise-mas. Every route answers the
+    stable envelope `ApiEnvelope { data | StableApiError, meta }`; bearer JWT
+    or API-key authentication on protected routes; SSE (`text/event-stream`)
+    for `/v1/stream`; keyset pagination on list endpoints.
+  version: 0.1.0
+servers:
+  - url: http://127.0.0.1:8080
+    description: local dev
+  - url: https://api.mas.example.com
+    description: production
+tags:
+  - name: health
+  - name: tenancy
+  - name: agents
+  - name: approvals
+  - name: api-keys
+  - name: notifications
+  - name: connectors
+  - name: webhooks
+  - name: inbound-webhooks
+  - name: workflows
+  - name: executions
+  - name: schedules
+  - name: search
+  - name: data-hub
+  - name: analytics
+  - name: billing
+  - name: admin
+  - name: governance
+  - name: tooling
+  - name: public
+paths:
+  # ── health (public) ──────────────────────────────────────────────
+  /v1/health/live:
+    get:
+      tags: [health]
+      summary: Liveness probe
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+  /v1/health/ready:
+    get:
+      tags: [health]
+      summary: Readiness probe
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+
+  # ── public callbacks ─────────────────────────────────────────────
+  /v1/public/inbound-webhooks/{route_id}:
+    post:
+      tags: [public]
+      summary: Public inbound webhook ingestion (HMAC-verified, no user auth)
+      parameters:
+        - $ref: '#/components/parameters/RouteId'
+      requestBody:
+        $ref: '#/components/requestBodies/RawBody'
+      responses:
+        '202':
+          $ref: '#/components/responses/Accepted'
+        '400':
+          $ref: '#/components/responses/Error'
+  /v1/public/oauth/{provider}/callback:
+    get:
+      tags: [public]
+      summary: OAuth provider callback (opaque one-shot state)
+      parameters:
+        - $ref: '#/components/parameters/Provider'
+      responses:
+        '302':
+          description: Redirect to callback target
+        '400':
+          $ref: '#/components/responses/Error'
+
+  # ── tenancy ──────────────────────────────────────────────────────
+  /v1/organizations:
+    get:
+      tags: [tenancy]
+      summary: List organizations
+      security: [{bearerAuth: []}]
+      responses:
+        '200':
+          $ref: '#/components/responses/OkList'
+        '401':
+          $ref: '#/components/responses/Error'
+    post:
+      tags: [tenancy]
+      summary: Register organization
+      security: [{bearerAuth: []}]
+      requestBody:
+        $ref: '#/components/requestBodies/Organization'
+      responses:
+        '201':
+          $ref: '#/components/responses/Created'
+        '400':
+          $ref: '#/components/responses/Error'
+  /v1/tenants:
+    get:
+      tags: [tenancy]
+      summary: List tenants
+      security: [{bearerAuth: []}]
+      responses:
+        '200':
+          $ref: '#/components/responses/OkList'
+    post:
+      tags: [tenancy]
+      summary: Register tenant
+      security: [{bearerAuth: []}]
+      requestBody:
+        $ref: '#/components/requestBodies/Tenant'
+      responses:
+        '201':
+          $ref: '#/components/responses/Created'
+  /v1/projects:
+    post:
+      tags: [tenancy]
+      summary: Register project
+      security: [{bearerAuth: []}]
+      requestBody:
+        $ref: '#/components/requestBodies/Project'
+      responses:
+        '201':
+          $ref: '#/components/responses/Created'
+  /v1/users:
+    post:
+      tags: [tenancy]
+      summary: Register user
+      security: [{bearerAuth: []}]
+      requestBody:
+        $ref: '#/components/requestBodies/User'
+      responses:
+        '201':
+          $ref: '#/components/responses/Created'
+  /v1/memberships:
+    post:
+      tags: [tenancy]
+      summary: Invite membership
+      security: [{bearerAuth: []}]
+      requestBody:
+        $ref: '#/components/requestBodies/Membership'
+      responses:
+        '201':
+          $ref: '#/components/responses/Created'
+
+  # ── agents ───────────────────────────────────────────────────────
+  /v1/agents:
+    get:
+      tags: [agents]
+      summary: List agents
+      security: [{bearerAuth: []}]
+      responses:
+        '200':
+          $ref: '#/components/responses/OkList'
+    post:
+      tags: [agents]
+      summary: Register agent
+      security: [{bearerAuth: []}]
+      requestBody:
+        $ref: '#/components/requestBodies/Agent'
+      responses:
+        '201':
+          $ref: '#/components/responses/Created'
+  /v1/agents/{agent_id}:
+    get:
+      tags: [agents]
+      summary: Get agent
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/AgentId'
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+        '404':
+          $ref: '#/components/responses/Error'
+  /v1/agents/{agent_id}/versions:
+    get:
+      tags: [agents]
+      summary: List agent versions
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/AgentId'
+      responses:
+        '200':
+          $ref: '#/components/responses/OkList'
+    post:
+      tags: [agents]
+      summary: Publish agent version
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/AgentId'
+      requestBody:
+        $ref: '#/components/requestBodies/AgentVersion'
+      responses:
+        '201':
+          $ref: '#/components/responses/Created'
+  /v1/agents/{agent_id}/versions/{version}/rollback:
+    post:
+      tags: [agents]
+      summary: Rollback agent version
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/AgentId'
+        - $ref: '#/components/parameters/Version'
+      requestBody:
+        $ref: '#/components/requestBodies/Rollback'
+      responses:
+        '201':
+          $ref: '#/components/responses/Created'
+
+  # ── approvals ────────────────────────────────────────────────────
+  /v1/approvals:
+    get:
+      tags: [approvals]
+      summary: List approvals
+      security: [{bearerAuth: []}]
+      responses:
+        '200':
+          $ref: '#/components/responses/OkList'
+  /v1/approvals/{id}/approve:
+    post:
+      tags: [approvals]
+      summary: Approve
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+  /v1/approvals/{id}/deny:
+    post:
+      tags: [approvals]
+      summary: Deny
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+
+  # ── api keys ─────────────────────────────────────────────────────
+  /v1/api-keys:
+    get:
+      tags: [api-keys]
+      summary: List API keys (metadata only)
+      security: [{bearerAuth: []}]
+      responses:
+        '200':
+          $ref: '#/components/responses/OkList'
+    post:
+      tags: [api-keys]
+      summary: Create API key (raw key returned once)
+      security: [{bearerAuth: []}]
+      requestBody:
+        $ref: '#/components/requestBodies/CreateApiKey'
+      responses:
+        '201':
+          $ref: '#/components/responses/Created'
+        '400':
+          $ref: '#/components/responses/Error'
+  /v1/api-keys/{id}/revoke:
+    post:
+      tags: [api-keys]
+      summary: Revoke API key
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+  /v1/api-keys/{id}/rotate:
+    post:
+      tags: [api-keys]
+      summary: Rotate API key
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      requestBody:
+        $ref: '#/components/requestBodies/RotateApiKey'
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+
+  # ── notifications ────────────────────────────────────────────────
+  /v1/notifications/recipients/{recipient_id}:
+    get:
+      tags: [notifications]
+      summary: List notifications for recipient
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/RecipientId'
+      responses:
+        '200':
+          $ref: '#/components/responses/OkList'
+  /v1/notifications/recipients/{recipient_id}/{notification_id}/read:
+    post:
+      tags: [notifications]
+      summary: Mark notification read
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/RecipientId'
+        - $ref: '#/components/parameters/NotificationId'
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+  /v1/notifications/recipients/{recipient_id}/{notification_id}/archive:
+    post:
+      tags: [notifications]
+      summary: Archive notification
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/RecipientId'
+        - $ref: '#/components/parameters/NotificationId'
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+
+  # ── connectors ───────────────────────────────────────────────────
+  /v1/connectors:
+    get:
+      tags: [connectors]
+      summary: List connectors
+      security: [{bearerAuth: []}]
+      responses:
+        '200':
+          $ref: '#/components/responses/OkList'
+    post:
+      tags: [connectors]
+      summary: Register connector
+      security: [{bearerAuth: []}]
+      requestBody:
+        $ref: '#/components/requestBodies/Connector'
+      responses:
+        '201':
+          $ref: '#/components/responses/Created'
+  /v1/connectors/test:
+    post:
+      tags: [connectors]
+      summary: Test connector
+      security: [{bearerAuth: []}]
+      requestBody:
+        $ref: '#/components/requestBodies/TestConnector'
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+  /v1/connectors/{connector_id}:
+    get:
+      tags: [connectors]
+      summary: Get connector
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/ConnectorId'
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+  /v1/connectors/{connector_id}/oauth/authorize:
+    post:
+      tags: [connectors]
+      summary: OAuth authorization initiation
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/ConnectorId'
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+  /v1/connectors/{connector_id}/probe:
+    post:
+      tags: [connectors]
+      summary: Probe connector
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/ConnectorId'
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+  /v1/connectors/{connector_id}/disable:
+    post:
+      tags: [connectors]
+      summary: Disable connector
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/ConnectorId'
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+
+  # ── webhooks ─────────────────────────────────────────────────────
+  /v1/webhooks:
+    get:
+      tags: [webhooks]
+      summary: List webhooks
+      security: [{bearerAuth: []}]
+      responses:
+        '200':
+          $ref: '#/components/responses/OkList'
+    post:
+      tags: [webhooks]
+      summary: Register webhook
+      security: [{bearerAuth: []}]
+      requestBody:
+        $ref: '#/components/requestBodies/RegisterWebhook'
+      responses:
+        '201':
+          $ref: '#/components/responses/Created'
+  /v1/webhooks/{webhook_id}/enable:
+    post:
+      tags: [webhooks]
+      summary: Enable webhook
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/WebhookId'
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+  /v1/webhooks/{webhook_id}/disable:
+    post:
+      tags: [webhooks]
+      summary: Disable webhook
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/WebhookId'
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+  /v1/webhooks/{id}/deliveries:
+    get:
+      tags: [webhooks]
+      summary: List webhook deliveries
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/WebhookId'
+      responses:
+        '200':
+          $ref: '#/components/responses/OkList'
+  /v1/webhooks/{id}/deliveries/{delivery_id}/replay:
+    post:
+      tags: [webhooks]
+      summary: Replay webhook delivery
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/WebhookId'
+        - $ref: '#/components/parameters/DeliveryId'
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+
+  # ── inbound webhooks ─────────────────────────────────────────────
+  /v1/inbound-webhooks:
+    get:
+      tags: [inbound-webhooks]
+      summary: List inbound webhook endpoints
+      security: [{bearerAuth: []}]
+      responses:
+        '200':
+          $ref: '#/components/responses/OkList'
+    post:
+      tags: [inbound-webhooks]
+      summary: Register inbound webhook endpoint
+      security: [{bearerAuth: []}]
+      requestBody:
+        $ref: '#/components/requestBodies/RegisterInboundWebhook'
+      responses:
+        '201':
+          $ref: '#/components/responses/Created'
+  /v1/inbound-webhooks/{endpoint_id}:
+    get:
+      tags: [inbound-webhooks]
+      summary: Get inbound webhook endpoint
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/EndpointId'
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+  /v1/inbound-webhooks/{endpoint_id}/enable:
+    post:
+      tags: [inbound-webhooks]
+      summary: Enable inbound webhook endpoint
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/EndpointId'
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+  /v1/inbound-webhooks/{endpoint_id}/disable:
+    post:
+      tags: [inbound-webhooks]
+      summary: Disable inbound webhook endpoint
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/EndpointId'
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+
+  # ── workflows ────────────────────────────────────────────────────
+  /v1/workflows:
+    get:
+      tags: [workflows]
+      summary: List workflows
+      security: [{bearerAuth: []}]
+      responses:
+        '200':
+          $ref: '#/components/responses/OkList'
+    post:
+      tags: [workflows]
+      summary: Create workflow
+      security: [{bearerAuth: []}]
+      requestBody:
+        $ref: '#/components/requestBodies/Workflow'
+      responses:
+        '201':
+          $ref: '#/components/responses/Created'
+  /v1/workflows/{workflow_id}:
+    get:
+      tags: [workflows]
+      summary: Get workflow
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/WorkflowId'
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+  /v1/workflows/{workflow_id}/graph:
+    put:
+      tags: [workflows]
+      summary: Update workflow graph
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/WorkflowId'
+      requestBody:
+        $ref: '#/components/requestBodies/WorkflowGraph'
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+  /v1/workflows/{workflow_id}/publish:
+    post:
+      tags: [workflows]
+      summary: Publish workflow
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/WorkflowId'
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+  /v1/workflows/{workflow_id}/disable:
+    post:
+      tags: [workflows]
+      summary: Disable workflow
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/WorkflowId'
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+  /v1/workflows/{workflow_id}/versions:
+    get:
+      tags: [workflows]
+      summary: List workflow versions
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/WorkflowId'
+      responses:
+        '200':
+          $ref: '#/components/responses/OkList'
+  /v1/workflows/{workflow_id}/versions/{version}/rollback:
+    post:
+      tags: [workflows]
+      summary: Rollback workflow version
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/WorkflowId'
+        - $ref: '#/components/parameters/Version'
+      requestBody:
+        $ref: '#/components/requestBodies/Rollback'
+      responses:
+        '201':
+          $ref: '#/components/responses/Created'
+  /v1/rollbacks:
+    get:
+      tags: [workflows]
+      summary: List rollback history
+      security: [{bearerAuth: []}]
+      responses:
+        '200':
+          $ref: '#/components/responses/OkList'
+
+  # ── executions ───────────────────────────────────────────────────
+  /v1/projects/{project_id}/executions:
+    post:
+      tags: [executions]
+      summary: Submit execution (idempotent)
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+      requestBody:
+        $ref: '#/components/requestBodies/SubmitExecution'
+      responses:
+        '201':
+          $ref: '#/components/responses/Created'
+        '409':
+          $ref: '#/components/responses/Error'
+  /v1/executions:
+    get:
+      tags: [executions]
+      summary: List executions
+      security: [{bearerAuth: []}]
+      responses:
+        '200':
+          $ref: '#/components/responses/OkList'
+  /v1/executions/{execution_id}:
+    get:
+      tags: [executions]
+      summary: Get execution
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/ExecutionId'
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+        '404':
+          $ref: '#/components/responses/Error'
+  /v1/executions/{execution_id}/steps:
+    get:
+      tags: [executions]
+      summary: Get execution steps timeline
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/ExecutionId'
+      responses:
+        '200':
+          $ref: '#/components/responses/OkList'
+  /v1/executions/{execution_id}/start:
+    post:
+      tags: [executions]
+      summary: Start execution
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/ExecutionId'
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+  /v1/executions/{execution_id}/pause:
+    post:
+      tags: [executions]
+      summary: Pause execution
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/ExecutionId'
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+  /v1/executions/{execution_id}/resume:
+    post:
+      tags: [executions]
+      summary: Resume execution
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/ExecutionId'
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+  /v1/executions/{execution_id}/cancel:
+    post:
+      tags: [executions]
+      summary: Cancel execution
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/ExecutionId'
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+
+  # ── schedules ────────────────────────────────────────────────────
+  /v1/schedules:
+    get:
+      tags: [schedules]
+      summary: List schedules
+      security: [{bearerAuth: []}]
+      responses:
+        '200':
+          $ref: '#/components/responses/OkList'
+    post:
+      tags: [schedules]
+      summary: Register schedule
+      security: [{bearerAuth: []}]
+      requestBody:
+        $ref: '#/components/requestBodies/Schedule'
+      responses:
+        '201':
+          $ref: '#/components/responses/Created'
+  /v1/schedules/{schedule_id}:
+    get:
+      tags: [schedules]
+      summary: Get schedule
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/ScheduleId'
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+  /v1/schedules/{schedule_id}/pause:
+    post:
+      tags: [schedules]
+      summary: Pause schedule
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/ScheduleId'
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+  /v1/schedules/{schedule_id}/resume:
+    post:
+      tags: [schedules]
+      summary: Resume schedule
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/ScheduleId'
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+  /v1/schedules/{schedule_id}/disable:
+    post:
+      tags: [schedules]
+      summary: Disable schedule
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/ScheduleId'
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+
+  # ── search ───────────────────────────────────────────────────────
+  /v1/search:
+    get:
+      tags: [search]
+      summary: Command palette search
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/SearchQuery'
+      responses:
+        '200':
+          $ref: '#/components/responses/OkList'
+
+  # ── data hub ─────────────────────────────────────────────────────
+  /v1/data-sources:
+    get:
+      tags: [data-hub]
+      summary: List data sources
+      security: [{bearerAuth: []}]
+      responses:
+        '200':
+          $ref: '#/components/responses/OkList'
+    post:
+      tags: [data-hub]
+      summary: Create data source
+      security: [{bearerAuth: []}]
+      requestBody:
+        $ref: '#/components/requestBodies/DataSource'
+      responses:
+        '201':
+          $ref: '#/components/responses/Created'
+  /v1/data-sources/{id}:
+    get:
+      tags: [data-hub]
+      summary: Get data source
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+  /v1/data-sources/{id}/sync:
+    post:
+      tags: [data-hub]
+      summary: Sync data source
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '202':
+          $ref: '#/components/responses/Accepted'
+  /v1/data-sources/{id}/documents:
+    get:
+      tags: [data-hub]
+      summary: List documents
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '200':
+          $ref: '#/components/responses/OkList'
+  /v1/documents/upload:
+    post:
+      tags: [data-hub]
+      summary: Upload document (bounded multipart)
+      security: [{bearerAuth: []}]
+      requestBody:
+        $ref: '#/components/requestBodies/DocumentUpload'
+      responses:
+        '201':
+          $ref: '#/components/responses/Created'
+  /v1/documents/{id}:
+    get:
+      tags: [data-hub]
+      summary: Get document
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+    delete:
+      tags: [data-hub]
+      summary: Delete document
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+
+  # ── analytics ────────────────────────────────────────────────────
+  /v1/analytics/overview:
+    get:
+      tags: [analytics]
+      summary: Analytics overview (KPI cards)
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+        - $ref: '#/components/parameters/Granularity'
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+  /v1/analytics/performance:
+    get:
+      tags: [analytics]
+      summary: Performance time series
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+        - $ref: '#/components/parameters/Granularity'
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+  /v1/analytics/tasks-by-agent:
+    get:
+      tags: [analytics]
+      summary: Tasks by agent
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+        - $ref: '#/components/parameters/Granularity'
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+  /v1/analytics/usage-cost:
+    get:
+      tags: [analytics]
+      summary: Usage and cost
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+        - $ref: '#/components/parameters/Granularity'
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+  /v1/assistant/insights:
+    get:
+      tags: [analytics]
+      summary: Deterministic assistant insights
+      security: [{bearerAuth: []}]
+      responses:
+        '200':
+          $ref: '#/components/responses/OkList'
+
+  /v1/assistant/messages:
+    post:
+      tags: [assistant]
+      summary: Submit assistant message
+      security: [{bearerAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                content:
+                  type: string
+                thread_id:
+                  type: string
+              required:
+                - content
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+
+  # ── control plane (billing / entitlements / usage) ───────────────
+  /v1/billing/subscription:
+    get:
+      tags: [billing]
+      summary: Get subscription
+      security: [{bearerAuth: []}]
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+  /v1/billing/entitlements:
+    get:
+      tags: [billing]
+      summary: List entitlements
+      security: [{bearerAuth: []}]
+      responses:
+        '200':
+          $ref: '#/components/responses/OkList'
+  /v1/billing/usage-totals:
+    get:
+      tags: [billing]
+      summary: Usage totals
+      security: [{bearerAuth: []}]
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+  /v1/billing/receipts:
+    get:
+      tags: [billing]
+      summary: List receipts
+      security: [{bearerAuth: []}]
+      responses:
+        '200':
+          $ref: '#/components/responses/OkList'
+  /v1/billing/receipts/{provider}/{event_id}:
+    get:
+      tags: [billing]
+      summary: Get receipt
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/Provider'
+        - $ref: '#/components/parameters/EventId'
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+  /v1/usage:
+    get:
+      tags: [billing]
+      summary: List usage records
+      security: [{bearerAuth: []}]
+      responses:
+        '200':
+          $ref: '#/components/responses/OkList'
+
+  # ── control plane administration ─────────────────────────────────
+  /v1/admin/plans:
+    post:
+      tags: [admin]
+      summary: Create plan
+      security: [{bearerAuth: []}]
+      requestBody:
+        $ref: '#/components/requestBodies/Plan'
+      responses:
+        '201':
+          $ref: '#/components/responses/Created'
+  /v1/admin/plans/{code}/features:
+    put:
+      tags: [admin]
+      summary: Grant plan feature
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/PlanCode'
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+  /v1/admin/tenants/{tenant_id}/subscription:
+    post:
+      tags: [admin]
+      summary: Create tenant subscription
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+      responses:
+        '201':
+          $ref: '#/components/responses/Created'
+  /v1/admin/tenants/{tenant_id}/subscription/transitions:
+    post:
+      tags: [admin]
+      summary: Transition subscription
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+  /v1/admin/tenants/{tenant_id}/overrides/features:
+    post:
+      tags: [admin]
+      summary: Grant feature override
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+  /v1/admin/tenants/{tenant_id}/overrides/quotas:
+    post:
+      tags: [admin]
+      summary: Grant quota override
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+  /v1/admin/tenants/{tenant_id}/overrides/features/{feature}/end:
+    post:
+      tags: [admin]
+      summary: End feature override
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/Feature'
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+
+  # ── governance ───────────────────────────────────────────────────
+  /v1/auth/me:
+    get:
+      tags: [governance]
+      summary: Authenticated actor + scope
+      security: [{bearerAuth: []}]
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+        '401':
+          $ref: '#/components/responses/Error'
+  /v1/audit-events:
+    get:
+      tags: [governance]
+      summary: Audit events (keyset-paginated, redacted)
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          $ref: '#/components/responses/OkList'
+  /v1/policies:
+    get:
+      tags: [governance]
+      summary: List policies
+      security: [{bearerAuth: []}]
+      responses:
+        '200':
+          $ref: '#/components/responses/OkList'
+    post:
+      tags: [governance]
+      summary: Create policy
+      security: [{bearerAuth: []}]
+      requestBody:
+        $ref: '#/components/requestBodies/Policy'
+      responses:
+        '201':
+          $ref: '#/components/responses/Created'
+  /v1/policies/{id}:
+    get:
+      tags: [governance]
+      summary: Get policy
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+    patch:
+      tags: [governance]
+      summary: Update policy draft
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      requestBody:
+        $ref: '#/components/requestBodies/UpdatePolicy'
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+  /v1/policies/{id}/publish:
+    post:
+      tags: [governance]
+      summary: Publish policy
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+  /v1/policies/{id}/rollback:
+    post:
+      tags: [governance]
+      summary: Rollback policy
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+  /v1/policies/{id}/evaluate:
+    post:
+      tags: [governance]
+      summary: Evaluate policy (dry run)
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+  /v1/quotas:
+    get:
+      tags: [governance]
+      summary: Quota utilization
+      security: [{bearerAuth: []}]
+      responses:
+        '200':
+          $ref: '#/components/responses/OkList'
+  /v1/usage/summary:
+    get:
+      tags: [governance]
+      summary: Usage summary
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+        - $ref: '#/components/parameters/Dimension'
+      responses:
+        '200':
+          $ref: '#/components/responses/OkList'
+
+  # ── tooling ──────────────────────────────────────────────────────
+  /v1/tools:
+    get:
+      tags: [tooling]
+      summary: List tools
+      security: [{bearerAuth: []}]
+      responses:
+        '200':
+          $ref: '#/components/responses/OkList'
+    post:
+      tags: [tooling]
+      summary: Register tool
+      security: [{bearerAuth: []}]
+      requestBody:
+        $ref: '#/components/requestBodies/Tool'
+      responses:
+        '201':
+          $ref: '#/components/responses/Created'
+  /v1/tools/{id}:
+    get:
+      tags: [tooling]
+      summary: Get tool
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+    patch:
+      tags: [tooling]
+      summary: Update tool
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      requestBody:
+        $ref: '#/components/requestBodies/UpdateTool'
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+  /v1/agents/{agent_id}/tool-permissions:
+    put:
+      tags: [tooling]
+      summary: Replace agent tool permissions
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/AgentId'
+      requestBody:
+        $ref: '#/components/requestBodies/ReplaceToolPermissions'
+      responses:
+        '200':
+          $ref: '#/components/responses/OkList'
+  /v1/connector-manifests:
+    get:
+      tags: [tooling]
+      summary: List connector manifests
+      security: [{bearerAuth: []}]
+      responses:
+        '200':
+          $ref: '#/components/responses/OkList'
+
+  # ── stream ───────────────────────────────────────────────────────
+  /v1/stream:
+    get:
+      tags: [tooling]
+      summary: SSE event stream (text/event-stream)
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/LastEventId'
+      responses:
+        '200':
+          description: SSE event stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Bearer API key or JWT.
+
+  parameters:
+    RouteId:
+      name: route_id
+      in: path
+      required: true
+      schema:
+        type: string
+    Provider:
+      name: provider
+      in: path
+      required: true
+      schema:
+        type: string
+    AgentId:
+      name: agent_id
+      in: path
+      required: true
+      schema:
+        type: string
+    Version:
+      name: version
+      in: path
+      required: true
+      schema:
+        type: string
+    Id:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+    RecipientId:
+      name: recipient_id
+      in: path
+      required: true
+      schema:
+        type: string
+    NotificationId:
+      name: notification_id
+      in: path
+      required: true
+      schema:
+        type: string
+    ConnectorId:
+      name: connector_id
+      in: path
+      required: true
+      schema:
+        type: string
+    WebhookId:
+      name: webhook_id
+      in: path
+      required: true
+      schema:
+        type: string
+    DeliveryId:
+      name: delivery_id
+      in: path
+      required: true
+      schema:
+        type: string
+    EndpointId:
+      name: endpoint_id
+      in: path
+      required: true
+      schema:
+        type: string
+    WorkflowId:
+      name: workflow_id
+      in: path
+      required: true
+      schema:
+        type: string
+    ProjectId:
+      name: project_id
+      in: path
+      required: true
+      schema:
+        type: string
+    ExecutionId:
+      name: execution_id
+      in: path
+      required: true
+      schema:
+        type: string
+    ScheduleId:
+      name: schedule_id
+      in: path
+      required: true
+      schema:
+        type: string
+    SearchQuery:
+      name: q
+      in: query
+      required: false
+      schema:
+        type: string
+    From:
+      name: from
+      in: query
+      required: false
+      schema:
+        type: string
+        format: date-time
+    To:
+      name: to
+      in: query
+      required: false
+      schema:
+        type: string
+        format: date-time
+    Granularity:
+      name: granularity
+      in: query
+      required: false
+      schema:
+        type: string
+        enum: [hour, day, week]
+    Dimension:
+      name: dimension
+      in: query
+      required: false
+      schema:
+        type: string
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      schema:
+        type: string
+    Limit:
+      name: limit
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 200
+    PlanCode:
+      name: code
+      in: path
+      required: true
+      schema:
+        type: string
+    TenantId:
+      name: tenant_id
+      in: path
+      required: true
+      schema:
+        type: string
+    Feature:
+      name: feature
+      in: path
+      required: true
+      schema:
+        type: string
+    Provider:
+      name: provider
+      in: path
+      required: true
+      schema:
+        type: string
+    EventId:
+      name: event_id
+      in: path
+      required: true
+      schema:
+        type: string
+    LastEventId:
+      name: Last-Event-Id
+      in: header
+      required: false
+      schema:
+        type: string
+
+  requestBodies:
+    RawBody:
+      content:
+        application/octet-stream:
+          schema:
+            type: string
+            format: binary
+    Organization:
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [name]
+            properties:
+              name:
+                type: string
+    Tenant:
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [name, organization_id]
+            properties:
+              name:
+                type: string
+              organization_id:
+                type: string
+    Project:
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [name, tenant_id]
+            properties:
+              name:
+                type: string
+              tenant_id:
+                type: string
+    User:
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [email]
+            properties:
+              email:
+                type: string
+    Membership:
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [user_id, tenant_id, role]
+            properties:
+              user_id:
+                type: string
+              tenant_id:
+                type: string
+              role:
+                type: string
+    Agent:
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [name, project_id]
+            properties:
+              name:
+                type: string
+              project_id:
+                type: string
+    AgentVersion:
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [configuration_checksum, configuration_snapshot]
+            properties:
+              configuration_checksum:
+                type: string
+              configuration_snapshot:
+                type: object
+    Rollback:
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [target_version_number]
+            properties:
+              target_version_number:
+                type: integer
+    CreateApiKey:
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [name, scopes]
+            properties:
+              name:
+                type: string
+              scopes:
+                type: array
+                items:
+                  type: string
+              expires_at:
+                type: string
+                format: date-time
+    RotateApiKey:
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              grace_seconds:
+                type: integer
+    Connector:
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [provider, name]
+            properties:
+              provider:
+                type: string
+              name:
+                type: string
+    TestConnector:
+      content:
+        application/json:
+          schema:
+            type: object
+    RegisterWebhook:
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [url, subscribed_events, secret_reference_id]
+            properties:
+              url:
+                type: string
+              subscribed_events:
+                type: array
+                items:
+                  type: string
+              secret_reference_id:
+                type: string
+              description:
+                type: string
+    RegisterInboundWebhook:
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [url, secret_reference_id]
+            properties:
+              url:
+                type: string
+              secret_reference_id:
+                type: string
+    Workflow:
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [name, project_id]
+            properties:
+              name:
+                type: string
+              project_id:
+                type: string
+    WorkflowGraph:
+      content:
+        application/json:
+          schema:
+            type: object
+    SubmitExecution:
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [agent_id]
+            properties:
+              workflow_id:
+                type: string
+              agent_id:
+                type: string
+              input:
+                type: object
+              correlation_id:
+                type: string
+              idempotency_key:
+                type: string
+    Schedule:
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [name, cron]
+            properties:
+              name:
+                type: string
+              cron:
+                type: string
+    DataSource:
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [name, kind]
+            properties:
+              name:
+                type: string
+              kind:
+                type: string
+    DocumentUpload:
+      content:
+        multipart/form-data:
+          schema:
+            type: object
+            required: [file]
+            properties:
+              file:
+                type: string
+                format: binary
+    Policy:
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [name, definition]
+            properties:
+              name:
+                type: string
+              definition:
+                type: object
+    UpdatePolicy:
+      content:
+        application/json:
+          schema:
+            type: object
+    Plan:
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [code]
+            properties:
+              code:
+                type: string
+    Tool:
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [name, kind, project_id]
+            properties:
+              name:
+                type: string
+              kind:
+                type: string
+              project_id:
+                type: string
+    UpdateTool:
+      content:
+        application/json:
+          schema:
+            type: object
+    ReplaceToolPermissions:
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [grants]
+            properties:
+              grants:
+                type: array
+
+  responses:
+    Ok:
+      description: Success
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [data, meta]
+            properties:
+              data:
+                type: object
+              error:
+                type: object
+              meta:
+                $ref: '#/components/schemas/EnvelopeMeta'
+    OkList:
+      description: Success list
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [data, meta]
+            properties:
+              data:
+                type: array
+              error:
+                type: object
+              meta:
+                $ref: '#/components/schemas/EnvelopeMeta'
+    Created:
+      description: Created
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [data, meta]
+            properties:
+              data:
+                type: object
+              error:
+                type: object
+              meta:
+                $ref: '#/components/schemas/EnvelopeMeta'
+    Accepted:
+      description: Accepted
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [data, meta]
+            properties:
+              data:
+                type: object
+              error:
+                type: object
+              meta:
+                $ref: '#/components/schemas/EnvelopeMeta'
+    Error:
+      description: Error
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [error, meta]
+            properties:
+              data:
+                type: object
+              error:
+                $ref: '#/components/schemas/StableApiError'
+              meta:
+                $ref: '#/components/schemas/EnvelopeMeta'
+
+  schemas:
+    StableApiError:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+        request_id:
+          type: string
+        details:
+          type: object
+    EnvelopeMeta:
+      type: object
+      required: [request_id, correlation_id, api_version, responded_at]
+      properties:
+        request_id:
+          type: string
+        correlation_id:
+          type: string
+        api_version:
+          type: string
+        responded_at:
+          type: string
+          format: date-time

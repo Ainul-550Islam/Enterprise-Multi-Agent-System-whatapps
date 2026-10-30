@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "enterprise-mas.fullname" . }}-config
+  labels:
+    {{- include "enterprise-mas.labels" . | nindent 4 }}
+data:
+  MAS_ENV: "production"
+  MAS_API_HTTP_ADDR: "0.0.0.0:8080"
+  MAS_API_GRPC_ADDR: "0.0.0.0:50051"
+  MAS_LOG_FORMAT: "json"
+  MAS_LOG_LEVEL: "info"
+  # Non-secret config rendered from values (matches config/production.toml keys).
+  # Secret values reference existingSecret names via envFrom in deployments.
+  MAS_SCHEDULER_INTERVAL_MS: "{{ .Values.scheduler.replicaCount | default 1 }}"
+  MAS_WORKER_CONSUMER: "{{ .Values.worker.consumerName }}"
+  MAS_BROKER_KIND: "nats"
+  MAS_PROVIDERS_MODE: "{{ .Values.providers.mode }}"

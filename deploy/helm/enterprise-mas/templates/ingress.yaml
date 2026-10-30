@@ -1,0 +1,34 @@
+{{- if .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "enterprise-mas.fullname" . }}-api
+  labels:
+    {{- include "enterprise-mas.labels" . | nindent 4 }}
+  {{- if .Values.ingress.tls.enabled }}
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+  {{- end }}
+spec:
+  {{- if .Values.ingress.class }}
+  ingressClassName: {{ .Values.ingress.class }}
+  {{- end }}
+  rules:
+    - host: api.mas.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "enterprise-mas.fullname" . }}-api
+                port:
+                  number: 8080
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        - api.mas.example.com
+      secretName: {{ include "enterprise-mas.fullname" . }}-tls
+  {{- end }}
+{{- end }}

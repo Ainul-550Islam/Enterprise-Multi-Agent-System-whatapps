@@ -1,0 +1,14 @@
+=== rustc ===
+rustc 1.99.1 (58cf8f9c3 2026-10-13)
+=== cargo ===
+cargo 1.99.1 (5f94df478 2026-08-27)
+=== python ===
+Python 3.13.16
+=== psql ===
+/bin/bash: line 1: psql: command not found
+psql: not available
+=== nats-server ===
+/bin/bash: line 1: nats-server: command not found
+nats-server: not available
+=== uname ===
+Linux e2b.local 6.1.158+ #1 SMP PREEMPT_DYNAMIC Wed Sep 30 12:40:02 UTC 2026 x86_64 GNU/Linux

@@ -1,0 +1,49 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "enterprise-mas.fullname" . }}-worker
+  labels:
+    {{- include "enterprise-mas.labels" . | nindent 4 }}
+    component: worker
+spec:
+  replicas: {{ .Values.worker.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "enterprise-mas.selectorLabels" . | nindent 6 }}
+      component: worker
+  template:
+    metadata:
+      labels:
+        {{- include "enterprise-mas.selectorLabels" . | nindent 8 }}
+        component: worker
+    spec:
+      securityContext:
+        {{- toYaml .Values.securityContext | nindent 8 }}
+      containers:
+        - name: worker
+          image: "{{ .Values.image.registry }}/{{ .Values.image.repository }}-{{ .Values.worker.image }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - name: MAS_ENV
+              value: "production"
+            - name: MAS_WORKER_NAME
+              value: "worker-prod-{{ .Release.Revision }}"
+            - name: MAS_AI_BRIDGE_ENDPOINT
+              value: "http://{{ include "enterprise-mas.fullname" . }}-orchestrator:9100"
+            - name: MAS_AI_BRIDGE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.postgres.existingSecret }}
+                  key: ai-bridge-token
+          envFrom:
+            - secretRef:
+                name: {{ .Values.postgres.existingSecret }}
+          {{- if .Values.worker.gracefulTerminationSeconds }}
+          terminationGracePeriodSeconds: {{ .Values.worker.gracefulTerminationSeconds }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.worker.resources | nindent 12 }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

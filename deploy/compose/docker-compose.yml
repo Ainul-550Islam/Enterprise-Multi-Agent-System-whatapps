@@ -1,0 +1,124 @@
+# docker-compose.yml — enterprise-mas local development stack
+#
+# postgres(pgvector) + nats(+jetstream) + migrate (one-shot) + api + worker +
+# scheduler + orchestrator. Only the api port (8080) is published; every other
+# service sits on the internal `mas` network. Secrets come from .env.example
+# placeholders (operator must supply real values via secret manager).
+#
+# Usage: docker compose up -d   (from deploy/compose)
+
+version: "3.8"
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: mas_live
+      POSTGRES_USER: mas
+      POSTGRES_PASSWORD: ${MAS_DB_PASSWORD:-mas_dev_pw}
+      POSTGRES_INITDB_ARGS: "--auth-local=trust"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mas -d mas_live"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - mas
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  nats:
+    image: nats:2.10
+    command: ["-c", "/etc/nats/nats.conf"]
+    volumes:
+      - ./nats.conf:/etc/nats/nats.conf:ro
+    healthcheck:
+      test: ["CMD", "nats", "ping", "-s", "127.0.0.1:4222"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - mas
+
+  migrate:
+    image: enterprise-mas/migrate:local
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://mas:${MAS_DB_PASSWORD:-mas_dev_pw}@postgres:5432/mas_live
+    networks:
+      - mas
+    restart: "no"
+
+  api:
+    image: enterprise-mas/api:local
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      MAS_ENV: development
+      MAS_API_HTTP_ADDR: 0.0.0.0:8080
+      MAS_API_GRPC_ADDR: 0.0.0.0:50051
+      MAS_DATABASE_URL: postgres://mas:${MAS_DB_PASSWORD:-mas_dev_pw}@postgres:5432/mas_live
+      MAS_AI_BRIDGE_ENDPOINT: http://orchestrator:9100
+      MAS_AI_BRIDGE_TOKEN: ${MAS_AI_BRIDGE_TOKEN:-dev-bridge-token}
+    ports:
+      - "8080:8080"
+    networks:
+      - mas
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/v1/health/live || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  worker:
+    image: enterprise-mas/worker:local
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    environment:
+      MAS_ENV: development
+      MAS_WORKER_NAME: worker-1
+      MAS_AI_BRIDGE_ENDPOINT: http://orchestrator:9100
+      MAS_AI_BRIDGE_TOKEN: ${MAS_AI_BRIDGE_TOKEN:-dev-bridge-token}
+    networks:
+      - mas
+
+  scheduler:
+    image: enterprise-mas/scheduler:local
+    depends_on:
+      postgres:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    environment:
+      MAS_ENV: development
+      MAS_SCHEDULER_INTERVAL_MS: 1000
+      MAS_SCHEDULER_API_URL: http://api:8080
+    networks:
+      - mas
+
+  orchestrator:
+    image: enterprise-mas/orchestrator:local
+    environment:
+      MAS_ENV: development
+    networks:
+      - mas
+
+networks:
+  mas:
+    driver: bridge
+    internal: true   # api port 8080 is the only published port
+
+volumes:
+  pgdata:

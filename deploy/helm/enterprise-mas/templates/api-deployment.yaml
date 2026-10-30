@@ -1,0 +1,70 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "enterprise-mas.fullname" . }}-api
+  labels:
+    {{- include "enterprise-mas.labels" . | nindent 4 }}
+    component: api
+spec:
+  replicas: {{ .Values.api.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "enterprise-mas.selectorLabels" . | nindent 6 }}
+      component: api
+  template:
+    metadata:
+      labels:
+        {{- include "enterprise-mas.selectorLabels" . | nindent 8 }}
+        component: api
+    spec:
+      securityContext:
+        {{- toYaml .Values.securityContext | nindent 8 }}
+      containers:
+        - name: api
+          image: "{{ .Values.image.registry }}/{{ .Values.image.repository }}-{{ .Values.api.image }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - containerPort: 8080
+              name: http
+            - containerPort: 50051
+              name: grpc
+          env:
+            - name: MAS_ENV
+              value: "production"
+            - name: MAS_API_HTTP_ADDR
+              value: "0.0.0.0:8080"
+            - name: MAS_API_GRPC_ADDR
+              value: "0.0.0.0:50051"
+            - name: MAS_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.postgres.existingSecret }}
+                  key: database-url
+            - name: MAS_AI_BRIDGE_ENDPOINT
+              value: "http://{{ include "enterprise-mas.fullname" . }}-orchestrator:9100"
+            - name: MAS_AI_BRIDGE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.postgres.existingSecret }}
+                  key: ai-bridge-token
+          envFrom:
+            - secretRef:
+                name: {{ .Values.postgres.existingSecret }}
+          livenessProbe:
+            httpGet:
+              path: /v1/health/live
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /v1/health/ready
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.api.resources | nindent 12 }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

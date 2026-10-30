@@ -1,0 +1,195 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUST_TOOLCHAIN: 1.98.1
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: rust (fmt, clippy, test, nats, deny)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: mas_live
+          POSTGRES_USER: mas
+          POSTGRES_PASSWORD: mas
+          POSTGRES_INITDB_ARGS: "--auth-local=trust"
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U mas -d mas_live"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      nats:
+        image: nats:2.10
+        ports: ["4222:4222"]
+        options: >-
+          --health-cmd "nats ping || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+          components: rustfmt, clippy
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            enterprise-mas/rust-core/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('enterprise-mas/rust-core/Cargo.lock') }}
+      - name: cargo fmt --check
+        working-directory: enterprise-mas/rust-core
+        run: cargo fmt --all -- --check
+      - name: cargo clippy
+        working-directory: enterprise-mas/rust-core
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: cargo test (live DB)
+        working-directory: enterprise-mas/rust-core
+        env:
+          MAS_ENV: test
+          MAS_TEST_DATABASE_URL: postgres://mas:mas@127.0.0.1:5432/mas_live
+          MAS_TEST_DATABASE_APP_URL: postgres://mas_app:mas_app_pw@127.0.0.1:5432/mas_live
+        run: cargo test --workspace --locked
+      - name: cargo test (nats feature)
+        working-directory: enterprise-mas/rust-core
+        run: cargo test --workspace --locked --features nats
+      - name: cargo deny check
+        working-directory: enterprise-mas/rust-core
+        run: cargo deny check
+
+  bridge-e2e:
+    name: bridge-e2e (Rust <-> Python)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install Python deps
+        working-directory: enterprise-mas/python-orchestrator
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install grpcio>=1.84 protobuf>=7.35.1,<8
+      - name: cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            enterprise-mas/rust-core/target
+          key: ${{ runner.os }}-cargo-e2e-${{ hashFiles('enterprise-mas/rust-core/Cargo.lock') }}
+      - name: run ignored bridge e2e tests
+        working-directory: enterprise-mas/rust-core
+        run: cargo test -p mas-ai-bridge --test e2e_python --locked -- --ignored
+
+  python:
+    name: python (scripts/check.sh)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install toolchain
+        working-directory: enterprise-mas/python-orchestrator
+        run: bash scripts/bootstrap.sh
+      - name: run checks
+        working-directory: enterprise-mas/python-orchestrator
+        run: bash scripts/check.sh
+
+  openapi-parity:
+    name: openapi parity (api crate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+      - name: cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            enterprise-mas/rust-core/target
+          key: ${{ runner.os }}-cargo-parity-${{ hashFiles('enterprise-mas/rust-core/Cargo.lock') }}
+      - name: run openapi parity test
+        working-directory: enterprise-mas/rust-core
+        run: cargo test -p mas-api --test openapi_parity --locked
+
+  docker-build:
+    name: docker-build (all images, no push)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: build api image
+        run: docker build -f deploy/docker/api.Dockerfile -t enterprise-mas/api:local .
+      - name: build worker image
+        run: docker build -f deploy/docker/worker.Dockerfile -t enterprise-mas/worker:local .
+      - name: build scheduler image
+        run: docker build -f deploy/docker/scheduler.Dockerfile -t enterprise-mas/scheduler:local .
+      - name: build migrate image
+        run: docker build -f deploy/docker/migrate.Dockerfile -t enterprise-mas/migrate:local .
+      - name: build orchestrator image
+        run: docker build -f deploy/docker/orchestrator.Dockerfile -t enterprise-mas/orchestrator:local .
+
+  compose-smoke:
+    name: compose smoke (scripts/e2e-smoke.sh)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: mas_live
+          POSTGRES_USER: mas
+          POSTGRES_PASSWORD: mas
+          POSTGRES_INITDB_ARGS: "--auth-local=trust"
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U mas -d mas_live"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      nats:
+        image: nats:2.10
+        ports: ["4222:4222"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: run compose smoke
+        run: bash enterprise-mas/scripts/e2e-smoke.sh
+        env:
+          MAS_ENV: test
+          MAS_TEST_DATABASE_URL: postgres://mas:mas@127.0.0.1:5432/mas_live
+          MAS_TEST_DATABASE_APP_URL: postgres://mas_app:mas_app_pw@127.0.0.1:5432/mas_live

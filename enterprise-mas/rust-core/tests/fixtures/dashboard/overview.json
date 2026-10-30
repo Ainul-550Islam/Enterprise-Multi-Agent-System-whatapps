@@ -1,0 +1,37 @@
+{
+  "data": {
+    "from": "2026-10-01T00:00:00Z",
+    "to": "2026-10-30T00:00:00Z",
+    "total_agents": {
+      "value": 12.0,
+      "delta_percent": 5.0,
+      "sparkline": [8.0, 9.0, 10.0, 11.0, 12.0],
+      "unit": "count"
+    },
+    "tasks_completed": {
+      "value": 1240.0,
+      "delta_percent": 12.0,
+      "sparkline": [200.0, 220.0, 240.0, 260.0, 320.0],
+      "unit": "count"
+    },
+    "success_rate": {
+      "value": 0.97,
+      "delta_percent": 1.0,
+      "sparkline": [0.95, 0.96, 0.965, 0.97, 0.97],
+      "unit": "percent"
+    },
+    "time_saved_minutes": {
+      "value": 450.0,
+      "delta_percent": 8.0,
+      "sparkline": [80.0, 90.0, 100.0, 110.0, 70.0],
+      "unit": "minutes"
+    }
+  },
+  "error": null,
+  "meta": {
+    "request_id": "00000000-0000-0000-0000-000000000001",
+    "correlation_id": "corr-overview-01",
+    "api_version": "v1",
+    "responded_at": "2026-10-30T00:00:00Z"
+  }
+}

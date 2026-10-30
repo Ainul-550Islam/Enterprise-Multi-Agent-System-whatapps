@@ -47,3 +47,12 @@ The repository also provides `scripts/bootstrap.sh`, `scripts/check.sh`, `script
 ## Production run
 
 The Python process exposes only the private gRPC listener and its configured health surface. Run it as a non-root service, restrict network ingress to Rust API/worker callers, limit provider egress, mount secret references read-only, and shut it down through the registered lifecycle coordinator so active bridge calls can drain. Production composition refuses an empty provider/model registry or a missing required backend instead of serving a degraded health response.
+
+## Deployment
+
+The orchestrator ships as `deploy/docker/orchestrator.Dockerfile` (non-root, gRPC
+private port only, no provider keys baked in) and is wired into
+`deploy/compose/docker-compose.yml` (internal network; only the Rust API port
+is published) and `deploy/helm/enterprise-mas/templates/orchestrator-deployment.yaml`
+(ClusterIP gRPC service, default-deny NetworkPolicy). Provider mode defaults to
+`disabled`; enable explicitly in production.

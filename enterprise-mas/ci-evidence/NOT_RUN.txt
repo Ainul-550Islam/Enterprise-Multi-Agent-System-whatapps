@@ -1,0 +1,13 @@
+Commands that could not be run in this environment (honest record — no Docker daemon, no PostgreSQL/pgvector server, no nats-server binary, and no root/apt access to install them):
+
+- cargo test -p mas-persistence --locked --test live_pg ... (MAS_TEST_DATABASE_URL / MAS_TEST_DATABASE_APP_URL)
+  Reason: PostgreSQL with pgvector is not installed and cannot be installed (no root; apt-get lock permission denied). Live-pg tests self-skip without the env URLs.
+  Real error: `psql: command not found`; no postgres initdb/pg_ctl binary present.
+
+- scripts/e2e-smoke.sh / compose-smoke (docker compose up)
+  Reason: Docker daemon not available (`docker: command not found`); no postgres/pgvector or nats-server binaries present.
+
+- cargo doc --workspace --no-deps --locked (RUSTDOCFLAGS=-D warnings)
+  Not required by Batch 03 command list (check.sh equivalent in repo omits doc gate); listed here only as not-run-by-batch-03.
+
+ENVIRONMENT captured in ci-evidence/ENVIRONMENT.txt: rustc 1.99.1, cargo 1.99.1, Python 3.13.16, Linux x86_64. psql/nats-server/docker absent.

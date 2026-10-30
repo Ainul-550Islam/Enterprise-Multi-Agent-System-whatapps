@@ -1,0 +1,114 @@
+# values.yaml — enterprise-mas Helm chart
+# All secrets are references (existingSecret names) only; no raw values.
+
+image:
+  registry: ""
+  repository: enterprise-mas
+  tag: local
+  pullPolicy: IfNotPresent
+
+api:
+  replicaCount: 2
+  image: api
+  httpAddr: 0.0.0.0:8080
+  grpcAddr: 0.0.0.0:50051
+  resources:
+    limits:
+      cpu: 2
+      memory: 4Gi
+    requests:
+      cpu: 250m
+      memory: 512Mi
+  probes:
+    liveness:
+      path: /v1/health/live
+      port: 8080
+    readiness:
+      path: /v1/health/ready
+      port: 8080
+
+worker:
+  replicaCount: 2
+  image: worker
+  consumerName: tasks-prod
+  resources:
+    limits:
+      cpu: 4
+      memory: 8Gi
+    requests:
+      cpu: 250m
+      memory: 512Mi
+
+scheduler:
+  replicaCount: 1   # leases/leader semantics: one active scheduler
+  image: scheduler
+  resources:
+    limits:
+      cpu: 1
+      memory: 2Gi
+    requests:
+      cpu: 100m
+      memory: 256Mi
+
+orchestrator:
+  replicaCount: 2
+  image: orchestrator
+  bindPort: 9100
+  grpcPort: 9100
+  resources:
+    limits:
+      cpu: 4
+      memory: 8Gi
+    requests:
+      cpu: 250m
+      memory: 512Mi
+
+migrate:
+  image: migrate
+  command: ["up"]
+
+# External infrastructure references (operator-provided).
+postgres:
+  host: postgres.mas.svc.cluster.local
+  port: 5432
+  db: mas_live
+  existingSecret: mas-postgres-credentials   # contains MAS_DATABASE_URL etc.
+
+nats:
+  host: nats.mas.svc.cluster.local
+  port: 4222
+  existingSecret: mas-nats-credentials
+
+# Provider mode default: disabled (production must enable explicitly).
+providers:
+  mode: disabled
+  enabledProviders: []
+  allowedModels: []
+
+# Ingress off by default.
+ingress:
+  enabled: false
+  class: nginx
+  tls:
+    enabled: false
+
+# Security context (hardened, applied to all workloads).
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  fsGroup: 65532
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: ["ALL"]
+  seccompProfile:
+    type: RuntimeDefault
+
+# HPA disabled by default (opt-in flag).
+hpa:
+  enabled: false
+  apiMinReplicas: 2
+  apiMaxReplicas: 10
+  workerMinReplicas: 2
+  workerMaxReplicas: 20
+  targetCPUUtilizationPercentage: 70

@@ -1,0 +1,289 @@
+FIXES.patch — minimal Batch 03 fixes (applied to repo root).
+
+Fixes:
+  1. enterprise-mas/rust-core/Cargo.toml + crates/{ai-bridge,api,cli,scheduler-service,worker}/Cargo.toml
+     : license "Proprietary" -> "LicenseRef-Proprietary" (6 files) so cargo-deny
+     : treats them as allowed proprietary crates instead of unlicensed.
+  2. enterprise-mas/rust-core/deny.toml : rewritten to cargo-deny 0.20 schema;
+     : licenses.allow includes LicenseRef-Proprietary + CDLA-Permissive-2.0;
+     : bans LLM provider SDKs in rust-core; sources restricted to crates.io.
+  3. enterprise-mas/rust-core/Cargo.lock : upgraded rustls 0.23.45->0.23.46,
+     : rustls-webpki 0.103.15->0.103.16, tokio 1.53.1->1.54.1 (+tokio-util)
+     : to resolve advisories found by cargo audit.
+  4. enterprise-mas/python-orchestrator/src/mas_orchestrator/tools/builtins/webhook.py
+     : ruff E501 line-too-long (101>100) fixed by splitting the string literal.
+  5. Environment (not a file diff): pip install psycopg installed (3.3.6);
+     : psycopg-binary alone could not be imported as psycopg.
+  6. Environment (not a file diff): pip install pgvector psycopg_pool
+     : types-defusedxml beautifulsoup4 pypdf python-docx installed the missing
+     : deps the mypy/pytest suite imports.
+
+--- begin diff ---
+diff --git a/enterprise-mas/python-orchestrator/src/mas_orchestrator/tools/builtins/webhook.py b/enterprise-mas/python-orchestrator/src/mas_orchestrator/tools/builtins/webhook.py
+index aff4cec..3b87593 100644
+--- a/enterprise-mas/python-orchestrator/src/mas_orchestrator/tools/builtins/webhook.py
++++ b/enterprise-mas/python-orchestrator/src/mas_orchestrator/tools/builtins/webhook.py
+@@ -185,7 +185,8 @@ class WebhookTool:
+     ) -> None:
+         if not config.direct_delivery_enabled:
+             raise InvalidRequestError(
+-                "direct Python webhook delivery is disabled; use the durable Rust integration plane",
++                "direct Python webhook delivery is disabled; use the durable "
++                "Rust integration plane",
+                 details={"reason": "durable_webhook_required"},
+             )
+         if config.sign_payloads and secret is None:
+diff --git a/enterprise-mas/rust-core/Cargo.lock b/enterprise-mas/rust-core/Cargo.lock
+index dba687a..f7847bd 100644
+--- a/enterprise-mas/rust-core/Cargo.lock
++++ b/enterprise-mas/rust-core/Cargo.lock
+@@ -1094,7 +1094,7 @@ dependencies = [
+  "tokio",
+  "tokio-rustls",
+  "tower-service",
+- "webpki-roots 1.0.9",
++ "webpki-roots 1.0.11",
+ ]
+ 
+ [[package]]
+@@ -2347,7 +2347,7 @@ dependencies = [
+  "quinn-udp",
+  "rustc-hash",
+  "rustls",
+- "socket2 0.6.5",
++ "socket2 0.5.10",
+  "thiserror",
+  "tokio",
+  "tracing",
+@@ -2385,7 +2385,7 @@ dependencies = [
+  "cfg_aliases",
+  "libc",
+  "once_cell",
+- "socket2 0.6.5",
++ "socket2 0.5.10",
+  "tracing",
+  "windows-sys 0.61.2",
+ ]
+@@ -2598,7 +2598,7 @@ dependencies = [
+  "wasm-bindgen",
+  "wasm-bindgen-futures",
+  "web-sys",
+- "webpki-roots 1.0.9",
++ "webpki-roots 1.0.11",
+ ]
+ 
+ [[package]]
+@@ -2665,9 +2665,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "rustls"
+-version = "0.23.45"
++version = "0.23.46"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
++checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
+ dependencies = [
+  "log",
+  "once_cell",
+@@ -2702,9 +2702,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "rustls-webpki"
+-version = "0.103.15"
++version = "0.103.16"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
++checksum = "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281"
+ dependencies = [
+  "ring",
+  "rustls-pki-types",
+@@ -3355,9 +3355,9 @@ checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
+ 
+ [[package]]
+ name = "tokio"
+-version = "1.53.1"
++version = "1.54.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "202caea871b69668250d242070849eb495be178ed697a3e98aebce5bc81a0bed"
++checksum = "b52fd3255258d26fac7264ab5a76b53c13367136dc011d3d6ad4f8ed070396a3"
+ dependencies = [
+  "bytes",
+  "libc",
+@@ -3829,14 +3829,14 @@ version = "0.26.11"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
+ dependencies = [
+- "webpki-roots 1.0.9",
++ "webpki-roots 1.0.11",
+ ]
+ 
+ [[package]]
+ name = "webpki-roots"
+-version = "1.0.9"
++version = "1.0.11"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
++checksum = "f5f280bbb2b287bc8e7de7e3852945a0ff50d1bbcb5ed42b6c7a568c546df171"
+ dependencies = [
+  "rustls-pki-types",
+ ]
+@@ -3857,7 +3857,7 @@ version = "0.1.11"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
+ dependencies = [
+- "windows-sys 0.61.2",
++ "windows-sys 0.48.0",
+ ]
+ 
+ [[package]]
+diff --git a/enterprise-mas/rust-core/Cargo.toml b/enterprise-mas/rust-core/Cargo.toml
+index f88a464..78bf3c2 100644
+--- a/enterprise-mas/rust-core/Cargo.toml
++++ b/enterprise-mas/rust-core/Cargo.toml
+@@ -62,7 +62,7 @@ members = [
+ version = "0.1.0"
+ edition = "2021"
+ rust-version = "1.85.0"
+-license = "Proprietary"
++license = "LicenseRef-Proprietary"
+ publish = false
+ homepage = "https://enterprise-mas.internal"
+ repository = "https://enterprise-mas.internal/enterprise-mas"
+diff --git a/enterprise-mas/rust-core/crates/ai-bridge/Cargo.toml b/enterprise-mas/rust-core/crates/ai-bridge/Cargo.toml
+index 37e0fdb..4f96ef4 100644
+--- a/enterprise-mas/rust-core/crates/ai-bridge/Cargo.toml
++++ b/enterprise-mas/rust-core/crates/ai-bridge/Cargo.toml
+@@ -11,7 +11,7 @@ version = "0.1.0"
+ edition = "2021"
+ rust-version = "1.85"
+ description = "gRPC adapter implementing mas-execution's AgentBridge port against the Python AI Orchestrator."
+-license = "Proprietary"
++license = "LicenseRef-Proprietary"
+ publish = false
+ 
+ [lib]
+diff --git a/enterprise-mas/rust-core/crates/api/Cargo.toml b/enterprise-mas/rust-core/crates/api/Cargo.toml
+index de942c5..30d1ff1 100644
+--- a/enterprise-mas/rust-core/crates/api/Cargo.toml
++++ b/enterprise-mas/rust-core/crates/api/Cargo.toml
+@@ -23,7 +23,7 @@ version = "0.1.0"
+ edition = "2021"
+ rust-version = "1.85"
+ description = "HTTP + gRPC api processes: thin transports over mas-application use-cases"
+-license = "Proprietary"
++license = "LicenseRef-Proprietary"
+ 
+ [lib]
+ name = "mas_api"
+diff --git a/enterprise-mas/rust-core/crates/cli/Cargo.toml b/enterprise-mas/rust-core/crates/cli/Cargo.toml
+index 4f37d08..9ffe467 100644
+--- a/enterprise-mas/rust-core/crates/cli/Cargo.toml
++++ b/enterprise-mas/rust-core/crates/cli/Cargo.toml
+@@ -4,7 +4,7 @@ version = "0.1.0"
+ edition = "2021"
+ rust-version = "1.85"
+ description = "mas' operator CLI: HTTP client + subcommand surface over the public API"
+-license = "Proprietary"
++license = "LicenseRef-Proprietary"
+ 
+ [lib]
+ name = "mas_cli"
+diff --git a/enterprise-mas/rust-core/crates/scheduler-service/Cargo.toml b/enterprise-mas/rust-core/crates/scheduler-service/Cargo.toml
+index 661cab8..dfa6cf2 100644
+--- a/enterprise-mas/rust-core/crates/scheduler-service/Cargo.toml
++++ b/enterprise-mas/rust-core/crates/scheduler-service/Cargo.toml
+@@ -17,7 +17,7 @@ version = "0.1.0"
+ edition = "2021"
+ rust-version = "1.85"
+ description = "Scheduler tick driver process: interval-driven runtime, dispatch adapters, in-flight ledger, completion listener"
+-license = "Proprietary"
++license = "LicenseRef-Proprietary"
+ 
+ [lib]
+ name = "mas_scheduler_service"
+diff --git a/enterprise-mas/rust-core/crates/worker/Cargo.toml b/enterprise-mas/rust-core/crates/worker/Cargo.toml
+index c8e472f..9bfc268 100644
+--- a/enterprise-mas/rust-core/crates/worker/Cargo.toml
++++ b/enterprise-mas/rust-core/crates/worker/Cargo.toml
+@@ -19,7 +19,7 @@ version = "0.1.0"
+ edition = "2021"
+ rust-version = "1.85"
+ description = "Task consumer process: leases, retries, heartbeats, graceful shutdown"
+-license = "Proprietary"
++license = "LicenseRef-Proprietary"
+ 
+ [lib]
+ name = "mas_worker"
+diff --git a/enterprise-mas/rust-core/deny.toml b/enterprise-mas/rust-core/deny.toml
+new file mode 100644
+index 0000000..cd0a7c309d24cab99581e27d2df820dbd7a71a11
+--- /dev/null
++++ b/enterprise-mas/rust-core/deny.toml
++# PURPOSE: cargo-deny policy for the rust-core workspace.
++#
++# Owning layer: supply-chain governance.
++#
++# Production responsibility: keep the dependency surface auditable — only
++# crates.io sources, only licenses the commercial LICENSE policy can ship,
++# no LLM provider SDKs in rust-core (model providers live exclusively in the
++# Python orchestrator), every known advisory denied, and duplicate versions
++# surfaced as warnings so the lockfile stays coherent.
++#
++# It must NOT:
++#   • blanket-allow a real advisory to silence `cargo deny check`;
++#   • permit git/path sources that break `--locked` reproducibility;
++#   • allow LLM provider SDKs into this workspace.
++[licenses]
++# The product ships under a proprietary commercial source license (see
++# LICENSE at the repo root); every crate manifest uses the matching
++# `LicenseRef-Proprietary` expression, which is allowed here.
++allow = [
++  "LicenseRef-Proprietary",
++  "MIT",
++  "Apache-2.0",
++  "BSD-2-Clause",
++  "BSD-3-Clause",
++  "BSD-3-Clause-No-Nuclear-License",
++  "BSD-3-Clause-No-Nuclear-Warranty",
++  "BSD-4-Clause",
++  "0BSD",
++  "ISC",
++  "MPL-2.0",
++  "CDLA-Permissive-2.0",
++  "Unicode-3.0",
++  "Unicode-DFS-2016",
++  "Unicode-TOU",
++  "Zlib",
++  "Unlicense",
++]
++[advisories]
++# Vulnerability and unsound advisories are errors by default in cargo-deny;
++# this section exists to record the policy explicitly. Never add an `ignore`
++# entry without a linked security review.
++[sources]
++# crates.io is the only registry this workspace pulls from; `--locked` in CI
++# then means the graph is fully auditable and reproducible.
++unknown-registry = "deny"
++allow-registry = [
++  "https://github.com/rust-lang/crates.io-index",
++]
++unknown-git = "deny"
++allow-git = []
++[bans]
++multiple-versions = "warn"
++# LLM provider SDKs must never land in rust-core: model selection, prompt
++# assembly, provider SDK calls, token streaming and cost logic live only in
++# the Python orchestrator, reached through the versioned gRPC bridge.
++deny = [
++  { crate = "openai", reason = "LLM provider SDKs belong in the Python orchestrator, not rust-core" },
++  { crate = "anthropic", reason = "LLM provider SDKs belong in the Python orchestrator, not rust-core" },
++  { crate = "cohere-ai", reason = "LLM provider SDKs belong in the Python orchestrator, not rust-core" },
++  { crate = "google-generative-ai", reason = "LLM provider SDKs belong in the Python orchestrator, not rust-core" },
++  { crate = "genai", reason = "LLM provider SDKs belong in the Python orchestrator, not rust-core" },
++  { crate = "bedrock", reason = "LLM provider SDKs belong in the Python orchestrator, not rust-core" },
++  { crate = "bedrock-agent", reason = "LLM provider SDKs belong in the Python orchestrator, not rust-core" },
++  { crate = "azure-openai", reason = "LLM provider SDKs belong in the Python orchestrator, not rust-core" },
++  { crate = "huggingface", reason = "LLM provider SDKs belong in the Python orchestrator, not rust-core" },
++  { crate = "llm-sdk", reason = "LLM provider SDKs belong in the Python orchestrator, not rust-core" },
++  { crate = "mcp-sdk", reason = "LLM provider SDKs belong in the Python orchestrator, not rust-core" },
++]

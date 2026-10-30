@@ -1,0 +1,33 @@
+# Root ignore — enterprise-mas sale-readiness (Batch 03)
+# Build outputs
+target/
+.venv/
+__pycache__/
+*.pyc
+node_modules/
+pgdata/
+pg16/
+.cargo/bin/
+
+# Environment files — never commit real values; .env.example is the template
+.env
+.env.*
+!.env.example
+
+# Logs — keep only the CI evidence tree (raw logs, intentional)
+*.log
+!ci-evidence/*.log
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Duplicates / legacy archives removed by scripts/repo-cleanup.sh
+Module1_Full_Source.zip
+module1-full-source/
+.cargo/bin/rustup
+.profile
