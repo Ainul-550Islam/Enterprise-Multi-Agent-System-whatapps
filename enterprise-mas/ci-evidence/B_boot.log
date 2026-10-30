@@ -1,0 +1,2 @@
+mas-api: 0 migration(s) applied on boot
+mas-api starting mode=production http=127.0.0.1:18080 grpc=127.0.0.1:15051

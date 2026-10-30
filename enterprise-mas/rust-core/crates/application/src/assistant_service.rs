@@ -222,4 +222,63 @@ mod tests {
         ));
         assert_eq!(checksum.len(), 64);
     }
+
+    /// Assistant submission is a user action: the audit actor must be the
+    /// person chatting. An API-key principal (the only token type the
+    /// production HTTP verifier issues besides OIDC users) hits the gate
+    /// and is refused with the production message; a user actor with a real
+    /// id passes.
+    #[test]
+    fn submission_gate_refuses_api_key_principals_and_accepts_users() {
+        let requested_at = mas_common::timestamps::Timestamp::now();
+
+        let user_actor = mas_domain::AuditActor::new(
+            mas_domain::AuditActorKind::User,
+            uuid::Uuid::now_v7().to_string(),
+        )
+        .expect("user actor");
+        let user_ctx =
+            ServiceContext::new(user_actor, None, None, "assistant-gate-user", &requested_at)
+                .expect("user context");
+        assert!(
+            authenticated_user(&user_ctx).is_ok(),
+            "a user principal must pass the assistant submission gate"
+        );
+
+        let key_actor = mas_domain::AuditActor::new(
+            mas_domain::AuditActorKind::ApiKey,
+            format!("api-key:{}", uuid::Uuid::now_v7()),
+        )
+        .expect("api-key actor");
+        let key_ctx = ServiceContext::new(
+            key_actor,
+            None,
+            None,
+            "assistant-gate-api-key",
+            &requested_at,
+        )
+        .expect("api-key context");
+        let err = authenticated_user(&key_ctx)
+            .expect_err("an api-key principal must be refused by the assistant gate");
+        assert!(
+            matches!(err, AppError::Forbidden(ref message) if message
+                .contains("requires an authenticated user principal")),
+            "unexpected refusal shape: {err:?}"
+        );
+
+        let nil_user = mas_domain::AuditActor::new(
+            mas_domain::AuditActorKind::User,
+            uuid::Uuid::nil().to_string(),
+        )
+        .expect("nil user actor");
+        let nil_ctx =
+            ServiceContext::new(nil_user, None, None, "assistant-gate-nil", &requested_at)
+                .expect("nil user context");
+        let err = authenticated_user(&nil_ctx)
+            .expect_err("the nil user id must be refused rather than audited");
+        assert!(
+            matches!(err, AppError::Forbidden(_)),
+            "unexpected refusal shape: {err:?}"
+        );
+    }
 }

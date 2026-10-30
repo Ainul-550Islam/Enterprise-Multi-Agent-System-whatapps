@@ -277,6 +277,67 @@ pub fn refuse_if(condition: bool, message: impl Into<String>) -> Result<()> {
     }
 }
 
+/// Typed bounds for the Server-Sent Events plane (`[stream]` in
+/// `config/{default,production}.toml`).
+///
+/// These are the only knobs the SSE fan-out obeys: a keep-alive heartbeat so
+/// idle connections and intermediary timeouts stay distinguishable, one
+/// bounded broadcast buffer per active tenant channel, and a per-principal
+/// connection cap so one authenticated actor cannot monopolise the hub.
+/// Bounds are validated fail-closed — a zero heartbeat or unbounded buffer
+/// must refuse configuration, never degrade into a silent default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamConfig {
+    /// Seconds between SSE keep-alive heartbeat comments.
+    pub heartbeat_secs: u64,
+    /// Per-tenant broadcast channel capacity; a slower client is disconnected
+    /// once it lags this far behind rather than growing an unbounded queue.
+    pub channel_buffer: usize,
+    /// Maximum concurrent `/v1/stream` connections per authenticated
+    /// principal (tenant + subject).
+    pub max_connections_per_principal: usize,
+}
+
+impl StreamConfig {
+    /// Validates every bound; failures name the offending key.
+    ///
+    /// # Errors
+    /// `AppError::validation` when any bound is zero or outside the
+    /// supported production range.
+    pub fn validate(&self) -> Result<()> {
+        if !(1..=300).contains(&self.heartbeat_secs) {
+            return Err(AppError::validation(format!(
+                "stream.heartbeat_secs must be between 1 and 300 (got {})",
+                self.heartbeat_secs
+            )));
+        }
+        if !(1..=65_536).contains(&self.channel_buffer) {
+            return Err(AppError::validation(format!(
+                "stream.channel_buffer must be between 1 and 65536 (got {})",
+                self.channel_buffer
+            )));
+        }
+        if !(1..=1_024).contains(&self.max_connections_per_principal) {
+            return Err(AppError::validation(format!(
+                "stream.max_connections_per_principal must be between 1 and 1024 (got {})",
+                self.max_connections_per_principal
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl Default for StreamConfig {
+    /// Production/typed defaults mirroring `config/default.toml`.
+    fn default() -> Self {
+        Self {
+            heartbeat_secs: 15,
+            channel_buffer: 256,
+            max_connections_per_principal: 8,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,5 +395,29 @@ mod tests {
     fn refuse_if_guards() {
         assert!(refuse_if(true, "nope").is_err());
         assert!(refuse_if(false, "fine").is_ok());
+    }
+
+    #[test]
+    fn stream_config_defaults_are_valid_and_bounds_fail_closed() {
+        let config = StreamConfig::default();
+        assert_eq!(config.heartbeat_secs, 15);
+        assert_eq!(config.channel_buffer, 256);
+        assert_eq!(config.max_connections_per_principal, 8);
+        assert!(config.validate().is_ok());
+        let zero_heartbeat = StreamConfig {
+            heartbeat_secs: 0,
+            ..StreamConfig::default()
+        };
+        assert!(zero_heartbeat.validate().is_err());
+        let unbounded_buffer = StreamConfig {
+            channel_buffer: 0,
+            ..StreamConfig::default()
+        };
+        assert!(unbounded_buffer.validate().is_err());
+        let no_cap = StreamConfig {
+            max_connections_per_principal: 0,
+            ..StreamConfig::default()
+        };
+        assert!(no_cap.validate().is_err());
     }
 }

@@ -37,6 +37,8 @@ pub mod oidc_auth;
 pub mod prod_auth;
 pub mod response;
 pub mod router;
+pub mod routes_governance;
+pub mod routes_tooling;
 pub mod scope_resolution;
 pub mod server;
 pub mod state;

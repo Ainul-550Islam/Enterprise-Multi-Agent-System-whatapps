@@ -1,0 +1,19 @@
+[55472] 2026/10/29 14:54:20.833976 [INF] Starting nats-server
+[55472] 2026/10/29 14:54:20.834021 [INF]   Version:  2.15.2
+[55472] 2026/10/29 14:54:20.834024 [INF]   Git:      [5a815f1]
+[55472] 2026/10/29 14:54:20.834026 [INF]   Name:     NB7TGL5QGIZCOQPVYTWBXH3ZIKT47JGY6VVNA5GKO5HF7UQDDLQVRA2Y
+[55472] 2026/10/29 14:54:20.834031 [INF]   ID:       NB7TGL5QGIZCOQPVYTWBXH3ZIKT47JGY6VVNA5GKO5HF7UQDDLQVRA2Y
+[55472] 2026/10/29 14:54:20.834464 [INF] Listening for client connections on 0.0.0.0:4222
+[55472] 2026/10/29 14:54:20.834591 [ERR] Address "0.0.0.0" can not be resolved properly
+[55472] 2026/10/29 14:54:20.834598 [INF] Server is ready
+[55472] 2026/10/29 14:54:21.830318 [ERR] 127.0.0.1:48134 - cid:5 - Client parser ERROR, state=0, i=0: proto='""...'
+[55472] 2026/10/29 14:54:27.610086 [ERR] 127.0.0.1:40298 - cid:6 - Client parser ERROR, state=0, i=0: proto='""...'
+[55472] 2026/10/29 14:54:27.610847 [ERR] 127.0.0.1:40312 - cid:7 - Client parser ERROR, state=0, i=0: proto='""...'
+[55472] 2026/10/29 15:13:20.832750 [ERR] 127.0.0.1:48414 - cid:9 - Client parser ERROR, state=0, i=0: proto='""...'
+[55472] 2026/10/29 15:13:20.832828 [ERR] 127.0.0.1:48416 - cid:10 - Client parser ERROR, state=0, i=0: proto='""...'
+[55472] 2026/10/29 15:56:15.359311 [ERR] 127.0.0.1:38178 - cid:19 - Client parser ERROR, state=0, i=0: proto='""...'
+[55472] 2026/10/29 15:56:15.359382 [ERR] 127.0.0.1:38184 - cid:20 - Client parser ERROR, state=0, i=0: proto='""...'
+[55472] 2026/10/29 16:01:02.502466 [ERR] 127.0.0.1:33014 - cid:23 - Client parser ERROR, state=0, i=0: proto='""...'
+[55472] 2026/10/29 16:01:02.503274 [ERR] 127.0.0.1:33016 - cid:24 - Client parser ERROR, state=0, i=0: proto='""...'
+[55472] 2026/10/29 17:13:53.964458 [ERR] 127.0.0.1:35572 - cid:27 - Client parser ERROR, state=0, i=0: proto='""...'
+[55472] 2026/10/29 17:13:53.964576 [ERR] 127.0.0.1:35566 - cid:26 - Client parser ERROR, state=0, i=0: proto='""...'

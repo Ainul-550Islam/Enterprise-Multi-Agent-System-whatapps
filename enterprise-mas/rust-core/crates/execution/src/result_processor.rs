@@ -133,6 +133,9 @@ pub fn classify_failure(error: &AppError) -> FailureClass {
             FailureClass::Platform
         },
         AppError::Conflict(_) => FailureClass::NonRetryable,
+        // Not a request or environment failure: the deployment has no such
+        // surface, and no number of attempts will compose one.
+        AppError::Unavailable(_) => FailureClass::NonRetryable,
     }
 }
 

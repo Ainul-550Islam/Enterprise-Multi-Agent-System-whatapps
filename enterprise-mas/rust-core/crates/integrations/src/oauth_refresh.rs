@@ -310,6 +310,10 @@ fn classify_refresh_error(error: AppError) -> OAuthRefreshFailure {
         | AppError::ExternalFailure { .. }
         | AppError::QuotaExceeded { .. }
         | AppError::PolicyDenied { .. }
+        // A not-composed surface is classified with the other transient
+        // conditions: the bounded attempt budget dead-letters the job rather
+        // than silently dropping token refresh work.
+        | AppError::Unavailable(_)
         | AppError::EntitlementRequired { .. } => OAuthRefreshFailure::transient(),
     }
 }

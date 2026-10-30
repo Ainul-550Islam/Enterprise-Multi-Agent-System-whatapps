@@ -1,0 +1,18 @@
+    Finished `test` profile [unoptimized] target(s) in 0.32s
+     Running tests/governance_routes.rs (target/debug/deps/governance_routes-cf6bd11c099b830a)
+
+running 9 tests
+test audit_actor_type_is_redactable_and_canonical ... ok
+test audit_page_uses_items_and_optional_next_cursor_shape ... ok
+test dry_run_policy_evaluation_does_not_emit_a_mutation_audit ... ok
+test foreign_tenant_policy_ids_are_hidden_as_not_found ... ok
+test foreign_tenant_policy_mutations_and_dry_runs_are_hidden_as_not_found ... ok
+test auth_me_requires_authentication ... ok
+test protected_governance_routes_reject_unauthenticated_requests ... ok
+test viewer_cannot_mutate_policies_through_the_canonical_matrix ... ok
+test published_policy_versions_are_not_edited_in_place ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+EXIT_CODE=0
+UTC=2026-10-29T17:18:01Z

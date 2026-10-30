@@ -1,0 +1,330 @@
+== Phase C: static gates (batch files + diff vs origin/main) ==
+-- S1 existence / PURPOSE header / size --
+PASS S1 crates/api/src/handlers/auth.rs PURPOSE header
+PASS S1 crates/api/src/handlers/audit.rs PURPOSE header
+PASS S1 crates/api/src/handlers/policies.rs PURPOSE header
+PASS S1 crates/api/src/handlers/usage.rs PURPOSE header
+PASS S1 crates/api/src/routes_governance.rs PURPOSE header
+PASS S1 crates/api/tests/governance_routes.rs PURPOSE header
+PASS S1 crates/application/src/audit_query_service.rs PURPOSE header
+PASS S1 crates/application/src/policy_service.rs PURPOSE header
+PASS S1 crates/application/src/usage_service.rs PURPOSE header
+PASS S1 crates/persistence/src/repositories/usage.rs PURPOSE header
+PASS S1 crates/persistence/tests/usage_live_pg.rs PURPOSE header
+PASS S1 crates/persistence/src/repositories/audit.rs PURPOSE header
+PASS S1 crates/security/tests/jwks.rs PURPOSE header
+PASS S1 crates/api/src/handlers/tools.rs PURPOSE header
+PASS S1 crates/api/src/handlers/connectors.rs PURPOSE header
+PASS S1 crates/api/src/handlers/webhooks.rs PURPOSE header
+PASS S1 crates/api/src/handlers/stream.rs PURPOSE header
+PASS S1 crates/api/src/handlers/assistant.rs PURPOSE header
+PASS S1 crates/api/src/routes_tooling.rs PURPOSE header
+PASS S1 crates/api/tests/tooling_routes.rs PURPOSE header
+PASS S1 crates/application/src/tool_service.rs PURPOSE header
+PASS S1 crates/application/src/connector_service.rs PURPOSE header
+PASS S1 crates/application/src/webhook_service.rs PURPOSE header
+PASS S1 crates/application/src/stores.rs PURPOSE header
+PASS S1 crates/persistence/src/repositories/tools.rs PURPOSE header
+PASS S1 crates/persistence/src/repositories/webhook_admin.rs PURPOSE header
+PASS S1 crates/persistence/src/repositories/connector_lifecycle.rs PURPOSE header
+PASS S1 crates/persistence/tests/tools_live_pg.rs PURPOSE header
+PASS S1 crates/persistence/tests/analytics_live_pg.rs PURPOSE header
+PASS S1 crates/persistence/tests/rollback_live_pg.rs PURPOSE header
+PASS S1 crates/messaging/src/event_tail.rs PURPOSE header
+PASS S1 crates/persistence/tests/project_list_live_pg.rs PURPOSE header
+PASS S1 scripts/verify-inventory.sh PURPOSE header
+PASS S1 scripts/verify-routes.sh PURPOSE header
+PASS S1 scripts/verify-static.sh PURPOSE header
+PASS S1 crates/ai-bridge/src/lib.rs size ok (before=1334 after=1335)
+PASS S1 crates/api/src/grpc.rs size ok (before=1361 after=1362)
+PASS S1 crates/api/src/handlers/assistant.rs size ok (before=50 after=57)
+PASS S1 crates/api/src/handlers/audit.rs size ok (before=60 after=60)
+PASS S1 crates/api/src/handlers/auth.rs size ok (before=154 after=161)
+PASS S1 crates/api/src/handlers/connectors.rs size ok (before=135 after=135)
+PASS S1 crates/api/src/handlers/mod.rs size ok (before=151 after=160)
+PASS S1 crates/api/src/handlers/policies.rs size ok (before=163 after=163)
+PASS S1 crates/api/src/handlers/stream.rs size ok (before=428 after=428)
+PASS S1 crates/api/src/handlers/tools.rs size ok (before=334 after=334)
+PASS S1 crates/api/src/handlers/usage.rs size ok (before=76 after=76)
+PASS S1 crates/api/src/handlers/webhooks.rs size ok (before=110 after=110)
+PASS S1 crates/api/src/lib.rs size ok (before=47 after=49)
+PASS S1 crates/api/src/main.rs PREEXISTING_OVERSIZE (before=1630 after=1889 — not pushed over the cap by this change set)
+PASS S1 crates/api/src/router.rs size ok (before=1068 after=1074)
+PASS S1 crates/api/src/routes_governance.rs size ok (before=43 after=43)
+PASS S1 crates/api/src/routes_tooling.rs size ok (before=57 after=57)
+PASS S1 crates/api/src/state.rs size ok (before=673 after=903)
+PASS S1 crates/api/tests/governance_routes.rs size ok (before=158 after=315)
+PASS S1 crates/api/tests/tooling_routes.rs size ok (before=174 after=582)
+PASS S1 crates/application/src/assistant_service.rs size ok (before=225 after=284)
+PASS S1 crates/application/src/audit_query_service.rs size ok (before=369 after=482)
+PASS S1 crates/application/src/connector_service.rs size ok (before=123 after=123)
+PASS S1 crates/application/src/lib.rs size ok (before=75 after=82)
+PASS S1 crates/application/src/policy_service.rs size ok (before=316 after=316)
+PASS S1 crates/application/src/stores.rs PREEXISTING_OVERSIZE (before=2063 after=2063 — not pushed over the cap by this change set)
+PASS S1 crates/application/src/tool_service.rs size ok (before=512 after=515)
+PASS S1 crates/application/src/usage_service.rs size ok (before=183 after=183)
+PASS S1 crates/application/src/webhook_service.rs size ok (before=264 after=276)
+PASS S1 crates/common/src/config.rs size ok (before=338 after=423)
+PASS S1 crates/common/src/error.rs size ok (before=678 after=705)
+PASS S1 crates/contracts/src/connector.rs size ok (before=165 after=187)
+PASS S1 crates/contracts/src/tool.rs size ok (before=187 after=449)
+PASS S1 crates/contracts/src/webhook.rs size ok (before=174 after=228)
+PASS S1 crates/domain/src/project.rs size ok (before=154 after=190)
+PASS S1 crates/execution/src/result_processor.rs size ok (before=337 after=340)
+PASS S1 crates/integrations/src/oauth_refresh.rs size ok (before=328 after=332)
+PASS S1 ADDED file crates/messaging/src/event_tail.rs size ok (253 lines)
+PASS S1 crates/messaging/src/lib.rs size ok (before=40 after=42)
+PASS S1 crates/persistence/src/directory.rs size ok (before=442 after=442)
+PASS S1 crates/persistence/src/lib.rs size ok (before=60 after=63)
+PASS S1 crates/persistence/src/migrations.rs size ok (before=750 after=771)
+PASS S1 crates/persistence/src/repositories/audit.rs size ok (before=287 after=301)
+PASS S1 ADDED file crates/persistence/src/repositories/connector_lifecycle.rs size ok (171 lines)
+PASS S1 crates/persistence/src/repositories/mod.rs size ok (before=92 after=100)
+PASS S1 crates/persistence/src/repositories/tools.rs size ok (before=401 after=401)
+PASS S1 crates/persistence/src/repositories/usage.rs size ok (before=294 after=294)
+PASS S1 ADDED file crates/persistence/src/repositories/webhook_admin.rs size ok (373 lines)
+PASS S1 crates/persistence/tests/analytics_live_pg.rs size ok (before=233 after=233)
+PASS S1 crates/persistence/tests/live_pg.rs PREEXISTING_OVERSIZE (before=1882 after=1882 — not pushed over the cap by this change set)
+PASS S1 ADDED file crates/persistence/tests/project_list_live_pg.rs size ok (144 lines)
+PASS S1 crates/persistence/tests/rollback_live_pg.rs size ok (before=192 after=192)
+PASS S1 crates/persistence/tests/tools_live_pg.rs size ok (before=233 after=233)
+PASS S1 crates/persistence/tests/usage_live_pg.rs size ok (before=187 after=187)
+PASS S1 crates/security/tests/jwks.rs size ok (before=157 after=157)
+PASS S1 crates/worker/src/classify.rs size ok (before=306 after=310)
+-- S2 forbidden markers (todo!/TODO/FIXME/XXX/unimplemented!/placeholder) --
+PASS S2 crates/api/src/handlers/auth.rs clean
+PASS S2 crates/api/src/handlers/audit.rs clean
+PASS S2 crates/api/src/handlers/policies.rs clean
+PASS S2 crates/api/src/handlers/usage.rs clean
+PASS S2 crates/api/src/routes_governance.rs clean
+PASS S2 crates/api/tests/governance_routes.rs clean
+PASS S2 crates/application/src/audit_query_service.rs clean
+PASS S2 crates/application/src/policy_service.rs clean
+PASS S2 crates/application/src/usage_service.rs clean
+PASS S2 crates/persistence/src/repositories/usage.rs clean
+PASS S2 crates/persistence/tests/usage_live_pg.rs clean
+PASS S2 crates/persistence/src/repositories/audit.rs clean
+PASS S2 crates/security/tests/jwks.rs clean
+PASS S2 crates/api/src/handlers/tools.rs clean
+PASS S2 crates/api/src/handlers/connectors.rs clean
+PASS S2 crates/api/src/handlers/webhooks.rs clean
+PASS S2 crates/api/src/handlers/stream.rs clean
+PASS S2 crates/api/src/handlers/assistant.rs clean
+PASS S2 crates/api/src/routes_tooling.rs clean
+PASS S2 crates/api/tests/tooling_routes.rs clean
+PASS S2 crates/application/src/tool_service.rs clean
+PASS S2 crates/application/src/connector_service.rs clean
+PASS S2 crates/application/src/webhook_service.rs clean
+PASS S2 crates/application/src/stores.rs clean
+PASS S2 crates/persistence/src/repositories/tools.rs clean
+PASS S2 crates/persistence/src/repositories/webhook_admin.rs clean
+PASS S2 crates/persistence/src/repositories/connector_lifecycle.rs clean
+PASS S2 crates/persistence/tests/tools_live_pg.rs clean
+PASS S2 crates/persistence/tests/analytics_live_pg.rs clean
+PASS S2 crates/persistence/tests/rollback_live_pg.rs clean
+PASS S2 added crates/persistence/src/repositories/connector_lifecycle.rs clean
+PASS S2 added crates/persistence/src/repositories/webhook_admin.rs clean
+PASS S2 added-lines of modified files scanned
+-- S3 request-path panics (unwrap/expect/panic/unreachable outside tests) --
+PASS S3 crates/messaging/src/event_tail.rs non-test code clean
+PASS S3 crates/persistence/src/repositories/connector_lifecycle.rs non-test code clean
+PASS S3 crates/persistence/src/repositories/webhook_admin.rs non-test code clean
+PASS S3 added-lines of modified files scanned
+-- S4 raw reqwest/hyper outside egress --
+PASS S4 Cargo.lock no raw HTTP client
+PASS S4 config/default.toml no raw HTTP client
+PASS S4 config/production.toml no raw HTTP client
+PASS S4 crates/ai-bridge/src/lib.rs no raw HTTP client
+PASS S4 crates/api/Cargo.toml no raw HTTP client
+PASS S4 crates/api/src/grpc.rs no raw HTTP client
+PASS S4 crates/api/src/handlers/assistant.rs no raw HTTP client
+PASS S4 crates/api/src/handlers/audit.rs no raw HTTP client
+PASS S4 crates/api/src/handlers/auth.rs no raw HTTP client
+PASS S4 crates/api/src/handlers/connectors.rs no raw HTTP client
+PASS S4 crates/api/src/handlers/mod.rs no raw HTTP client
+PASS S4 crates/api/src/handlers/policies.rs no raw HTTP client
+PASS S4 crates/api/src/handlers/stream.rs no raw HTTP client
+PASS S4 crates/api/src/handlers/tools.rs no raw HTTP client
+PASS S4 crates/api/src/handlers/usage.rs no raw HTTP client
+PASS S4 crates/api/src/handlers/webhooks.rs no raw HTTP client
+PASS S4 crates/api/src/lib.rs no raw HTTP client
+PASS S4 crates/api/src/main.rs no raw HTTP client
+PASS S4 crates/api/src/router.rs no raw HTTP client
+PASS S4 crates/api/src/routes_governance.rs no raw HTTP client
+PASS S4 crates/api/src/routes_tooling.rs no raw HTTP client
+PASS S4 crates/api/src/state.rs no raw HTTP client
+PASS S4 crates/api/tests/governance_routes.rs no raw HTTP client
+PASS S4 crates/api/tests/tooling_routes.rs no raw HTTP client
+PASS S4 crates/application/src/assistant_service.rs no raw HTTP client
+PASS S4 crates/application/src/audit_query_service.rs no raw HTTP client
+PASS S4 crates/application/src/connector_service.rs no raw HTTP client
+PASS S4 crates/application/src/lib.rs no raw HTTP client
+PASS S4 crates/application/src/policy_service.rs no raw HTTP client
+PASS S4 crates/application/src/stores.rs no raw HTTP client
+PASS S4 crates/application/src/tool_service.rs no raw HTTP client
+PASS S4 crates/application/src/usage_service.rs no raw HTTP client
+PASS S4 crates/application/src/webhook_service.rs no raw HTTP client
+PASS S4 crates/common/src/config.rs no raw HTTP client
+PASS S4 crates/common/src/error.rs no raw HTTP client
+PASS S4 crates/contracts/src/connector.rs no raw HTTP client
+PASS S4 crates/contracts/src/tool.rs no raw HTTP client
+PASS S4 crates/contracts/src/webhook.rs no raw HTTP client
+PASS S4 crates/domain/src/project.rs no raw HTTP client
+PASS S4 crates/execution/src/result_processor.rs no raw HTTP client
+PASS S4 crates/integrations/src/oauth_refresh.rs no raw HTTP client
+PASS S4 crates/messaging/Cargo.toml no raw HTTP client
+PASS S4 crates/messaging/src/event_tail.rs no raw HTTP client
+PASS S4 crates/messaging/src/lib.rs no raw HTTP client
+PASS S4 crates/persistence/src/directory.rs no raw HTTP client
+PASS S4 crates/persistence/src/lib.rs no raw HTTP client
+PASS S4 crates/persistence/src/migrations.rs no raw HTTP client
+PASS S4 crates/persistence/src/repositories/audit.rs no raw HTTP client
+PASS S4 crates/persistence/src/repositories/connector_lifecycle.rs no raw HTTP client
+PASS S4 crates/persistence/src/repositories/mod.rs no raw HTTP client
+PASS S4 crates/persistence/src/repositories/tools.rs no raw HTTP client
+PASS S4 crates/persistence/src/repositories/usage.rs no raw HTTP client
+PASS S4 crates/persistence/src/repositories/webhook_admin.rs no raw HTTP client
+PASS S4 crates/persistence/tests/analytics_live_pg.rs no raw HTTP client
+PASS S4 crates/persistence/tests/live_pg.rs no raw HTTP client
+PASS S4 crates/persistence/tests/project_list_live_pg.rs no raw HTTP client
+PASS S4 crates/persistence/tests/rollback_live_pg.rs no raw HTTP client
+PASS S4 crates/persistence/tests/tools_live_pg.rs no raw HTTP client
+PASS S4 crates/persistence/tests/usage_live_pg.rs no raw HTTP client
+PASS S4 crates/security/tests/jwks.rs no raw HTTP client
+PASS S4 crates/worker/src/classify.rs no raw HTTP client
+PASS S4 migrations/0051_webhook_replay_attempts/down.sql no raw HTTP client
+PASS S4 migrations/0051_webhook_replay_attempts/up.sql no raw HTTP client
+PASS S4 added-lines of modified files scanned
+-- S5 format!-built SQL --
+PASS S5 no format!-built SQL beyond uppercase CONST interpolation
+-- S6 SQL tenant scoping evidence --
+PASS S6 crates/persistence/src/directory.rs:148 [tenants] explicit tenant/org predicate
+PASS S6 crates/persistence/src/directory.rs:191 [organizations] DESIGN: dedicated directory-pool resolver read (PURPOSE-documented, membership-validated)
+PASS S6 crates/persistence/src/directory.rs:220 [projects] explicit tenant/org predicate
+PASS S6 crates/persistence/src/directory.rs:257 [tenants] explicit tenant/org predicate
+PASS S6 crates/persistence/src/directory.rs:278 [projects] explicit tenant/org predicate
+PASS S6 crates/persistence/src/directory.rs:358 [memberships] explicit tenant/org predicate
+PASS S6 crates/persistence/src/directory.rs:373 [memberships] explicit tenant/org predicate
+PASS S6 crates/persistence/src/directory.rs:389 [memberships] explicit tenant/org predicate
+PASS S6 crates/persistence/src/migrations.rs:515 [?] non-tenant bookkeeping/session statement (no tenant column by design)
+PASS S6 crates/persistence/src/migrations.rs:525 [?] non-tenant bookkeeping/session statement (no tenant column by design)
+PASS S6 crates/persistence/src/migrations.rs:536 [migrations_table] non-tenant bookkeeping/session statement (no tenant column by design)
+PASS S6 crates/persistence/src/migrations.rs:547 [migrations_table] non-tenant bookkeeping/session statement (no tenant column by design)
+PASS S6 crates/persistence/src/migrations.rs:609 [migrations_table] non-tenant bookkeeping/session statement (no tenant column by design)
+PASS S6 crates/persistence/src/repositories/audit.rs:51 [audit_events] FORCE-RLS table through scoped request transaction
+PASS S6 crates/persistence/src/repositories/audit.rs:84 [audit_events] explicit tenant/org predicate
+PASS S6 crates/persistence/src/repositories/audit.rs:114 [audit_events] explicit tenant/org predicate
+PASS S6 crates/persistence/src/repositories/audit.rs:166 [audit_events] explicit tenant/org predicate
+PASS S6 crates/persistence/src/repositories/audit.rs:202 [audit_events] explicit tenant/org predicate
+PASS S6 crates/persistence/src/repositories/audit.rs:234 [audit_events] explicit tenant/org predicate
+PASS S6 crates/persistence/src/repositories/connector_lifecycle.rs:42 [credentials] explicit tenant/org predicate
+PASS S6 crates/persistence/src/repositories/connector_lifecycle.rs:53 [oauth_token_cleanup_jobs] explicit tenant/org predicate
+PASS S6 crates/persistence/src/repositories/connector_lifecycle.rs:70 [oauth_authorization_states] explicit tenant/org predicate
+PASS S6 crates/persistence/src/repositories/webhook_admin.rs:143 [webhooks] explicit tenant/org predicate
+PASS S6 crates/persistence/src/repositories/webhook_admin.rs:157 [webhook_deliveries] explicit tenant/org predicate
+PASS S6 crates/persistence/src/repositories/webhook_admin.rs:191 [webhook_replay_attempts] explicit tenant/org predicate
+PASS S6 crates/persistence/src/repositories/webhook_admin.rs:217 [webhook_deliveries] explicit tenant/org predicate
+PASS S6 crates/persistence/src/repositories/webhook_admin.rs:256 [webhook_deliveries] explicit tenant/org predicate
+PASS S6 crates/persistence/src/repositories/webhook_admin.rs:291 [webhook_dead_letters] explicit tenant/org predicate
+PASS S6 crates/persistence/src/repositories/webhook_admin.rs:313 [webhook_deliveries] explicit tenant/org predicate
+-- S7 secrets in DTOs, SSE, audit, logs --
+PASS S7 contracts scanned for raw secret-valued DTO fields (no FAIL lines above = clean)
+PASS S7 SSE production payload construction has no secret-bearing keys (no FAIL lines above = clean)
+PASS S7 log statements in changed files interpolate no secret values (no FAIL lines above = clean)
+-- S8 handler shape (ctx -> one service call -> envelope) --
+PASS S8 auth::me — documented matrix projection (no state service, no persistence)
+PASS S8 crates/api/src/handlers/audit.rs::list ctx -> audit_query_service -> envelope
+PASS S8 crates/api/src/handlers/policies.rs::list ctx -> policy_service -> envelope
+PASS S8 crates/api/src/handlers/policies.rs::create ctx -> policy_service -> envelope
+PASS S8 crates/api/src/handlers/policies.rs::get ctx -> policy_service -> envelope
+PASS S8 crates/api/src/handlers/policies.rs::update ctx -> policy_service -> envelope
+PASS S8 crates/api/src/handlers/policies.rs::publish ctx -> policy_service -> envelope
+PASS S8 crates/api/src/handlers/policies.rs::rollback ctx -> policy_service -> envelope
+PASS S8 crates/api/src/handlers/policies.rs::evaluate ctx -> policy_service -> envelope
+PASS S8 crates/api/src/handlers/usage.rs::quotas ctx -> usage_service -> envelope
+PASS S8 crates/api/src/handlers/usage.rs::summary ctx -> usage_service -> envelope
+PASS S8 crates/api/src/handlers/tools.rs::register ctx -> tool_service -> envelope
+PASS S8 crates/api/src/handlers/tools.rs::list ctx -> tool_service -> envelope
+PASS S8 crates/api/src/handlers/tools.rs::get ctx -> tool_service -> envelope
+PASS S8 crates/api/src/handlers/tools.rs::update ctx -> tool_service -> envelope
+PASS S8 crates/api/src/handlers/tools.rs::replace_agent_permissions ctx -> tool_service -> envelope
+PASS S8 crates/api/src/handlers/connectors.rs::manifests ctx -> connector_admin_service -> envelope
+PASS S8 crates/api/src/handlers/connectors.rs::probe ctx -> connector_admin_service -> envelope
+PASS S8 crates/api/src/handlers/connectors.rs::disable ctx -> connector_admin_service -> envelope
+PASS S8 crates/api/src/handlers/webhooks.rs::deliveries ctx -> webhook_admin_service -> envelope
+PASS S8 crates/api/src/handlers/webhooks.rs::replay ctx -> webhook_admin_service -> envelope
+PASS S8 crates/api/src/handlers/assistant.rs::submit ctx -> assistant_service -> envelope
+PASS S8 crates/api/src/handlers/stream.rs::connect ctx -> stream_hub_service -> envelope
+-- S9 mutation authz + audit (fail closed) --
+PASS S9 policies::create ['post'] handler carries canonical authz
+PASS S9 policies::create -> policy_service records audit
+PASS S9 policies::update ['patch'] handler carries canonical authz
+PASS S9 policies::update -> policy_service records audit
+PASS S9 tools::update ['patch'] handler carries canonical authz
+PASS S9 tools::update -> tool_service records audit
+-- S10 shared-file non-additive edits (allowlist) --
+PASS S10 crates/api/src/handlers/assistant.rs: 3 deletions inside allowlist — verify fix: canonical Execution/Create authz on submit
+PASS S10 crates/api/src/handlers/auth.rs: 6 deletions inside allowlist — verify fix: api-key actor id strip_prefix before ApiKeyId parse
+PASS S10 crates/application/src/stores.rs: 1 deletions inside allowlist — verify: PURPOSE header
+PASS S10 crates/application/src/tool_service.rs: 9 deletions inside allowlist — verify fix: encode_cursor returns Result (no request-path expect)
+PASS S10 crates/application/src/webhook_service.rs: 7 deletions inside allowlist — verify fix: encode_cursor returns Result (no request-path expect)
+PASS S10 crates/domain/src/project.rs: 1 deletions inside allowlist — verify fix: serde container default on ProjectConfig (schema default '{}')
+PASS S10 crates/messaging/Cargo.toml: 1 deletions inside allowlist — verify feature: nats feature gains optional tokio for the SSE tail
+PASS S10 crates/persistence/src/directory.rs: 8 deletions inside allowlist — verify fix: bind uuid (uuid = text operator error)
+PASS S10 crates/persistence/src/migrations.rs: 6 deletions inside allowlist — verify: registry entries 0050-0052 + registry test pins
+PASS S10 crates/persistence/src/repositories/audit.rs: 10 deletions inside allowlist — verify fix: tenant predicates on audit-pool reads + PURPOSE header
+PASS S10 crates/persistence/tests/live_pg.rs: 1 deletions inside allowlist — verify: correlation read gains tenant argument
+PASS S10 migrations/0051_webhook_replay_attempts/up.sql: 1 deletions inside allowlist — verify: PURPOSE header
+-- S11 diff --stat vs origin/main (no deletions of files) --
+PASS S11 no files deleted (D status) anywhere in the change set
+ enterprise-mas/rust-core/Cargo.lock                |   3 +
+ enterprise-mas/rust-core/config/default.toml       |   1 +
+ enterprise-mas/rust-core/config/production.toml    |   1 +
+ .../rust-core/crates/ai-bridge/src/lib.rs          |   1 +
+ enterprise-mas/rust-core/crates/api/Cargo.toml     |   5 +
+ enterprise-mas/rust-core/crates/api/src/grpc.rs    |   1 +
+ .../rust-core/crates/api/src/handlers/assistant.rs |  13 +-
+ .../rust-core/crates/api/src/handlers/auth.rs      |  19 +-
+ .../rust-core/crates/api/src/handlers/mod.rs       |   9 +
+ enterprise-mas/rust-core/crates/api/src/lib.rs     |   2 +
+ enterprise-mas/rust-core/crates/api/src/main.rs    | 259 +++++++++++++
+ enterprise-mas/rust-core/crates/api/src/router.rs  |   6 +
+ enterprise-mas/rust-core/crates/api/src/state.rs   | 230 ++++++++++++
+ .../crates/api/tests/governance_routes.rs          | 157 ++++++++
+ .../rust-core/crates/api/tests/tooling_routes.rs   | 408 +++++++++++++++++++++
+ .../crates/application/src/assistant_service.rs    |  59 +++
+ .../crates/application/src/audit_query_service.rs  | 113 ++++++
+ .../rust-core/crates/application/src/lib.rs        |   7 +
+ .../rust-core/crates/application/src/stores.rs     |   2 +-
+ .../crates/application/src/tool_service.rs         |  21 +-
+ .../crates/application/src/webhook_service.rs      |  26 +-
+ .../rust-core/crates/common/src/config.rs          |  85 +++++
+ .../rust-core/crates/common/src/error.rs           |  27 ++
+ .../rust-core/crates/contracts/src/connector.rs    |  22 ++
+ .../rust-core/crates/contracts/src/tool.rs         | 262 +++++++++++++
+ .../rust-core/crates/contracts/src/webhook.rs      |  54 +++
+ .../rust-core/crates/domain/src/project.rs         |  38 +-
+ .../crates/execution/src/result_processor.rs       |   3 +
+ .../crates/integrations/src/oauth_refresh.rs       |   4 +
+ .../rust-core/crates/messaging/Cargo.toml          |   3 +-
+ .../rust-core/crates/messaging/src/lib.rs          |   2 +
+ .../rust-core/crates/persistence/src/directory.rs  |  16 +-
+ .../rust-core/crates/persistence/src/lib.rs        |   3 +
+ .../rust-core/crates/persistence/src/migrations.rs |  33 +-
+ .../crates/persistence/src/repositories/audit.rs   |  34 +-
+ .../src/repositories/connector_lifecycle.rs        | 171 +++++++++
+ .../crates/persistence/src/repositories/mod.rs     |   8 +
+ .../persistence/src/repositories/webhook_admin.rs  | 373 +++++++++++++++++++
+ .../rust-core/crates/persistence/tests/live_pg.rs  |   2 +-
+ .../rust-core/crates/worker/src/classify.rs        |   4 +
+ .../0051_webhook_replay_attempts/down.sql          |   8 +
+ .../migrations/0051_webhook_replay_attempts/up.sql |   2 +-
+ 42 files changed, 2443 insertions(+), 54 deletions(-)
+
+PY_FAIL_COUNT=0
+STATIC_FAIL_COUNT=0
+STATIC: ALL PASS
+EXIT_CODE=0
+2026-10-29T17:13:42Z
+EXIT_CODE=0
+UTC=2026-10-29T17:13:42Z

@@ -49,6 +49,21 @@ async fn protected_governance_routes_reject_unauthenticated_requests() {
 }
 
 #[tokio::test]
+async fn auth_me_requires_authentication() {
+    let app = router(inmemory_state());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/auth/me")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn foreign_tenant_policy_ids_are_hidden_as_not_found() {
     let tenant_a = TenantId::new();
     let tenant_b = TenantId::new();
@@ -70,6 +85,148 @@ async fn foreign_tenant_policy_ids_are_hidden_as_not_found() {
         .await
         .expect_err("foreign policy is hidden");
     assert_eq!(error.error_code(), "RESOURCE_NOT_FOUND");
+}
+
+#[tokio::test]
+async fn foreign_tenant_policy_mutations_and_dry_runs_are_hidden_as_not_found() {
+    let tenant_a = TenantId::new();
+    let tenant_b = TenantId::new();
+    let organization = OrganizationId::new();
+    let store = Arc::new(InMemoryPolicyStore::new());
+    let definition = json!({"rules":[{"id":"allow","effect":"allow","actions":["task.submit"],"resources":["task"]}]});
+    let policy = Policy::new(
+        Some(tenant_b),
+        Some(organization),
+        None,
+        "foreign-policy",
+        PolicyType::Execution,
+        PolicyScope::Tenant,
+        1,
+        definition.clone(),
+    )
+    .expect("policy");
+    let policy_id = policy.id;
+    store.upsert(&policy).await.expect("insert");
+    let service = PolicyService::new(
+        store.clone(),
+        Arc::new(PolicyEngine::new(store)),
+        Arc::new(InMemoryAuditSink::new()),
+    );
+    let context = ServiceContext::for_service("test", "foreign-ops", &Timestamp::now())
+        .expect("ctx")
+        .with_scope(tenant_a, organization);
+
+    let update = service
+        .update(
+            &context,
+            policy_id,
+            mas_contracts::policy::UpdatePolicyRequest {
+                name: Some("renamed-by-tenant-a".to_owned()),
+                description: None,
+                priority: None,
+                definition: None,
+                active: None,
+            },
+        )
+        .await
+        .expect_err("foreign policy update is hidden");
+    assert_eq!(update.error_code(), "RESOURCE_NOT_FOUND");
+
+    let publish = service
+        .publish(&context, policy_id)
+        .await
+        .expect_err("foreign policy publish is hidden");
+    assert_eq!(publish.error_code(), "RESOURCE_NOT_FOUND");
+
+    let rollback = service
+        .rollback(&context, policy_id, definition.clone())
+        .await
+        .expect_err("foreign policy rollback is hidden");
+    assert_eq!(rollback.error_code(), "RESOURCE_NOT_FOUND");
+
+    let evaluate = service
+        .evaluate(
+            &context,
+            policy_id,
+            mas_contracts::policy::EvaluatePolicyRequest {
+                subject: json!({"actor":"test"}),
+                resource: json!({"kind":"task"}),
+                action: "task.submit".to_owned(),
+                environment: json!({}),
+            },
+        )
+        .await
+        .expect_err("foreign policy evaluation is hidden");
+    assert_eq!(evaluate.error_code(), "RESOURCE_NOT_FOUND");
+}
+
+#[tokio::test]
+async fn published_policy_versions_are_not_edited_in_place() {
+    let tenant = TenantId::new();
+    let organization = OrganizationId::new();
+    let store = Arc::new(InMemoryPolicyStore::new());
+    let policy = Policy::new(
+        Some(tenant),
+        Some(organization),
+        None,
+        "published-policy",
+        PolicyType::Execution,
+        PolicyScope::Tenant,
+        1,
+        json!({"rules":[{"id":"allow","effect":"allow","actions":["task.submit"],"resources":["task"]}]}),
+    )
+    .expect("policy");
+    let policy_id = policy.id;
+    store.upsert(&policy).await.expect("draft");
+    let service = PolicyService::new(
+        store.clone(),
+        Arc::new(PolicyEngine::new(store.clone())),
+        Arc::new(InMemoryAuditSink::new()),
+    );
+    let context = ServiceContext::for_service("test", "immutable-publish", &Timestamp::now())
+        .expect("ctx")
+        .with_scope(tenant, organization);
+
+    let published = service
+        .publish(&context, policy_id)
+        .await
+        .expect("first publish");
+    assert!(published.active);
+    let published_version = published.version;
+
+    let edited = service
+        .update(
+            &context,
+            policy_id,
+            mas_contracts::policy::UpdatePolicyRequest {
+                name: None,
+                description: None,
+                priority: None,
+                definition: Some(
+                    json!({"rules":[{"id":"allow","effect":"allow","actions":["task.abort"],"resources":["task"]}]}),
+                ),
+                active: None,
+            },
+        )
+        .await
+        .expect("definition edit");
+    // The published artifact is immutable: the edit lands on a new version
+    // that is inactive until explicitly republished.
+    assert!(
+        edited.version > published_version,
+        "definition edits must bump the version"
+    );
+    assert!(
+        !edited.active,
+        "an edited version must be deactivated until republished"
+    );
+
+    let republished = service
+        .publish(&context, policy_id)
+        .await
+        .expect("republish");
+    assert!(republished.active);
+    assert_eq!(republished.version, edited.version);
 }
 
 #[test]

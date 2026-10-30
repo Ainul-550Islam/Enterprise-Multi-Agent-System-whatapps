@@ -292,6 +292,26 @@ pub static MIGRATIONS: &[Migration] = &[
         "integration_keyset_indexes",
         "../../../migrations/0049_integration_keyset_indexes/up.sql"
     ),
+    migration!(
+        50,
+        "audit_query_indexes",
+        "../../../migrations/0050_audit_query_indexes/up.sql"
+    ),
+    migration!(
+        51,
+        "webhook_replay_attempts",
+        "../../../migrations/0051_webhook_replay_attempts/up.sql"
+    ),
+    migration!(
+        52,
+        "usage_append_only",
+        "../../../migrations/0052_usage_append_only/up.sql"
+    ),
+    migration!(
+        53,
+        "runtime_role_sequence_usage",
+        "../../../migrations/0053_runtime_role_sequence_usage/up.sql"
+    ),
 ];
 
 /// A migration already recorded in the database.
@@ -625,11 +645,11 @@ mod tests {
     #[test]
     fn registry_is_contiguous_and_ordered() {
         validate_registry().expect("registry must be valid");
-        assert_eq!(MIGRATIONS.len(), 49);
+        assert_eq!(MIGRATIONS.len(), 53);
         assert_eq!(MIGRATIONS.first().map(|m| m.name), Some("extensions"));
         assert_eq!(
             MIGRATIONS.last().map(|m| m.name),
-            Some("integration_keyset_indexes")
+            Some("runtime_role_sequence_usage")
         );
         let search_indexes = MIGRATIONS
             .iter()
@@ -656,13 +676,14 @@ mod tests {
         }
         for migration in MIGRATIONS {
             // No migration is a no-op. Most define schema; a migration that
-            // only corrects privileges declares that with `GRANT` instead —
-            // which 0021 is, since the defect it fixes was a missing grant
-            // rather than a missing table.
+            // only corrects privileges declares that with `GRANT` (0021: a
+            // missing grant rather than a missing table) or `REVOKE` (0052:
+            // closing a broad default grant) instead of DDL.
             assert!(
                 migration.sql.contains("CREATE")
                     || migration.sql.contains("ALTER")
-                    || migration.sql.contains("GRANT"),
+                    || migration.sql.contains("GRANT")
+                    || migration.sql.contains("REVOKE"),
                 "{} must change the schema or the privilege set",
                 migration.name
             );

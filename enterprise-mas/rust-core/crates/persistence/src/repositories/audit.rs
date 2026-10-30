@@ -1,4 +1,4 @@
-//! Append-only audit log store.
+//! PURPOSE: Append-only audit log store — append and keyset reads only.
 //!
 //! The API deliberately offers **only** append and read methods — there is no
 //! update/delete here, and the SQL triggers (`0011_audit`) reject mutations
@@ -76,12 +76,15 @@ impl PostgresAuditLog {
         Self::append_in(&mut conn, event).await
     }
 
-    /// Fetches one event by id.
-    pub async fn get(&self, id: AuditEventId) -> Result<AuditEvent> {
+    /// Fetches one event by id inside a tenant: the tenant predicate is
+    /// explicit (the dedicated audit pool's role bypasses RLS by design —
+    /// 0011 grants an append path — so reads must carry their own scope).
+    pub async fn get(&self, tenant: TenantId, id: AuditEventId) -> Result<AuditEvent> {
         let row = sqlx::query(&format!(
-            "SELECT {AUDIT_COLUMNS} FROM audit_events WHERE id = $1"
+            "SELECT {AUDIT_COLUMNS} FROM audit_events WHERE id = $1 AND tenant_id = $2"
         ))
         .bind(id.into_uuid())
+        .bind(tenant.into_uuid())
         .fetch_optional(&self.pool)
         .await
         .map_err(map_sqlx)?
@@ -129,9 +132,13 @@ impl PostgresAuditLog {
             .collect::<Result<_>>()?;
 
         let next_cursor = if events.len() as i64 == limit {
-            let last = events.pop().expect("last element exists");
-            let cursor = Cursor::new(last.occurred_at.to_unix_ms(), last.id.to_string());
-            Some(cursor.encode()?)
+            match events.pop() {
+                Some(last) => {
+                    let cursor = Cursor::new(last.occurred_at.to_unix_ms(), last.id.to_string());
+                    Some(cursor.encode()?)
+                },
+                None => None,
+            }
         } else {
             None
         };
@@ -140,8 +147,14 @@ impl PostgresAuditLog {
 
     /// All events for one correlation id (request tracing), oldest first.
     /// Bounded at 1 000 entries — a single request causing more audit events
-    /// than that is itself a finding.
-    pub async fn list_for_correlation(&self, correlation_id: &str) -> Result<Vec<AuditEvent>> {
+    /// than that is itself a finding. The tenant predicate is explicit: the
+    /// audit pool's role bypasses RLS (0011 append design), so a read on it
+    /// never relies on the policy layer for scope.
+    pub async fn list_for_correlation(
+        &self,
+        tenant: TenantId,
+        correlation_id: &str,
+    ) -> Result<Vec<AuditEvent>> {
         if correlation_id.is_empty() || correlation_id.len() > 256 {
             return Err(AppError::invalid_field(
                 "correlation_id",
@@ -151,10 +164,11 @@ impl PostgresAuditLog {
         }
         let rows = sqlx::query(&format!(
             "SELECT {AUDIT_COLUMNS} FROM audit_events
-             WHERE correlation_id = $1
+             WHERE tenant_id = $1 AND correlation_id = $2
              ORDER BY occurred_at ASC, id ASC
              LIMIT 1000"
         ))
+        .bind(tenant.into_uuid())
         .bind(correlation_id)
         .fetch_all(&self.pool)
         .await

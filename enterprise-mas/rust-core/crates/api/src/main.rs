@@ -122,6 +122,14 @@ async fn run() -> Result<i32, String> {
         approvals,
         data_hub,
         search,
+        audit_query,
+        policies,
+        usage,
+        tools,
+        connector_admin,
+        webhook_admin,
+        stream_hub,
+        assistant,
         control_plane,
         audit,
         control_plane_stores,
@@ -171,6 +179,15 @@ async fn run() -> Result<i32, String> {
     .with_approvals(approvals)
     .with_data_hub(data_hub)
     .with_search(search);
+    let state = install_governance_services(state, audit_query, policies, usage);
+    let state = install_tooling_services(
+        state,
+        tools,
+        connector_admin,
+        webhook_admin,
+        stream_hub,
+        assistant,
+    );
     let state = match (inbound_webhook_endpoints, inbound_webhook_ingress) {
         (Some(endpoints), Some(ingress)) => state.with_inbound_webhooks(endpoints, ingress),
         (None, None) if dev_inmemory => state,
@@ -311,6 +328,18 @@ type ServiceSet = (
     Arc<ApprovalApplicationService>,
     Arc<DataHubApplicationService>,
     Arc<SearchService>,
+    // BATCH-01 governance reads. `None` (the in-memory lane, or production
+    // without an audit cursor key) means the route answers a typed 503
+    // instead of fabricating data.
+    Option<Arc<mas_application::audit_query_service::AuditQueryService>>,
+    Option<Arc<mas_application::policy_service::PolicyService>>,
+    Option<Arc<mas_application::usage_service::UsageService>>,
+    // BATCH-02 tooling reads/actions. `None` ⇒ typed 503 per surface.
+    Option<Arc<mas_application::tool_service::ToolService>>,
+    Option<Arc<mas_application::connector_service::ConnectorService>>,
+    Option<Arc<mas_application::webhook_service::WebhookService>>,
+    Option<Arc<mas_api::handlers::stream::StreamHub>>,
+    Option<Arc<mas_application::assistant_service::AssistantService>>,
     // The canonical control plane, and the Postgres control-plane stores
     // (`None` in the in-memory lane, which has no database).
     Arc<mas_application::control_plane::ControlPlane>,
@@ -381,6 +410,99 @@ async fn connect_role_pool(
         .await
         .map(|database| database.pool().clone())
         .map_err(|error| format!("{application_name} database: {error}"))
+}
+
+/// Installs whichever governance services this lane composed. A lane that
+/// omitted one (in-memory bring-up, or production without an audit cursor
+/// key) leaves the field `None`, and the dependent route answers a typed 503
+/// instead of serving fabricated data.
+fn install_governance_services(
+    state: AppState,
+    audit_query: Option<Arc<mas_application::audit_query_service::AuditQueryService>>,
+    policies: Option<Arc<mas_application::policy_service::PolicyService>>,
+    usage: Option<Arc<mas_application::usage_service::UsageService>>,
+) -> AppState {
+    let state = match audit_query {
+        Some(service) => state.with_audit_query(service),
+        None => state,
+    };
+    let state = match policies {
+        Some(service) => state.with_policies(service),
+        None => state,
+    };
+    match usage {
+        Some(service) => state.with_usage(service),
+        None => state,
+    }
+}
+
+/// Installs whichever tooling services this lane composed. Every field is
+/// optional for the same reason as the governance services: a lane that
+/// omitted one answers a typed 503 on the dependent routes instead of
+/// fabricating catalogues, deliveries, or stream events.
+fn install_tooling_services(
+    state: AppState,
+    tools: Option<Arc<mas_application::tool_service::ToolService>>,
+    connector_admin: Option<Arc<mas_application::connector_service::ConnectorService>>,
+    webhook_admin: Option<Arc<mas_application::webhook_service::WebhookService>>,
+    stream_hub: Option<Arc<mas_api::handlers::stream::StreamHub>>,
+    assistant: Option<Arc<mas_application::assistant_service::AssistantService>>,
+) -> AppState {
+    let state = match tools {
+        Some(service) => state.with_tools(service),
+        None => state,
+    };
+    let state = match connector_admin {
+        Some(service) => state.with_connector_admin(service),
+        None => state,
+    };
+    let state = match webhook_admin {
+        Some(service) => state.with_webhook_admin(service),
+        None => state,
+    };
+    let state = match stream_hub {
+        Some(hub) => state.with_stream_hub(hub),
+        None => state,
+    };
+    match assistant {
+        Some(service) => state.with_assistant(service),
+        None => state,
+    }
+}
+
+/// Typed `[stream]` bounds for the SSE hub from the layered configuration.
+///
+/// # Errors
+/// A missing/invalid key or an out-of-range value — configuration must fail
+/// at boot, never at the first connected client.
+fn stream_config(
+    merger: &mas_common::config::Merger<'_>,
+) -> Result<mas_common::config::StreamConfig, String> {
+    let heartbeat_secs = merger
+        .u64("MAS_STREAM_HEARTBEAT_SECS", "stream.heartbeat_secs", 15)
+        .map_err(|error| format!("stream.heartbeat_secs: {error}"))?;
+    let channel_buffer = merger
+        .u64("MAS_STREAM_CHANNEL_BUFFER", "stream.channel_buffer", 256)
+        .map_err(|error| format!("stream.channel_buffer: {error}"))?;
+    let max_connections = merger
+        .u64(
+            "MAS_STREAM_MAX_CONNECTIONS_PER_PRINCIPAL",
+            "stream.max_connections_per_principal",
+            8,
+        )
+        .map_err(|error| format!("stream.max_connections_per_principal: {error}"))?;
+    let config = mas_common::config::StreamConfig {
+        heartbeat_secs,
+        channel_buffer: usize::try_from(channel_buffer)
+            .map_err(|_| "stream.channel_buffer does not fit this platform".to_owned())?,
+        max_connections_per_principal: usize::try_from(max_connections).map_err(|_| {
+            "stream.max_connections_per_principal does not fit this platform".to_owned()
+        })?,
+    };
+    config
+        .validate()
+        .map_err(|error| format!("stream configuration: {error}"))?;
+    Ok(config)
 }
 
 /// Starts the lease-fenced outbound webhook relay. The loop owns no queue
@@ -825,6 +947,18 @@ fn compose_inmemory(merger: &mas_common::config::Merger<'_>) -> Result<ServiceSe
         approvals,
         data_hub,
         search,
+        // The in-memory lane has no database plane for governance reads; the
+        // routes answer a typed 503 rather than a plausible empty result.
+        None,
+        None,
+        None,
+        // Likewise the tooling plane: no durable catalogue, deliveries, or
+        // event transport in the dev lane — typed 503, never fake data.
+        None,
+        None,
+        None,
+        None,
+        None,
         // The ExecutionService owns one handle; this is a second handle to
         // the same control plane, not a second control plane.
         control_plane,
@@ -1108,6 +1242,123 @@ async fn compose_production(merger: &mas_common::config::Merger<'_>) -> Result<S
     let search = Arc::new(SearchService::with_catalog(Box::new(
         mas_persistence::repositories::PostgresSearchCatalog::new(pool.clone()),
     )));
+
+    // ── Governance surface: audit reads, policy lifecycle, usage/quota ──
+    //
+    // The policy service deliberately shares the control plane's canonical
+    // engine and store: the same compiled policy set is both enforced at
+    // execution time and administered through /v1/policies, so an edit can
+    // never drift from what is evaluated.
+    let policy_service = Arc::new(mas_application::policy_service::PolicyService::new(
+        Arc::clone(control_plane.policy().store()),
+        Arc::clone(control_plane.policy()),
+        Arc::clone(&audit_sink),
+    ));
+    // Plan-card and usage reads come from the append-only usage ledger and
+    // the tenant's quota definitions; utilization is computed here, never
+    // supplied by a client.
+    let usage_service = Arc::new(mas_application::usage_service::UsageService::new(Box::new(
+        mas_persistence::PostgresUsageStore::new(pool.clone()),
+    )));
+    // Filtered audit keyset cursors must be opaque and tamper-checked, so
+    // they are HMAC-signed with a deployment-owned >=32-byte key. Prefer the
+    // dedicated key, fall back to the internal service secret; without either
+    // the read plane stays uncomposed and /v1/audit-events answers a typed
+    // 503 — minting unverifiable cursors would be worse than refusing.
+    let audit_cursor_key = {
+        let dedicated = merger.string("MAS_AUDIT_CURSOR_KEY", "audit.cursor_key", "");
+        let fallback = load_internal_secret(merger)?.map(|secret| secret.expose().to_owned());
+        if dedicated.len() >= 32 {
+            Some(dedicated.into_bytes())
+        } else if fallback.as_deref().is_some_and(|value| value.len() >= 32) {
+            fallback.map(String::into_bytes)
+        } else {
+            eprintln!(
+                "mas-api: no >=32-byte MAS_AUDIT_CURSOR_KEY or internal service secret; \
+                 /v1/audit-events stays disabled (typed 503)"
+            );
+            None
+        }
+    };
+    let audit_query = audit_cursor_key.and_then(|key| {
+        match mas_application::audit_query_service::AuditQueryService::new(
+            Box::new(PostgresAuditLog::new(audit_pool.clone())),
+            key,
+        ) {
+            Ok(service) => Some(Arc::new(service)),
+            Err(error) => {
+                eprintln!("mas-api: audit query composition failed: {error}");
+                None
+            },
+        }
+    });
+
+    // ── Tooling surface: catalogue, connector admin, webhook ops, SSE, assistant
+    //
+    // Tool permissions are evaluated against the SAME canonical policy engine
+    // the control plane enforces with, so a grant can never disagree with the
+    // policy an invocation is checked against.
+    let tool_service = Arc::new(mas_application::tool_service::ToolService::new(
+        Box::new(mas_persistence::PostgresToolStore::new(pool.clone())),
+        Box::new(PgServices::new(pool.clone())),
+        Arc::clone(control_plane.policy()),
+        Box::new(PostgresAuditLog::new(audit_pool.clone())),
+    ));
+    // Provider manifests are an operator-owned built-in registry (no tenant
+    // state); disable+revoke is the durable lifecycle port written for this
+    // batch, and probes reuse the already-composed guarded integration plane.
+    let connector_admin = Arc::new(mas_application::connector_service::ConnectorService::new(
+        Box::new(mas_integrations::registry::InMemoryProviderRegistry::with_builtin()),
+        Arc::clone(&integration_plane.service),
+        Box::new(
+            mas_persistence::repositories::connector_lifecycle::PostgresConnectorLifecycle::new(
+                pool.clone(),
+            ),
+        ),
+        Box::new(PostgresAuditLog::new(audit_pool.clone())),
+    ));
+    // Delivery history and replay over the dead-letter evidence tables; the
+    // relay (not the API) owns sending, so nothing here touches leases.
+    let webhook_admin = Arc::new(mas_application::webhook_service::WebhookService::new(
+        Box::new(
+            mas_persistence::repositories::webhook_admin::PostgresWebhookAdmin::new(pool.clone()),
+        ),
+        Box::new(PostgresAuditLog::new(audit_pool.clone())),
+    ));
+    // The assistant is an ordinary execution submission (same stores, same
+    // policy/quota/audit path) — no second execution path exists.
+    let assistant = Arc::new(mas_application::assistant_service::AssistantService::new(
+        Box::new(PgServices::new(pool.clone())),
+        Box::new(PgServices::new(pool.clone())),
+        Box::new(PgServices::new(pool.clone())),
+        Arc::clone(&executions),
+        Box::new(PostgresAuditLog::new(audit_pool.clone())),
+    ));
+    // SSE fan-out tails the canonical event plane through the read-only
+    // `mas.events.>` tail (the relay's `NatsEventBus` stays publish-only by
+    // contract). No NATS URL means no live event source: production boots
+    // must fail loudly here rather than serve an `/v1/stream` that silently
+    // never delivers.
+    let stream_hub = {
+        let config = stream_config(merger)?;
+        let nats_url = merger.string("MAS_NATS_URL", "broker.nats_url", "");
+        if nats_url.is_empty() {
+            return Err("the production event stream requires an event bus address \
+                 (MAS_NATS_URL or config broker.nats_url); refusing to boot \
+                 an SSE plane with no live event source"
+                .to_owned());
+        }
+        let tail = mas_messaging::event_tail::NatsEventTailBus::connect(&nats_url)
+            .await
+            .map_err(|error| format!("nats event tail: {error}"))?;
+        let hub =
+            mas_api::handlers::stream::StreamHub::new(config).map_err(|error| error.to_string())?;
+        hub.attach(Arc::new(tail))
+            .await
+            .map_err(|error| format!("event stream hub subscription: {error}"))?;
+        hub
+    };
+
     let oidc = compose_oidc_verifier(merger)?;
     let verifier: Arc<dyn mas_api::auth::TokenVerifierPort> =
         Arc::new(mas_api::oidc_auth::ProductionTokenVerifier::new(
@@ -1207,6 +1458,14 @@ async fn compose_production(merger: &mas_common::config::Merger<'_>) -> Result<S
         approvals,
         data_hub,
         search,
+        audit_query,
+        Some(policy_service),
+        Some(usage_service),
+        Some(tool_service),
+        Some(connector_admin),
+        Some(webhook_admin),
+        Some(Arc::new(stream_hub)),
+        Some(assistant),
         // A second handle to the control plane the ExecutionService owns —
         // not a second control plane.
         control_plane,

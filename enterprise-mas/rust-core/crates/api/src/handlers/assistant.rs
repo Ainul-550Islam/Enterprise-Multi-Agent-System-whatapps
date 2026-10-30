@@ -33,9 +33,16 @@ pub async fn submit(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_owned);
-    let service_context = ctx
-        .service_context()
-        .map_err(|error| ApiError::new(error, &ctx))?;
+    // Canonical security matrix first: submitting a message is exactly an
+    // execution creation, so it carries the same authorization contract as
+    // `POST /v1/executions` (resource `Execution`, action `Create`).
+    let service_context = crate::handlers::authorized_service_context(
+        &ctx,
+        mas_security::ResourceKind::Execution,
+        mas_security::Action::Create,
+        None,
+    )
+    .map_err(|error| ApiError::new(error, &ctx))?;
     let outcome = state
         .assistant_service(&ctx)?
         .submit(&service_context, &request.message, header_key.as_deref())

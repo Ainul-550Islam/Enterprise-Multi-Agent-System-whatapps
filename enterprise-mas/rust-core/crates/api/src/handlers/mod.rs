@@ -25,6 +25,10 @@ pub mod agents;
 pub mod analytics;
 pub mod api_keys;
 pub mod approvals;
+pub mod assistant;
+pub mod audit;
+pub mod auth;
+pub mod connectors;
 pub mod control_plane;
 pub mod data_hub;
 pub mod executions;
@@ -35,10 +39,15 @@ pub mod internal;
 pub mod notifications;
 /// OAuth authorization-code start/callback handlers.
 pub mod oauth;
+pub mod policies;
 pub mod rollbacks;
 pub mod schedules;
 pub mod search;
+pub mod stream;
 pub mod tenancy;
+pub mod tools;
+pub mod usage;
+pub mod webhooks;
 pub mod workflows;
 
 use axum::extract::FromRequestParts;

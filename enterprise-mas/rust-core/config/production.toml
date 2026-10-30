@@ -1,3 +1,4 @@
+# PURPOSE: MAS runtime configuration — PRODUCTION overlay (fail-closed bounds; no secrets checked in).
 # ─────────────────────────────────────────────────────────────────────────────
 # PRODUCTION overlay (MAS_ENV=production). Merges over default.toml.
 #

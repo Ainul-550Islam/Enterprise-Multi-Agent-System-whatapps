@@ -344,6 +344,119 @@ mod tests {
             .is_err());
     }
 
+    fn owner_principal(
+        tenant: TenantId,
+        organization: mas_common::ids::OrganizationId,
+    ) -> mas_security::SecurityPrincipal {
+        mas_security::SecurityPrincipal::new(
+            "owner",
+            mas_security::PrincipalKind::User,
+            None,
+            mas_security::ScopeSet::denied(),
+        )
+        .with_memberships(vec![mas_security::TenantMembership::new(
+            organization,
+            tenant,
+            mas_domain::MembershipRole::Owner,
+        )])
+    }
+
+    fn open_query() -> AuditQuery {
+        AuditQuery {
+            actor: None,
+            action: None,
+            resource: None,
+            outcome: None,
+            from: None,
+            to: None,
+            cursor: None,
+            limit: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn audit_query_window_is_bounded_server_side() {
+        let tenant = TenantId::new();
+        let organization = mas_common::ids::OrganizationId::new();
+        let service = svc();
+        let now = mas_common::timestamps::Timestamp::now();
+        let from = now
+            .checked_sub(std::time::Duration::from_secs(367 * 24 * 60 * 60))
+            .expect("past timestamp");
+        let query = AuditQuery {
+            from: Some(from),
+            to: Some(now),
+            ..open_query()
+        };
+        let error = service
+            .query(
+                &owner_principal(tenant, organization),
+                tenant,
+                organization,
+                &query,
+            )
+            .await
+            .expect_err("an oversized window is refused by the service");
+        assert_eq!(error.error_code(), "VALIDATION_FAILED");
+        match error {
+            AppError::Validation { issues, .. } => {
+                assert!(
+                    issues.iter().any(|issue| issue.code == "window_too_large"),
+                    "the refusal must carry the window_too_large rule code"
+                );
+            },
+            other => panic!("unexpected error shape: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn audit_dto_metadata_is_redacted_before_the_page_leaves_the_service() {
+        let tenant = TenantId::new();
+        let organization = mas_common::ids::OrganizationId::new();
+        let mut event = AuditEvent::new(
+            Some(tenant),
+            None,
+            AuditActor::new(AuditActorKind::User, "user-1").expect("actor"),
+            "api_key.create",
+            "api_key",
+            None,
+            AuditOutcome::Success,
+            "corr-redaction",
+        )
+        .expect("event");
+        event
+            .metadata
+            .insert("api_key".to_owned(), serde_json::json!("sk-live-secret"));
+        event
+            .metadata
+            .insert("label".to_owned(), serde_json::json!("keep-me"));
+        let port = InMemoryAuditReadPort::default();
+        port.push(event);
+        let service = AuditQueryService::new(Box::new(port), vec![9; 32]).expect("service");
+        let page = service
+            .query(
+                &owner_principal(tenant, organization),
+                tenant,
+                organization,
+                &open_query(),
+            )
+            .await
+            .expect("query");
+        let item = page.items.first().expect("one event");
+        assert_eq!(
+            item.metadata
+                .get("api_key")
+                .and_then(|value| value.as_str()),
+            Some("[REDACTED]"),
+            "sensitive metadata must be redacted in the DTO"
+        );
+        assert_eq!(
+            item.metadata.get("label").and_then(|value| value.as_str()),
+            Some("keep-me"),
+            "non-sensitive metadata must survive unchanged"
+        );
+    }
+
     #[tokio::test]
     async fn in_memory_reader_hides_other_tenants() {
         let tenant = TenantId::new();

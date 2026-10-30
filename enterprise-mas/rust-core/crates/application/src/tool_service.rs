@@ -146,12 +146,15 @@ impl ToolService {
             items.truncate(usize::from(limit));
         }
         let next_cursor = if has_more {
-            items.last().map(|tool| {
-                encode_cursor(ToolCursor {
-                    created_at: tool.created_at,
-                    id: tool.id,
+            items
+                .last()
+                .map(|tool| {
+                    encode_cursor(ToolCursor {
+                        created_at: tool.created_at,
+                        id: tool.id,
+                    })
                 })
-            })
+                .transpose()?
         } else {
             None
         };
@@ -351,12 +354,12 @@ impl ToolService {
     }
 }
 
-fn encode_cursor(cursor: ToolCursor) -> String {
+fn encode_cursor(cursor: ToolCursor) -> Result<String> {
     use base64::Engine as _;
     let raw =
         serde_json::to_vec(&serde_json::json!({"created_at": cursor.created_at, "id": cursor.id}))
-            .expect("tool cursor serialization is infallible");
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw)
+            .map_err(|error| AppError::serialization(format!("tool cursor: {error}")))?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw))
 }
 
 fn decode_cursor(value: &str) -> Result<ToolCursor> {
@@ -404,7 +407,7 @@ mod tests {
             created_at: Timestamp::from_unix_ms(1_700_000_000_000).expect("time"),
             id: ToolId::new(),
         };
-        let encoded = encode_cursor(cursor);
+        let encoded = encode_cursor(cursor).expect("encode");
         let decoded = decode_cursor(&encoded).expect("decode");
         assert_eq!(decoded, cursor);
         assert!(decode_cursor("../../private").is_err());

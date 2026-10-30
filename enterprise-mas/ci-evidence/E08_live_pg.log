@@ -1,0 +1,137 @@
+   Compiling mas-persistence v0.1.0 (/home/user/repo/enterprise-mas/rust-core/crates/persistence)
+    Finished `test` profile [unoptimized] target(s) in 21.00s
+     Running tests/analytics_live_pg.rs (target/debug/deps/analytics_live_pg-194c383eb6304dd0)
+
+running 1 test
+test hourly_rollups_honor_windows_and_kpi_reads_are_tenant_scoped ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/control_plane_pg.rs (target/debug/deps/control_plane_pg-8c426ee6e340e772)
+
+running 38 tests
+test a_control_plane_write_for_another_tenant_is_refused_by_the_database ... ok
+test a_concurrent_storm_never_breaches_the_ceiling ... ok
+test a_counter_never_goes_negative_on_a_double_release ... ok
+test a_control_plane_write_succeeds_inside_a_request_scope ... ok
+test a_failed_metering_unit_leaves_no_partial_usage ... ok
+test a_failure_before_the_provider_meters_nothing_and_returns_the_quota ... ok
+test a_leased_reservation_does_not_consume_quota_forever ... ok
+test a_malformed_policy_never_becomes_active ... ok
+test a_metering_key_makes_taskless_usage_exactly_once ... ok
+test a_plan_is_data_and_resolves_to_its_grants ... ok
+test a_policy_is_persisted_published_and_versioned ... ok
+test a_provider_failure_still_meters_what_was_reported ... ok
+test a_quota_decision_survives_a_stale_definition_change ... ok
+test a_quota_override_is_scoped_to_its_tenant_and_period ... ok
+test a_refused_reservation_does_not_move_the_counter ... ok
+test a_replayed_webhook_event_is_recorded_once ... ok
+test a_reservation_that_outlives_its_lease_is_reclaimable ... ok
+test a_reservation_is_idempotent_settles_once_and_releases_the_rest ... ok
+test a_settled_reservation_is_never_reclaimed ... ok
+test a_subscription_transitions_and_every_step_is_recorded ... ok
+test a_zero_quantity_is_refused_rather_than_recorded ... ok
+test an_audit_event_survives_the_rollback_of_the_mutation_it_describes ... ok
+test an_empty_sweep_is_a_no_op ... ok
+test an_illegal_subscription_transition_is_refused ... ok
+test an_override_changes_the_effective_limit_without_touching_the_plan ... ok
+test an_unsigned_callback_is_recorded_as_rejected_not_applied ... ok
+test concurrent_observations_of_each_dimension_are_metered_once ... ok
+test concurrent_quota_overrides_cannot_both_be_live ... ok
+test concurrent_subscription_updates_serialize_on_the_version ... ok
+test concurrent_usage_settlement_records_each_observation_once ... ok
+test the_default_reservation_lease_is_bounded ... ok
+test tenant_b_cannot_read_or_write_tenant_a_billing_state ... ok
+test the_runtime_role_cannot_switch_row_level_security_off ... ok
+test the_same_task_settled_twice_produces_one_usage_record ... ok
+test two_concurrent_subscription_creations_leave_one_live_subscription ... ok
+test two_replicas_cannot_both_take_the_exact_remainder ... ok
+test two_replicas_cannot_together_exceed_one_ceiling ... ok
+test usage_totals_refuse_to_add_mixed_currencies ... ok
+
+test result: ok. 38 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.53s
+
+     Running tests/live_pg.rs (target/debug/deps/live_pg-ff4cae4dd7c02471)
+
+running 17 tests
+test agents_round_trip ... ok
+test a_pooled_connection_does_not_inherit_the_previous_request_tenant ... ok
+test api_keys_prefix_lookup_and_touch ... ok
+test audit_append_list_and_counts ... ok
+test concurrent_migrate_is_serialized ... ok
+test broker_publish_fetch_ack_round_trip ... ok
+test executions_round_trip_and_idempotency ... ok
+test migrations_are_idempotent ... ok
+test schedules_due_scan_and_run_journal ... ok
+test tasks_round_trip ... ok
+test tenancy_round_trip ... ok
+test tenant_b_cannot_read_claim_cancel_or_settle_tenant_a_execution ... ok
+test the_plane_roles_are_confined_to_their_own_tables ... ok
+test the_runtime_role_cannot_bypass_row_level_security ... ok
+test the_same_idempotency_key_in_two_tenants_is_two_executions ... ok
+test workflows_round_trip ... ok
+test expired_running_delivery_is_redelivered_as_one_replacement_attempt ... ok
+
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.87s
+
+     Running tests/plane_grants.rs (target/debug/deps/plane_grants-9156752b552f8ce8)
+
+running 6 tests
+test the_runtime_role_may_use_every_sequence ... ok
+test the_runtime_role_cannot_bypass_row_level_security ... ok
+test the_worker_plane_cannot_read_or_rewrite_usage ... ok
+test the_worker_plane_keeps_its_durable_execution_grants ... ok
+test the_worker_plane_cannot_reach_credentials_or_keys ... ok
+test the_worker_plane_may_append_usage ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+     Running tests/project_list_live_pg.rs (target/debug/deps/project_list_live_pg-1b2139f1d62869e4)
+
+running 1 test
+test project_list_round_trips_in_scope_and_stays_tenant_bound ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/rollback_live_pg.rs (target/debug/deps/rollback_live_pg-7f61a836104d0511)
+
+running 1 test
+test rollback_appends_a_forward_version_and_hides_foreign_history ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/tenant_sql_contract.rs (target/debug/deps/tenant_sql_contract-79be40ccae94cc7b)
+
+running 13 tests
+test duplicate_parallel_attempts_are_unrepresentable ... ok
+test api_key_prefix_lookup_is_narrow_and_remains_under_force_rls ... ok
+test every_allowlist_entry_still_matches_a_real_statement ... ok
+test every_statement_naming_a_tenant_owned_table_is_tenant_scoped_or_allowlisted ... ok
+test idempotency_is_unique_per_tenant_in_the_database ... ok
+test oauth_lifecycle_jobs_are_fenced_rls_protected_and_path_blind ... ok
+test the_claim_hot_path_and_ownership_fences_are_indexed ... ok
+test the_claim_statement_scopes_by_tenant_before_it_locks_anything ... ok
+test no_migration_is_destructive ... ok
+test the_idempotency_lookup_is_tenant_scoped_and_uses_the_unique_index ... ok
+test usage_cannot_be_double_metered_for_one_task ... ok
+test version_columns_exist_for_optimistic_concurrency ... ok
+test the_settlement_loads_the_task_for_update_under_a_tenant_predicate ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/tools_live_pg.rs (target/debug/deps/tools_live_pg-43936eb8ef41412c)
+
+running 1 test
+test live_tool_crud_permission_replace_and_cross_tenant_rls ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/usage_live_pg.rs (target/debug/deps/usage_live_pg-1c6e67fca9d14e8b)
+
+running 1 test
+test usage_append_windows_tenant_isolation_and_audit_keysets_use_live_postgres ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+EXIT_CODE=0
+UTC=2026-10-29T17:03:57Z

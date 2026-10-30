@@ -58,3 +58,6 @@ pub mod rows;
 pub mod scoped;
 pub mod scoped_request;
 pub mod transaction;
+
+pub use repositories::tools::PostgresToolStore;
+pub use repositories::usage::PostgresUsageStore;

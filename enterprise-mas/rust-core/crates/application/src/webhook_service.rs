@@ -56,6 +56,11 @@ pub struct DeliveryPage {
 /// Persistence port for redacted webhook administration.
 #[async_trait::async_trait]
 pub trait WebhookAdminPort: std::fmt::Debug + Send + Sync {
+    /// Reads one bounded page of an endpoint's delivery history.
+    ///
+    /// Contract (mirrored by the PostgreSQL implementation): an endpoint that
+    /// is not visible under `tenant` is `RESOURCE_NOT_FOUND` — never an empty
+    /// page, so a foreign id cannot be told apart from an empty own id.
     async fn list_deliveries(
         &self,
         tenant: TenantId,
@@ -111,7 +116,7 @@ impl WebhookService {
             items.truncate(usize::from(limit));
         }
         let next_cursor = if more {
-            items.last().map(encode_cursor)
+            items.last().map(encode_cursor).transpose()?
         } else {
             None
         };
@@ -149,12 +154,17 @@ impl WebhookService {
     }
 }
 
-fn encode_cursor(record: &DeliveryRecord) -> String {
+fn encode_cursor(record: &DeliveryRecord) -> Result<String> {
     use base64::Engine as _;
+    // Serialization of two scalar columns cannot fail in practice, but this
+    // runs inside a live request (keyset paging) — an error must travel the
+    // envelope, not panic the worker.
     let bytes =
         serde_json::to_vec(&serde_json::json!({"created_at":record.created_at,"id":record.id}))
-            .expect("cursor serialization is infallible");
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+            .map_err(|error| {
+                AppError::serialization(format!("delivery cursor serialization: {error}"))
+            })?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
 }
 
 fn decode_cursor(encoded: &str) -> Result<DeliveryCursor> {
@@ -209,7 +219,7 @@ mod tests {
             last_error: None,
             created_at: Timestamp::now(),
         };
-        let encoded = encode_cursor(&record);
+        let encoded = encode_cursor(&record).expect("cursor encode");
         let decoded = decode_cursor(&encoded).expect("cursor");
         assert_eq!(decoded.id, record.id);
         assert!(decode_cursor("../../secret").is_err());
@@ -223,11 +233,13 @@ mod tests {
         async fn list_deliveries(
             &self,
             _tenant: TenantId,
-            _endpoint: WebhookId,
+            endpoint: WebhookId,
             _after: Option<DeliveryCursor>,
             _limit: u16,
         ) -> Result<Vec<DeliveryRecord>> {
-            Ok(Vec::new())
+            // This fixture exposes no endpoints; the port contract requires a
+            // non-visible endpoint to be `not_found`, not an empty page.
+            Err(AppError::not_found("webhook", endpoint.to_string()))
         }
 
         async fn replay_dead_letter(

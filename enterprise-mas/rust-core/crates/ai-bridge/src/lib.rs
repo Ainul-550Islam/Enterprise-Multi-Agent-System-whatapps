@@ -648,6 +648,7 @@ fn annotate(error: AppError, suffix: &str) -> AppError {
         },
         Timeout(message) => Timeout(push(message)),
         Cancelled(message) => Cancelled(push(message)),
+        Unavailable(message) => Unavailable(push(message)),
         Database(message) => Database(push(message)),
         Messaging(message) => Messaging(push(message)),
         Serialization(message) => Serialization(push(message)),

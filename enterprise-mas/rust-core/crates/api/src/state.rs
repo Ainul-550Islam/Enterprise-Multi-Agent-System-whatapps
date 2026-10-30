@@ -23,16 +23,23 @@ use mas_application::agent_service::AgentService;
 use mas_application::analytics_service::AnalyticsService;
 use mas_application::api_key_service::ApiKeyApplicationService;
 use mas_application::approval_service::ApprovalApplicationService;
+use mas_application::assistant_service::AssistantService;
+use mas_application::audit_query_service::AuditQueryService;
+use mas_application::connector_service::ConnectorService;
 use mas_application::data_hub_service::DataHubApplicationService;
 use mas_application::execution_service::ExecutionService;
 use mas_application::inbound_webhook_service::InboundWebhookEndpointService;
 use mas_application::integration_service::IntegrationService;
 use mas_application::notification_service::NotificationService;
 use mas_application::oauth_authorization_service::OAuthAuthorizationService;
+use mas_application::policy_service::PolicyService;
 use mas_application::rollback_service::RollbackApplicationService;
 use mas_application::schedule_service::ScheduleService;
 use mas_application::search_service::SearchService;
 use mas_application::tenancy_service::TenancyService;
+use mas_application::tool_service::ToolService;
+use mas_application::usage_service::UsageService;
+use mas_application::webhook_service::WebhookService;
 use mas_application::workflow_service::WorkflowService;
 use mas_integrations::durable_oauth::DurableOAuthAuthorizationService;
 use mas_integrations::inbound_webhooks::InboundWebhookIngressPort;
@@ -40,6 +47,7 @@ use mas_observability::health::HealthRegistry;
 use sqlx::PgPool;
 
 use crate::auth::TokenVerifierPort;
+use crate::handlers::stream::StreamHub;
 use crate::scope_resolution::RequestScopeResolver;
 
 /// Everything a request may touch.
@@ -105,6 +113,34 @@ pub struct AppState {
     /// this service at bootstrap and handlers fail loudly rather than return
     /// a plausible empty dashboard.
     pub analytics: Option<Arc<AnalyticsService>>,
+    /// Read-only, filtered, keyset-paginated audit projection for the UI.
+    ///
+    /// `None` means this embedding has no audit read plane (or no signed
+    /// cursor key); `/v1/audit-events` then answers a typed 503 instead of
+    /// an empty page that reads as "nothing ever happened".
+    pub audit_query: Option<Arc<AuditQueryService>>,
+    /// Policy lifecycle facade: draft → publish → rollback, plus dry-run
+    /// evaluation through the canonical engine. `None` ⇒ typed 503.
+    pub policies: Option<Arc<PolicyService>>,
+    /// Quota and usage plan-card reads with server-computed utilization.
+    /// `None` ⇒ typed 503, never fabricated zero-valued usage.
+    pub usage: Option<Arc<UsageService>>,
+    /// Tenant tool catalogue, runtime config, and agent tool-permission
+    /// grants, policy-checked server-side. `None` ⇒ typed 503.
+    pub tools: Option<Arc<ToolService>>,
+    /// Connector administration: declarative manifests, guarded probe, and
+    /// disable-with-revocation. `None` ⇒ typed 503.
+    pub connector_admin: Option<Arc<ConnectorService>>,
+    /// Webhook delivery inspection and dead-letter replay.
+    /// `None` ⇒ typed 503.
+    pub webhook_admin: Option<Arc<WebhookService>>,
+    /// Tenant-isolated Server-Sent Events fan-out with bounded per-tenant
+    /// buffers and per-principal connection caps. `None` ⇒ typed 503.
+    pub stream_hub: Option<Arc<StreamHub>>,
+    /// Built-in platform assistant submission routed through the ordinary
+    /// execution pipeline (policy, quota, audit and usage still apply).
+    /// `None` ⇒ typed 503.
+    pub assistant: Option<Arc<AssistantService>>,
     /// The canonical control plane (entitlement → policy → quota).
     pub control_plane: Arc<mas_application::control_plane::ControlPlane>,
     /// Where control-plane mutations are recorded.
@@ -411,6 +447,192 @@ impl AppState {
         })
     }
 
+    /// Installs the audit query service after its read port and signed
+    /// cursor key have been composed.
+    #[must_use]
+    pub fn with_audit_query(mut self, audit_query: Arc<AuditQueryService>) -> Self {
+        self.audit_query = Some(audit_query);
+        self
+    }
+
+    /// Returns the audit query service or a typed `503` composition error.
+    pub fn audit_query_service(
+        &self,
+        ctx: &crate::context::RequestContext,
+    ) -> std::result::Result<Arc<AuditQueryService>, crate::response::ApiError> {
+        self.audit_query.clone().ok_or_else(|| {
+            crate::response::ApiError::new(
+                mas_common::error::AppError::unavailable(
+                    "the audit query service is not configured for this API deployment",
+                ),
+                ctx,
+            )
+        })
+    }
+
+    /// Installs the policy lifecycle service over the canonical policy
+    /// engine and store.
+    #[must_use]
+    pub fn with_policies(mut self, policies: Arc<PolicyService>) -> Self {
+        self.policies = Some(policies);
+        self
+    }
+
+    /// Returns the policy service or a typed `503` composition error.
+    pub fn policy_service(
+        &self,
+        ctx: &crate::context::RequestContext,
+    ) -> std::result::Result<Arc<PolicyService>, crate::response::ApiError> {
+        self.policies.clone().ok_or_else(|| {
+            crate::response::ApiError::new(
+                mas_common::error::AppError::unavailable(
+                    "the policy service is not configured for this API deployment",
+                ),
+                ctx,
+            )
+        })
+    }
+
+    /// Installs the quota/usage read service over the production usage and
+    /// quota stores.
+    #[must_use]
+    pub fn with_usage(mut self, usage: Arc<UsageService>) -> Self {
+        self.usage = Some(usage);
+        self
+    }
+
+    /// Returns the usage service or a typed `503` composition error.
+    pub fn usage_service(
+        &self,
+        ctx: &crate::context::RequestContext,
+    ) -> std::result::Result<Arc<UsageService>, crate::response::ApiError> {
+        self.usage.clone().ok_or_else(|| {
+            crate::response::ApiError::new(
+                mas_common::error::AppError::unavailable(
+                    "the usage service is not configured for this API deployment",
+                ),
+                ctx,
+            )
+        })
+    }
+
+    /// Installs the tool catalogue service over the production tool store
+    /// and the canonical policy engine.
+    #[must_use]
+    pub fn with_tools(mut self, tools: Arc<ToolService>) -> Self {
+        self.tools = Some(tools);
+        self
+    }
+
+    /// Returns the tool service or a typed `503` composition error.
+    pub fn tool_service(
+        &self,
+        ctx: &crate::context::RequestContext,
+    ) -> std::result::Result<Arc<ToolService>, crate::response::ApiError> {
+        self.tools.clone().ok_or_else(|| {
+            crate::response::ApiError::new(
+                mas_common::error::AppError::unavailable(
+                    "the tool service is not configured for this API deployment",
+                ),
+                ctx,
+            )
+        })
+    }
+
+    /// Installs connector administration over the canonical integration
+    /// plane and revocation persistence.
+    #[must_use]
+    pub fn with_connector_admin(mut self, connector_admin: Arc<ConnectorService>) -> Self {
+        self.connector_admin = Some(connector_admin);
+        self
+    }
+
+    /// Returns the connector administration service or a typed `503`
+    /// composition error.
+    pub fn connector_admin_service(
+        &self,
+        ctx: &crate::context::RequestContext,
+    ) -> std::result::Result<Arc<ConnectorService>, crate::response::ApiError> {
+        self.connector_admin.clone().ok_or_else(|| {
+            crate::response::ApiError::new(
+                mas_common::error::AppError::unavailable(
+                    "the connector administration service is not configured for this API deployment",
+                ),
+                ctx,
+            )
+        })
+    }
+
+    /// Installs webhook delivery administration over the durable delivery
+    /// and dead-letter stores.
+    #[must_use]
+    pub fn with_webhook_admin(mut self, webhook_admin: Arc<WebhookService>) -> Self {
+        self.webhook_admin = Some(webhook_admin);
+        self
+    }
+
+    /// Returns the webhook administration service or a typed `503`
+    /// composition error.
+    pub fn webhook_admin_service(
+        &self,
+        ctx: &crate::context::RequestContext,
+    ) -> std::result::Result<Arc<WebhookService>, crate::response::ApiError> {
+        self.webhook_admin.clone().ok_or_else(|| {
+            crate::response::ApiError::new(
+                mas_common::error::AppError::unavailable(
+                    "the webhook administration service is not configured for this API deployment",
+                ),
+                ctx,
+            )
+        })
+    }
+
+    /// Installs the tenant-isolated SSE hub after its event-bus subscriber
+    /// has been attached (or deliberately omitted in a lane without one).
+    #[must_use]
+    pub fn with_stream_hub(mut self, stream_hub: Arc<StreamHub>) -> Self {
+        self.stream_hub = Some(stream_hub);
+        self
+    }
+
+    /// Returns the SSE stream hub or a typed `503` composition error.
+    pub fn stream_hub_service(
+        &self,
+        ctx: &crate::context::RequestContext,
+    ) -> std::result::Result<Arc<StreamHub>, crate::response::ApiError> {
+        self.stream_hub.clone().ok_or_else(|| {
+            crate::response::ApiError::new(
+                mas_common::error::AppError::unavailable(
+                    "the event stream hub is not configured for this API deployment",
+                ),
+                ctx,
+            )
+        })
+    }
+
+    /// Installs the built-in platform assistant over the same stores and
+    /// execution service the rest of the API already composes.
+    #[must_use]
+    pub fn with_assistant(mut self, assistant: Arc<AssistantService>) -> Self {
+        self.assistant = Some(assistant);
+        self
+    }
+
+    /// Returns the assistant service or a typed `503` composition error.
+    pub fn assistant_service(
+        &self,
+        ctx: &crate::context::RequestContext,
+    ) -> std::result::Result<Arc<AssistantService>, crate::response::ApiError> {
+        self.assistant.clone().ok_or_else(|| {
+            crate::response::ApiError::new(
+                mas_common::error::AppError::unavailable(
+                    "the assistant service is not configured for this API deployment",
+                ),
+                ctx,
+            )
+        })
+    }
+
     /// The canonical control plane.
     #[must_use]
     pub fn control_plane(&self) -> &Arc<mas_application::control_plane::ControlPlane> {
@@ -477,6 +699,14 @@ impl AppState {
             oauth_authorization: None,
             oauth_callbacks: None,
             analytics: None,
+            audit_query: None,
+            policies: None,
+            usage: None,
+            tools: None,
+            connector_admin: None,
+            webhook_admin: None,
+            stream_hub: None,
+            assistant: None,
             control_plane,
             audit,
             control_plane_stores,

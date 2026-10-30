@@ -1,0 +1,13 @@
+    Checking mas-security v0.1.0 (/home/user/repo/enterprise-mas/rust-core/crates/security)
+    Checking mas-tenancy v0.1.0 (/home/user/repo/enterprise-mas/rust-core/crates/tenancy)
+    Checking mas-integrations v0.1.0 (/home/user/repo/enterprise-mas/rust-core/crates/integrations)
+    Checking mas-ai-bridge v0.1.0 (/home/user/repo/enterprise-mas/rust-core/crates/ai-bridge)
+    Checking mas-application v0.1.0 (/home/user/repo/enterprise-mas/rust-core/crates/application)
+    Checking mas-worker v0.1.0 (/home/user/repo/enterprise-mas/rust-core/crates/worker)
+    Checking mas-persistence v0.1.0 (/home/user/repo/enterprise-mas/rust-core/crates/persistence)
+    Checking mas-api v0.1.0 (/home/user/repo/enterprise-mas/rust-core/crates/api)
+    Checking mas-scheduler-service v0.1.0 (/home/user/repo/enterprise-mas/rust-core/crates/scheduler-service)
+    Checking mas-worker-service v0.1.0 (/home/user/repo/enterprise-mas/rust-core/crates/worker-service)
+    Finished `dev` profile [unoptimized] target(s) in 27.90s
+EXIT_CODE=0
+UTC=2026-10-29T17:15:23Z

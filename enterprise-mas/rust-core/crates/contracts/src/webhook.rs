@@ -172,3 +172,57 @@ pub struct WebhookDeliveryDto {
     /// Sanitized error summary.
     pub last_error: Option<String>,
 }
+
+/// Bounded delivery-history page (`GET /v1/webhooks/{id}/deliveries`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebhookDeliveryPageDto {
+    pub items: Vec<WebhookDeliveryDto>,
+    pub next_cursor: Option<String>,
+}
+
+/// Query parameters for a bounded webhook delivery history page.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WebhookDeliveryQuery {
+    /// Opaque URL-safe base64 cursor returned by the preceding page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    /// Maximum number of deliveries to return.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u16>,
+}
+
+impl WebhookDeliveryQuery {
+    /// Bounds the page size and cursor shape before the store is touched.
+    pub fn validate(&self) -> Result<()> {
+        if self.limit.is_some_and(|limit| !(1..=200).contains(&limit)) {
+            return Err(mas_common::error::AppError::invalid_field(
+                "limit",
+                "out_of_range",
+                "delivery page limit must be between 1 and 200",
+            ));
+        }
+        if let Some(cursor) = &self.cursor {
+            validation::validate_length("cursor", cursor, 1, 512)?;
+            if !cursor
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            {
+                return Err(mas_common::error::AppError::invalid_field(
+                    "cursor",
+                    "invalid_format",
+                    "delivery cursor must be URL-safe base64 without padding",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Page size with the default applied.
+    #[must_use]
+    pub const fn page_limit(&self) -> u16 {
+        match self.limit {
+            Some(limit) => limit,
+            None => 50,
+        }
+    }
+}

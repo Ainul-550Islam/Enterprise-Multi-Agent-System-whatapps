@@ -163,6 +163,18 @@ pub enum AppError {
     #[error("operation cancelled: {0}")]
     Cancelled(String),
 
+    /// A composed application surface (service/store port) was not installed
+    /// in this deployment, so the route that depends on it must refuse.
+    ///
+    /// Deliberately distinct from [`Self::Internal`]: a missing composition
+    /// is a deployment fact, not a crash. The API boundary maps it to
+    /// `503 Service Unavailable` with a deterministic `SERVICE_UNAVAILABLE`
+    /// code so a client can tell "this build has no such surface" apart from
+    /// "something broke", and handlers must never answer such a route with
+    /// fabricated or empty data instead.
+    #[error("service unavailable: {0}")]
+    Unavailable(String),
+
     /// Database-layer failure (connection, query, migration, integrity).
     #[error("database error: {0}")]
     Database(String),
@@ -257,6 +269,13 @@ impl AppError {
 
     pub fn forbidden(message: impl Into<String>) -> Self {
         Self::Forbidden(message.into())
+    }
+
+    /// A composed surface this route depends on is absent in this deployment.
+    /// Maps to `503 Service Unavailable`; the message must name what is not
+    /// configured, never an internal detail.
+    pub fn unavailable(message: impl Into<String>) -> Self {
+        Self::Unavailable(message.into())
     }
 
     pub fn conflict(message: impl Into<String>) -> Self {
@@ -443,6 +462,7 @@ impl AppError {
             Self::EntitlementRequired { .. } => "ENTITLEMENT_REQUIRED",
             Self::Timeout(_) => "TIMEOUT",
             Self::Cancelled(_) => "CANCELLED",
+            Self::Unavailable(_) => "SERVICE_UNAVAILABLE",
             Self::Database(_) => "DATABASE_ERROR",
             Self::Messaging(_) => "MESSAGING_ERROR",
             Self::Serialization(_) => "SERIALIZATION_ERROR",
@@ -479,6 +499,9 @@ impl AppError {
             | Self::Forbidden(_)
             | Self::Conflict(_)
             | Self::Cancelled(_)
+            // A not-configured surface stays unavailable until an operator
+            // changes the deployment; retrying the same request cannot help.
+            | Self::Unavailable(_)
             | Self::Serialization(_)
             | Self::Internal(_)
             | Self::PolicyDenied { .. }
@@ -514,6 +537,9 @@ impl AppError {
             // 499 (nginx-style "Client Closed Request") is the de-facto
             // cancellation status; fall back to 400 if a stack rejects it.
             Self::Cancelled(_) => StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
+            // A route whose composed service is absent answers 503 so clients
+            // and load balancers can distinguish "not wired here" from a bug.
+            Self::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::Database(_) | Self::Messaging(_) | Self::Serialization(_) | Self::Internal(_) => {
                 StatusCode::INTERNAL_SERVER_ERROR
             },
@@ -595,6 +621,7 @@ impl AppError {
             },
             Self::Timeout(_) => "the operation timed out; it may be retried".to_owned(),
             Self::Cancelled(_) => "the operation was cancelled".to_owned(),
+            Self::Unavailable(message) => format!("service unavailable: {message}"),
             Self::ExternalService { service, .. } => {
                 format!("upstream dependency '{service}' is temporarily unavailable")
             },

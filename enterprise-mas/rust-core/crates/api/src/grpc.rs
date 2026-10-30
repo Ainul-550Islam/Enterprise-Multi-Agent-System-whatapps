@@ -64,6 +64,7 @@ fn to_status(err: AppError) -> Status {
         AppError::Timeout(_) => Code::DeadlineExceeded,
         AppError::Cancelled(_) => Code::Cancelled,
         AppError::ExternalService { .. } => Code::Unavailable,
+        AppError::Unavailable(_) => Code::Unavailable,
         _ => Code::Internal,
     };
     tracing::warn!(code = %err.error_code(), grpc_code = ?code, "grpc call failed");

@@ -1,0 +1,57 @@
+sha256(before): f7445a08ea8ad444d4f085f17a570435b8e67dca5acc891307f0985577f2a99a
+mutation applied: tenant filter removed from ToolService::get
+==== RUN 1: expect FAIL (foreign tool must now leak) ====
+   Compiling mas-application v0.1.0 (/home/user/repo/enterprise-mas/rust-core/crates/application)
+warning: unused variable: `tenant`
+   --> crates/application/src/tool_service.rs:111:13
+    |
+111 |         let tenant = ctx.require_tenant()?;
+    |             ^^^^^^ help: if this is intentional, prefix it with an underscore: `_tenant`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+   Compiling mas-worker v0.1.0 (/home/user/repo/enterprise-mas/rust-core/crates/worker)
+   Compiling mas-persistence v0.1.0 (/home/user/repo/enterprise-mas/rust-core/crates/persistence)
+warning: `mas-application` (lib) generated 1 warning (run `cargo fix --lib -p mas-application` to apply 1 suggestion)
+   Compiling mas-api v0.1.0 (/home/user/repo/enterprise-mas/rust-core/crates/api)
+    Finished `test` profile [unoptimized] target(s) in 36.13s
+     Running tests/tooling_routes.rs (target/debug/deps/tooling_routes-7b99ae7c92f1f239)
+
+running 1 test
+test foreign_tenant_tool_ids_are_hidden_as_not_found ... FAILED
+
+failures:
+
+---- foreign_tenant_tool_ids_are_hidden_as_not_found stdout ----
+
+thread 'foreign_tenant_tool_ids_are_hidden_as_not_found' (92192) panicked at crates/api/tests/tooling_routes.rs:370:10:
+foreign tool id is hidden from tenant A: Tool { id: ToolId(01a188a2-7084-72fa-998a-dbb30ca94be7), tenant_id: TenantId(01a188a2-7084-72fa-998a-dbb0e894b97c), organization_id: OrganizationId(01a188a2-7084-72fa-998a-dbb1be5d77ee), project_id: None, name: "foreign-tool", description: None, kind: Internal, input_schema: Object {"type": String("object")}, output_schema: None, runtime: ToolRuntime { endpoint: None, timeout_ms: 30000, sandbox_required: false, settings: {} }, safety: Standard, status: Draft, version: 2, created_at: Timestamp(2026-10-29T17:08:29.444256305Z), updated_at: Timestamp(2026-10-29T17:08:29.444331574Z) }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    foreign_tenant_tool_ids_are_hidden_as_not_found
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p mas-api --test tooling_routes`
+RUN1_EXIT=101
+OBSERVED: broken tenant predicate makes the foreign-tenant test FAIL
+restored; sha256(after): f7445a08ea8ad444d4f085f17a570435b8e67dca5acc891307f0985577f2a99a
+==== RUN 2: expect PASS after restore ====
+   Compiling mas-application v0.1.0 (/home/user/repo/enterprise-mas/rust-core/crates/application)
+   Compiling mas-worker v0.1.0 (/home/user/repo/enterprise-mas/rust-core/crates/worker)
+   Compiling mas-persistence v0.1.0 (/home/user/repo/enterprise-mas/rust-core/crates/persistence)
+   Compiling mas-api v0.1.0 (/home/user/repo/enterprise-mas/rust-core/crates/api)
+    Finished `test` profile [unoptimized] target(s) in 35.27s
+     Running tests/tooling_routes.rs (target/debug/deps/tooling_routes-7b99ae7c92f1f239)
+
+running 1 test
+test foreign_tenant_tool_ids_are_hidden_as_not_found ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s
+
+RUN2_EXIT=0
+MUTATION_SANITY_1_OK: FAIL observed under mutation, PASS after restore
+EXIT_CODE=0
+UTC=2026-10-29T17:09:04Z

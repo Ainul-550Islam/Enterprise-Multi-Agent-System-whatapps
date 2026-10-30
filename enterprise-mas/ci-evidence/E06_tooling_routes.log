@@ -1,0 +1,18 @@
+    Finished `test` profile [unoptimized] target(s) in 0.29s
+     Running tests/tooling_routes.rs (target/debug/deps/tooling_routes-7b99ae7c92f1f239)
+
+running 9 tests
+test foreign_tenant_agent_tool_permissions_are_hidden_as_not_found ... ok
+test foreign_tenant_connector_ids_are_hidden_as_not_found ... ok
+test foreign_tenant_tool_ids_are_hidden_as_not_found ... ok
+test foreign_tenant_webhook_delivery_ids_are_hidden_as_not_found ... ok
+test omitted_tool_composition_fails_with_a_typed_service_unavailable ... ok
+test private_and_metadata_destinations_are_rejected_before_a_connector_probe ... ok
+test tool_pages_and_tool_metadata_keep_the_stable_envelope_shape ... ok
+test viewer_is_denied_tool_connector_and_webhook_mutations_by_the_canonical_matrix ... ok
+test every_new_tenant_surface_rejects_unauthenticated_requests ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+EXIT_CODE=0
+UTC=2026-10-29T17:18:01Z

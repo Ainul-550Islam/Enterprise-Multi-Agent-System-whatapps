@@ -32,6 +32,8 @@
 pub mod broker;
 pub mod codec;
 pub mod connection;
+#[cfg(feature = "nats")]
+pub mod event_tail;
 pub mod grpc;
 pub mod headers;
 pub mod health;

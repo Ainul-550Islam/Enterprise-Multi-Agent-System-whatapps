@@ -148,7 +148,7 @@ impl TenantDirectoryPort for PgTenantDirectory {
             "SELECT id, organization_id, name, slug, status, environment, isolation_mode, settings, created_at, updated_at
                FROM tenants WHERE id = $1",
         )
-        .bind(id.to_database_string())
+        .bind(id.into_uuid())
         .fetch_optional(&self.pool)
         .await
         .map_err(map_sqlx)?;
@@ -191,7 +191,7 @@ impl TenantDirectoryPort for PgTenantDirectory {
             "SELECT id, legal_name, display_name, slug, status, settings, created_at, updated_at
                FROM organizations WHERE id = $1",
         )
-        .bind(id.to_database_string())
+        .bind(id.into_uuid())
         .fetch_optional(&self.pool)
         .await
         .map_err(map_sqlx)?;
@@ -220,7 +220,7 @@ impl TenantDirectoryPort for PgTenantDirectory {
             "SELECT id, tenant_id, organization_id, name, slug, description, status, config, created_at, updated_at
                FROM projects WHERE id = $1",
         )
-        .bind(id.to_database_string())
+        .bind(id.into_uuid())
         .fetch_optional(&self.pool)
         .await
         .map_err(map_sqlx)?;
@@ -257,7 +257,7 @@ impl TenantDirectoryPort for PgTenantDirectory {
             "SELECT id, organization_id, name, slug, status, environment, isolation_mode, settings, created_at, updated_at
                FROM tenants WHERE organization_id = $1 ORDER BY id",
         )
-        .bind(organization_id.to_database_string())
+        .bind(organization_id.into_uuid())
         .fetch_all(&self.pool)
         .await
         .map_err(map_sqlx)?;
@@ -278,7 +278,7 @@ impl TenantDirectoryPort for PgTenantDirectory {
             "SELECT id, tenant_id, organization_id, name, slug, description, status, config, created_at, updated_at
                FROM projects WHERE tenant_id = $1 ORDER BY id",
         )
-        .bind(tenant_id.to_database_string())
+        .bind(tenant_id.into_uuid())
         .fetch_all(&self.pool)
         .await
         .map_err(map_sqlx)?;
@@ -358,7 +358,7 @@ impl MembershipDirectoryPort for PgMembershipDirectory {
             "SELECT id, user_id, organization_id, tenant_id, roles, status, invited_at, joined_at, created_at, updated_at
                FROM memberships WHERE user_id = $1 ORDER BY id",
         )
-        .bind(user_id.to_database_string())
+        .bind(user_id.into_uuid())
         .fetch_all(&self.pool)
         .await
         .map_err(map_sqlx)?;
@@ -373,7 +373,7 @@ impl MembershipDirectoryPort for PgMembershipDirectory {
             "SELECT id, user_id, organization_id, tenant_id, roles, status, invited_at, joined_at, created_at, updated_at
                FROM memberships WHERE organization_id = $1 ORDER BY id",
         )
-        .bind(organization_id.to_database_string())
+        .bind(organization_id.into_uuid())
         .fetch_all(&self.pool)
         .await
         .map_err(map_sqlx)?;
@@ -389,7 +389,7 @@ impl MembershipDirectoryPort for PgMembershipDirectory {
             "SELECT id, user_id, organization_id, tenant_id, roles, status, invited_at, joined_at, created_at, updated_at
                FROM memberships WHERE id = $1",
         )
-        .bind(id.to_database_string())
+        .bind(id.into_uuid())
         .fetch_optional(&self.pool)
         .await
         .map_err(map_sqlx)?;

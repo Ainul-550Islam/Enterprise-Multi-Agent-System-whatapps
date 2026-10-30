@@ -1,0 +1,66 @@
+
+==== STEP 1: ledger + objects BEFORE (up state for 0050-0053) ====
+ 49:integration_keyset_indexes
+ 50:audit_query_indexes
+ 51:webhook_replay_attempts
+ 52:usage_append_only
+ 53:runtime_role_sequence_usage
+
+ audit_keyset_indexes=5
+
+ webhook_replay_attempts=webhook_replay_attempts
+
+ mas_app_can_update_usage=false
+
+ mas_app_usage_broker_seq=true
+
+
+==== STEP 2: DOWN 0053 -> 0052 -> 0051 -> 0050 (down.sql + ledger row per migration) ====
+-- down migration 53 from /home/user/repo/enterprise-mas/rust-core/migrations/0053_runtime_role_sequence_usage
+-- down migration 52 from /home/user/repo/enterprise-mas/rust-core/migrations/0052_usage_append_only
+-- down migration 51 from /home/user/repo/enterprise-mas/rust-core/migrations/0051_webhook_replay_attempts
+-- down migration 50 from /home/user/repo/enterprise-mas/rust-core/migrations/0050_audit_query_indexes
+
+==== STEP 3: state AFTER down ====
+ max_version=49
+
+ audit_keyset_indexes=0
+
+ webhook_replay_attempts=ABSENT
+
+ mas_app_can_update_usage=true
+
+ mas_app_usage_broker_seq=false
+
+
+==== STEP 4: UP again via the production MigrationRunner (live test harness migrates on connect) ====
+    Finished `test` profile [unoptimized] target(s) in 0.24s
+     Running tests/usage_live_pg.rs (target/debug/deps/usage_live_pg-1c6e67fca9d14e8b)
+
+running 1 test
+test usage_append_windows_tenant_isolation_and_audit_keysets_use_live_postgres ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+
+==== STEP 5: state AFTER up (round-trip complete) ====
+ 49:integration_keyset_indexes
+ 50:audit_query_indexes
+ 51:webhook_replay_attempts
+ 52:usage_append_only
+ 53:runtime_role_sequence_usage
+
+ max_version=53
+
+ audit_keyset_indexes=5
+
+ webhook_replay_attempts=webhook_replay_attempts
+
+ mas_app_can_update_usage=false
+
+ mas_app_usage_broker_seq=true
+
+
+ROUNDTRIP_OK
+EXIT_CODE=0
+UTC=2026-10-29T17:07:04Z

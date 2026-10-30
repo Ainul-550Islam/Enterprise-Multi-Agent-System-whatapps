@@ -1,0 +1,105 @@
+== Phase B: route completeness (source) ==
+UTC_NOW=2026-10-29T17:13:53Z
+PASS route GET /v1/auth/me registered exactly once (crates/api/src/routes_governance.rs)
+PASS route GET /v1/audit-events registered exactly once (crates/api/src/routes_governance.rs)
+PASS route GET /v1/policies registered exactly once (crates/api/src/routes_governance.rs)
+PASS route POST /v1/policies registered exactly once (crates/api/src/routes_governance.rs)
+PASS route GET /v1/policies/{id} registered exactly once (crates/api/src/routes_governance.rs)
+PASS route PATCH /v1/policies/{id} registered exactly once (crates/api/src/routes_governance.rs)
+PASS route POST /v1/policies/{id}/publish registered exactly once (crates/api/src/routes_governance.rs)
+PASS route POST /v1/policies/{id}/rollback registered exactly once (crates/api/src/routes_governance.rs)
+PASS route POST /v1/policies/{id}/evaluate registered exactly once (crates/api/src/routes_governance.rs)
+PASS route GET /v1/quotas registered exactly once (crates/api/src/routes_governance.rs)
+PASS route GET /v1/usage/summary registered exactly once (crates/api/src/routes_governance.rs)
+PASS route POST /v1/tools registered exactly once (crates/api/src/routes_tooling.rs)
+PASS route GET /v1/tools registered exactly once (crates/api/src/routes_tooling.rs)
+PASS route GET /v1/tools/{id} registered exactly once (crates/api/src/routes_tooling.rs)
+PASS route PATCH /v1/tools/{id} registered exactly once (crates/api/src/routes_tooling.rs)
+PASS route PUT /v1/agents/{agent_id}/tool-permissions registered exactly once (crates/api/src/routes_tooling.rs)
+PASS route GET /v1/connector-manifests registered exactly once (crates/api/src/routes_tooling.rs)
+PASS route POST /v1/connectors/{connector_id}/probe registered exactly once (crates/api/src/routes_tooling.rs)
+PASS route POST /v1/connectors/{connector_id}/disable registered exactly once (crates/api/src/routes_tooling.rs)
+PASS route GET /v1/webhooks/{id}/deliveries registered exactly once (crates/api/src/routes_tooling.rs)
+PASS route POST /v1/webhooks/{id}/deliveries/{delivery_id}/replay registered exactly once (crates/api/src/routes_tooling.rs)
+PASS route GET /v1/stream registered exactly once (crates/api/src/routes_tooling.rs)
+PASS route POST /v1/assistant/messages registered exactly once (crates/api/src/routes_tooling.rs)
+PASS pre-existing route GET /v1/usage still registered (crates/api/src/router.rs)
+PASS pre-existing route GET /v1/billing/subscription still registered (crates/api/src/router.rs)
+PASS pre-existing route GET /v1/billing/entitlements still registered (crates/api/src/router.rs)
+PASS pre-existing route GET /v1/billing/usage-totals still registered (crates/api/src/router.rs)
+PASS pre-existing route GET /v1/billing/receipts still registered (crates/api/src/router.rs)
+PASS pre-existing route GET /v1/billing/receipts/{provider}/{event_id} still registered (crates/api/src/router.rs)
+PASS pre-existing route POST /v1/connectors still registered (crates/api/src/router.rs)
+PASS pre-existing route GET /v1/connectors still registered (crates/api/src/router.rs)
+PASS pre-existing route POST /v1/connectors/test still registered (crates/api/src/router.rs)
+PASS pre-existing route GET /v1/connectors/{connector_id} still registered (crates/api/src/router.rs)
+PASS pre-existing route POST /v1/connectors/{connector_id}/oauth/authorize still registered (crates/api/src/router.rs)
+PASS pre-existing route POST /v1/webhooks still registered (crates/api/src/router.rs)
+PASS pre-existing route GET /v1/webhooks still registered (crates/api/src/router.rs)
+PASS pre-existing route POST /v1/webhooks/{webhook_id}/enable still registered (crates/api/src/router.rs)
+PASS pre-existing route POST /v1/webhooks/{webhook_id}/disable still registered (crates/api/src/router.rs)
+PASS pre-existing route GET /v1/assistant/insights still registered (crates/api/src/router.rs)
+PASS pre-existing route GET /v1/analytics/overview still registered (crates/api/src/router.rs)
+PASS pre-existing route GET /v1/analytics/performance still registered (crates/api/src/router.rs)
+PASS pre-existing route GET /v1/analytics/tasks-by-agent still registered (crates/api/src/router.rs)
+PASS pre-existing route GET /v1/analytics/usage-cost still registered (crates/api/src/router.rs)
+PASS pre-existing route GET /v1/rollbacks still registered (crates/api/src/router.rs)
+PASS pre-existing route GET /v1/approvals still registered (crates/api/src/router.rs)
+PASS pre-existing route POST /v1/approvals/{id}/approve still registered (crates/api/src/router.rs)
+PASS pre-existing route POST /v1/approvals/{id}/deny still registered (crates/api/src/router.rs)
+PASS no duplicate (method, path) registrations anywhere in api src
+PASS protected router closes with authenticated_layer before internal/public merge
+PASS routes_governance merged inside the protected (authenticated) router
+PASS routes_tooling merged inside the protected (authenticated) router
+PASS global request_context_layer applied to the full router
+PASS routes_governance registers routes with no second middleware envelope
+PASS routes_tooling registers routes with no second middleware envelope
+STATIC_FAIL_COUNT=0
+== Phase B: live boot against real PostgreSQL + route curls ==
+PASS psql client available
+PASS PostgreSQL cluster accepting connections
+PASS NATS server listening on 4222
+-- cargo build -p mas-api --bin mas-api --
+PASS cargo build -p mas-api --bin mas-api
+BUILD_EXIT_CODE=0
+PASS Python AgentBridge stub listening on 127.0.0.1:42759 (ci-evidence/B_stub.log)
+PASS production server booted (GET /v1/health/live -> 200)
+PASS seeded org/tenant/project + API key (prefix mas_57c1cde0…)
+-- batch route curl matrix (observed codes) --
+PASS GET /v1/auth/me invalid=401 valid=200
+PASS GET /v1/audit-events invalid=401 valid=200
+PASS GET /v1/policies invalid=401 valid=200
+PASS POST /v1/policies invalid=401 valid=422
+PASS GET /v1/policies/{id} invalid=401 valid=404
+PASS PATCH /v1/policies/{id} invalid=401 valid=400
+PASS POST /v1/policies/{id}/publish invalid=401 valid=404
+PASS POST /v1/policies/{id}/rollback invalid=401 valid=422
+PASS POST /v1/policies/{id}/evaluate invalid=401 valid=422
+PASS GET /v1/quotas invalid=401 valid=200
+PASS GET /v1/usage/summary?from=2026-10-01T00:00:00Z&to=2026-10-30T00:00:00Z invalid=401 valid=200
+PASS POST /v1/tools invalid=401 valid=422
+PASS GET /v1/tools invalid=401 valid=200
+PASS GET /v1/tools/{id} invalid=401 valid=404
+PASS PATCH /v1/tools/{id} invalid=401 valid=404
+PASS PUT /v1/agents/{agent_id}/tool-permissions invalid=401 valid=422
+PASS GET /v1/connector-manifests invalid=401 valid=200
+PASS POST /v1/connectors/{connector_id}/probe invalid=401 valid=404
+PASS POST /v1/connectors/{connector_id}/disable invalid=401 valid=404
+PASS GET /v1/webhooks/{id}/deliveries invalid=401 valid=404
+PASS POST /v1/webhooks/{id}/deliveries/{delivery_id}/replay invalid=401 valid=404
+PASS GET /v1/stream invalid=401 valid=200
+PASS POST /v1/assistant/messages invalid=401 valid=403 (expected: 403)
+-- pre-existing route liveness with valid token --
+PASS GET /v1/usage invalid=401 valid=200
+PASS GET /v1/billing/subscription invalid=401 valid=404
+PASS GET /v1/rollbacks invalid=401 valid=200
+PASS GET /v1/approvals invalid=401 valid=200
+PASS GET /v1/assistant/insights invalid=401 valid=200
+PASS GET /v1/analytics/overview?from=2026-10-01T00:00:00Z&to=2026-10-30T00:00:00Z invalid=401 valid=200
+PASS GET /v1/connectors invalid=401 valid=200
+PASS GET /v1/webhooks invalid=401 valid=200
+ROUTES: ALL PASS
+EXIT_CODE=0
+2026-10-29T17:14:02Z
+EXIT_CODE=0
+UTC=2026-10-29T17:14:02Z

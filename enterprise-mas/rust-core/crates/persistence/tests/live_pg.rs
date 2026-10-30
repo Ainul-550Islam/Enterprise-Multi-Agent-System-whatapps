@@ -691,7 +691,7 @@ async fn audit_append_list_and_counts() {
     assert!(ours >= 2, "both appended events returned, got {ours}");
 
     let by_corr = sink
-        .list_for_correlation(&correlation)
+        .list_for_correlation(scope.tenant_id(), &correlation)
         .await
         .expect("list for correlation");
     assert_eq!(by_corr.len(), 2);

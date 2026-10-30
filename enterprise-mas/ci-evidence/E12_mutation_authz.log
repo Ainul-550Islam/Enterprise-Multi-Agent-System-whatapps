@@ -1,0 +1,75 @@
+sha256(before): a308b75f12acb3cd0eca69c781b1a90e82a79c0dd0b738f27b146fd9f7723e1b
+mutation applied: AuthorizationService::authorize always allows
+==== RUN 1: expect FAIL (viewer would be allowed to manage policies) ====
+   Compiling mas-security v0.1.0 (/home/user/repo/enterprise-mas/rust-core/crates/security)
+warning: unreachable statement
+   --> crates/security/src/authorization.rs:689:9
+    |
+685 | /         return AuthorizationDecision::Allow {
+686 | |             granted_by: mas_domain::MembershipRole::Owner,
+687 | |         };
+    | |_________- any code following this expression is unreachable
+688 |           // 1. The credential itself.
+689 | /         if !principal.is_usable() {
+690 | |             return AuthorizationDecision::Deny(
+691 | |                 AuthFailure::expired_credential().with_detail("credential is no longer in date"),
+692 | |             );
+693 | |         }
+    | |_________^ unreachable statement
+    |
+    = note: `#[warn(unreachable_code)]` (part of `#[warn(unused)]`) on by default
+
+   Compiling mas-tenancy v0.1.0 (/home/user/repo/enterprise-mas/rust-core/crates/tenancy)
+warning: `mas-security` (lib) generated 1 warning
+   Compiling mas-integrations v0.1.0 (/home/user/repo/enterprise-mas/rust-core/crates/integrations)
+   Compiling mas-ai-bridge v0.1.0 (/home/user/repo/enterprise-mas/rust-core/crates/ai-bridge)
+   Compiling mas-application v0.1.0 (/home/user/repo/enterprise-mas/rust-core/crates/application)
+   Compiling mas-worker v0.1.0 (/home/user/repo/enterprise-mas/rust-core/crates/worker)
+   Compiling mas-persistence v0.1.0 (/home/user/repo/enterprise-mas/rust-core/crates/persistence)
+   Compiling mas-api v0.1.0 (/home/user/repo/enterprise-mas/rust-core/crates/api)
+    Finished `test` profile [unoptimized] target(s) in 37.54s
+     Running tests/governance_routes.rs (target/debug/deps/governance_routes-cf6bd11c099b830a)
+
+running 1 test
+test viewer_cannot_mutate_policies_through_the_canonical_matrix ... FAILED
+
+failures:
+
+---- viewer_cannot_mutate_policies_through_the_canonical_matrix stdout ----
+
+thread 'viewer_cannot_mutate_policies_through_the_canonical_matrix' (92561) panicked at crates/api/tests/governance_routes.rs:249:5:
+assertion failed: matches!(AuthorizationService::new().authorize(&viewer, &request),
+    mas_security::AuthorizationDecision::Deny(_))
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    viewer_cannot_mutate_policies_through_the_canonical_matrix
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p mas-api --test governance_routes`
+RUN1_EXIT=101
+OBSERVED: broken authorization matrix makes the viewer-denial test FAIL
+restored; sha256(after): a308b75f12acb3cd0eca69c781b1a90e82a79c0dd0b738f27b146fd9f7723e1b
+==== RUN 2: expect PASS after restore ====
+   Compiling mas-security v0.1.0 (/home/user/repo/enterprise-mas/rust-core/crates/security)
+   Compiling mas-tenancy v0.1.0 (/home/user/repo/enterprise-mas/rust-core/crates/tenancy)
+   Compiling mas-integrations v0.1.0 (/home/user/repo/enterprise-mas/rust-core/crates/integrations)
+   Compiling mas-ai-bridge v0.1.0 (/home/user/repo/enterprise-mas/rust-core/crates/ai-bridge)
+   Compiling mas-application v0.1.0 (/home/user/repo/enterprise-mas/rust-core/crates/application)
+   Compiling mas-worker v0.1.0 (/home/user/repo/enterprise-mas/rust-core/crates/worker)
+   Compiling mas-persistence v0.1.0 (/home/user/repo/enterprise-mas/rust-core/crates/persistence)
+   Compiling mas-api v0.1.0 (/home/user/repo/enterprise-mas/rust-core/crates/api)
+    Finished `test` profile [unoptimized] target(s) in 37.11s
+     Running tests/governance_routes.rs (target/debug/deps/governance_routes-cf6bd11c099b830a)
+
+running 1 test
+test viewer_cannot_mutate_policies_through_the_canonical_matrix ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s
+
+RUN2_EXIT=0
+MUTATION_SANITY_2_OK: FAIL observed under mutation, PASS after restore
+EXIT_CODE=0
+UTC=2026-10-29T17:10:35Z

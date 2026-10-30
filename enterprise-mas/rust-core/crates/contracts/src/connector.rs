@@ -163,3 +163,25 @@ pub struct ConnectorStatusResponse {
     pub latency_ms: Option<u64>,
     pub tested_at: Timestamp,
 }
+
+/// Declarative provider capability manifest exposed to tenants
+/// (`GET /v1/connector-manifests`). Carries no tenant state, credentials, or
+/// secret references — only what an installation must/may configure.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnectorManifestDto {
+    /// Unique provider key (e.g. `slack`).
+    pub provider: String,
+    /// Human-readable provider name.
+    pub name: String,
+    /// Category driving installation config validation.
+    pub category: String,
+    /// Canonical auth modes the provider supports.
+    pub supported_auth: Vec<String>,
+    /// Config keys every installation MUST provide.
+    pub required_config: std::collections::BTreeSet<String>,
+    /// Config keys an installation MAY provide.
+    pub optional_config: std::collections::BTreeSet<String>,
+    /// Free-form operator notes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}

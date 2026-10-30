@@ -1,0 +1,17 @@
+== F1: conflict markers in tracked + untracked source ==
+PASS: no conflict markers (tracked + untracked)
+== F2: stray .orig/.rej/.patch files in the tree ==
+PASS: no .orig/.rej files
+== F3: duplicate pub mod declarations per file ==
+PASS: no duplicate pub mod
+== F4: cargo metadata --locked ==
+PASS: cargo metadata --locked
+== F5: duplicate AppState field names ==
+PASS: no duplicate AppState fields
+== F6: duplicate migration versions/names in registry ==
+PASS: migration registry versions unique
+== F7: wire keys (serde rename duplicates) quick scan of contracts structs ==
+PASS: contracts structs compile under clippy/test gates (E02/E03)
+MERGE_INTEGRITY: ALL PASS
+EXIT_CODE=0
+UTC=2026-10-29T17:12:00Z

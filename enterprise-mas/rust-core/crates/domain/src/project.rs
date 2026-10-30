@@ -20,12 +20,18 @@ string_enum! {
 }
 
 /// Project-level configuration.
+///
+/// `#[serde(default)]` is load-bearing: the `projects.config` column defaults
+/// to `'{}'::jsonb` in the schema, so a row created by the database default
+/// (or by direct SQL seeding) must hydrate into the aggregate with the same
+/// documented defaults `Default` provides — otherwise every read of such a
+/// row fails hydration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ProjectConfig {
     /// Default limits applied to executions launched inside the project.
     pub default_resource_limits: ResourceLimits,
     /// Free-form non-secret labels (team, cost center, …).
-    #[serde(default)]
     pub labels: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -150,5 +156,35 @@ impl Project {
 
     fn touch(&mut self) {
         self.updated_at = Timestamp::now();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The database column default `'{}'::jsonb` must hydrate: a project row
+    /// created without an explicit config is a legal row, and reading it is
+    /// a production path (assistant bootstrap lists projects first).
+    #[test]
+    fn empty_config_json_uses_documented_defaults() {
+        let config: ProjectConfig = serde_json::from_value(serde_json::json!({}))
+            .expect("the schema default '{}' must deserialize into ProjectConfig");
+        assert_eq!(
+            config.default_resource_limits,
+            ResourceLimits::default(),
+            "missing limits fall back to the bounded default"
+        );
+        assert!(config.labels.is_empty());
+    }
+
+    #[test]
+    fn config_round_trips_without_labels_key() {
+        let config = ProjectConfig::default();
+        let value = serde_json::to_value(&config).expect("config serializes");
+        let back: ProjectConfig =
+            serde_json::from_value(value).expect("default config round-trips");
+        assert_eq!(back.default_resource_limits, config.default_resource_limits);
+        assert_eq!(back.labels, config.labels);
     }
 }

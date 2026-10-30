@@ -1,4 +1,4 @@
-//! Application-facing store ports, one per aggregate the use-cases
+//! PURPOSE: Application-facing store ports, one per aggregate the use-cases
 //! compose, plus a unified in-memory implementation (`InMemoryServices`)
 //! used by tests, the CLI demo harness and local development.
 //!

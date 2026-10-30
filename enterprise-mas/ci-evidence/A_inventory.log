@@ -1,0 +1,89 @@
+== Batch 01 inventory ==
+PASS crates/api/src/handlers/auth.rs (161 lines, PURPOSE header)
+PASS crates/api/src/handlers/audit.rs (60 lines, PURPOSE header)
+PASS crates/api/src/handlers/policies.rs (163 lines, PURPOSE header)
+PASS crates/api/src/handlers/usage.rs (76 lines, PURPOSE header)
+PASS crates/api/src/routes_governance.rs (43 lines, PURPOSE header)
+PASS crates/api/tests/governance_routes.rs (315 lines, PURPOSE header)
+PASS crates/application/src/audit_query_service.rs (482 lines, PURPOSE header)
+PASS crates/application/src/policy_service.rs (316 lines, PURPOSE header)
+PASS crates/application/src/usage_service.rs (183 lines, PURPOSE header)
+PASS crates/persistence/src/repositories/usage.rs (294 lines, PURPOSE header)
+PASS crates/persistence/tests/usage_live_pg.rs (187 lines, PURPOSE header)
+PASS crates/persistence/src/repositories/audit.rs (301 lines, PURPOSE header)
+PASS crates/security/tests/jwks.rs (157 lines, PURPOSE header)
+== Batch 02 inventory ==
+PASS crates/api/src/handlers/tools.rs (334 lines, PURPOSE header)
+PASS crates/api/src/handlers/connectors.rs (135 lines, PURPOSE header)
+PASS crates/api/src/handlers/webhooks.rs (110 lines, PURPOSE header)
+PASS crates/api/src/handlers/stream.rs (428 lines, PURPOSE header)
+PASS crates/api/src/handlers/assistant.rs (57 lines, PURPOSE header)
+PASS crates/api/src/routes_tooling.rs (57 lines, PURPOSE header)
+PASS crates/api/tests/tooling_routes.rs (582 lines, PURPOSE header)
+PASS crates/application/src/tool_service.rs (515 lines, PURPOSE header)
+PASS crates/application/src/connector_service.rs (123 lines, PURPOSE header)
+PASS crates/application/src/webhook_service.rs (276 lines, PURPOSE header)
+PASS crates/application/src/stores.rs (2063 lines, PURPOSE header)
+PASS crates/persistence/src/repositories/tools.rs (401 lines, PURPOSE header)
+PASS crates/persistence/tests/tools_live_pg.rs (233 lines, PURPOSE header)
+PASS crates/persistence/tests/analytics_live_pg.rs (233 lines, PURPOSE header)
+PASS crates/persistence/tests/rollback_live_pg.rs (192 lines, PURPOSE header)
+PASS config/default.toml (266 lines, PURPOSE header)
+PASS config/production.toml (174 lines, PURPOSE header)
+PASS migrations/0050_audit_query_indexes/up.sql (18 lines, PURPOSE header)
+PASS migrations/0050_audit_query_indexes/down.sql (6 lines, PURPOSE header)
+PASS migrations/0051_webhook_replay_attempts/up.sql (40 lines, PURPOSE header)
+PASS migrations/0051_webhook_replay_attempts/down.sql (10 lines, PURPOSE header)
+== Wiring present ==
+PASS wiring: pub mod auth/audit/policies/usage
+PASS wiring: pub mod audit handler
+PASS wiring: pub mod policies handler
+PASS wiring: pub mod usage handler
+PASS wiring: pub mod tools
+PASS wiring: pub mod connectors
+PASS wiring: pub mod webhooks
+PASS wiring: pub mod stream
+PASS wiring: pub mod assistant
+PASS wiring: routes_governance module
+PASS wiring: routes_tooling module
+PASS wiring: merge routes_governance
+PASS wiring: merge routes_tooling
+PASS wiring: AppState audit_query field
+PASS wiring: AppState policies field
+PASS wiring: AppState usage field
+PASS wiring: AppState tools field
+PASS wiring: AppState connector_admin field
+PASS wiring: AppState webhook_admin field
+PASS wiring: AppState stream_hub field
+PASS wiring: with_audit_query builder
+PASS wiring: with_policies builder
+PASS wiring: with_usage builder
+PASS wiring: with_tools builder
+PASS wiring: with_connector_admin builder
+PASS wiring: with_webhook_admin builder
+PASS wiring: with_stream_hub builder
+PASS wiring: app lib: audit_query_service mod
+PASS wiring: app lib: policy_service mod
+PASS wiring: app lib: usage_service mod
+PASS wiring: app lib: tool_service mod
+PASS wiring: app lib: connector_service mod
+PASS wiring: app lib: webhook_service mod
+PASS wiring: persistence lib re-export toolstore
+PASS wiring: persistence lib re-export usagestore
+PASS wiring: repositories mod usage
+PASS wiring: repositories mod tools
+PASS wiring: composition: ToolService built
+PASS wiring: composition: ConnectorService built
+PASS wiring: composition: WebhookService built
+PASS wiring: composition: StreamHub built
+PASS wiring: composition: AuditQueryService built
+PASS wiring: composition: PolicyService built
+PASS wiring: composition: UsageService built
+PASS wiring: config default [stream] heartbeat_secs
+PASS wiring: config production [stream] channel_buffer
+PASS wiring: config default [stream] max_connections_per_principal
+== forbidden markers in batch files ==
+PASS no todo!/unimplemented!/TODO/FIXME/XXX/placeholder in batch files
+INVENTORY: ALL PASS
+EXIT_CODE=0
+UTC=2026-10-29T17:12:07Z

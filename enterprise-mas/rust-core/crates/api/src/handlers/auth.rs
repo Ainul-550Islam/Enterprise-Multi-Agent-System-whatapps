@@ -35,12 +35,19 @@ pub async fn me(State(_state): State<AppState>, Ctx(ctx): Ctx) -> ApiResult<Auth
             })?,
         },
         PrincipalKind::ApiKey => AuthenticatedActor::ApiKey {
-            api_key_id: principal.actor_id.parse::<ApiKeyId>().map_err(|_| {
-                ApiError::new(
-                    AppError::internal("authenticated API key identity is malformed"),
-                    &ctx,
-                )
-            })?,
+            // Producers mint the actor id as `api-key:<uuid>` (prod_auth and
+            // the security mint path); the HTTP projection needs the bare id.
+            api_key_id: principal
+                .actor_id
+                .strip_prefix("api-key:")
+                .unwrap_or(&principal.actor_id)
+                .parse::<ApiKeyId>()
+                .map_err(|_| {
+                    ApiError::new(
+                        AppError::internal("authenticated API key identity is malformed"),
+                        &ctx,
+                    )
+                })?,
         },
         _ => AuthenticatedActor::Service {
             service_name: principal.actor_id.clone(),

@@ -1,3 +1,4 @@
+# PURPOSE: MAS runtime configuration — DEFAULT layer (checked in, never secrets; env overlays override).
 # ─────────────────────────────────────────────────────────────────────────────
 # MAS runtime configuration — DEFAULT layer.
 #

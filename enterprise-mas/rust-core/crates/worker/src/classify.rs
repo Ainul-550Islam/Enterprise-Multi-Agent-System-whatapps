@@ -133,6 +133,10 @@ pub fn classify(error: &AppError) -> ClassifiedFailure {
 
         // ── Cancelled: deliberate stop, never a failure. ─────────────────
         AppError::Cancelled(_) => FailureClass::Cancelled,
+        // A surface this deployment never composed cannot appear by waiting;
+        // retrying the unit of work only burns the attempt budget against a
+        // wiring gap an operator has to fix.
+        AppError::Unavailable(_) => FailureClass::Terminal,
 
         // ── Retryable: the environment, not the request. ─────────────────
         AppError::RateLimited(_) => FailureClass::Retryable,

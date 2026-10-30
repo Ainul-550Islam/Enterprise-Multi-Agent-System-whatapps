@@ -1,0 +1,31 @@
+   Compiling serde v1.0.229
+   Compiling getrandom v0.3.4
+   Compiling rand_core v0.9.5
+   Compiling serde_spanned v0.6.9
+   Compiling toml_datetime v0.6.11
+   Compiling chrono v0.4.45
+   Compiling toml_edit v0.22.27
+   Compiling toml v0.8.23
+   Compiling mas-common v0.1.0 (/home/user/repo/enterprise-mas/rust-core/crates/common)
+   Compiling cron v0.12.1
+   Compiling rand_chacha v0.9.0
+   Compiling getrandom v0.2.17
+   Compiling ring v0.17.14
+   Compiling tokio v1.53.1
+   Compiling mas-domain v0.1.0 (/home/user/repo/enterprise-mas/rust-core/crates/domain)
+   Compiling rand v0.9.5
+   Compiling mas-security v0.1.0 (/home/user/repo/enterprise-mas/rust-core/crates/security)
+    Finished `test` profile [unoptimized] target(s) in 16.95s
+     Running tests/jwks.rs (target/debug/deps/jwks-d751738a6a66dfe0)
+
+running 5 tests
+test none_hs256_and_rs256_algorithm_confusion_are_rejected ... ok
+test unknown_kid_is_rejected_after_the_trusted_jwks_refresh ... ok
+test malformed_expired_future_and_wrong_issuer_or_audience_tokens_are_rejected ... ok
+test valid_asymmetric_token_verifies_against_the_generated_jwk ... ok
+test valid_rs256_token_verifies_with_a_real_rsa_jwks_fixture ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+EXIT_CODE=0
+UTC=2026-10-29T16:57:41Z

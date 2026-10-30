@@ -240,6 +240,12 @@ pub fn router(state: AppState) -> Router {
             "/v1/admin/tenants/{tenant_id}/overrides/features/{feature}/end",
             post(control_plane::end_feature_override),
         )
+        // ---- governance (identity, audit, policies, quotas, usage) ----
+        // Registered through the additive route group so this table keeps one
+        // line per surface and the auth envelope above stays the only one.
+        .merge(crate::routes_governance::routes())
+        // ---- tooling (tools, connector admin, webhook ops, SSE, assistant)
+        .merge(crate::routes_tooling::routes())
         .route_layer(axum::middleware::from_fn_with_state(state.clone(), authenticated_layer))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES));
 

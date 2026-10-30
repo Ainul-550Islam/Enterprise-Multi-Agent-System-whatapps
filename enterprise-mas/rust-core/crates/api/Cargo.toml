@@ -47,6 +47,10 @@ sqlx = { workspace = true }
 mas-tenancy = { workspace = true }
 mas-events = { workspace = true }
 mas-integrations = { workspace = true }
+# SSE delivery consumes the one canonical event plane in production
+# (`mas_messaging::nats::NatsEventBus`); there is no second transport.
+mas-messaging = { workspace = true, features = ["nats"] }
+futures-util = { workspace = true }
 chrono = { workspace = true }
 
 axum = { workspace = true }
@@ -69,6 +73,7 @@ protoc-bin-vendored = "3"
 
 [dev-dependencies]
 mas-cli = { workspace = true }
+mas-policy = { workspace = true }
 reqwest = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 tokio = { workspace = true, features = ["macros", "rt", "time", "net", "rt-multi-thread"] }

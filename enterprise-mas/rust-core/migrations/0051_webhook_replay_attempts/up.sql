@@ -1,4 +1,4 @@
--- 0051_webhook_replay_attempts: append-only evidence for manual DLQ replay.
+-- PURPOSE: 0051_webhook_replay_attempts — append-only evidence for manual DLQ replay.
 --
 -- Stores only ids, payload digest, and the signing-key version reference; the
 -- payload body and secret material remain owned by their existing stores.
