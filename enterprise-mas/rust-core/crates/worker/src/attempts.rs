@@ -346,14 +346,13 @@ impl AttemptCoordinator {
     pub async fn succeed(
         &self,
         claim: &TaskClaim,
-        result: serde_json::Value,
         usage: mas_application::durable::ExecutionUsage,
         finalize_execution: bool,
         at: &Timestamp,
     ) -> Result<SettlementReceipt> {
         self.settle(
             claim,
-            TaskOutcome::Succeeded { result, usage },
+            TaskOutcome::Succeeded { usage },
             finalize_execution,
             at,
         )
@@ -600,7 +599,6 @@ mod tests {
                 project_id: ProjectId::from_uuid(uuid::Uuid::from_u128(2)),
                 workflow_id: Some(WorkflowId::from_uuid(uuid::Uuid::from_u128(3))),
                 agent_id: None,
-                agent_version_id: None,
                 input,
                 idempotency_key: Some(key.to_owned()),
                 fingerprint,
@@ -688,13 +686,7 @@ mod tests {
 
         // Settling one attempt frees exactly one slot.
         coordinator
-            .succeed(
-                &first[0],
-                serde_json::Value::Null,
-                ExecutionUsage::default(),
-                true,
-                &now(),
-            )
+            .succeed(&first[0], ExecutionUsage::default(), true, &now())
             .await
             .expect("settle");
         assert_eq!(
@@ -725,13 +717,7 @@ mod tests {
 
         // A finishes late and tries to record its success. It must be rejected.
         let error = worker_a
-            .succeed(
-                &claim,
-                serde_json::Value::Null,
-                ExecutionUsage::default(),
-                true,
-                &after_lapse,
-            )
+            .succeed(&claim, ExecutionUsage::default(), true, &after_lapse)
             .await
             .expect_err("a stale worker must not overwrite newer state");
         assert!(matches!(error, AppError::Conflict(_)), "{error:?}");
@@ -751,13 +737,7 @@ mod tests {
 
         let claim = owner.claim(4, &now()).await.expect("claim").remove(0);
         let error = stranger
-            .succeed(
-                &claim,
-                serde_json::Value::Null,
-                ExecutionUsage::default(),
-                false,
-                &now(),
-            )
+            .succeed(&claim, ExecutionUsage::default(), false, &now())
             .await
             .expect_err("a non-owner must be rejected");
         assert!(matches!(error, AppError::Conflict(_)));
@@ -773,7 +753,6 @@ mod tests {
         let receipt = coordinator
             .succeed(
                 &claim,
-                serde_json::Value::Null,
                 ExecutionUsage {
                     provider: Some("openai".to_owned()),
                     model: Some("gpt-4o-mini".to_owned()),

@@ -78,36 +78,6 @@ class AgentRegistry:
             },
         )
 
-    def register_builtin(
-        self,
-        spec: AgentSpec,
-        factory: Callable[[], BaseAgent],
-    ) -> None:
-        """Registers a tenant-visible, immutable product-owned agent.
-
-        Built-ins are normal registry entries for routing/listing, but their
-        spec is marked read-only. Re-registering the exact same built-in is
-        idempotent; replacing its definition under the same id is refused.
-        """
-        from dataclasses import replace
-
-        builtin = spec if spec.read_only else replace(spec, read_only=True)
-        key = (builtin.tenant_id, builtin.agent_id)
-        existing = self._specs.get(key)
-        if existing is not None:
-            if existing == builtin and existing.read_only:
-                return
-            raise ConfigurationError(
-                "built-in agent id collides with a different registered agent",
-                details={"agent_id": builtin.agent_id, "tenant_id": builtin.tenant_id},
-            )
-        self.register(builtin, factory)
-
-    def is_read_only(self, tenant_id: str, agent_id: str) -> bool:
-        """Whether an agent is a product-owned, non-editable built-in."""
-        spec = self._specs.get((tenant_id, agent_id))
-        return spec.read_only if spec is not None else False
-
     def spec(self, tenant_id: str, agent_id: str) -> AgentSpec:
         """Returns an agent's definition.
 

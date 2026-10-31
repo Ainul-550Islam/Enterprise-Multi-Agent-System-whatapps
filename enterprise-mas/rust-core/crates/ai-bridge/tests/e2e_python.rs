@@ -34,14 +34,9 @@ use std::time::Duration;
 
 use mas_ai_bridge::{GrpcAgentBridge, GrpcAgentBridgeConfig};
 use mas_common::enums::Environment;
-use mas_common::ids::{
-    AgentId, AgentVersionId, OrganizationId, ProjectId, TaskAttemptId, TaskId, TenantId,
-};
+use mas_common::ids::{AgentId, OrganizationId, ProjectId, TaskAttemptId, TaskId, TenantId};
 use mas_domain::{ResourceLimits, TokenBudget};
-use mas_execution::agent_bridge::{
-    AgentBridge, AgentRunRequest, AgentRunVerdict, AgentRuntimeConfiguration, AgentRuntimeLimits,
-    AgentRuntimeSnapshot,
-};
+use mas_execution::agent_bridge::{AgentBridge, AgentRunRequest, AgentRunVerdict};
 use mas_orchestration::runtime_context::RuntimeContext;
 use mas_security::secret_string::SecretString;
 use uuid::Uuid;
@@ -307,73 +302,25 @@ fn miskeyed_bridge(port: u16) -> GrpcAgentBridgeConfig {
     }
 }
 
-/// Builds the complete immutable configuration attached to the Rust-owned
-/// version selected by each cross-language test request.
-fn runtime_snapshot(
-    agent_id: AgentId,
-    tenant_id: TenantId,
-    organization_id: OrganizationId,
-    project_id: ProjectId,
-    agent_version_id: AgentVersionId,
-) -> AgentRuntimeSnapshot {
-    AgentRuntimeSnapshot {
-        agent_id,
-        tenant_id,
-        organization_id,
-        project_id,
-        agent_version_id,
-        version_number: 1,
-        configuration_checksum: "a".repeat(64),
-        name: "E2E Agent".to_owned(),
-        slug: "e2e-agent".to_owned(),
-        kind: "standard".to_owned(),
-        status: "active".to_owned(),
-        origin: "user".to_owned(),
-        read_only: false,
-        configuration: AgentRuntimeConfiguration {
-            description: Some("cross-language pinned-version fixture".to_owned()),
-            model_hint: Some("test/snapshot-model".to_owned()),
-            system_prompt: "Immutable E2E version prompt".to_owned(),
-            limits: AgentRuntimeLimits::default(),
-            tags: vec!["e2e".to_owned()],
-            allowed_tools: vec!["search".to_owned()],
-        },
-    }
-}
-
-/// Builds a properly scoped run request with a pinned Rust snapshot.
+/// Builds a properly scoped run request.
 fn request() -> AgentRunRequest {
-    let tenant_id = TenantId::new();
-    let organization_id = OrganizationId::new();
-    let project_id = ProjectId::new();
-    let agent_id = AgentId::new();
-    let agent_version_id = AgentVersionId::new();
     let context = RuntimeContext::new(
-        tenant_id,
-        organization_id,
-        project_id,
+        TenantId::new(),
+        OrganizationId::new(),
+        ProjectId::new(),
         "e2e",
         Environment::Development,
     )
     .expect("context");
 
-    let mut request = AgentRunRequest::from_context(
+    AgentRunRequest::from_context(
         &context,
-        agent_id,
+        AgentId::new(),
         serde_json::json!({"prompt": "hello from rust"}),
         ResourceLimits::default(),
         &TokenBudget::unlimited(),
     )
-    .expect("request");
-    request.agent_version = Some(agent_version_id.to_string());
-    request.agent_snapshot = Some(runtime_snapshot(
-        agent_id,
-        tenant_id,
-        organization_id,
-        project_id,
-        agent_version_id,
-    ));
-    request
+    .expect("request")
 }
 
 /// Converts an unavailable bridge prerequisite into a visible test failure.
@@ -471,24 +418,14 @@ fn scoped_request(
     .expect("context")
     .with_request_id(request_id);
 
-    let agent_id = AgentId::new();
-    let agent_version_id = AgentVersionId::new();
     let mut request = AgentRunRequest::from_context(
         &context,
-        agent_id,
+        AgentId::new(),
         serde_json::json!({"prompt": "hello from rust"}),
         ResourceLimits::default(),
         &TokenBudget::unlimited(),
     )
     .expect("request");
-    request.agent_version = Some(agent_version_id.to_string());
-    request.agent_snapshot = Some(runtime_snapshot(
-        agent_id,
-        context.tenant_id(),
-        context.organization_id(),
-        context.project_id(),
-        agent_version_id,
-    ));
     request.task_id = Some(TaskId::from_uuid(task_id));
     request.task_attempt_id = Some(TaskAttemptId::from_uuid(task_attempt_id));
     request

@@ -64,12 +64,6 @@ pub mod gen {
     tonic::include_proto!("mas.api.v1");
 }
 
-mod data_hub;
-
-pub use data_hub::{
-    GrpcDataHubBridge, GrpcDataHubBridgeConfig, DEFAULT_MAX_REQUEST_BYTES, MAX_REQUEST_BYTES,
-};
-
 use gen::agent_bridge_api_client::AgentBridgeApiClient;
 use gen::{agent_run_reply, AgentRunReply, BridgeHealthReply, ResourceLimitsMsg};
 
@@ -91,7 +85,7 @@ const PROTOCOL_VERSION_HEADER: &str = "x-ai-protocol-version";
 const IDEMPOTENCY_HEADER: &str = "idempotency-key";
 
 /// The AI wire protocol version this adapter speaks.
-const AI_PROTOCOL_VERSION: &str = "1.1.0";
+const AI_PROTOCOL_VERSION: &str = "1.0.0";
 
 /// A deadline shorter than this is not worth a round trip: fail fast instead of
 /// starting work that cannot finish.
@@ -190,8 +184,6 @@ impl Default for GrpcAgentBridgeConfig {
 #[derive(Debug, Clone)]
 pub struct GrpcAgentBridge {
     client: AgentBridgeApiClient<tonic::transport::Channel>,
-    /// Reused by sibling bridge adapters so both services share one TLS/auth configuration.
-    channel: tonic::transport::Channel,
     config: GrpcAgentBridgeConfig,
 }
 
@@ -255,14 +247,10 @@ impl GrpcAgentBridge {
             AppError::external_service("ai-orchestrator", format!("connect failed: {}", err))
         })?;
 
-        let client = AgentBridgeApiClient::new(channel.clone())
-            .max_decoding_message_size(config.max_response_bytes);
+        let client =
+            AgentBridgeApiClient::new(channel).max_decoding_message_size(config.max_response_bytes);
 
-        Ok(Self {
-            client,
-            channel,
-            config,
-        })
+        Ok(Self { client, config })
     }
 
     /// Computes the RPC timeout for a request.
@@ -292,13 +280,6 @@ impl GrpcAgentBridge {
         Ok(gen::AgentRunRequest {
             agent_id: request.agent_id.to_string(),
             agent_version: request.agent_version.clone(),
-            agent_snapshot_json: request
-                .agent_snapshot
-                .as_ref()
-                .map(serde_json::to_string)
-                .transpose()
-                .map_err(|err| AppError::serialization(format!("agent runtime snapshot: {err}")))?
-                .unwrap_or_default(),
             input_json: serde_json::to_string(&request.input)
                 .map_err(|err| AppError::serialization(format!("agent input: {err}")))?,
             correlation_id: request.correlation_id.clone(),
@@ -648,7 +629,6 @@ fn annotate(error: AppError, suffix: &str) -> AppError {
         },
         Timeout(message) => Timeout(push(message)),
         Cancelled(message) => Cancelled(push(message)),
-        Unavailable(message) => Unavailable(push(message)),
         Database(message) => Database(push(message)),
         Messaging(message) => Messaging(push(message)),
         Serialization(message) => Serialization(push(message)),
@@ -784,9 +764,6 @@ mod tests {
     use mas_common::enums::Environment;
     use mas_common::ids::{AgentId, TaskAttemptId, TaskId};
     use mas_domain::{ResourceLimits, TokenBudget};
-    use mas_execution::agent_bridge::{
-        AgentRuntimeConfiguration, AgentRuntimeLimits, AgentRuntimeSnapshot,
-    };
     use mas_orchestration::runtime_context::RuntimeContext;
 
     fn context() -> RuntimeContext {
@@ -859,7 +836,6 @@ mod tests {
         gen::AgentRunRequest {
             agent_id: "00000000-0000-0000-0000-000000000001".to_owned(),
             agent_version: Some("v1".to_owned()),
-            agent_snapshot_json: String::new(),
             input_json: "{\"prompt\":\"hi\"}".to_owned(),
             correlation_id: "corr-1".to_owned(),
             request_id: "req-1".to_owned(),
@@ -927,10 +903,7 @@ mod tests {
     fn the_signature_covers_the_bytes_python_will_verify() {
         use prost::Message;
 
-        let mut signed_request = pinned_request();
-        signed_request.agent_snapshot_json =
-            r#"{"agent_id":"00000000-0000-0000-0000-000000000001","version_number":2}"#.to_owned();
-        let body = signed_request.encode_to_vec();
+        let body = pinned_request().encode_to_vec();
         let secret = b"s3cr3t";
         let signed_at = mas_common::timestamps::Timestamp::from_unix_ms(1_700_000_000_000)
             .expect("fixed instant");
@@ -951,8 +924,7 @@ mod tests {
         assert!(verified.is("mas-worker"));
 
         // And a signature over one body does not verify over another.
-        let mut tampered = signed_request.clone();
-        tampered.agent_snapshot_json.push(' ');
+        let mut tampered = pinned_request();
         tampered.tenant_id = "tenant-2".to_owned();
         assert!(
             mas_security::internal_service::verify(
@@ -988,45 +960,6 @@ mod tests {
         let decoded: serde_json::Value =
             serde_json::from_str(&wire.input_json).expect("input json");
         assert_eq!(decoded["prompt"], "hi");
-    }
-
-    #[test]
-    fn encode_request_serializes_the_rust_runtime_snapshot() {
-        let mut request = request();
-        let version_id = mas_common::ids::AgentVersionId::new();
-        request.agent_version = Some(version_id.to_string());
-        request.agent_snapshot = Some(AgentRuntimeSnapshot {
-            agent_id: request.agent_id,
-            tenant_id: request.tenant_id.expect("tenant"),
-            organization_id: request.organization_id.expect("organization"),
-            project_id: request.project_id.expect("project"),
-            agent_version_id: version_id,
-            version_number: 4,
-            configuration_checksum: "a".repeat(64),
-            name: "Runtime agent".to_owned(),
-            slug: "runtime-agent".to_owned(),
-            kind: "standard".to_owned(),
-            status: "active".to_owned(),
-            origin: "user".to_owned(),
-            read_only: false,
-            configuration: AgentRuntimeConfiguration {
-                description: Some("published description".to_owned()),
-                model_hint: Some("provider/model-v4".to_owned()),
-                system_prompt: "immutable instructions".to_owned(),
-                limits: AgentRuntimeLimits::default(),
-                tags: vec!["versioned".to_owned()],
-                allowed_tools: vec!["search".to_owned()],
-            },
-        });
-
-        let wire = GrpcAgentBridge::encode_request(&request).expect("encode");
-        let snapshot: serde_json::Value =
-            serde_json::from_str(&wire.agent_snapshot_json).expect("snapshot JSON");
-        assert_eq!(snapshot["agent_id"], request.agent_id.to_string());
-        assert_eq!(snapshot["agent_version_id"], version_id.to_string());
-        assert_eq!(snapshot["version_number"], 4);
-        assert_eq!(snapshot["configuration"]["model_hint"], "provider/model-v4");
-        assert_eq!(snapshot["configuration"]["allowed_tools"][0], "search");
     }
 
     #[test]

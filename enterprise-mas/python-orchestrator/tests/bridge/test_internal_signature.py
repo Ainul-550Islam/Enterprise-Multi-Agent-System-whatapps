@@ -26,9 +26,7 @@ Four variants matter and are tested separately:
 * **Unknown service** — a syntactically perfect signature from a service that
   is not on the allowlist. Refused.
 * **Stale** — a valid signature whose timestamp is outside the skew window.
-  Refused: freshness bounds nonce lifetime.
-* **Replay** — the exact valid signature sent a second time. Refused because
-  its nonce was atomically consumed before the first execution.
+  Refused: this is the replay defence.
 
 The positive case is tested too, because a verification that refuses
 everything is not a working control — it is an outage.
@@ -182,25 +180,8 @@ class TestTamperedBodyIsRefused:
         assert signed_bridge.service.call_count == 0
 
 
-class TestReplayIsRefused:
-    """A fresh nonce is consumed before bridge work begins."""
-
-    async def test_same_valid_signature_cannot_run_twice(
-        self, signed_bridge: BridgeHarness
-    ) -> None:
-        message = request()
-        signed_headers = internal_signature_pairs(message)
-
-        await _run(signed_bridge, message, signed_headers)
-        with pytest.raises(grpc.aio.AioRpcError) as raised:
-            await _run(signed_bridge, message, signed_headers)
-
-        assert raised.value.code() is grpc.StatusCode.UNAUTHENTICATED
-        assert signed_bridge.service.call_count == 1
-
-
 class TestStaleSignatureIsRefused:
-    """Timestamp freshness bounds the useful life of a signed nonce."""
+    """The timestamp bound is the replay defence."""
 
     async def test_a_signature_outside_the_skew_window_is_refused(
         self, signed_bridge: BridgeHarness

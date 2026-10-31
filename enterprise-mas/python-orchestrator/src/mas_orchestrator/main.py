@@ -47,12 +47,10 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final
 
 from mas_orchestrator.config.settings import load_settings
-from mas_orchestrator.config.validation import validate_settings_or_raise
 from mas_orchestrator.grpc.agent_bridge_servicer import (
     AgentBridgeServicer,
     AgentBridgeServicerConfig,
 )
-from mas_orchestrator.grpc.data_hub_servicer import DataHubBridgeServicer
 from mas_orchestrator.grpc.server import GrpcServer, GrpcServerConfig
 from mas_orchestrator.observability.logging import LoggingConfig, configure_logging
 from mas_orchestrator.security.identity import ServiceScope
@@ -69,7 +67,6 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Sequence
 
     from mas_orchestrator.config.settings import Settings
-    from mas_orchestrator.security.internal_replay import InternalReplayGuard
 
 _LOGGER: Final[logging.Logger] = logging.getLogger("mas_orchestrator.main")
 
@@ -141,7 +138,7 @@ def bootstrap(
     from mas_orchestrator.config.enums import Environment
 
     resolved = Environment(environment) if environment else None
-    settings = validate_settings_or_raise(load_settings(environment=resolved))
+    settings = load_settings(environment=resolved)
 
     configure_logging(
         LoggingConfig(
@@ -199,17 +196,6 @@ def _internal_signing_secret(settings: Settings) -> str | None:
     return resolve_secret(reference).reveal()
 
 
-def _internal_replay_guard(settings: Settings) -> InternalReplayGuard | None:
-    """Builds the shared nonce consumer required by production bridge auth."""
-    reference = settings.security.internal_replay_database_url_secret_ref
-    if not reference:
-        return None
-    from mas_orchestrator.security.credentials import resolve_secret
-    from mas_orchestrator.security.internal_replay import PostgresReplayGuard
-
-    return PostgresReplayGuard(resolve_secret(reference).reveal())
-
-
 def build_bridge_server(
     settings: Settings,
     coordinator: ShutdownCoordinator,
@@ -229,10 +215,6 @@ def build_bridge_server(
             no degraded mode: a bridge that cannot reach a real model provider
             must not start, because a bridge that starts and then fails every
             run is indistinguishable from one that is being retried.
-
-    Both bridge servicers share one listener and one AgentBridge authentication
-    boundary. The runtime bundle is registered as a closeable so provider and
-    Data Hub resources are released after drain, including failed startup.
 
     This is the composition root for the Rust → Python path. It is separate
     from :func:`bootstrap` so that loading configuration can be tested without
@@ -254,17 +236,10 @@ def build_bridge_server(
             # that: a bridge that has not been provisioned must not quietly
             # start accepting traffic.
             require_internal_signature=settings.is_production,
-            replay_guard=_internal_replay_guard(settings),
         ),
-    )
-    data_hub_servicer = DataHubBridgeServicer(
-        service=bundle.data_hub_service,
-        agent_bridge=servicer,
     )
     server = GrpcServer(
         servicer=servicer,
-        data_hub_servicer=data_hub_servicer,
-        closeables=(bundle,),
         config=GrpcServerConfig.from_service_settings(
             settings.service,
             environment=settings.environment,

@@ -27,8 +27,7 @@
 
 use mas_common::error::AppError;
 use mas_common::ids::{
-    AgentId, AgentVersionId, ExecutionId, OrganizationId, ProjectId, TaskAttemptId, TaskId,
-    TenantId,
+    AgentId, ExecutionId, OrganizationId, ProjectId, TaskAttemptId, TaskId, TenantId,
 };
 use mas_common::result::Result;
 use mas_common::timestamps::Timestamp;
@@ -71,216 +70,6 @@ impl AgentUsage {
     }
 }
 
-/// Sanitized runtime settings extracted from one immutable Rust-published
-/// version. Only fields consumed by the Python runtime cross the bridge; the
-/// arbitrary domain metadata map is intentionally never serialized.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AgentRuntimeConfiguration {
-    #[serde(default)]
-    pub description: Option<String>,
-    #[serde(default)]
-    pub model_hint: Option<String>,
-    #[serde(default)]
-    pub system_prompt: String,
-    #[serde(default)]
-    pub limits: AgentRuntimeLimits,
-    #[serde(default)]
-    pub tags: Vec<String>,
-    #[serde(default)]
-    pub allowed_tools: Vec<String>,
-}
-
-/// Per-agent runtime ceilings. Python applies the same platform hard caps.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AgentRuntimeLimits {
-    #[serde(default = "default_runtime_max_steps")]
-    pub max_steps: u32,
-    #[serde(default = "default_runtime_max_tool_calls")]
-    pub max_tool_calls: u32,
-    #[serde(default)]
-    pub max_delegation_depth: u32,
-    #[serde(default)]
-    pub timeout_seconds: Option<f64>,
-}
-
-impl Default for AgentRuntimeLimits {
-    fn default() -> Self {
-        Self {
-            max_steps: default_runtime_max_steps(),
-            max_tool_calls: default_runtime_max_tool_calls(),
-            max_delegation_depth: 0,
-            timeout_seconds: None,
-        }
-    }
-}
-
-const fn default_runtime_max_steps() -> u32 {
-    25
-}
-
-const fn default_runtime_max_tool_calls() -> u32 {
-    50
-}
-
-/// Complete, sanitized resolution of one tenant-owned agent version.
-///
-/// It is built only by the Rust application catalog after tenant/org/project
-/// checks. Its contents are covered by the AgentBridge body's existing HMAC;
-/// Python validates the scope and version fields again before execution.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AgentRuntimeSnapshot {
-    pub agent_id: AgentId,
-    pub tenant_id: TenantId,
-    pub organization_id: OrganizationId,
-    pub project_id: ProjectId,
-    pub agent_version_id: AgentVersionId,
-    pub version_number: u64,
-    pub configuration_checksum: String,
-    pub name: String,
-    pub slug: String,
-    pub kind: String,
-    pub status: String,
-    pub origin: String,
-    pub read_only: bool,
-    pub configuration: AgentRuntimeConfiguration,
-}
-
-impl AgentRuntimeSnapshot {
-    /// Projects a domain agent/version pair into the bridge-safe runtime shape.
-    ///
-    /// The version snapshot has a closed schema: unknown keys are rejected
-    /// rather than silently ignored or forwarded. This keeps Rust the source
-    /// of truth while preventing arbitrary metadata from becoming a Python
-    /// runtime configuration channel.
-    pub fn from_domain(
-        agent: &mas_domain::Agent,
-        version: &mas_domain::AgentVersion,
-    ) -> Result<Self> {
-        if version.agent_id() != agent.id {
-            return Err(AppError::validation(
-                "agent runtime version belongs to a different agent",
-            ));
-        }
-        if !agent.is_executable() {
-            return Err(AppError::not_found("agent", agent.id.to_string()));
-        }
-        if agent.current_version != Some(version.version_number())
-            && version.version_number() > agent.current_version.unwrap_or_default()
-        {
-            return Err(AppError::validation(
-                "agent runtime version is newer than the published current version",
-            ));
-        }
-
-        let configuration: AgentRuntimeConfiguration =
-            serde_json::from_value(version.configuration_snapshot().clone()).map_err(|error| {
-                AppError::invalid_field(
-                    "configuration_snapshot",
-                    "unsupported_runtime_configuration",
-                    format!("agent version has unsupported runtime configuration: {error}"),
-                )
-            })?;
-        validate_runtime_configuration(&configuration)?;
-
-        let mut configuration = configuration;
-        configuration.allowed_tools.sort();
-        configuration.allowed_tools.dedup();
-
-        Ok(Self {
-            agent_id: agent.id,
-            tenant_id: agent.tenant_id,
-            organization_id: agent.organization_id,
-            project_id: agent.project_id,
-            agent_version_id: version.id(),
-            version_number: version.version_number(),
-            configuration_checksum: version.configuration_checksum().to_owned(),
-            name: agent.name.clone(),
-            slug: agent.slug.as_str().to_owned(),
-            kind: agent.kind.to_string(),
-            status: agent.status.to_string(),
-            origin: agent.origin.to_string(),
-            read_only: agent.origin == mas_domain::AgentOrigin::System,
-            configuration,
-        })
-    }
-}
-
-fn validate_runtime_configuration(configuration: &AgentRuntimeConfiguration) -> Result<()> {
-    if configuration.system_prompt.len() > 128 * 1024 {
-        return Err(AppError::invalid_field(
-            "configuration_snapshot.system_prompt",
-            "too_large",
-            "agent system prompt exceeds 128 KiB",
-        ));
-    }
-    if configuration
-        .description
-        .as_ref()
-        .is_some_and(|value| value.len() > mas_common::constants::MAX_DESCRIPTION_LENGTH)
-    {
-        return Err(AppError::invalid_field(
-            "configuration_snapshot.description",
-            "too_large",
-            "agent description exceeds the platform limit",
-        ));
-    }
-    if configuration
-        .model_hint
-        .as_ref()
-        .is_some_and(|value| value.trim().is_empty() || value.len() > 256)
-    {
-        return Err(AppError::invalid_field(
-            "configuration_snapshot.model_hint",
-            "invalid_value",
-            "agent model hint must be non-empty and at most 256 bytes",
-        ));
-    }
-    if configuration.tags.len() > mas_common::constants::MAX_TAG_COUNT
-        || configuration
-            .tags
-            .iter()
-            .any(|tag| tag.is_empty() || tag.len() > mas_common::constants::MAX_TAG_LENGTH)
-    {
-        return Err(AppError::invalid_field(
-            "configuration_snapshot.tags",
-            "invalid_value",
-            "agent tags exceed the platform bounds",
-        ));
-    }
-    if configuration.allowed_tools.len() > 128
-        || configuration
-            .allowed_tools
-            .iter()
-            .any(|tool| tool.trim().is_empty() || tool.len() > 256)
-    {
-        return Err(AppError::invalid_field(
-            "configuration_snapshot.allowed_tools",
-            "invalid_value",
-            "agent tool permissions exceed the platform bounds",
-        ));
-    }
-    if configuration.limits.max_steps == 0
-        || configuration.limits.max_steps > mas_common::constants::MAX_STEPS_PER_EXECUTION
-        || configuration.limits.max_tool_calls > mas_common::constants::MAX_TOOL_CALLS_PER_EXECUTION
-        || configuration.limits.max_delegation_depth > mas_common::constants::MAX_DELEGATION_DEPTH
-        || configuration.limits.timeout_seconds.is_some_and(|timeout| {
-            !timeout.is_finite()
-                || timeout <= 0.0
-                || timeout > (mas_common::constants::MAX_EXECUTION_DURATION_MS as f64 / 1_000.0)
-        })
-    {
-        return Err(AppError::invalid_field(
-            "configuration_snapshot.limits",
-            "out_of_range",
-            "agent runtime limits exceed the platform bounds",
-        ));
-    }
-    Ok(())
-}
-
 /// One agent:run request (the wire shape).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentRunRequest {
@@ -288,11 +77,6 @@ pub struct AgentRunRequest {
     /// Pinned agent version when required (None = current published).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_version: Option<String>,
-    /// Sanitized snapshot resolved from Rust's tenant-scoped catalog.
-    /// Production bridges require it; development/unit callers may leave it
-    /// absent while constructing a request before catalog resolution.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent_snapshot: Option<AgentRuntimeSnapshot>,
     #[serde(default)]
     pub input: Value,
     /// End-to-end trace key (execution correlation id).
@@ -360,8 +144,7 @@ impl AgentRunRequest {
         let snapshot = context.snapshot();
         Ok(Self {
             agent_id,
-            agent_version: context.agent_version_id().map(|id| id.to_string()),
-            agent_snapshot: None,
+            agent_version: None,
             input,
             correlation_id: context.correlation_id().to_owned(),
             deadline: deadline.expires_at(),
@@ -437,13 +220,6 @@ pub enum AgentRunVerdict {
         correlation_id: Option<String>,
         request_id: Option<String>,
     },
-}
-
-/// Rust-owned catalog port used by the production worker before an agent run.
-#[async_trait::async_trait]
-pub trait AgentRuntimeSnapshotResolver: Send + Sync + fmt::Debug {
-    /// Resolves one agent and immutable version under the authoritative request scope.
-    async fn resolve(&self, request: &AgentRunRequest) -> Result<AgentRuntimeSnapshot>;
 }
 
 /// The bridge port.

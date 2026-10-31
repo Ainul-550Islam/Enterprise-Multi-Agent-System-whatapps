@@ -39,16 +39,12 @@ use std::sync::Arc;
 // `AgentBridge` is imported for its `health()` method, which the boot-time
 // readiness probe calls on the concrete bridge.
 use agent_execution::{AgentBridgeSettings, AgentRunHandler};
-use mas_execution::agent_bridge::AgentRuntimeSnapshotResolver;
 use mas_execution::AgentBridge;
 use mas_messaging::broker::BrokerPort;
 use mas_worker::consumer::{ConsumerConfig, TaskConsumer};
 use mas_worker::handler::OperationDispatcher;
 use mas_worker::AttemptCoordinator;
 use mas_worker::ConsumerOutcome;
-use mas_worker_service::agent_runtime_bridge::{
-    PostgresAgentRuntimeSnapshotResolver, ResolvedAgentBridge,
-};
 use mas_worker_service::run_slots::ControlPlaneRunSlots;
 
 #[tokio::main]
@@ -88,7 +84,7 @@ async fn main() {
 /// if the operator can tell why.
 async fn run() -> Result<(), String> {
     use mas_persistence::pool::{Database, DatabaseUrl, PoolConfig};
-    use mas_persistence::repositories::{PgDurableExecution, PostgresDeliveryReceiptStore};
+    use mas_persistence::repositories::PgDurableExecution;
 
     let layered = mas_common::config::load_layered().map_err(|e| format!("config: {e}"))?;
     let merger = mas_common::config::Merger::new(&layered);
@@ -193,12 +189,7 @@ async fn run() -> Result<(), String> {
     // everything else from the database rather than from anything the broker
     // told it.
     let durable: Arc<dyn mas_application::durable::DurableExecutionPort> =
-        Arc::new(PgDurableExecution::new(worker_pool.clone()));
-    // Delivery receipts have their own database-generated identities and are
-    // shared by all replicas using this worker-plane role. A process-local
-    // broker sequence cannot safely identify a delivery across restarts.
-    let delivery_receipts: Arc<dyn mas_worker::DeliveryReceiptPort> =
-        Arc::new(PostgresDeliveryReceiptStore::new(worker_pool.clone()));
+        Arc::new(PgDurableExecution::new(worker_pool));
     // ── The concurrency slot a run holds for its duration ──────────────
     //
     // Built over the *runtime* pool, not the worker-plane pool. The slot is a
@@ -270,22 +261,12 @@ async fn run() -> Result<(), String> {
             },
         }
 
-        // Resolve the tenant-scoped immutable agent snapshot inside the
-        // canonical bridge path. `PgServices` will use the RLS-armed transaction
-        // owned by the resolver; the durable worker role receives no broader
-        // agent/version table grants.
-        let resolver: Arc<dyn AgentRuntimeSnapshotResolver> =
-            Arc::new(PostgresAgentRuntimeSnapshotResolver::new(pool.clone()));
-        let grpc_bridge: Arc<dyn AgentBridge> = Arc::new(bridge);
-        let resolved_bridge: Arc<dyn AgentBridge> =
-            Arc::new(ResolvedAgentBridge::new(resolver, grpc_bridge));
-
         // The cancellation token the graceful-drain path owns: cancelling it
         // stops in-flight AI work instead of abandoning it mid-run.
         let cancellation = mas_orchestration::cancellation::CancellationToken::new();
         dispatcher = dispatcher.with_handler(
             "execution.run",
-            Arc::new(AgentRunHandler::new(resolved_bridge, cancellation)),
+            Arc::new(AgentRunHandler::new(Arc::new(bridge), cancellation)),
         );
     }
     let ops: Vec<&str> = dispatcher.operations();
@@ -295,7 +276,6 @@ async fn run() -> Result<(), String> {
         broker,
         attempts,
         Arc::new(dispatcher),
-        delivery_receipts,
         ConsumerConfig {
             consumer_name,
             poll_interval: std::time::Duration::from_millis(poll_ms),

@@ -69,11 +69,6 @@ from mas_orchestrator.security.identity import (
     StaticTokenServiceIdentityResolver,
     require_scope,
 )
-from mas_orchestrator.security.internal_replay import (
-    InMemoryReplayGuard,
-    InternalReplayGuard,
-    PostgresReplayGuard,
-)
 from mas_orchestrator.security.internal_service import (
     DEFAULT_ALLOWED_CALLERS,
     MAX_SKEW_SECONDS,
@@ -117,10 +112,7 @@ __all__ = [
     "ClientTransportConfig",
     "EnvironmentSecretResolver",
     "FileSecretResolver",
-    "InMemoryReplayGuard",
-    "InternalReplayGuard",
     "InternalServiceIdentity",
-    "PostgresReplayGuard",
     "Secret",
     "SecretResolver",
     "SecretResolverChain",

@@ -39,7 +39,6 @@ from typing import Any, Final
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
 from mas_orchestrator.config.enums import (
-    DataSourceKind,
     Environment,
     GuardrailFailureMode,
     LogFormat,
@@ -338,102 +337,6 @@ class MemorySettings(_Frozen):
     enforce_tenant_filters: bool = True
 
 
-class DataHubSettings(_Frozen):
-    """Bounds and allow-lists for the tenant-scoped Data Hub ingestion plane.
-
-    Rust owns data-source/document metadata and tenant authorization. These
-    settings only constrain Python-side fetching, parsing, embedding and
-    vector storage; they do not contain credentials or caller-controlled
-    filesystem paths.
-    """
-
-    allowed_source_kinds: tuple[DataSourceKind, ...] = (DataSourceKind.UPLOAD,)
-    max_document_bytes: int = Field(default=8 * 1024 * 1024, ge=1, le=32 * 1024 * 1024)
-    max_upload_bytes: int = Field(default=8 * 1024 * 1024, ge=1, le=32 * 1024 * 1024)
-    max_sync_bytes: int = Field(default=32 * 1024 * 1024, ge=1, le=512 * 1024 * 1024)
-    max_pages_per_sync: int = Field(default=100, ge=1, le=10_000)
-    max_crawl_depth: int = Field(default=3, ge=0, le=20)
-    max_crawl_pages: int = Field(default=100, ge=1, le=10_000)
-    #: Process-isolated parser limits for untrusted rich documents.
-    parser_workers: int = Field(default=2, ge=1, le=32)
-    parser_timeout_seconds: float = Field(default=30.0, ge=0.1, le=300)
-    parser_memory_bytes: int = Field(
-        default=256 * 1024 * 1024, ge=64 * 1024 * 1024, le=2 * 1024 * 1024 * 1024
-    )
-    allowed_mime_types: tuple[str, ...] = (
-        "text/plain",
-        "text/markdown",
-        "text/html",
-        "text/csv",
-        "application/json",
-        "application/pdf",
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    )
-    crawl_egress_allowlist: tuple[str, ...] = ()
-    object_storage_egress_allowlist: tuple[str, ...] = ()
-    database_url_secret_ref: str | None = Field(default=None, max_length=512)
-    database_role: str | None = Field(default=None, max_length=63)
-
-    @field_validator("crawl_egress_allowlist", "object_storage_egress_allowlist")
-    @classmethod
-    def _normalise_egress_hosts(cls, hosts: tuple[str, ...]) -> tuple[str, ...]:
-        """Accepts DNS hostnames only; URL schemes, paths, and IP literals are refused."""
-        import ipaddress
-        import re
-
-        result: list[str] = []
-        for host in hosts:
-            candidate = host.strip().rstrip(".").lower()
-            if not candidate or "://" in candidate or "/" in candidate:
-                raise ValueError("Data Hub egress entries must be hostnames, not URLs")
-            try:
-                ipaddress.ip_address(candidate)
-            except ValueError:
-                pass
-            else:
-                raise ValueError("Data Hub egress allow-lists must use DNS names, not IP literals")
-            if not re.fullmatch(
-                r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\.(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?))*",
-                candidate,
-            ):
-                raise ValueError("Data Hub egress entry is not a valid DNS hostname")
-            result.append(candidate)
-        if len(set(result)) != len(result):
-            raise ValueError("Data Hub egress allow-list must not contain duplicate hosts")
-        return tuple(result)
-
-    @field_validator("allowed_source_kinds")
-    @classmethod
-    def _unique_source_kinds(cls, kinds: tuple[DataSourceKind, ...]) -> tuple[DataSourceKind, ...]:
-        """Rejects duplicate source capabilities in configuration."""
-        if len(set(kinds)) != len(kinds):
-            raise ValueError("data_hub.allowed_source_kinds must not contain duplicates")
-        return kinds
-
-    @field_validator("allowed_mime_types")
-    @classmethod
-    def _normalise_mime_types(cls, values: tuple[str, ...]) -> tuple[str, ...]:
-        """Requires normalized media types without parameters or wildcards."""
-        import re
-
-        normalised = tuple(value.strip().lower() for value in values)
-        if any(
-            not re.fullmatch(r"[a-z0-9!#$&^_.+-]+/[a-z0-9!#$&^_.+-]+", value)
-            for value in normalised
-        ):
-            raise ValueError("data_hub.allowed_mime_types must contain exact media types")
-        if len(set(normalised)) != len(normalised):
-            raise ValueError("data_hub.allowed_mime_types must not contain duplicates")
-        return normalised
-
-    @model_validator(mode="after")
-    def _document_caps_sane(self) -> DataHubSettings:
-        """Prevents upload-specific settings from exceeding the document cap."""
-        if self.max_upload_bytes > self.max_document_bytes:
-            raise ValueError("data_hub.max_upload_bytes must not exceed max_document_bytes")
-        return self
-
-
 class RagSettings(_Frozen):
     """Retrieval-augmented generation configuration."""
 
@@ -445,11 +348,6 @@ class RagSettings(_Frozen):
 
     #: Embedding dimensionality. Zero means "unknown, do not assume".
     embedding_dimensions: int = Field(default=0, ge=0, le=16_384)
-    embedding_provider: str = Field(default="openai", min_length=1, max_length=64)
-    embedding_model: str = Field(default="text-embedding-3-small", min_length=1, max_length=128)
-    embedding_api_key_secret_ref: str | None = Field(
-        default="env:MAS_OPENAI_API_KEY", max_length=256
-    )
 
     #: Chunking window.
     chunk_size_chars: int = Field(default=1_200, ge=64, le=64_000)
@@ -615,11 +513,6 @@ class SecuritySettings(_Frozen):
     #: identity.
     internal_service_secret_ref: str | None = Field(default=None, max_length=256)
 
-    #: Secret reference for the PostgreSQL DSN used to atomically consume
-    #: internal-service signature nonces. It is required in production because
-    #: a process-local replay cache does not survive restarts or span replicas.
-    internal_replay_database_url_secret_ref: str | None = Field(default=None, max_length=512)
-
     #: Service ids permitted to call this process, in addition to the
     #: built-in default. A syntactically perfect signature from a service
     #: that is not on the allowlist is still a refusal.
@@ -649,7 +542,6 @@ class Settings(_Frozen):
     tools: ToolSettings = Field(default_factory=ToolSettings)
     memory: MemorySettings = Field(default_factory=MemorySettings)
     rag: RagSettings = Field(default_factory=RagSettings)
-    data_hub: DataHubSettings = Field(default_factory=DataHubSettings)
     guardrails: GuardrailSettings = Field(default_factory=GuardrailSettings)
     agents: AgentRuntimeSettings = Field(default_factory=AgentRuntimeSettings)
     observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
@@ -815,7 +707,6 @@ __all__ = [
     "DEFAULT_MAX_TOOL_RESULT_BYTES",
     "ENV_PREFIX",
     "AgentRuntimeSettings",
-    "DataHubSettings",
     "GuardrailSettings",
     "MemorySettings",
     "ObservabilitySettings",

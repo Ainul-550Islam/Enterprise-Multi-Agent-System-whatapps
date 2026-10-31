@@ -52,13 +52,7 @@ dependencies = [
     # Runtime required by the checked-in protobuf modules.
     "protobuf>=7.35.1,<8",
     # Outbound HTTP for provider/tool adapters (SSRF-guarded by our own layer).
-    "httpx>=0.27,<0.29",
-    # Public network-backend API used to pin validated DNS answers to the TCP dial.
-    "httpcore>=1.0,<2",
-    # Safe parsing of untrusted S3 listing XML in the Data Hub source adapter.
-    "defusedxml>=0.7.1,<1",
-    # Durable cross-replica replay receipts for internal service authentication.
-    "psycopg[binary,pool]>=3.2,<4",
+    "httpx>=0.27",
 ]
 
 [project.optional-dependencies]
@@ -71,16 +65,6 @@ otel = [
 ]
 # Prometheus exposition for the metrics registry when scraping is configured.
 metrics = ["prometheus-client>=0.20"]
-# PostgreSQL/pgvector RAG storage. The extra is optional so bridge-only
-# deployments do not install a database driver or gain a Rust-table path.
-pgvector = ["psycopg[binary,pool]>=3.2,<4", "pgvector>=0.3,<1"]
-# Parsers used by Data Hub ingestion. Every parser is imported lazily and
-# guarded by MIME/byte/page limits in the ingestion pipeline.
-ingest = [
-    "beautifulsoup4>=4.12,<5",
-    "pypdf>=5,<7",
-    "python-docx>=1.1,<2",
-]
 
 [project.scripts]
 mas-orchestrator = "mas_orchestrator.main:main"
@@ -91,7 +75,6 @@ dev = [
     "pytest-asyncio>=0.24",
     "ruff>=0.6",
     "mypy>=1.11",
-    "types-defusedxml>=0.7.0",
     "grpcio-tools>=1.84",
 ]
 
@@ -110,7 +93,7 @@ testpaths = ["tests"]
 pythonpath = ["src"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
-addopts = "-ra --strict-markers --strict-config --import-mode=importlib"
+addopts = "-ra --strict-markers --strict-config"
 markers = [
     "unit: fast deterministic unit tests",
     "integration: tests requiring external infrastructure (rust core, db, broker)",
@@ -155,11 +138,10 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S", "S101"]
 "src/mas_orchestrator/grpc/generated/**" = ["ALL"]
-# Servicers implement methods whose names are fixed by the protobuf contract
-# (`RunAgent`, `SyncSource`, `Health`). Renaming them would break the wire, so
-# the naming rule is relaxed only for those contract-bound files.
+# The servicer implements methods whose names are fixed by the protobuf
+# contract (`RunAgent`, `Health`). Renaming them would break the wire, so the
+# naming rule is relaxed for the one file that must match the schema.
 "src/mas_orchestrator/grpc/agent_bridge_servicer.py" = ["N802"]
-"src/mas_orchestrator/grpc/data_hub_servicer.py" = ["N802"]
 
 [tool.ruff.format]
 quote-style = "double"
@@ -207,10 +189,3 @@ exclude_lines = [
     "raise NotImplementedError",
     "@abstractmethod",
 ]
-
-# Optional ingestion/vector integrations are imported lazily. A bridge-only
-# installation deliberately does not install them, so static checking of the
-# base dependency set must not require their third-party stubs.
-[[tool.mypy.overrides]]
-module = ["pypdf", "pgvector", "pgvector.*"]
-ignore_missing_imports = true

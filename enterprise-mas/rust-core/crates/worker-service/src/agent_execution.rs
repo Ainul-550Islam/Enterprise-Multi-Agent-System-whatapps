@@ -447,9 +447,6 @@ impl AgentRunHandler {
         if let Some(request_id) = message.request_id {
             context = context.with_request_id(request_id);
         }
-        if let Some(version_id) = message.agent_version_id {
-            context = context.with_agent_version_id(version_id);
-        }
         context = context.for_execution(execution_id, None);
         // The run is cancelled by the worker's shutdown path, so a graceful
         // drain stops AI work instead of abandoning it mid-flight.
@@ -626,7 +623,6 @@ mod tests {
             "corr-1",
         )
         .expect("message")
-        .with_agent_version_id(mas_common::ids::AgentVersionId::new())
         .with_request_id(uuid::Uuid::from_u128(901))
     }
 
@@ -755,25 +751,6 @@ mod tests {
         assert_eq!(dispatch.context.correlation_id(), "corr-1");
         assert_eq!(dispatch.context.request_id(), message.request_id);
         assert_eq!(dispatch.context.execution_id(), message.execution_id);
-        let version_id = message.agent_version_id.expect("test message is pinned");
-        assert_eq!(dispatch.context.agent_version_id(), Some(version_id));
-        let restored = RuntimeContext::from_snapshot(dispatch.context.snapshot())
-            .expect("restore pinned context");
-        assert_eq!(restored.agent_version_id(), Some(version_id));
-
-        let bridge_request = mas_execution::agent_bridge::AgentRunRequest::from_context(
-            &dispatch.context,
-            dispatch.agent_id,
-            dispatch.input.clone(),
-            mas_domain::ResourceLimits::default(),
-            &mas_domain::TokenBudget::unlimited(),
-        )
-        .expect("build bridge request from durable context");
-        let expected_version = version_id.to_string();
-        assert_eq!(
-            bridge_request.agent_version.as_deref(),
-            Some(expected_version.as_str())
-        );
     }
 
     #[test]

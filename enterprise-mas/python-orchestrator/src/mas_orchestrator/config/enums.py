@@ -116,18 +116,6 @@ class VectorBackend(StrEnum):
     DISABLED = "disabled"
 
 
-class DataSourceKind(StrEnum):
-    """Data Hub source kinds accepted by the ingestion plane.
-
-    Values are wire/configuration contracts shared with Rust's
-    ``DataSourceKind`` domain enum.
-    """
-
-    UPLOAD = "upload"
-    OBJECT_STORAGE = "object_storage"
-    WEB = "web"
-
-
 class ToolExecutionMode(StrEnum):
     """How tool code execution is performed.
 
@@ -161,7 +149,6 @@ class GuardrailFailureMode(StrEnum):
 
 
 __all__ = [
-    "DataSourceKind",
     "Environment",
     "GuardrailFailureMode",
     "LogFormat",

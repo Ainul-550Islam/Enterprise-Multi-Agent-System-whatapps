@@ -20,7 +20,7 @@
 //! child-context constructors.
 
 use mas_common::error::AppError;
-use mas_common::ids::{AgentVersionId, ExecutionId, OrganizationId, ProjectId, TenantId};
+use mas_common::ids::{ExecutionId, OrganizationId, ProjectId, TenantId};
 use mas_common::result::Result;
 use mas_common::Timestamp;
 use serde::{Deserialize, Serialize};
@@ -48,8 +48,6 @@ pub struct RuntimeContext {
     // -- execution scope --
     execution_id: Option<ExecutionId>,
     parent_execution_id: Option<ExecutionId>,
-    /// Submission-time agent version selection; never re-resolved on retry.
-    agent_version_id: Option<AgentVersionId>,
 
     // -- authorization --
     permissions: BTreeSet<String>,
@@ -77,10 +75,6 @@ pub struct RuntimeContextSnapshot {
     pub request_id: Option<uuid::Uuid>,
     pub execution_id: Option<ExecutionId>,
     pub parent_execution_id: Option<ExecutionId>,
-    /// Submission-time agent version selection; `default` keeps older
-    /// checkpoint snapshots readable as unpinned legacy work.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent_version_id: Option<AgentVersionId>,
     pub permissions: BTreeSet<String>,
     pub deadline_epoch_ms: Option<i64>,
     pub data: serde_json::Map<String, serde_json::Value>,
@@ -115,7 +109,6 @@ impl RuntimeContext {
             request_id: None,
             execution_id: None,
             parent_execution_id: None,
-            agent_version_id: None,
             permissions: BTreeSet::new(),
             deadline: None,
             cancellation: CancellationToken::new(),
@@ -139,7 +132,6 @@ impl RuntimeContext {
             request_id: self.request_id,
             execution_id: Some(execution_id),
             parent_execution_id: parent,
-            agent_version_id: self.agent_version_id,
             permissions: self.permissions.clone(),
             deadline,
             cancellation: self.cancellation.child(),
@@ -200,10 +192,6 @@ impl RuntimeContext {
         self.parent_execution_id
     }
     #[must_use]
-    pub const fn agent_version_id(&self) -> Option<AgentVersionId> {
-        self.agent_version_id
-    }
-    #[must_use]
     pub const fn permissions(&self) -> &BTreeSet<String> {
         &self.permissions
     }
@@ -231,14 +219,6 @@ impl RuntimeContext {
     #[must_use]
     pub fn with_request_id(mut self, request_id: uuid::Uuid) -> Self {
         self.request_id = Some(request_id);
-        self
-    }
-
-    /// Carries the durable submission's immutable agent-version pin into the
-    /// execution context and every child context derived from it.
-    #[must_use]
-    pub fn with_agent_version_id(mut self, version_id: AgentVersionId) -> Self {
-        self.agent_version_id = Some(version_id);
         self
     }
 
@@ -309,7 +289,6 @@ impl RuntimeContext {
             request_id: self.request_id,
             execution_id: self.execution_id,
             parent_execution_id: self.parent_execution_id,
-            agent_version_id: self.agent_version_id,
             permissions: self.permissions.clone(),
             deadline_epoch_ms: self.deadline.map(|d| d.expires_at().to_unix_ms()),
             data: self.data.clone(),
@@ -333,7 +312,6 @@ impl RuntimeContext {
             request_id: snapshot.request_id,
             execution_id: snapshot.execution_id,
             parent_execution_id: snapshot.parent_execution_id,
-            agent_version_id: snapshot.agent_version_id,
             permissions: snapshot.permissions,
             deadline,
             cancellation: CancellationToken::new(),
