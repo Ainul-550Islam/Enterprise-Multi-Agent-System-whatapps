@@ -1,0 +1,26 @@
+# External surface contracts: API DTOs, RPC payloads, event contracts and
+# the stable error contract.prost/tonic generated bindings for the gRPC
+# protocol are added in the messaging/api phase (see scripts/generate-proto.sh).
+# Depends on mas-common only — never on domain internals, transports or DBs.
+[package]
+name = "mas-contracts"
+description = "Stable external contracts: API DTOs, envelopes, error contract. Wire-compatible with the Python orchestrator."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+mas-common.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+# chrono is pulled in transitively via mas-common::Timestamp; declare for
+# direct use in schema annotations and tests.
+chrono.workspace = true
+# Added when protobuf definitions land:
+#   prost, tonic — gRPC code generation for shared Rust/Python bindings

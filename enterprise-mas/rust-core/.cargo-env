@@ -1,0 +1,6 @@
+# Toolchain environment for this workspace (kept beside the project so it
+# survives sandbox reattaches; the toolchain itself lives under the user's
+# .toolchains/ and is rebuilt by scripts/bootstrap-toolchain.sh when wiped).
+export RUSTUP_HOME=/home/user/.toolchains/rust/rustup
+export CARGO_HOME=/home/user/.toolchains/rust/cargo
+export PATH="$CARGO_HOME/bin:$PATH"

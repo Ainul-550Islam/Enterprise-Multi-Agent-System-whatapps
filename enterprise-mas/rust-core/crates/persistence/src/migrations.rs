@@ -1,0 +1,771 @@
+//! PURPOSE: The embedded migration registry and runner.
+//!
+//! Owning layer: `mas-persistence`.
+//!
+//! Production responsibility: apply the schema forward-only, exactly once,
+//! under a ledger — concurrent boots must not double-apply or interleave, and
+//! every migration in the set must be additive.
+//!
+//! It must NOT:
+//!   • reorder, rewrite or skip an applied migration;
+//!   • allow a destructive statement (no `DROP TABLE`, `DROP COLUMN`,
+//!     `TRUNCATE`) in the set;
+//!   • treat an unverifiable ledger as healthy.
+
+//! Embedded migration registry and the [`MigrationRunner`].
+//!
+//! Migrations live in `migrations/NNNN_name/up.sql` at the repository root
+//! and are embedded at compile time. The runner:
+//!
+//! * records every applied migration in `mas_schema_migrations` (version,
+//!   name, FNV-1a checksum of the SQL text, applied_at);
+//! * **refuses incompatible states**: a database ahead of the binary
+//!   (unknown applied version), a gap in the applied prefix, or any checksum
+//!   drift on an already-applied migration — all hard errors, never
+//!   "self-healing";
+//! * applies each pending migration inside its own transaction, inserting
+//!   the record row in the same transaction so state and bookkeeping commit
+//!   atomically;
+//! * applies in strictly ascending version order, youngest pending first
+//!   applied last.
+
+use std::fmt;
+
+use mas_common::error::AppError;
+use mas_common::result::Result;
+use sqlx::Acquire;
+use sqlx::PgPool;
+use sqlx::Row;
+
+use crate::error::map_sqlx;
+
+/// Table the runner uses for bookkeeping (always in the default schema).
+pub const MIGRATIONS_TABLE: &str = "mas_schema_migrations";
+
+/// Session-scoped advisory lock key held while the migration ledger is touched.
+///
+/// Two replicas booting together (or `MAS_DATABASE_MIGRATE_ON_BOOT=true` on a
+/// rolling deploy) would otherwise race: `CREATE TABLE IF NOT EXISTS` and the
+/// ledger insert both conflict on catalog unique indexes, so the loser crashes
+/// at boot. The lock serialises them and is released explicitly even when the
+/// migration fails, so a failed boot cannot wedge later boots.
+const MIGRATION_ADVISORY_LOCK_KEY: i64 = 0x4D41_534D_4947; // "MASMIG"
+
+/// FNV-1a 64-bit checksum over the migration SQL — stable, `const`-computable,
+/// and collision-resistant enough for drift detection (not a security hash).
+pub const fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut i = 0;
+    while i < bytes.len() {
+        hash ^= bytes[i] as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        i += 1;
+    }
+    hash
+}
+
+/// One embedded migration.
+#[derive(Debug, Clone, Copy)]
+pub struct Migration {
+    /// 1-based, strictly ascending version (`0001` → 1).
+    pub version: u32,
+    /// Short snake-case name (`tenancy`, `outbox`, …).
+    pub name: &'static str,
+    /// The full `up.sql` text.
+    pub sql: &'static str,
+    /// Checksum of `sql` at compile time.
+    pub checksum: u64,
+}
+
+/// Declares one registry entry, embedding the SQL file.
+macro_rules! migration {
+    ($version:literal, $name:literal, $path:literal) => {
+        Migration {
+            version: $version,
+            name: $name,
+            sql: include_str!($path),
+            checksum: fnv1a(include_str!($path).as_bytes()),
+        }
+    };
+}
+
+/// The complete, ordered registry. `NNNN_name` — strict tree order.
+pub static MIGRATIONS: &[Migration] = &[
+    migration!(
+        1,
+        "extensions",
+        "../../../migrations/0001_extensions/up.sql"
+    ),
+    migration!(2, "tenancy", "../../../migrations/0002_tenancy/up.sql"),
+    migration!(3, "identity", "../../../migrations/0003_identity/up.sql"),
+    migration!(4, "agents", "../../../migrations/0004_agents/up.sql"),
+    migration!(5, "workflows", "../../../migrations/0005_workflows/up.sql"),
+    migration!(6, "execution", "../../../migrations/0006_execution/up.sql"),
+    migration!(7, "policy", "../../../migrations/0007_policy/up.sql"),
+    migration!(8, "billing", "../../../migrations/0008_billing/up.sql"),
+    migration!(9, "schedules", "../../../migrations/0009_schedules/up.sql"),
+    migration!(
+        10,
+        "integrations",
+        "../../../migrations/0010_integrations/up.sql"
+    ),
+    migration!(11, "audit", "../../../migrations/0011_audit/up.sql"),
+    migration!(12, "outbox", "../../../migrations/0012_outbox/up.sql"),
+    migration!(
+        13,
+        "task_created_by",
+        "../../../migrations/0013_task_created_by/up.sql"
+    ),
+    migration!(
+        14,
+        "durable_pipeline",
+        "../../../migrations/0014_durable_pipeline/up.sql"
+    ),
+    migration!(
+        15,
+        "directory_role",
+        "../../../migrations/0015_directory_role/up.sql"
+    ),
+    migration!(
+        16,
+        "api_key_binding",
+        "../../../migrations/0016_api_key_binding/up.sql"
+    ),
+    migration!(
+        17,
+        "plane_roles",
+        "../../../migrations/0017_plane_roles/up.sql"
+    ),
+    migration!(
+        18,
+        "api_key_owner",
+        "../../../migrations/0018_api_key_owner/up.sql"
+    ),
+    migration!(
+        19,
+        "scheduler_plane_role",
+        "../../../migrations/0019_scheduler_plane_role/up.sql"
+    ),
+    migration!(
+        20,
+        "control_plane",
+        "../../../migrations/0020_control_plane/up.sql"
+    ),
+    migration!(
+        21,
+        "control_plane_grants",
+        "../../../migrations/0021_control_plane_grants/up.sql"
+    ),
+    migration!(
+        22,
+        "worker_metering_grant",
+        "../../../migrations/0022_worker_metering_grant/up.sql"
+    ),
+    migration!(
+        23,
+        "agent_dashboard_columns",
+        "../../../migrations/0023_agent_dashboard_columns/up.sql"
+    ),
+    migration!(
+        24,
+        "workflow_versions",
+        "../../../migrations/0024_workflow_versions/up.sql"
+    ),
+    migration!(
+        25,
+        "rollback_records",
+        "../../../migrations/0025_rollback_records/up.sql"
+    ),
+    migration!(
+        26,
+        "analytics_rollups",
+        "../../../migrations/0026_analytics_rollups/up.sql"
+    ),
+    migration!(27, "approvals", "../../../migrations/0027_approvals/up.sql"),
+    migration!(
+        28,
+        "rag_pgvector_plane",
+        "../../../migrations/0028_rag_pgvector_plane/up.sql"
+    ),
+    migration!(
+        29,
+        "data_hub_state",
+        "../../../migrations/0029_data_hub_state/up.sql"
+    ),
+    migration!(
+        30,
+        "execution_step_domain_parity",
+        "../../../migrations/0030_execution_step_domain_parity/up.sql"
+    ),
+    migration!(
+        31,
+        "worker_execution_step_insert",
+        "../../../migrations/0031_worker_execution_step_insert/up.sql"
+    ),
+    migration!(
+        32,
+        "api_key_prefix_lookup",
+        "../../../migrations/0032_api_key_prefix_lookup/up.sql"
+    ),
+    migration!(
+        33,
+        "delivery_and_replay_receipts",
+        "../../../migrations/0033_delivery_and_replay_receipts/up.sql"
+    ),
+    migration!(
+        34,
+        "delivery_receipt_integrity",
+        "../../../migrations/0034_delivery_receipt_integrity/up.sql"
+    ),
+    migration!(
+        35,
+        "approval_domain_parity",
+        "../../../migrations/0035_approval_domain_parity/up.sql"
+    ),
+    migration!(
+        36,
+        "data_hub_scope_integrity",
+        "../../../migrations/0036_data_hub_scope_integrity/up.sql"
+    ),
+    migration!(
+        37,
+        "connector_domain_parity",
+        "../../../migrations/0037_connector_domain_parity/up.sql"
+    ),
+    migration!(
+        38,
+        "bounded_search_indexes",
+        "../../../migrations/0038_bounded_search_indexes/up.sql"
+    ),
+    migration!(
+        39,
+        "enterprise_integration_plane",
+        "../../../migrations/0039_enterprise_integration_plane/up.sql"
+    ),
+    migration!(
+        40,
+        "oauth_pkce_callback_lifecycle",
+        "../../../migrations/0040_oauth_pkce_callback_lifecycle/up.sql"
+    ),
+    migration!(
+        41,
+        "inbound_webhook_payload_outbox",
+        "../../../migrations/0041_inbound_webhook_payload_outbox/up.sql"
+    ),
+    migration!(
+        42,
+        "inbound_webhook_endpoints",
+        "../../../migrations/0042_inbound_webhook_endpoints/up.sql"
+    ),
+    migration!(
+        43,
+        "oauth_credential_lifecycle",
+        "../../../migrations/0043_oauth_credential_lifecycle/up.sql"
+    ),
+    migration!(
+        44,
+        "oauth_token_refresh_jobs",
+        "../../../migrations/0044_oauth_token_refresh_jobs/up.sql"
+    ),
+    migration!(
+        45,
+        "oauth_token_cleanup_jobs",
+        "../../../migrations/0045_oauth_token_cleanup_jobs/up.sql"
+    ),
+    migration!(
+        46,
+        "oauth_opaque_secret_locators",
+        "../../../migrations/0046_oauth_opaque_secret_locators/up.sql"
+    ),
+    migration!(
+        47,
+        "oauth_materialization_reconciliation",
+        "../../../migrations/0047_oauth_materialization_reconciliation/up.sql"
+    ),
+    migration!(
+        48,
+        "oauth_reference_invariants",
+        "../../../migrations/0048_oauth_reference_invariants/up.sql"
+    ),
+    migration!(
+        49,
+        "integration_keyset_indexes",
+        "../../../migrations/0049_integration_keyset_indexes/up.sql"
+    ),
+    migration!(
+        50,
+        "audit_query_indexes",
+        "../../../migrations/0050_audit_query_indexes/up.sql"
+    ),
+    migration!(
+        51,
+        "webhook_replay_attempts",
+        "../../../migrations/0051_webhook_replay_attempts/up.sql"
+    ),
+    migration!(
+        52,
+        "usage_append_only",
+        "../../../migrations/0052_usage_append_only/up.sql"
+    ),
+    migration!(
+        53,
+        "runtime_role_sequence_usage",
+        "../../../migrations/0053_runtime_role_sequence_usage/up.sql"
+    ),
+];
+
+/// A migration already recorded in the database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppliedMigration {
+    /// Applied version.
+    pub version: u32,
+    /// Recorded name.
+    pub name: String,
+    /// Recorded checksum of the SQL at apply time.
+    pub checksum: u64,
+}
+
+/// Why a plan cannot be produced — every variant is a hard stop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MigrationPlanError {
+    /// The embedded registry itself is broken (build/test bug).
+    RegistryInvalid {
+        /// What's wrong.
+        reason: String,
+    },
+    /// The database recorded a version this binary does not know (DB ahead).
+    UnknownApplied {
+        /// The unknown version.
+        version: u32,
+    },
+    /// An applied version is missing an earlier registry version (gap).
+    GapInApplied {
+        /// The first un-applied registry version below an applied one.
+        version: u32,
+    },
+    /// SQL text drifted after the migration was applied (check the record).
+    ChecksumMismatch {
+        /// Drifting version.
+        version: u32,
+        /// Checksum recorded in the database.
+        recorded: u64,
+        /// Checksum of the embedded SQL.
+        expected: u64,
+    },
+}
+
+impl fmt::Display for MigrationPlanError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RegistryInvalid { reason } => {
+                write!(f, "migration registry is invalid: {reason}")
+            },
+            Self::UnknownApplied { version } => write!(
+                f,
+                "database has applied migration v{version} unknown to this binary \
+                 (database is ahead of the code — refuse to run)"
+            ),
+            Self::GapInApplied { version } => write!(
+                f,
+                "applied migrations are not a clean prefix: v{version} is unapplied \
+                 while later versions exist in the database"
+            ),
+            Self::ChecksumMismatch {
+                version,
+                recorded,
+                expected,
+            } => write!(
+                f,
+                "applied migration v{version} no longer matches its recorded SQL \
+                 (recorded checksum {recorded:#x}, embedded {expected:#x}); \
+                 never hand-edit applied migrations"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MigrationPlanError {}
+
+impl From<MigrationPlanError> for AppError {
+    fn from(value: MigrationPlanError) -> Self {
+        AppError::conflict(value.to_string())
+    }
+}
+
+/// Validates the embedded registry: contiguous versions starting at 1,
+/// ascending order, unique names, non-empty SQL.
+pub fn validate_registry() -> std::result::Result<(), MigrationPlanError> {
+    let mut names = std::collections::BTreeSet::new();
+    for (expected, migration) in (1u32..).zip(MIGRATIONS.iter()) {
+        if migration.version != expected {
+            return Err(MigrationPlanError::RegistryInvalid {
+                reason: format!(
+                    "expected version {expected}, found {} ({})",
+                    migration.version, migration.name
+                ),
+            });
+        }
+        if migration.sql.trim().is_empty() {
+            return Err(MigrationPlanError::RegistryInvalid {
+                reason: format!(
+                    "migration {} ({}) has empty SQL",
+                    migration.version, migration.name
+                ),
+            });
+        }
+        if !names.insert(migration.name) {
+            return Err(MigrationPlanError::RegistryInvalid {
+                reason: format!("duplicate migration name {}", migration.name),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Computes which migrations must run, given what's recorded as applied.
+///
+/// Rules: applied entries must form a clean prefix of the registry, every
+/// applied checksum must match the embedded SQL, and nothing unknown to this
+/// binary may be applied.
+pub fn plan_pending(
+    applied: &[AppliedMigration],
+) -> std::result::Result<Vec<&'static Migration>, MigrationPlanError> {
+    validate_registry()?;
+
+    // Sort applied copy by version for prefix comparison.
+    let mut applied_sorted = applied.to_vec();
+    applied_sorted.sort_by_key(|a| a.version);
+
+    for (index, entry) in applied_sorted.iter().enumerate() {
+        let Some(registered) = MIGRATIONS.get(index) else {
+            return Err(MigrationPlanError::UnknownApplied {
+                version: entry.version,
+            });
+        };
+        if entry.version != registered.version {
+            return Err(MigrationPlanError::GapInApplied {
+                version: registered.version,
+            });
+        }
+        if entry.checksum != registered.checksum {
+            return Err(MigrationPlanError::ChecksumMismatch {
+                version: entry.version,
+                recorded: entry.checksum,
+                expected: registered.checksum,
+            });
+        }
+        if entry.name != registered.name {
+            return Err(MigrationPlanError::ChecksumMismatch {
+                version: entry.version,
+                recorded: 0,
+                expected: registered.checksum,
+            });
+        }
+    }
+
+    Ok(MIGRATIONS[applied_sorted.len()..].iter().collect())
+}
+
+/// Applies and verifies migrations against a live pool.
+#[derive(Debug, Clone)]
+pub struct MigrationRunner {
+    pool: PgPool,
+}
+
+impl MigrationRunner {
+    /// Binds a runner to a pool.
+    #[must_use]
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
+    /// Creates the bookkeeping table if absent.
+    pub async fn ensure_table(&self) -> Result<()> {
+        // Concurrent `CREATE TABLE IF NOT EXISTS` races on catalog indexes, so
+        // even this "harmless" DDL must be serialised.
+        let mut connection = self.locked_connection().await?;
+        let outcome = Self::ensure_table_in(&mut connection).await;
+        self.unlock(&mut connection).await?;
+        outcome
+    }
+
+    /// Creates the ledger table on a connection that already holds the lock.
+    async fn ensure_table_in(connection: &mut sqlx::PgConnection) -> Result<()> {
+        sqlx::query(&format!(
+            "CREATE TABLE IF NOT EXISTS {MIGRATIONS_TABLE} (
+                 version integer PRIMARY KEY,
+                 name    text        NOT NULL,
+                 checksum text       NOT NULL,
+                 applied_at timestamptz NOT NULL DEFAULT now()
+             )"
+        ))
+        .execute(&mut *connection)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(())
+    }
+
+    /// Acquires a dedicated connection and takes the migration advisory lock.
+    ///
+    /// A session-scoped lock must live on one connection for its whole
+    /// duration, so a pooled connection is checked out and held rather than
+    /// relying on the pool to route statements consistently.
+    async fn locked_connection(&self) -> Result<sqlx::pool::PoolConnection<sqlx::Postgres>> {
+        let mut connection = self.pool.acquire().await.map_err(map_sqlx)?;
+        sqlx::query("SELECT pg_advisory_lock($1)")
+            .bind(MIGRATION_ADVISORY_LOCK_KEY)
+            .execute(&mut *connection)
+            .await
+            .map_err(map_sqlx)?;
+        Ok(connection)
+    }
+
+    /// Releases the advisory lock. Called on every path, including failure.
+    async fn unlock(&self, connection: &mut sqlx::PgConnection) -> Result<()> {
+        sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(MIGRATION_ADVISORY_LOCK_KEY)
+            .execute(&mut *connection)
+            .await
+            .map_err(map_sqlx)?;
+        Ok(())
+    }
+
+    /// Reads what's recorded as applied (unordered; planner sorts).
+    pub async fn applied(&self) -> Result<Vec<AppliedMigration>> {
+        let rows = sqlx::query(&format!(
+            "SELECT version, name, checksum FROM {MIGRATIONS_TABLE} ORDER BY version"
+        ))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Self::decode_applied(&rows)
+    }
+
+    /// Reads the ledger on a connection that already holds the lock.
+    async fn applied_in(connection: &mut sqlx::PgConnection) -> Result<Vec<AppliedMigration>> {
+        let rows = sqlx::query(&format!(
+            "SELECT version, name, checksum FROM {MIGRATIONS_TABLE} ORDER BY version"
+        ))
+        .fetch_all(&mut *connection)
+        .await
+        .map_err(map_sqlx)?;
+        Self::decode_applied(&rows)
+    }
+
+    /// Decodes ledger rows (shared by the pooled and locked readers).
+    fn decode_applied(rows: &[sqlx::postgres::PgRow]) -> Result<Vec<AppliedMigration>> {
+        rows.iter()
+            .map(|row| {
+                let version: i32 = row.try_get("version").map_err(map_sqlx)?;
+                let checksum_text: String = row.try_get("checksum").map_err(map_sqlx)?;
+                let checksum = u64::from_str_radix(checksum_text.trim_start_matches("0x"), 16)
+                    .map_err(|_| AppError::database("corrupt checksum in migration ledger"))?;
+                Ok(AppliedMigration {
+                    version: u32::try_from(version)
+                        .map_err(|_| AppError::database("negative migration version in ledger"))?,
+                    name: row.try_get("name").map_err(map_sqlx)?,
+                    checksum,
+                })
+            })
+            .collect()
+    }
+
+    /// Runs all pending migrations, verifying ledger compatibility first.
+    /// Returns the versions applied by this call (empty when up to date).
+    pub async fn migrate(&self) -> Result<Vec<u32>> {
+        validate_registry().map_err(AppError::from)?;
+
+        // Serialise against other processes: the lock is held on one dedicated
+        // connection for the entire run and released on every exit path.
+        let mut connection = self.locked_connection().await?;
+        let outcome = self.migrate_locked(&mut connection).await;
+        self.unlock(&mut connection).await?;
+        outcome
+    }
+
+    /// Applies pending migrations on a connection holding the advisory lock.
+    async fn migrate_locked(
+        &self,
+        connection: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
+    ) -> Result<Vec<u32>> {
+        Self::ensure_table_in(connection).await?;
+        let applied = Self::applied_in(connection).await?;
+        let pending = plan_pending(&applied).map_err(AppError::from)?;
+
+        let mut done = Vec::with_capacity(pending.len());
+        for migration in pending {
+            tracing::info!(
+                version = migration.version,
+                name = migration.name,
+                "applying migration"
+            );
+            let mut tx = (&mut **connection).begin().await.map_err(map_sqlx)?;
+            // Whole migration + ledger insert commit atomically.
+            sqlx::raw_sql(migration.sql)
+                .execute(&mut *tx)
+                .await
+                .map_err(map_sqlx)?;
+            sqlx::query(&format!(
+                "INSERT INTO {MIGRATIONS_TABLE} (version, name, checksum) VALUES ($1, $2, $3)"
+            ))
+            .bind(i32::try_from(migration.version).unwrap_or(i32::MAX))
+            .bind(migration.name)
+            .bind(format!("{:#x}", migration.checksum))
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+            tx.commit().await.map_err(map_sqlx)?;
+            done.push(migration.version);
+        }
+        Ok(done)
+    }
+
+    /// Compatibility check only: fails when the ledger disagrees with the
+    /// embedded registry (used by `migrate status` and startup probes).
+    pub async fn verify(&self) -> Result<()> {
+        self.ensure_table().await?;
+        let applied = self.applied().await?;
+        plan_pending(&applied).map_err(AppError::from)?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn applied(version: u32, name: &str, checksum: u64) -> AppliedMigration {
+        AppliedMigration {
+            version,
+            name: name.to_owned(),
+            checksum,
+        }
+    }
+
+    #[test]
+    fn registry_is_contiguous_and_ordered() {
+        validate_registry().expect("registry must be valid");
+        assert_eq!(MIGRATIONS.len(), 53);
+        assert_eq!(MIGRATIONS.first().map(|m| m.name), Some("extensions"));
+        assert_eq!(
+            MIGRATIONS.last().map(|m| m.name),
+            Some("runtime_role_sequence_usage")
+        );
+        let search_indexes = MIGRATIONS
+            .iter()
+            .find(|migration| migration.name == "bounded_search_indexes")
+            .expect("bounded search index migration is registered");
+        assert!(search_indexes
+            .sql
+            .contains("CREATE EXTENSION IF NOT EXISTS pg_trgm"));
+        assert!(search_indexes.sql.contains("name gin_trgm_ops"));
+        assert!(
+            search_indexes.sql.contains("(slug::text) gin_trgm_ops"),
+            "the indexed expression must match the ILIKE query expression"
+        );
+        // Versions are 1-based and strictly ascending: the runner applies them
+        // in registry order and refuses gaps.
+        for (index, migration) in MIGRATIONS.iter().enumerate() {
+            assert_eq!(
+                migration.version as usize,
+                index + 1,
+                "{} must be version {}",
+                migration.name,
+                index + 1
+            );
+        }
+        for migration in MIGRATIONS {
+            // No migration is a no-op. Most define schema; a migration that
+            // only corrects privileges declares that with `GRANT` (0021: a
+            // missing grant rather than a missing table) or `REVOKE` (0052:
+            // closing a broad default grant) instead of DDL.
+            assert!(
+                migration.sql.contains("CREATE")
+                    || migration.sql.contains("ALTER")
+                    || migration.sql.contains("GRANT")
+                    || migration.sql.contains("REVOKE"),
+                "{} must change the schema or the privilege set",
+                migration.name
+            );
+            assert!(migration.checksum != 0);
+        }
+        // RLS policies live in the SQL set, per platform rule.
+        let rls_count: usize = MIGRATIONS
+            .iter()
+            .filter(|m| m.sql.contains("ROW LEVEL SECURITY"))
+            .count();
+        assert!(
+            rls_count >= 10,
+            "every tenant-touching migration must carry RLS policies ({rls_count})"
+        );
+    }
+
+    #[test]
+    fn fnv1a_is_stable_and_sensitive() {
+        assert_eq!(fnv1a(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a(b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_ne!(fnv1a(b"ab"), fnv1a(b"ba"));
+    }
+
+    #[test]
+    fn plan_full_then_empty() {
+        // Nothing applied → everything pending, in registry order.
+        let pending = plan_pending(&[]).expect("plan");
+        assert_eq!(pending.len(), MIGRATIONS.len());
+        assert_eq!(pending[0].version, 1);
+
+        // Full clean prefix applied → nothing pending.
+        let full: Vec<AppliedMigration> = MIGRATIONS
+            .iter()
+            .map(|m| applied(m.version, m.name, m.checksum))
+            .collect();
+        assert!(plan_pending(&full).expect("plan").is_empty());
+
+        // Partial prefix → exactly the tail pending.
+        let partial = &full[..4];
+        let pending = plan_pending(partial).expect("plan");
+        assert_eq!(pending.len(), MIGRATIONS.len() - 4);
+        assert_eq!(pending[0].name, "workflows");
+    }
+
+    #[test]
+    fn plan_refuses_every_incompatible_state() {
+        let full: Vec<AppliedMigration> = MIGRATIONS
+            .iter()
+            .map(|m| applied(m.version, m.name, m.checksum))
+            .collect();
+
+        // DB ahead of the binary. The version must stay above every version
+        // this binary knows, so it is derived rather than hand-written: a
+        // literal here silently stops testing anything the moment a migration
+        // is added above it.
+        let future_version = MIGRATIONS.last().map(|m| m.version).unwrap_or(0) + 1;
+        let mut ahead = full.clone();
+        ahead.push(applied(future_version, "future", 1));
+        assert!(matches!(
+            plan_pending(&ahead),
+            Err(MigrationPlanError::UnknownApplied { version }) if version == future_version
+        ));
+
+        // Gap: v2 missing but v3 applied (drop index 1 — sorted order keeps prefix).
+        let gapped: Vec<AppliedMigration> =
+            full.iter().filter(|a| a.version != 2).cloned().collect();
+        assert!(matches!(
+            plan_pending(&gapped),
+            Err(MigrationPlanError::GapInApplied { version: 2 })
+        ));
+
+        // Drift on an applied migration.
+        let mut drifted = full[..3].to_vec();
+        drifted[2].checksum ^= 0xdead;
+        assert!(matches!(
+            plan_pending(&drifted),
+            Err(MigrationPlanError::ChecksumMismatch { version: 3, .. })
+        ));
+
+        // Tampered ledger name.
+        let mut renamed = full[..2].to_vec();
+        renamed[1].name = "tenancy_evil".to_owned();
+        assert!(plan_pending(&renamed).is_err());
+    }
+}

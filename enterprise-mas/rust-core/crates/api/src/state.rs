@@ -1,0 +1,903 @@
+//! PURPOSE: Process state shared by every handler — the application services,
+//! the token verifier, the health registry and build identity.
+//!
+//! Owning layer: `mas-api` (the process edge).
+//!
+//! Production responsibility: build the object graph exactly once at bootstrap
+//! and share it `Arc`-wise, so there is one instance of each service per
+//! process and no per-request construction cost or per-request divergence.
+//!
+//! It must NOT:
+//!   • hold per-request or per-tenant mutable state (that belongs on the
+//!     request extensions / service context);
+//!   • expose a constructor that silently substitutes an in-memory store when
+//!     the production store is unavailable.
+
+//! Process state shared by every handler: the five application services
+//! (Arc-shared, since they own boxed store ports), the token verifier, the
+//! health registry, and build identity. Constructed ONCE at bootstrap.
+
+use std::sync::Arc;
+
+use mas_application::agent_service::AgentService;
+use mas_application::analytics_service::AnalyticsService;
+use mas_application::api_key_service::ApiKeyApplicationService;
+use mas_application::approval_service::ApprovalApplicationService;
+use mas_application::assistant_service::AssistantService;
+use mas_application::audit_query_service::AuditQueryService;
+use mas_application::connector_service::ConnectorService;
+use mas_application::data_hub_service::DataHubApplicationService;
+use mas_application::execution_service::ExecutionService;
+use mas_application::inbound_webhook_service::InboundWebhookEndpointService;
+use mas_application::integration_service::IntegrationService;
+use mas_application::notification_service::NotificationService;
+use mas_application::oauth_authorization_service::OAuthAuthorizationService;
+use mas_application::policy_service::PolicyService;
+use mas_application::rollback_service::RollbackApplicationService;
+use mas_application::schedule_service::ScheduleService;
+use mas_application::search_service::SearchService;
+use mas_application::tenancy_service::TenancyService;
+use mas_application::tool_service::ToolService;
+use mas_application::usage_service::UsageService;
+use mas_application::webhook_service::WebhookService;
+use mas_application::workflow_service::WorkflowService;
+use mas_integrations::durable_oauth::DurableOAuthAuthorizationService;
+use mas_integrations::inbound_webhooks::InboundWebhookIngressPort;
+use mas_observability::health::HealthRegistry;
+use sqlx::PgPool;
+
+use crate::auth::TokenVerifierPort;
+use crate::handlers::stream::StreamHub;
+use crate::scope_resolution::RequestScopeResolver;
+
+/// Everything a request may touch.
+#[derive(Clone)]
+pub struct AppState {
+    /// Deployment/service identity for health + logs.
+    pub service_name: Arc<str>,
+    /// Crate/binary version for health payloads.
+    pub service_version: Arc<str>,
+    /// Bearer-token verification boundary.
+    pub verifier: Arc<dyn TokenVerifierPort>,
+    /// Request-scope resolution from identity.
+    ///
+    /// `None` only in the in-memory development lane, which has no directory
+    /// to consult. A production process always has one, and
+    /// `middleware::authenticated_layer` refuses to resolve scope without it —
+    /// it does not fall back to the caller's claims.
+    pub scope_resolver: Option<RequestScopeResolver>,
+    /// Tenancy/identity use-cases.
+    pub tenancy: Arc<TenancyService>,
+    /// Agent lifecycle use-cases.
+    pub agents: Arc<AgentService>,
+    /// Workflow lifecycle use-cases.
+    pub workflows: Arc<WorkflowService>,
+    /// Agent/workflow rollback dispatch and tenant-scoped history.
+    pub rollbacks: Option<Arc<RollbackApplicationService>>,
+    /// Execution lifecycle use-cases.
+    pub executions: Arc<ExecutionService>,
+    /// Schedule lifecycle use-cases.
+    pub schedules: Arc<ScheduleService>,
+    /// API-key lifecycle service (hash-only persistence and security audit).
+    pub api_keys: Option<Arc<ApiKeyApplicationService>>,
+    /// Human-in-the-loop approval queue and policy decision facade.
+    pub approvals: Option<Arc<ApprovalApplicationService>>,
+    /// Rust-owned Data Hub metadata and authenticated Python bridge facade.
+    pub data_hub: Option<Arc<DataHubApplicationService>>,
+    /// Bounded cross-resource command-palette search facade.
+    pub search: Option<Arc<SearchService>>,
+    /// Durable recipient notification lifecycle facade.
+    ///
+    /// `None` means an embedding explicitly omitted the notification plane;
+    /// handlers fail loudly rather than returning a plausible empty inbox.
+    pub notifications: Option<Arc<NotificationService>>,
+    /// Authorized tenant configuration service for canonical public inbound
+    /// webhook endpoints. Omitted compositions fail loudly in its handlers.
+    pub inbound_webhook_endpoints: Option<Arc<InboundWebhookEndpointService>>,
+    /// Public signature-first ingress coordinator. It is intentionally distinct
+    /// from request services because public callbacks have no user RLS scope.
+    pub inbound_webhook_ingress: Option<Arc<dyn InboundWebhookIngressPort>>,
+    /// Authorized tenant connector and outbound-webhook management facade.
+    /// `None` is permitted only for a deliberately restricted embedding;
+    /// handlers fail loudly rather than pretending no connectors exist.
+    pub integrations: Option<Arc<IntegrationService>>,
+    /// Authenticated connector-bound OAuth authorization initiation service.
+    pub oauth_authorization: Option<Arc<OAuthAuthorizationService>>,
+    /// Public OAuth callback façade. It consumes opaque one-shot state and
+    /// persists only canonical credential references, never a request scope.
+    pub oauth_callbacks: Option<Arc<DurableOAuthAuthorizationService>>,
+    /// Tenant-scoped deterministic dashboard read models.
+    ///
+    /// `None` is only possible for a custom embedding that deliberately does
+    /// not compose dashboard dependencies; supported API compositions install
+    /// this service at bootstrap and handlers fail loudly rather than return
+    /// a plausible empty dashboard.
+    pub analytics: Option<Arc<AnalyticsService>>,
+    /// Read-only, filtered, keyset-paginated audit projection for the UI.
+    ///
+    /// `None` means this embedding has no audit read plane (or no signed
+    /// cursor key); `/v1/audit-events` then answers a typed 503 instead of
+    /// an empty page that reads as "nothing ever happened".
+    pub audit_query: Option<Arc<AuditQueryService>>,
+    /// Policy lifecycle facade: draft → publish → rollback, plus dry-run
+    /// evaluation through the canonical engine. `None` ⇒ typed 503.
+    pub policies: Option<Arc<PolicyService>>,
+    /// Quota and usage plan-card reads with server-computed utilization.
+    /// `None` ⇒ typed 503, never fabricated zero-valued usage.
+    pub usage: Option<Arc<UsageService>>,
+    /// Tenant tool catalogue, runtime config, and agent tool-permission
+    /// grants, policy-checked server-side. `None` ⇒ typed 503.
+    pub tools: Option<Arc<ToolService>>,
+    /// Connector administration: declarative manifests, guarded probe, and
+    /// disable-with-revocation. `None` ⇒ typed 503.
+    pub connector_admin: Option<Arc<ConnectorService>>,
+    /// Webhook delivery inspection and dead-letter replay.
+    /// `None` ⇒ typed 503.
+    pub webhook_admin: Option<Arc<WebhookService>>,
+    /// Tenant-isolated Server-Sent Events fan-out with bounded per-tenant
+    /// buffers and per-principal connection caps. `None` ⇒ typed 503.
+    pub stream_hub: Option<Arc<StreamHub>>,
+    /// Built-in platform assistant submission routed through the ordinary
+    /// execution pipeline (policy, quota, audit and usage still apply).
+    /// `None` ⇒ typed 503.
+    pub assistant: Option<Arc<AssistantService>>,
+    /// The canonical control plane (entitlement → policy → quota).
+    pub control_plane: Arc<mas_application::control_plane::ControlPlane>,
+    /// Where control-plane mutations are recorded.
+    ///
+    /// Shared with the tenancy/agent/workflow services rather than created
+    /// here, so one request's audit trail is one sequence regardless of which
+    /// service wrote which line. A control-plane change that is not audited is
+    /// indistinguishable from tampering, so this is not optional.
+    pub audit: Arc<dyn mas_application::audit::AuditSinkPort>,
+    /// The Postgres control-plane stores.
+    ///
+    /// `None` in the in-memory development lane, which has no database. The
+    /// billing and usage endpoints that read these return a clear error in
+    /// that lane rather than a plausible empty result: an empty usage list
+    /// from a lane that cannot meter is indistinguishable from a tenant that
+    /// consumed nothing.
+    pub control_plane_stores:
+        Option<Arc<mas_persistence::repositories::control_plane::ControlPlaneStores>>,
+    /// Liveness/readiness probes (observability plane).
+    pub health: Arc<HealthRegistry>,
+    /// The runtime PostgreSQL pool, when the process is running on
+    /// PostgreSQL.
+    ///
+    /// `None` only in the in-memory lane. When it is `Some`, the middleware
+    /// opens one transaction per request with row-level security armed, and
+    /// every repository call in that request runs inside it.
+    pub runtime_pool: Option<PgPool>,
+    /// Shared secret used to authenticate internal service calls.
+    ///
+    /// `None` means every internal route refuses, rather than trusting the
+    /// network. A production process must have one.
+    pub internal_secret: Option<mas_security::SecretString>,
+}
+
+impl std::fmt::Debug for AppState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppState")
+            .field("service_name", &self.service_name)
+            .field("service_version", &self.service_version)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AppState {
+    /// Installs the rollback use case after the shared agent/workflow services
+    /// have been composed over their common history store.
+    #[must_use]
+    pub fn with_rollbacks(mut self, rollbacks: Arc<RollbackApplicationService>) -> Self {
+        self.rollbacks = Some(rollbacks);
+        self
+    }
+
+    /// Installs the bounded search service after its durable catalogue
+    /// adapter has been composed.
+    #[must_use]
+    pub fn with_search(mut self, search: Arc<SearchService>) -> Self {
+        self.search = Some(search);
+        self
+    }
+
+    /// Returns the search facade or a deterministic composition error.
+    pub fn search_service(
+        &self,
+        ctx: &crate::context::RequestContext,
+    ) -> std::result::Result<Arc<SearchService>, crate::response::ApiError> {
+        self.search.clone().ok_or_else(|| {
+            crate::response::ApiError::new(
+                mas_common::error::AppError::internal(
+                    "search service is not configured for this API deployment",
+                ),
+                ctx,
+            )
+        })
+    }
+
+    /// Installs the Data Hub service after the scoped catalogue stores and
+    /// authenticated bridge are composed.
+    #[must_use]
+    pub fn with_data_hub(mut self, data_hub: Arc<DataHubApplicationService>) -> Self {
+        self.data_hub = Some(data_hub);
+        self
+    }
+
+    /// Returns the Data Hub facade or a deterministic composition error.
+    pub fn data_hub_service(
+        &self,
+        ctx: &crate::context::RequestContext,
+    ) -> std::result::Result<Arc<DataHubApplicationService>, crate::response::ApiError> {
+        self.data_hub.clone().ok_or_else(|| {
+            crate::response::ApiError::new(
+                mas_common::error::AppError::internal(
+                    "Data Hub service is not configured for this API deployment",
+                ),
+                ctx,
+            )
+        })
+    }
+
+    /// Installs the durable approval service after its store and mandatory
+    /// audit sink are composed.
+    #[must_use]
+    pub fn with_approvals(mut self, approvals: Arc<ApprovalApplicationService>) -> Self {
+        self.approvals = Some(approvals);
+        self
+    }
+
+    /// Returns the approval queue service or fails loudly when a custom
+    /// embedding omitted the durable governance dependency.
+    pub fn approval_service(
+        &self,
+        ctx: &crate::context::RequestContext,
+    ) -> std::result::Result<Arc<ApprovalApplicationService>, crate::response::ApiError> {
+        self.approvals.clone().ok_or_else(|| {
+            crate::response::ApiError::new(
+                mas_common::error::AppError::internal(
+                    "approval service is not configured for this API deployment",
+                ),
+                ctx,
+            )
+        })
+    }
+
+    /// Installs the API-key lifecycle service after its security store and
+    /// mandatory audit sink are composed.
+    #[must_use]
+    pub fn with_api_keys(mut self, api_keys: Arc<ApiKeyApplicationService>) -> Self {
+        self.api_keys = Some(api_keys);
+        self
+    }
+
+    /// Returns the API-key lifecycle service or a deterministic composition
+    /// error instead of a plausible empty credential list.
+    pub fn api_key_service(
+        &self,
+        ctx: &crate::context::RequestContext,
+    ) -> std::result::Result<Arc<ApiKeyApplicationService>, crate::response::ApiError> {
+        self.api_keys.clone().ok_or_else(|| {
+            crate::response::ApiError::new(
+                mas_common::error::AppError::internal(
+                    "API-key service is not configured for this API deployment",
+                ),
+                ctx,
+            )
+        })
+    }
+
+    /// Installs the durable recipient-notification lifecycle service.
+    #[must_use]
+    pub fn with_notifications(mut self, notifications: Arc<NotificationService>) -> Self {
+        self.notifications = Some(notifications);
+        self
+    }
+
+    /// Returns notification lifecycle composition or a deterministic error.
+    pub fn notification_service(
+        &self,
+        ctx: &crate::context::RequestContext,
+    ) -> std::result::Result<Arc<NotificationService>, crate::response::ApiError> {
+        self.notifications.clone().ok_or_else(|| {
+            crate::response::ApiError::new(
+                mas_common::error::AppError::internal(
+                    "notification service is not configured for this API deployment",
+                ),
+                ctx,
+            )
+        })
+    }
+
+    /// Installs both sides of the canonical inbound-webhook plane. Public
+    /// ingestion and authenticated endpoint management remain separate because
+    /// the former intentionally has no request identity or RLS tenant scope.
+    #[must_use]
+    pub fn with_inbound_webhooks(
+        mut self,
+        endpoints: Arc<InboundWebhookEndpointService>,
+        ingress: Arc<dyn InboundWebhookIngressPort>,
+    ) -> Self {
+        self.inbound_webhook_endpoints = Some(endpoints);
+        self.inbound_webhook_ingress = Some(ingress);
+        self
+    }
+
+    /// Returns the authenticated endpoint-management service or fails loudly
+    /// when a custom embedding omitted the integration plane.
+    pub fn inbound_webhook_endpoint_service(
+        &self,
+        ctx: &crate::context::RequestContext,
+    ) -> std::result::Result<Arc<InboundWebhookEndpointService>, crate::response::ApiError> {
+        self.inbound_webhook_endpoints.clone().ok_or_else(|| {
+            crate::response::ApiError::new(
+                mas_common::error::AppError::internal(
+                    "inbound webhook endpoint service is not configured for this API deployment",
+                ),
+                ctx,
+            )
+        })
+    }
+
+    /// Returns the public ingress coordinator or fails loudly; no route ever
+    /// substitutes an in-memory verifier or accepts unsigned data.
+    pub fn inbound_webhook_ingress(
+        &self,
+        ctx: &crate::context::RequestContext,
+    ) -> std::result::Result<Arc<dyn InboundWebhookIngressPort>, crate::response::ApiError> {
+        self.inbound_webhook_ingress.clone().ok_or_else(|| {
+            crate::response::ApiError::new(
+                mas_common::error::AppError::internal(
+                    "inbound webhook ingress is not configured for this API deployment",
+                ),
+                ctx,
+            )
+        })
+    }
+
+    /// Installs canonical connector and outbound-webhook management after its
+    /// request-scoped stores and guarded runtime adapters are composed.
+    #[must_use]
+    pub fn with_integrations(mut self, integrations: Arc<IntegrationService>) -> Self {
+        self.integrations = Some(integrations);
+        self
+    }
+
+    /// Returns the canonical integration management service or fails loudly.
+    pub fn integration_service(
+        &self,
+        ctx: &crate::context::RequestContext,
+    ) -> std::result::Result<Arc<IntegrationService>, crate::response::ApiError> {
+        self.integrations.clone().ok_or_else(|| {
+            crate::response::ApiError::new(
+                mas_common::error::AppError::internal(
+                    "integration service is not configured for this API deployment",
+                ),
+                ctx,
+            )
+        })
+    }
+
+    /// Installs the paired OAuth initiation/callback plane. Production
+    /// bootstrap must install both halves together; neither has an in-memory
+    /// fallback because a callback without durable PKCE/token lifecycle is
+    /// unsafe.
+    #[must_use]
+    pub fn with_oauth(
+        mut self,
+        authorization: Arc<OAuthAuthorizationService>,
+        callbacks: Arc<DurableOAuthAuthorizationService>,
+    ) -> Self {
+        self.oauth_authorization = Some(authorization);
+        self.oauth_callbacks = Some(callbacks);
+        self
+    }
+
+    /// Returns the authenticated OAuth initiation service or fails loudly.
+    pub fn oauth_authorization_service(
+        &self,
+        ctx: &crate::context::RequestContext,
+    ) -> std::result::Result<Arc<OAuthAuthorizationService>, crate::response::ApiError> {
+        self.oauth_authorization.clone().ok_or_else(|| {
+            crate::response::ApiError::new(
+                mas_common::error::AppError::internal(
+                    "OAuth authorization service is not configured for this API deployment",
+                ),
+                ctx,
+            )
+        })
+    }
+
+    /// Returns the public callback façade or fails loudly; there is no
+    /// unsigned/in-memory callback compatibility path.
+    pub fn oauth_callback_service(
+        &self,
+        ctx: &crate::context::RequestContext,
+    ) -> std::result::Result<Arc<DurableOAuthAuthorizationService>, crate::response::ApiError> {
+        self.oauth_callbacks.clone().ok_or_else(|| {
+            crate::response::ApiError::new(
+                mas_common::error::AppError::internal(
+                    "OAuth callback service is not configured for this API deployment",
+                ),
+                ctx,
+            )
+        })
+    }
+
+    /// Installs the dashboard read-model service after its tenant-scoped
+    /// persistence dependencies have been composed.
+    #[must_use]
+    pub fn with_analytics(mut self, analytics: Arc<AnalyticsService>) -> Self {
+        self.analytics = Some(analytics);
+        self
+    }
+
+    /// Returns the dashboard service or a deterministic composition error.
+    pub fn analytics_service(
+        &self,
+        ctx: &crate::context::RequestContext,
+    ) -> std::result::Result<Arc<AnalyticsService>, crate::response::ApiError> {
+        self.analytics.clone().ok_or_else(|| {
+            crate::response::ApiError::new(
+                mas_common::error::AppError::internal(
+                    "analytics service is not configured for this API deployment",
+                ),
+                ctx,
+            )
+        })
+    }
+
+    /// Installs the audit query service after its read port and signed
+    /// cursor key have been composed.
+    #[must_use]
+    pub fn with_audit_query(mut self, audit_query: Arc<AuditQueryService>) -> Self {
+        self.audit_query = Some(audit_query);
+        self
+    }
+
+    /// Returns the audit query service or a typed `503` composition error.
+    pub fn audit_query_service(
+        &self,
+        ctx: &crate::context::RequestContext,
+    ) -> std::result::Result<Arc<AuditQueryService>, crate::response::ApiError> {
+        self.audit_query.clone().ok_or_else(|| {
+            crate::response::ApiError::new(
+                mas_common::error::AppError::unavailable(
+                    "the audit query service is not configured for this API deployment",
+                ),
+                ctx,
+            )
+        })
+    }
+
+    /// Installs the policy lifecycle service over the canonical policy
+    /// engine and store.
+    #[must_use]
+    pub fn with_policies(mut self, policies: Arc<PolicyService>) -> Self {
+        self.policies = Some(policies);
+        self
+    }
+
+    /// Returns the policy service or a typed `503` composition error.
+    pub fn policy_service(
+        &self,
+        ctx: &crate::context::RequestContext,
+    ) -> std::result::Result<Arc<PolicyService>, crate::response::ApiError> {
+        self.policies.clone().ok_or_else(|| {
+            crate::response::ApiError::new(
+                mas_common::error::AppError::unavailable(
+                    "the policy service is not configured for this API deployment",
+                ),
+                ctx,
+            )
+        })
+    }
+
+    /// Installs the quota/usage read service over the production usage and
+    /// quota stores.
+    #[must_use]
+    pub fn with_usage(mut self, usage: Arc<UsageService>) -> Self {
+        self.usage = Some(usage);
+        self
+    }
+
+    /// Returns the usage service or a typed `503` composition error.
+    pub fn usage_service(
+        &self,
+        ctx: &crate::context::RequestContext,
+    ) -> std::result::Result<Arc<UsageService>, crate::response::ApiError> {
+        self.usage.clone().ok_or_else(|| {
+            crate::response::ApiError::new(
+                mas_common::error::AppError::unavailable(
+                    "the usage service is not configured for this API deployment",
+                ),
+                ctx,
+            )
+        })
+    }
+
+    /// Installs the tool catalogue service over the production tool store
+    /// and the canonical policy engine.
+    #[must_use]
+    pub fn with_tools(mut self, tools: Arc<ToolService>) -> Self {
+        self.tools = Some(tools);
+        self
+    }
+
+    /// Returns the tool service or a typed `503` composition error.
+    pub fn tool_service(
+        &self,
+        ctx: &crate::context::RequestContext,
+    ) -> std::result::Result<Arc<ToolService>, crate::response::ApiError> {
+        self.tools.clone().ok_or_else(|| {
+            crate::response::ApiError::new(
+                mas_common::error::AppError::unavailable(
+                    "the tool service is not configured for this API deployment",
+                ),
+                ctx,
+            )
+        })
+    }
+
+    /// Installs connector administration over the canonical integration
+    /// plane and revocation persistence.
+    #[must_use]
+    pub fn with_connector_admin(mut self, connector_admin: Arc<ConnectorService>) -> Self {
+        self.connector_admin = Some(connector_admin);
+        self
+    }
+
+    /// Returns the connector administration service or a typed `503`
+    /// composition error.
+    pub fn connector_admin_service(
+        &self,
+        ctx: &crate::context::RequestContext,
+    ) -> std::result::Result<Arc<ConnectorService>, crate::response::ApiError> {
+        self.connector_admin.clone().ok_or_else(|| {
+            crate::response::ApiError::new(
+                mas_common::error::AppError::unavailable(
+                    "the connector administration service is not configured for this API deployment",
+                ),
+                ctx,
+            )
+        })
+    }
+
+    /// Installs webhook delivery administration over the durable delivery
+    /// and dead-letter stores.
+    #[must_use]
+    pub fn with_webhook_admin(mut self, webhook_admin: Arc<WebhookService>) -> Self {
+        self.webhook_admin = Some(webhook_admin);
+        self
+    }
+
+    /// Returns the webhook administration service or a typed `503`
+    /// composition error.
+    pub fn webhook_admin_service(
+        &self,
+        ctx: &crate::context::RequestContext,
+    ) -> std::result::Result<Arc<WebhookService>, crate::response::ApiError> {
+        self.webhook_admin.clone().ok_or_else(|| {
+            crate::response::ApiError::new(
+                mas_common::error::AppError::unavailable(
+                    "the webhook administration service is not configured for this API deployment",
+                ),
+                ctx,
+            )
+        })
+    }
+
+    /// Installs the tenant-isolated SSE hub after its event-bus subscriber
+    /// has been attached (or deliberately omitted in a lane without one).
+    #[must_use]
+    pub fn with_stream_hub(mut self, stream_hub: Arc<StreamHub>) -> Self {
+        self.stream_hub = Some(stream_hub);
+        self
+    }
+
+    /// Returns the SSE stream hub or a typed `503` composition error.
+    pub fn stream_hub_service(
+        &self,
+        ctx: &crate::context::RequestContext,
+    ) -> std::result::Result<Arc<StreamHub>, crate::response::ApiError> {
+        self.stream_hub.clone().ok_or_else(|| {
+            crate::response::ApiError::new(
+                mas_common::error::AppError::unavailable(
+                    "the event stream hub is not configured for this API deployment",
+                ),
+                ctx,
+            )
+        })
+    }
+
+    /// Installs the built-in platform assistant over the same stores and
+    /// execution service the rest of the API already composes.
+    #[must_use]
+    pub fn with_assistant(mut self, assistant: Arc<AssistantService>) -> Self {
+        self.assistant = Some(assistant);
+        self
+    }
+
+    /// Returns the assistant service or a typed `503` composition error.
+    pub fn assistant_service(
+        &self,
+        ctx: &crate::context::RequestContext,
+    ) -> std::result::Result<Arc<AssistantService>, crate::response::ApiError> {
+        self.assistant.clone().ok_or_else(|| {
+            crate::response::ApiError::new(
+                mas_common::error::AppError::unavailable(
+                    "the assistant service is not configured for this API deployment",
+                ),
+                ctx,
+            )
+        })
+    }
+
+    /// The canonical control plane.
+    #[must_use]
+    pub fn control_plane(&self) -> &Arc<mas_application::control_plane::ControlPlane> {
+        &self.control_plane
+    }
+
+    /// The Postgres control-plane stores, when this lane has a database.
+    ///
+    /// Returns `Err(Unavailable)` rather than `None` so a handler turns it into
+    /// a deterministic error instead of an empty result that reads as "no
+    /// data".
+    pub fn control_plane_stores(
+        &self,
+    ) -> mas_common::result::Result<
+        Arc<mas_persistence::repositories::control_plane::ControlPlaneStores>,
+    > {
+        self.control_plane_stores.clone().ok_or_else(|| {
+            mas_common::error::AppError::internal(
+                "control-plane data requires the database lane; this deployment has none",
+            )
+        })
+    }
+
+    /// Composition root (services arrive fully wired).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        service_name: &str,
+        service_version: &str,
+        verifier: Arc<dyn TokenVerifierPort>,
+        scope_resolver: Option<RequestScopeResolver>,
+        tenancy: Arc<TenancyService>,
+        agents: Arc<AgentService>,
+        workflows: Arc<WorkflowService>,
+        executions: Arc<ExecutionService>,
+        schedules: Arc<ScheduleService>,
+        control_plane: Arc<mas_application::control_plane::ControlPlane>,
+        audit: Arc<dyn mas_application::audit::AuditSinkPort>,
+        control_plane_stores: Option<
+            Arc<mas_persistence::repositories::control_plane::ControlPlaneStores>,
+        >,
+        health: Arc<HealthRegistry>,
+        runtime_pool: Option<PgPool>,
+        internal_secret: Option<mas_security::SecretString>,
+    ) -> Self {
+        Self {
+            service_name: service_name.into(),
+            service_version: service_version.into(),
+            verifier,
+            scope_resolver,
+            tenancy,
+            agents,
+            workflows,
+            rollbacks: None,
+            executions,
+            schedules,
+            api_keys: None,
+            approvals: None,
+            data_hub: None,
+            search: None,
+            notifications: None,
+            inbound_webhook_endpoints: None,
+            inbound_webhook_ingress: None,
+            integrations: None,
+            oauth_authorization: None,
+            oauth_callbacks: None,
+            analytics: None,
+            audit_query: None,
+            policies: None,
+            usage: None,
+            tools: None,
+            connector_admin: None,
+            webhook_admin: None,
+            stream_hub: None,
+            assistant: None,
+            control_plane,
+            audit,
+            control_plane_stores,
+            health,
+            runtime_pool,
+            internal_secret,
+        }
+    }
+}
+
+/// Shared in-memory wiring for this crate's tests (and any downstream
+/// handler tests): all services over ONE `InMemoryServices` +
+/// `InMemoryAuditSink`, plus a `StaticTokenVerifier` with `test-token`.
+#[cfg(any(test, feature = "testutils"))]
+pub mod test_support {
+    use std::sync::Arc;
+
+    use mas_application::agent_service::AgentService;
+    use mas_application::analytics_service::AnalyticsService;
+    use mas_application::api_key_service::ApiKeyApplicationService;
+    use mas_application::approval_service::ApprovalApplicationService;
+    use mas_application::audit::InMemoryAuditSink;
+    use mas_application::data_hub_service::{DataHubApplicationService, DataHubLimits};
+    use mas_application::durable_memory::InMemoryDurableExecution;
+    use mas_application::execution_service::ExecutionService;
+    use mas_application::notification_service::NotificationService;
+    use mas_application::schedule_service::ScheduleService;
+    use mas_application::search_service::SearchService;
+    use mas_application::stores::InMemoryServices;
+    use mas_application::tenancy_service::TenancyService;
+    use mas_application::workflow_service::WorkflowService;
+    use mas_observability::health::HealthRegistry;
+
+    use super::{AppState, RollbackApplicationService};
+    use crate::auth::StaticTokenVerifier;
+    use mas_security::{PrincipalKind, ScopeSet, SecurityPrincipal};
+
+    /// Fresh, fully-wired state over one shared in-memory store.
+    pub fn inmemory_state() -> AppState {
+        inmemory_state_with_store().0
+    }
+
+    /// Fresh in-memory state and the shared backing store, for tests that need
+    /// to seed read models written by an external runtime.
+    pub fn inmemory_state_with_store() -> (AppState, Arc<InMemoryServices>) {
+        let store = Arc::new(InMemoryServices::new());
+        let audit = Arc::new(InMemoryAuditSink::new());
+        let control_plane =
+            Arc::new(mas_application::control_plane::build_in_memory_control_plane());
+        let tenancy = Arc::new(TenancyService::new(
+            Box::new(store.clone()),
+            Box::new(store.clone()),
+            Box::new(store.clone()),
+            Box::new(store.clone()),
+            Box::new(store.clone()),
+            Box::new(audit.clone()),
+            Box::new(control_plane.entitlement_store()),
+        ));
+        let agents = Arc::new(
+            AgentService::new(
+                Box::new(store.clone()),
+                Box::new(store.clone()),
+                Box::new(store.clone()),
+                Box::new(audit.clone()),
+            )
+            .with_rollback_store(Box::new(store.clone())),
+        );
+        let workflows = Arc::new(
+            WorkflowService::new(
+                Box::new(store.clone()),
+                Box::new(store.clone()),
+                Box::new(store.clone()),
+                Box::new(audit.clone()),
+            )
+            .with_rollback_store(Box::new(store.clone())),
+        );
+        let rollbacks = Arc::new(RollbackApplicationService::new(
+            Arc::clone(&agents),
+            Arc::clone(&workflows),
+            Box::new(store.clone()),
+        ));
+        // The durable port is mandatory. The in-memory implementation is
+        // accepted here only because this is the crate's test harness — the
+        // production composition root wires `PgDurableExecution`.
+        let durable = Arc::new(InMemoryDurableExecution::new());
+        let executions = Arc::new(
+            ExecutionService::new(
+                Box::new(store.clone()),
+                Box::new(store.clone()),
+                Box::new(store.clone()),
+                Box::new(store.clone()),
+                Box::new(audit.clone()),
+                durable,
+                Arc::clone(&control_plane),
+            )
+            .with_step_store(Box::new(store.clone())),
+        );
+        let schedules = Arc::new(ScheduleService::new(
+            Box::new(store.clone()),
+            Box::new(audit.clone()),
+        ));
+        let notifications = Arc::new(NotificationService::new(
+            Box::new(store.clone()),
+            Box::new(audit.clone()),
+        ));
+        let analytics = Arc::new(AnalyticsService::new(Box::new(store.clone())));
+        let api_key_store = Arc::new(mas_security::InMemoryApiKeyStore::new());
+        let security_api_keys = Arc::new(mas_security::ApiKeyService::new(
+            api_key_store.clone(),
+            audit.clone(),
+        ));
+        let api_keys = Arc::new(ApiKeyApplicationService::new(
+            security_api_keys,
+            api_key_store,
+        ));
+        let approvals = Arc::new(ApprovalApplicationService::new(
+            store.clone(),
+            audit.clone(),
+        ));
+        let search = Arc::new(SearchService::new(
+            Box::new(store.clone()),
+            Box::new(store.clone()),
+            Box::new(store.clone()),
+            Box::new(store.clone()),
+            Box::new(store.clone()),
+        ));
+        let data_hub = Arc::new(
+            DataHubApplicationService::new(
+                store.clone(),
+                store.clone(),
+                store.clone(),
+                Arc::new(mas_execution::InMemoryDataHubBridge::new()),
+                audit.clone(),
+                DataHubLimits::default(),
+            )
+            .expect("default Data Hub limits are valid"),
+        );
+        let verifier = Arc::new(StaticTokenVerifier::new().with_token(
+            "test-token",
+            SecurityPrincipal::new(
+                uuid::Uuid::now_v7().to_string(),
+                PrincipalKind::User,
+                None,
+                ScopeSet::denied(),
+            ),
+        ));
+        // The test lane resolves scope from identity too, over the same
+        // in-memory store the tenancy service writes to. Resolving from the
+        // header here would make this crate's tests unable to detect the
+        // defect this phase exists to fix.
+        let scope_resolver = Some(crate::scope_resolution::RequestScopeResolver::new(
+            mas_tenancy::TenantResolver::new(
+                Arc::new(crate::inmemory_directory::InMemoryTenantDirectory::new(
+                    store.clone(),
+                )),
+                Arc::new(crate::inmemory_directory::InMemoryMembershipDirectory::new(
+                    store.clone(),
+                )),
+            ),
+        ));
+        let state = AppState::new(
+            "mas-api-test",
+            env!("CARGO_PKG_VERSION"),
+            verifier,
+            scope_resolver,
+            tenancy,
+            agents,
+            workflows,
+            executions,
+            schedules,
+            Arc::clone(&control_plane),
+            audit.clone() as Arc<dyn mas_application::audit::AuditSinkPort>,
+            // No database in this lane, so no control-plane stores: the
+            // billing and usage endpoints answer with a deterministic error
+            // rather than an empty result that reads as "nothing consumed".
+            None,
+            Arc::new(HealthRegistry::new()),
+            None,
+            // Internal routes in the in-memory test lane are exercised with a
+            // fixed secret that is not a production credential.
+            Some(mas_security::SecretString::new(
+                "inmemory-internal-secret".to_owned(),
+            )),
+        )
+        .with_rollbacks(rollbacks)
+        .with_notifications(notifications)
+        .with_analytics(analytics)
+        .with_api_keys(api_keys)
+        .with_approvals(approvals)
+        .with_data_hub(data_hub)
+        .with_search(search);
+        (state, store)
+    }
+}

@@ -1,0 +1,82 @@
+//! PURPOSE: The use-case layer: the services `api`, `worker` and
+//! `scheduler-service` are thin processes around, plus the canonical durable
+//! execution pipeline's ports and its in-memory reference implementation.
+//!
+//! Owning layer: `mas-application`.
+//!
+//! Production responsibility: own every use case and every *canonical* state
+//! machine, so the same business rule cannot be implemented twice in two
+//! processes. Dependencies arrive as ports; nothing here binds HTTP, gRPC, SQL
+//! or a broker.
+//!
+//! It must NOT:
+//!   • depend on `mas-api`, `mas-worker` or any other process crate;
+//!   • grow a second execution lifecycle — `durable` is the only one;
+//!   • let a service take a concrete store when a port will do.
+
+//! # mas-application
+//!
+//! The use-case layer. `api`, `worker` and `scheduler-service` are thin
+//! processes around these services; nothing in here binds HTTP, gRPC,
+//! databases or brokers — every dependency arrives as a port (see
+//! [`stores`]) with in-memory reference implementations for composition
+//! and testing.
+//!
+//! Uniform rules shared by every service:
+//!
+//! * **Scoping** — a [`context::ServiceContext`] carries the acting principal,
+//!   tenant/organization scope and correlation id. Tenant-scoped reads for
+//!   foreign ids fail as `NotFound` (existence is hidden), never `Forbidden`.
+//! * **Domain-first validation** — all business invariants live in the
+//!   `domain` aggregates; services sequence calls, enforce
+//!   scope/uniqueness/idempotency, and persist via ports.
+//! * **Audit, via ports** — every mutating use-case records an
+//!   [`AuditEvent`](mas_domain::AuditEvent) through
+//!   [`audit::AuditSinkPort`]; a failed audit record fails the use-case
+//!   (compliance before convenience).
+//! * **DTO mapping** — domain `respond` functions in [`dto`] produce the
+//!   versioned `contracts` wire shapes; the API never serializes domain
+//!   aggregates directly.
+
+pub mod agent_runtime_catalog;
+pub mod agent_service;
+pub mod analytics_service;
+pub mod api_key_service;
+pub mod approval_service;
+pub mod assistant_service;
+pub mod audit;
+pub mod audit_query_service;
+pub mod connector_service;
+pub mod context;
+pub mod control_plane;
+pub mod data_hub_service;
+pub mod dto;
+/// The durable execution pipeline's atomic port, its canonical event builder,
+/// the request fingerprint, and the in-memory reference implementation.
+pub mod durable;
+pub mod durable_events;
+pub mod durable_memory;
+pub mod execution_service;
+pub mod fingerprint;
+/// Authorized inbound-webhook endpoint management and keyset pagination.
+pub mod inbound_webhook_service;
+/// Canonical tenant-scoped connector and durable outbound-webhook use cases.
+pub mod integration_service;
+/// Durable recipient notification lifecycle and stable feed pagination.
+pub mod notification_service;
+/// Authenticated connector-bound OAuth authorization initiation.
+pub mod oauth_authorization_service;
+pub mod pipeline_log;
+pub mod pipeline_metrics;
+pub mod policy_service;
+pub mod rollback_service;
+pub mod schedule_service;
+pub mod search_service;
+pub mod stores;
+pub mod tenancy_service;
+#[cfg(test)]
+mod tenant_isolation;
+pub mod tool_service;
+pub mod usage_service;
+pub mod webhook_service;
+pub mod workflow_service;

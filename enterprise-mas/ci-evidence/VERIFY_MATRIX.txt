@@ -1,0 +1,19 @@
+CHECK_ID | COMMAND | EXIT_CODE | PASS/FAIL/NOT_RUN
+A_inventory | bash scripts/verify-inventory.sh | 0 | PASS
+B_routes | bash scripts/verify-routes.sh | 0 | PASS
+C_static | bash scripts/verify-static.sh | 0 | PASS
+E01_fmt | cargo fmt --all -- --check | 0 | PASS
+E02_clippy | cargo clippy --workspace --all-targets --locked -- -D warnings | 0 | PASS
+E03_test_workspace | cargo test --workspace --locked | 0 | PASS
+E04_test_nats | cargo test --workspace --locked --features mas-messaging/nats | 0 | PASS
+E05_governance_routes | cargo test -p mas-api --test governance_routes --locked | 0 | PASS
+E06_tooling_routes | cargo test -p mas-api --test tooling_routes --locked | 0 | PASS
+E07_jwks | cargo test -p mas-security --test jwks --locked | 0 | PASS
+E08_live_pg | cargo test -p mas-persistence --locked --test live_pg --test analytics_live_pg --test project_list_live_pg --test rollback_live_pg --test tools_live_pg --test usage_live_pg --test control_plane_pg --test plane_grants --test tenant_sql_contract (MAS_TEST_DATABASE_URL + MAS_TEST_DATABASE_APP_URL set) | 0 | PASS
+E09_e2e_python | cargo test -p mas-ai-bridge --locked --test e2e_python -- --ignored | 0 | PASS
+E10_migrations_roundtrip | down 0053..0050 (down.sql + ledger) then up via MigrationRunner; verify ledger/objects/privileges | 0 | PASS
+E11_mutation_tenant_predicate | remove ToolService::get tenant filter -> foreign-tenant test FAIL -> restore -> PASS | 0 | PASS
+E12_mutation_authz | short-circuit AuthorizationService::authorize to Allow -> viewer-denial test FAIL -> restore -> PASS | 0 | PASS
+E13_cargo_doc | cargo doc --workspace --no-deps --locked | 0 | PASS
+E14_merge_integrity | conflict markers + stray files + duplicate pub mod/fields/versions + cargo metadata --locked | 0 | PASS
+GENERATED_AT_UTC | 2026-10-29T17:19:38Z | 0_NOT_RUN_ROWS | ALL_PASS

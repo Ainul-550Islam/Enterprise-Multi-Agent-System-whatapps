@@ -1,0 +1,37 @@
+[package]
+name = "mas-cli"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "mas' operator CLI: HTTP client + subcommand surface over the public API"
+license = "Proprietary"
+
+[lib]
+name = "mas_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mas"
+path = "src/main.rs"
+
+[dependencies]
+mas-common = { workspace = true }
+mas-contracts = { workspace = true }
+
+clap = { version = "4", features = ["derive", "env"] }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = "1"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+axum = { workspace = true }
+tower = { workspace = true }
+
+[features]
+testutils = []
+
+[lints]
+workspace = true

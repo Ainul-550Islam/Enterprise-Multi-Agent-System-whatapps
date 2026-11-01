@@ -1,0 +1,84 @@
+name: security
+
+on:
+  schedule:
+    - cron: "0 2 * * 1"   # weekly, Mondays
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  security-events: write   # for SARIF upload of scan results
+
+jobs:
+  cargo-deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+      - name: Install cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@v1
+      - name: cargo deny check
+        working-directory: enterprise-mas/rust-core
+        run: cargo deny check
+
+  cargo-audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+      - name: Install cargo-audit
+        uses: rustsec/audit-check@v1
+      - name: cargo audit
+        working-directory: enterprise-mas/rust-core
+        run: cargo audit
+
+  pip-audit:
+    name: pip audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install pip-audit
+        run: python3 -m pip install pip-audit
+      - name: pip audit (orchestrator)
+        working-directory: enterprise-mas/python-orchestrator
+        run: pip-audit --requirement <(python3 -m pip freeze)
+
+  gitleaks:
+    name: gitleaks secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Run gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+
+  trivy-fs:
+    name: trivy filesystem scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run trivy fs
+        uses: aquasecurity/trivy-action@v2
+        with:
+          scan-type: fs
+          scan-ref: .
+          exit-code: "1"
+          severity: HIGH,CRITICAL

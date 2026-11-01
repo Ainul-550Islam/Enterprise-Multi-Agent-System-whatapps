@@ -1,0 +1,87 @@
+# PURPOSE: The `mas-api` crate manifest — the tenant-facing HTTP + gRPC
+# process.
+#
+# Owning layer: the process edge.
+#
+# Production responsibility: declare the dependency set this process is
+# allowed to reach. Notably it depends on `mas-security` (the one
+# authorization and internal-service-authentication crate) and on `sqlx`
+# (the runtime pool it opens one RLS-armed transaction per request from).
+#
+# Security boundary: a dependency added here is reachable by request
+# handlers. Anything that can bypass authorization belongs in a plane crate
+# with its own role, not here.
+#
+# It must NOT:
+#   • depend on a plane crate directly (worker/outbox/audit) — those are
+#     separate processes with separate database roles;
+#   • enable a dev/test convenience dependency in the default feature set.
+
+[package]
+name = "mas-api"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "HTTP + gRPC api processes: thin transports over mas-application use-cases"
+license = "Proprietary"
+
+[lib]
+name = "mas_api"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mas-api"
+path = "src/main.rs"
+
+[dependencies]
+mas-common = { workspace = true }
+mas-domain = { workspace = true }
+mas-contracts = { workspace = true }
+mas-application = { workspace = true }
+mas-ai-bridge = { workspace = true }
+mas-execution = { workspace = true }
+mas-observability = { workspace = true }
+mas-persistence = { workspace = true }
+mas-security = { workspace = true }
+sqlx = { workspace = true }
+mas-tenancy = { workspace = true }
+mas-events = { workspace = true }
+mas-integrations = { workspace = true }
+# SSE delivery consumes the one canonical event plane in production
+# (`mas_messaging::nats::NatsEventBus`); there is no second transport.
+mas-messaging = { workspace = true, features = ["nats"] }
+futures-util = { workspace = true }
+chrono = { workspace = true }
+
+axum = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+tonic = { workspace = true }
+prost = { version = "0.13", features = ["prost-derive"] }
+tokio = { workspace = true, features = ["net", "signal", "rt-multi-thread", "time"] }
+serde = { workspace = true }
+serde_json = "1"
+toml = { workspace = true }
+uuid = { workspace = true }
+http = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+reqwest = { workspace = true }
+
+[build-dependencies]
+tonic-build = { version = "0.13", default-features = false, features = ["prost", "transport"] }
+protoc-bin-vendored = "3"
+
+[dev-dependencies]
+mas-cli = { workspace = true }
+mas-policy = { workspace = true }
+reqwest = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+tokio = { workspace = true, features = ["macros", "rt", "time", "net", "rt-multi-thread"] }
+http-body-util = "0.1"
+
+[features]
+default = ["testutils"]
+testutils = ["mas-cli/testutils"]
+
+[lints]
+workspace = true

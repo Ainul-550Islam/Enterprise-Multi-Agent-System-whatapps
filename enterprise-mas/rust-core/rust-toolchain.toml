@@ -1,0 +1,7 @@
+# Pins the exact toolchain used by CI and local development.
+# Update deliberately; CI runs `rustup component add` for the components below.
+[toolchain]
+channel = "1.98.1"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
+targets = ["x86_64-unknown-linux-gnu"]

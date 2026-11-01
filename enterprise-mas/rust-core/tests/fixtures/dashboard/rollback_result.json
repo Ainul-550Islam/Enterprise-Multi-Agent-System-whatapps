@@ -1,0 +1,17 @@
+{
+  "data": {
+    "rollback_record_id": "00000000-0000-0000-0000-000000000002",
+    "from_version": 2,
+    "to_version": 3,
+    "source_version": 1,
+    "reason": "restore the approved agent configuration",
+    "idempotency_key": "http-agent-rollback-1"
+  },
+  "error": null,
+  "meta": {
+    "request_id": "00000000-0000-0000-0000-000000000003",
+    "correlation_id": "corr-rollback-01",
+    "api_version": "v1",
+    "responded_at": "2026-10-30T00:00:00Z"
+  }
+}

@@ -1,0 +1,48 @@
+     Running unittests src/lib.rs (target/debug/deps/mas_api-8534d2191e75936a)	running 15 tests
+     Running unittests src/main.rs (target/debug/deps/mas_api-4b18821ad1c719fd)	running 0 tests
+     Running tests/root_contract.rs (target/debug/deps/root_contract-43f1302808768249)	running 5 tests
+     Running tests/root_integration.rs (target/debug/deps/root_integration-02172a5b7cf7b7e0)	running 2 tests
+     Running unittests src/lib.rs (target/debug/deps/mas_application-7778a6f1fd47fb20)	running 14 tests
+     Running unittests src/lib.rs (target/debug/deps/mas_cli-3b65ff764de50ae4)	running 9 tests
+     Running unittests src/main.rs (target/debug/deps/mas-9944bc038937cf7d)	running 0 tests
+     Running tests/e2e.rs (target/debug/deps/e2e-bcce5f19f4f56c20)	running 7 tests
+     Running unittests src/lib.rs (target/debug/deps/mas_common-8b40cabc1f1d012a)	running 34 tests
+     Running unittests src/lib.rs (target/debug/deps/mas_contracts-d3fe59ad845c0e31)	running 0 tests
+     Running unittests src/lib.rs (target/debug/deps/mas_domain-70e3a04cf596fb22)	running 0 tests
+     Running unittests src/lib.rs (target/debug/deps/mas_events-777a4944fb1bb1ac)	running 10 tests
+     Running unittests src/lib.rs (target/debug/deps/mas_execution-25c10722fc015069)	running 30 tests
+     Running unittests src/lib.rs (target/debug/deps/mas_integrations-c478faedf0606be4)	running 24 tests
+     Running unittests src/lib.rs (target/debug/deps/mas_messaging-049e97944b044de5)	running 24 tests
+     Running unittests src/lib.rs (target/debug/deps/mas_observability-8fe415998d20ed91)	running 20 tests
+     Running unittests src/lib.rs (target/debug/deps/mas_orchestration-fcaf50f7394d5dbb)	running 67 tests
+     Running unittests src/lib.rs (target/debug/deps/mas_persistence-457ce25e1ca64c91)	running 49 tests
+     Running unittests src/lib.rs (target/debug/deps/mas_policy-2548369fbc75c1ec)	running 23 tests
+     Running unittests src/lib.rs (target/debug/deps/mas_quota-7fe893c737a5764d)	running 11 tests
+     Running unittests src/lib.rs (target/debug/deps/mas_scheduler_service-9ff4e4554051aabe)	running 9 tests
+     Running unittests src/main.rs (target/debug/deps/mas_scheduler-0c02e38f15d386f3)	running 0 tests
+     Running tests/driver_loop.rs (target/debug/deps/driver_loop-ac0107cc15212370)	running 4 tests
+     Running unittests src/lib.rs (target/debug/deps/mas_scheduling-537f749765002004)	running 18 tests
+     Running unittests src/lib.rs (target/debug/deps/mas_security-8b0602a8a987405b)	running 16 tests
+     Running unittests src/lib.rs (target/debug/deps/mas_tenancy-8973048cce87ec46)	running 10 tests
+     Running unittests src/lib.rs (target/debug/deps/mas_worker-475b63e150279828)	running 12 tests
+     Running unittests src/main.rs (target/debug/deps/mas_worker-aeac69009ced398a)	running 0 tests
+   Doc-tests mas_api	running 0 tests
+   Doc-tests mas_application	running 0 tests
+   Doc-tests mas_cli	running 0 tests
+   Doc-tests mas_common	running 0 tests
+   Doc-tests mas_contracts	running 0 tests
+   Doc-tests mas_domain	running 0 tests
+   Doc-tests mas_events	running 0 tests
+   Doc-tests mas_execution	running 0 tests
+   Doc-tests mas_integrations	running 0 tests
+   Doc-tests mas_messaging	running 0 tests
+   Doc-tests mas_observability	running 0 tests
+   Doc-tests mas_orchestration	running 0 tests
+   Doc-tests mas_persistence	running 0 tests
+   Doc-tests mas_policy	running 0 tests
+   Doc-tests mas_quota	running 0 tests
+   Doc-tests mas_scheduler_service	running 0 tests
+   Doc-tests mas_scheduling	running 0 tests
+   Doc-tests mas_security	running 0 tests
+   Doc-tests mas_tenancy	running 0 tests
+   Doc-tests mas_worker	running 0 tests

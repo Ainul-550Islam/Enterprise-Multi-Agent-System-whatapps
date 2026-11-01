@@ -1,0 +1,36 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# DEVELOPMENT overlay (default when MAS_ENV is unset). Loopback-friendly,
+# chatty logs, in-memory stores by default. Merges over default.toml.
+# ─────────────────────────────────────────────────────────────────────────────
+environment = "development"
+
+[server]
+# Bind to loopback too (default's 0.0.0.0 is fine locally; keep explicit so
+# laptops without the firewall prompt behave). dev tokens enabled.
+http_addr = "127.0.0.1:8080"
+grpc_addr = "127.0.0.1:50051"
+# A single user token for `mas` CLI + curl workflows. MAS_DEV_TOKENS adds more.
+# A single user token for `mas` CLI + curl workflows. MAS_DEV_TOKENS adds more.
+# (subject = user UUID — minted at `cargo run -p mas-api -- --dev-inmemory` and
+# etched in that mode's seed output; MAS_DEV_TOKENS entries override.)
+dev_tokens = ""
+
+[scheduler]
+completion_addr = "127.0.0.1:8090"
+replica_id = "scheduler-dev-1"
+# One-second ticks keep dev lag minimal.
+tick_interval_ms = 1000
+# Dispatch to the API once its internal schedule-run route lands; empty keeps
+# the loopback (schedules fire + complete instantly in dev).
+api_base_url = ""
+api_bearer = ""
+
+[worker]
+# Fast polls make local runs feel synchronous.
+poll_interval_ms = 50
+worker_name = "worker-dev-1"
+
+[observability]
+log_format = "pretty"
+log_level = "info,mas=debug,tower_http=info"
+metrics_addr = "127.0.0.1:9090"

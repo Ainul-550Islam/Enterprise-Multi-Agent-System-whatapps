@@ -1,0 +1,54 @@
+TEMPLATE — have a lawyer review before sale. This is a proprietary commercial source
+license, not an open-source license. No certification (SOC2/ISO) or compliance claim
+is made by this document.
+
+ENTERPRISE-MAS PROPRIETARY COMMERCIAL SOURCE LICENSE (TEMPLATE)
+
+1. GRANT
+       Subject to the restrictions below, Licensor grants Licensee a non-exclusive,
+       non-transferable, limited right to use, reproduce, modify, and internally
+       distribute the source code and object code of the Enterprise Multi-Agent
+       System ("enterprise-mas") solely for Licensee's own internal business
+       operations. No right to sublicense, resell, distribute, or make the software
+       available as a hosted service to third parties is granted unless separately
+       agreed in writing.
+
+2. RESTRICTIONS
+       Licensee may not:
+         (a) remove, obscure, or alter any copyright, trademark, or proprietary
+             notice in the source;
+         (b) reverse engineer, decompile, or disassemble the software except to the
+             extent applicable law expressly permits notwithstanding this limitation;
+         (c) use the software to develop or train a competing product or service;
+         (d) publish, sublicense, rent, lease, or transfer the software or source
+             code to any third party;
+         (e) use the software for any unlawful purpose.
+
+3. OWNERSHIP
+       Licensor retains all right, title, and interest in and to the software,
+       including all intellectual-property rights. No rights are granted except as
+       expressly stated in Section 1.
+
+4. WARRANTY DISCLAIMER
+       THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+       IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+       FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. LICENSOR DISCLAIMS ALL
+       SUCH WARRANTIES TO THE FULLEST EXTENT PERMITTED BY LAW.
+
+5. LIABILITY LIMIT
+       IN NO EVENT SHALL LICENSOR BE LIABLE FOR ANY INDIRECT, INCIDENTAL, SPECIAL,
+       EXEMPLARY, OR CONSEQUENTIAL DAMAGES, INCLUDING BUT NOT LIMITED TO LOSS OF
+       DATA, PROFITS, OR BUSINESS INTERRUPTION, ARISING OUT OF OR IN CONNECTION WITH
+       THE SOFTWARE OR ITS USE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+       LICENSOR'S TOTAL AGGREGATE LIABILITY SHALL NOT EXCEED THE AMOUNT PAID BY
+       LICENSEE FOR THE SOFTWARE.
+
+6. TERM AND TERMINATION
+       This license is effective until terminated. Licensor may terminate it upon
+       written notice if Licensee breaches any restriction. Upon termination, all
+       rights granted under Section 1 cease immediately, and Licensee must destroy
+       all copies of the software.
+
+7. GOVERNING LAW
+       This license is governed by the laws of the jurisdiction in which Licensor is
+       incorporated, without regard to conflict-of-laws principles.

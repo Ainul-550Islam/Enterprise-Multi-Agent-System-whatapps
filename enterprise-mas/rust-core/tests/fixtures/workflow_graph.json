@@ -1,0 +1,36 @@
+{
+  "nodes": [
+    {
+      "node_key": "start",
+      "node_type": "start",
+      "name": "Begin",
+      "config": {}
+    },
+    {
+      "node_key": "summarize",
+      "node_type": "agent",
+      "name": "Summarize",
+      "config": {
+        "agent_ref": "copilot"
+      },
+      "timeout_ms": 30000,
+      "max_retries": 2
+    },
+    {
+      "node_key": "end",
+      "node_type": "end",
+      "name": "Done",
+      "config": {}
+    }
+  ],
+  "edges": [
+    {
+      "from": "start",
+      "to": "summarize"
+    },
+    {
+      "from": "summarize",
+      "to": "end"
+    }
+  ]
+}

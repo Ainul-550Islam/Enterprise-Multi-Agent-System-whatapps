@@ -1,0 +1,73 @@
+# PURPOSE: cargo-deny policy for the rust-core workspace.
+#
+# Owning layer: supply-chain governance.
+#
+# Production responsibility: keep the dependency surface auditable — only
+# crates.io sources, only licenses the commercial LICENSE policy can ship,
+# no LLM provider SDKs in rust-core (model providers live exclusively in the
+# Python orchestrator), every known advisory denied, and duplicate versions
+# surfaced as warnings so the lockfile stays coherent.
+#
+# It must NOT:
+#   • blanket-allow a real advisory to silence `cargo deny check`;
+#   • permit git/path sources that break `--locked` reproducibility;
+#   • allow LLM provider SDKs into this workspace.
+
+[licenses]
+# The product ships under a proprietary commercial source license (see
+# LICENSE at the repo root); every crate manifest uses the matching
+# `LicenseRef-Proprietary` expression, which is allowed here.
+allow = [
+  "LicenseRef-Proprietary",
+  "MIT",
+  "Apache-2.0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "BSD-3-Clause-No-Nuclear-License",
+  "BSD-3-Clause-No-Nuclear-Warranty",
+  "BSD-4-Clause",
+  "0BSD",
+  "ISC",
+  "MPL-2.0",
+  "CDLA-Permissive-2.0",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "Unicode-TOU",
+  "Zlib",
+  "Unlicense",
+]
+
+[advisories]
+# Vulnerability and unsound advisories are errors by default in cargo-deny;
+# this section exists to record the policy explicitly. Never add an `ignore`
+# entry without a linked security review.
+
+[sources]
+# crates.io is the only registry this workspace pulls from; `--locked` in CI
+# then means the graph is fully auditable and reproducible.
+unknown-registry = "deny"
+allow-registry = [
+  "https://github.com/rust-lang/crates.io-index",
+]
+unknown-git = "deny"
+allow-git = []
+
+[bans]
+multiple-versions = "warn"
+
+# LLM provider SDKs must never land in rust-core: model selection, prompt
+# assembly, provider SDK calls, token streaming and cost logic live only in
+# the Python orchestrator, reached through the versioned gRPC bridge.
+deny = [
+  { crate = "openai", reason = "LLM provider SDKs belong in the Python orchestrator, not rust-core" },
+  { crate = "anthropic", reason = "LLM provider SDKs belong in the Python orchestrator, not rust-core" },
+  { crate = "cohere-ai", reason = "LLM provider SDKs belong in the Python orchestrator, not rust-core" },
+  { crate = "google-generative-ai", reason = "LLM provider SDKs belong in the Python orchestrator, not rust-core" },
+  { crate = "genai", reason = "LLM provider SDKs belong in the Python orchestrator, not rust-core" },
+  { crate = "bedrock", reason = "LLM provider SDKs belong in the Python orchestrator, not rust-core" },
+  { crate = "bedrock-agent", reason = "LLM provider SDKs belong in the Python orchestrator, not rust-core" },
+  { crate = "azure-openai", reason = "LLM provider SDKs belong in the Python orchestrator, not rust-core" },
+  { crate = "huggingface", reason = "LLM provider SDKs belong in the Python orchestrator, not rust-core" },
+  { crate = "llm-sdk", reason = "LLM provider SDKs belong in the Python orchestrator, not rust-core" },
+  { crate = "mcp-sdk", reason = "LLM provider SDKs belong in the Python orchestrator, not rust-core" },
+]

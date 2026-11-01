@@ -1,0 +1,43 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "enterprise-mas.fullname" . }}-scheduler
+  labels:
+    {{- include "enterprise-mas.labels" . | nindent 4 }}
+    component: scheduler
+spec:
+  replicas: {{ .Values.scheduler.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "enterprise-mas.selectorLabels" . | nindent 6 }}
+      component: scheduler
+  template:
+    metadata:
+      labels:
+        {{- include "enterprise-mas.selectorLabels" . | nindent 8 }}
+        component: scheduler
+    spec:
+      securityContext:
+        {{- toYaml .Values.securityContext | nindent 8 }}
+      containers:
+        - name: scheduler
+          image: "{{ .Values.image.registry }}/{{ .Values.image.repository }}-{{ .Values.scheduler.image }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - name: MAS_ENV
+              value: "production"
+            - name: MAS_SCHEDULER_REPLICA_ID
+              value: "scheduler-prod-{{ .Release.Revision }}"
+            - name: MAS_SCHEDULER_INTERVAL_MS
+              value: "5000"
+            - name: MAS_SCHEDULER_API_URL
+              value: "http://{{ include "enterprise-mas.fullname" . }}-api:8080"
+          envFrom:
+            - secretRef:
+                name: {{ .Values.postgres.existingSecret }}
+          resources:
+            {{- toYaml .Values.scheduler.resources | nindent 12 }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

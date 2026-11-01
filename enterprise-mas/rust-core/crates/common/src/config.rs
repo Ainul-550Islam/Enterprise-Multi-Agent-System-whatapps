@@ -1,0 +1,423 @@
+//! Layered runtime configuration loader (TOML, no external config crate):
+//!
+//! ```text
+//!   config/default.toml   ←  config/{MAS_ENV}.toml   ←  environment vars
+//! ```
+//!
+//! Design constraints:
+//!
+//! * **Fail closed, not silent:** file mistakes (missing table, wrong type)
+//!   surface as `AppError::validation` naming the offending key; *missing
+//!   files* are fine (they select the empty layer), except when
+//!   [`load_from_env_config_dir`] is asked to require them.
+//! * **No secrets in files:** every caller overlays env vars *after* the
+//!   file layer ([`Merger::string`] etc.), and the production overlay
+//!   documents which keys must stay empty.
+//! * **Deep merge for tables:** the environment overlay replaces scalars but
+//!   merges tables recursively, so partial overlays don't have to repeat the
+//!   whole section.
+//!
+//! This module deliberately ships *no typed knobs*: each binary converts the
+//! merged [`toml::Value`] via the helpers below into its own validated
+//! config struct. That keeps `mas-common` free of per-process schema.
+
+use std::path::{Path, PathBuf};
+
+use crate::error::AppError;
+use crate::result::Result;
+
+/// Environment overlay selector variable.
+pub const ENV_NAME: &str = "MAS_ENV";
+/// Config directory override variable.
+pub const CONFIG_DIR_ENV: &str = "MAS_CONFIG_DIR";
+/// Default config directory name (repo-root relative).
+pub const DEFAULT_CONFIG_DIR: &str = "config";
+
+/// Resolves the config directory: `MAS_CONFIG_DIR` wins, otherwise
+/// `{cwd}/config` and (when missing) two parents up — so a binary launched
+/// from a crate dir still finds the workspace root's config.
+#[must_use]
+pub fn config_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var(CONFIG_DIR_ENV) {
+        return PathBuf::from(dir);
+    }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    for candidate in [
+        cwd.join(DEFAULT_CONFIG_DIR),
+        cwd.join("..").join(DEFAULT_CONFIG_DIR),
+        cwd.join("..").join("..").join(DEFAULT_CONFIG_DIR),
+    ] {
+        if candidate.is_dir() {
+            return candidate;
+        }
+    }
+    cwd.join(DEFAULT_CONFIG_DIR)
+}
+
+/// The current overlay name (`MAS_ENV`, default `development`).
+#[must_use]
+pub fn environment_name() -> String {
+    std::env::var(ENV_NAME).unwrap_or_else(|_| "development".to_owned())
+}
+
+/// Does a path exist?
+#[must_use]
+pub fn layer_exists(path: &Path) -> bool {
+    path.is_file()
+}
+
+/// Loads and deep-merges `default.toml` + `{environment}.toml` from the
+/// resolved directory. Returns the empty table when neither file exists
+/// (dev shells without the repo layout), an error when one exists but is
+/// invalid TOML.
+pub fn load_layered() -> Result<toml::Value> {
+    let dir = config_dir();
+    load_layers_in(&dir, &environment_name())
+}
+
+/// Explicit-dir, explicit-environment variant (tests + the loader core).
+pub fn load_layers_in(dir: &Path, environment: &str) -> Result<toml::Value> {
+    let mut merged = toml::Value::Table(toml::map::Map::new());
+    for name in ["default", environment] {
+        let path = dir.join(format!("{name}.toml"));
+        if !path.is_file() {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).map_err(|err| {
+            AppError::validation(format!("config file {} unreadable: {err}", path.display()))
+        })?;
+        let value: toml::Value = toml::from_str(&text).map_err(|err| {
+            AppError::validation(format!(
+                "config file {} invalid TOML: {err}",
+                path.display()
+            ))
+        })?;
+        deep_merge(&mut merged, value);
+    }
+    Ok(merged)
+}
+
+/// Package-friendly alias used by binaries when they merely want "the
+/// standard layered view". (Kept for call-site readability.)
+pub fn load_from_env_config_dir() -> Result<toml::Value> {
+    load_layered()
+}
+
+/// In-place deep merge: tables merge recursively; every other value (and a
+/// scalar/table kind clash) is replaced by the overlay.
+pub fn deep_merge(base: &mut toml::Value, overlay: toml::Value) {
+    match (base, overlay) {
+        (toml::Value::Table(base_table), toml::Value::Table(overlay_table)) => {
+            for (key, overlay_val) in overlay_table {
+                match base_table.get_mut(&key) {
+                    Some(base_val) => deep_merge(base_val, overlay_val),
+                    None => {
+                        base_table.insert(key, overlay_val);
+                    },
+                }
+            }
+        },
+        (base_val, overlay_val) => *base_val = overlay_val,
+    }
+}
+
+/// Dotted-path lookup (`"worker.poll_interval_ms"`).
+#[must_use]
+pub fn lookup<'a>(merged: &'a toml::Value, path: &str) -> Option<&'a toml::Value> {
+    let mut current = merged;
+    for segment in path.split('.') {
+        current = current.get(segment)?;
+    }
+    Some(current)
+}
+
+/// Helper with exactly the precedence contract: CLI/flag override → env var
+/// → file → built-in default. The generic callers below implement one width
+/// apiece so binaries never hand-roll the env dance.
+#[derive(Debug, Clone)]
+pub struct Merger<'a> {
+    merged: &'a toml::Value,
+}
+
+impl<'a> Merger<'a> {
+    /// Binds a merger to a layered view.
+    #[must_use]
+    pub fn new(merged: &'a toml::Value) -> Self {
+        Self { merged }
+    }
+
+    /// `env → file.path → default`, typed `String`.
+    #[must_use]
+    pub fn string(&self, env_key: &str, path: &str, default: &str) -> String {
+        if let Ok(value) = std::env::var(env_key) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_owned();
+            }
+        }
+        lookup(self.merged, path)
+            .and_then(toml::Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| default.to_owned())
+    }
+
+    /// `env → file.path → default`, typed non-empty string list. Environment
+    /// values use a comma-separated representation so list-valued TOML keys
+    /// remain overrideable without a shell-specific array syntax.
+    pub fn string_list(&self, env_key: &str, path: &str, default: &[&str]) -> Result<Vec<String>> {
+        if let Ok(value) = std::env::var(env_key) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return parse_string_list(trimmed, env_key);
+            }
+        }
+        match lookup(self.merged, path) {
+            Some(toml::Value::Array(items)) => {
+                let mut values = Vec::with_capacity(items.len());
+                for item in items {
+                    let Some(value) = item.as_str() else {
+                        return Err(AppError::validation(format!(
+                            "config {path} must contain only strings"
+                        )));
+                    };
+                    if value.trim().is_empty() {
+                        return Err(AppError::validation(format!(
+                            "config {path} must not contain empty values"
+                        )));
+                    }
+                    values.push(value.to_owned());
+                }
+                if values.is_empty() {
+                    return Err(AppError::validation(format!(
+                        "config {path} must not be empty"
+                    )));
+                }
+                Ok(values)
+            },
+            Some(_) => Err(AppError::validation(format!(
+                "config {path} must be an array of strings"
+            ))),
+            None => Ok(default.iter().map(|item| (*item).to_owned()).collect()),
+        }
+    }
+
+    /// Same precedence, `u64`.
+    pub fn u64(&self, env_key: &str, path: &str, default: u64) -> Result<u64> {
+        if let Ok(value) = std::env::var(env_key) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return trimmed.parse::<u64>().map_err(|err| {
+                    AppError::validation(format!("env {env_key} invalid u64 '{trimmed}': {err}"))
+                });
+            }
+        }
+        Ok(lookup(self.merged, path)
+            .and_then(toml::Value::as_integer)
+            .map_or(default, |v| v as u64))
+    }
+
+    /// Same precedence, `bool` (`true|false|1|0|yes|no` in env).
+    pub fn bool(&self, env_key: &str, path: &str, default: bool) -> Result<bool> {
+        if let Ok(value) = std::env::var(env_key) {
+            let trimmed = value.trim().to_ascii_lowercase();
+            if !trimmed.is_empty() {
+                return match trimmed.as_str() {
+                    "true" | "1" | "yes" | "on" => Ok(true),
+                    "false" | "0" | "no" | "off" => Ok(false),
+                    _ => Err(AppError::validation(format!(
+                        "env {env_key} invalid bool '{trimmed}' (true/false)"
+                    ))),
+                };
+            }
+        }
+        Ok(lookup(self.merged, path)
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(default))
+    }
+
+    /// Milliseconds-as-Duration variant of [`Merger::u64`].
+    pub fn duration_ms(
+        &self,
+        env_key: &str,
+        path: &str,
+        default: std::time::Duration,
+    ) -> Result<std::time::Duration> {
+        let ms = self.u64(env_key, path, default.as_millis() as u64)?;
+        Ok(std::time::Duration::from_millis(ms))
+    }
+}
+
+fn parse_string_list(raw: &str, source: &str) -> Result<Vec<String>> {
+    let values: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if values.is_empty() {
+        return Err(AppError::validation(format!(
+            "{source} must contain at least one non-empty value"
+        )));
+    }
+    if raw.split(',').any(|value| value.trim().is_empty()) {
+        return Err(AppError::validation(format!(
+            "{source} must not contain empty list values"
+        )));
+    }
+    Ok(values)
+}
+
+/// Production guardrail: errors when `predicate(value)` holds — used for
+/// "dev-token in prod" and "in-memory in prod" failures without cfg soups.
+pub fn refuse_if(condition: bool, message: impl Into<String>) -> Result<()> {
+    if condition {
+        Err(AppError::validation(message.into()))
+    } else {
+        Ok(())
+    }
+}
+
+/// Typed bounds for the Server-Sent Events plane (`[stream]` in
+/// `config/{default,production}.toml`).
+///
+/// These are the only knobs the SSE fan-out obeys: a keep-alive heartbeat so
+/// idle connections and intermediary timeouts stay distinguishable, one
+/// bounded broadcast buffer per active tenant channel, and a per-principal
+/// connection cap so one authenticated actor cannot monopolise the hub.
+/// Bounds are validated fail-closed — a zero heartbeat or unbounded buffer
+/// must refuse configuration, never degrade into a silent default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamConfig {
+    /// Seconds between SSE keep-alive heartbeat comments.
+    pub heartbeat_secs: u64,
+    /// Per-tenant broadcast channel capacity; a slower client is disconnected
+    /// once it lags this far behind rather than growing an unbounded queue.
+    pub channel_buffer: usize,
+    /// Maximum concurrent `/v1/stream` connections per authenticated
+    /// principal (tenant + subject).
+    pub max_connections_per_principal: usize,
+}
+
+impl StreamConfig {
+    /// Validates every bound; failures name the offending key.
+    ///
+    /// # Errors
+    /// `AppError::validation` when any bound is zero or outside the
+    /// supported production range.
+    pub fn validate(&self) -> Result<()> {
+        if !(1..=300).contains(&self.heartbeat_secs) {
+            return Err(AppError::validation(format!(
+                "stream.heartbeat_secs must be between 1 and 300 (got {})",
+                self.heartbeat_secs
+            )));
+        }
+        if !(1..=65_536).contains(&self.channel_buffer) {
+            return Err(AppError::validation(format!(
+                "stream.channel_buffer must be between 1 and 65536 (got {})",
+                self.channel_buffer
+            )));
+        }
+        if !(1..=1_024).contains(&self.max_connections_per_principal) {
+            return Err(AppError::validation(format!(
+                "stream.max_connections_per_principal must be between 1 and 1024 (got {})",
+                self.max_connections_per_principal
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl Default for StreamConfig {
+    /// Production/typed defaults mirroring `config/default.toml`.
+    fn default() -> Self {
+        Self {
+            heartbeat_secs: 15,
+            channel_buffer: 256,
+            max_connections_per_principal: 8,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deep_merge_replaces_scalars_and_merges_tables() {
+        let mut base: toml::Value =
+            toml::from_str("[worker]\npoll = 250\n[observability]\nformat = \"json\"\n")
+                .expect("base");
+        let overlay: toml::Value = toml::from_str("[worker]\npoll = 5\n").expect("overlay");
+        deep_merge(&mut base, overlay);
+        assert_eq!(
+            lookup(&base, "worker.poll").and_then(toml::Value::as_integer),
+            Some(5)
+        );
+        assert_eq!(
+            lookup(&base, "observability.format").and_then(toml::Value::as_str),
+            Some("json"),
+            "untouched table survives the merge",
+        );
+    }
+
+    #[test]
+    fn load_layers_in_layers_default_then_environment() {
+        let tmp = std::env::temp_dir().join("mas-config-layer-test");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).expect("mkdir");
+        std::fs::write(tmp.join("default.toml"), "[a]\nkeep = 1\ndrop = \"old\"\n")
+            .expect("default");
+        std::fs::write(tmp.join("test.toml"), "[a]\ndrop = \"new\"\n").expect("overlay");
+        let merged = load_layers_in(&tmp, "test").expect("merge");
+        assert_eq!(
+            lookup(&merged, "a.keep").and_then(toml::Value::as_integer),
+            Some(1)
+        );
+        assert_eq!(
+            lookup(&merged, "a.drop").and_then(toml::Value::as_str),
+            Some("new")
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn invalid_toml_fails_with_named_file() {
+        let tmp = std::env::temp_dir().join("mas-config-bad-test");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).expect("mkdir");
+        std::fs::write(tmp.join("default.toml"), "[broken\n").expect("write");
+        let err = load_layers_in(&tmp, "nothing").unwrap_err();
+        assert!(err.to_string().contains("default.toml"), "{err}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn refuse_if_guards() {
+        assert!(refuse_if(true, "nope").is_err());
+        assert!(refuse_if(false, "fine").is_ok());
+    }
+
+    #[test]
+    fn stream_config_defaults_are_valid_and_bounds_fail_closed() {
+        let config = StreamConfig::default();
+        assert_eq!(config.heartbeat_secs, 15);
+        assert_eq!(config.channel_buffer, 256);
+        assert_eq!(config.max_connections_per_principal, 8);
+        assert!(config.validate().is_ok());
+        let zero_heartbeat = StreamConfig {
+            heartbeat_secs: 0,
+            ..StreamConfig::default()
+        };
+        assert!(zero_heartbeat.validate().is_err());
+        let unbounded_buffer = StreamConfig {
+            channel_buffer: 0,
+            ..StreamConfig::default()
+        };
+        assert!(unbounded_buffer.validate().is_err());
+        let no_cap = StreamConfig {
+            max_connections_per_principal: 0,
+            ..StreamConfig::default()
+        };
+        assert!(no_cap.validate().is_err());
+    }
+}

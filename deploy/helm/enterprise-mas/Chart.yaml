@@ -1,0 +1,6 @@
+apiVersion: v2
+name: enterprise-mas
+description: Enterprise Multi-Agent System — Rust core + Python orchestrator
+type: application
+version: 0.1.0
+appVersion: 0.1.0

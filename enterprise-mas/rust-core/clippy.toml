@@ -1,0 +1,11 @@
+# Project-wide Clippy configuration. Contains lint tuning only; no business logic.
+msrv = "1.85"
+cognitive-complexity-threshold = 30
+too-many-arguments-threshold = 10
+too-many-lines-threshold = 500
+type-complexity-threshold = 300
+enum-variant-size-threshold = 256
+single-char-binding-names-threshold = 6
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-dbg-in-tests = true

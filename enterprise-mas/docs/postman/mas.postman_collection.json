@@ -1,0 +1,2772 @@
+{
+  "info": {
+    "name": "Enterprise MAS API",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "MAS v1",
+      "item": [
+        {
+          "name": "POST /v1/admin/plans",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/admin/plans",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "admin",
+                "plans"
+              ]
+            }
+          }
+        },
+        {
+          "name": "PUT /v1/admin/plans/{code}/features",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/admin/plans/{code}/features",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "admin",
+                "plans",
+                "code",
+                "features"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/admin/tenants/{tenant_id}/overrides/features",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/admin/tenants/{tenant_id}/overrides/features",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "admin",
+                "tenants",
+                "tenant_id",
+                "overrides",
+                "features"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/admin/tenants/{tenant_id}/overrides/features/{feature}/end",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/admin/tenants/{tenant_id}/overrides/features/{feature}/end",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "admin",
+                "tenants",
+                "tenant_id",
+                "overrides",
+                "features",
+                "feature",
+                "end"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/admin/tenants/{tenant_id}/overrides/quotas",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/admin/tenants/{tenant_id}/overrides/quotas",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "admin",
+                "tenants",
+                "tenant_id",
+                "overrides",
+                "quotas"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/admin/tenants/{tenant_id}/subscription",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/admin/tenants/{tenant_id}/subscription",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "admin",
+                "tenants",
+                "tenant_id",
+                "subscription"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/admin/tenants/{tenant_id}/subscription/transitions",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/admin/tenants/{tenant_id}/subscription/transitions",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "admin",
+                "tenants",
+                "tenant_id",
+                "subscription",
+                "transitions"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/agents",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/agents",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "agents"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/agents",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/agents",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "agents"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/agents/{agent_id}",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/agents/{agent_id}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "agents",
+                "agent_id"
+              ]
+            }
+          }
+        },
+        {
+          "name": "PUT /v1/agents/{agent_id}/tool-permissions",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/agents/{agent_id}/tool-permissions",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "agents",
+                "agent_id",
+                "tool-permissions"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/agents/{agent_id}/versions",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/agents/{agent_id}/versions",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "agents",
+                "agent_id",
+                "versions"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/agents/{agent_id}/versions",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/agents/{agent_id}/versions",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "agents",
+                "agent_id",
+                "versions"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/agents/{agent_id}/versions/{version}/rollback",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/agents/{agent_id}/versions/{version}/rollback",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "agents",
+                "agent_id",
+                "versions",
+                "version",
+                "rollback"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/analytics/overview",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/analytics/overview",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "analytics",
+                "overview"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/analytics/performance",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/analytics/performance",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "analytics",
+                "performance"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/analytics/tasks-by-agent",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/analytics/tasks-by-agent",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "analytics",
+                "tasks-by-agent"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/analytics/usage-cost",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/analytics/usage-cost",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "analytics",
+                "usage-cost"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/api-keys",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/api-keys",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "api-keys"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/api-keys",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/api-keys",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "api-keys"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/api-keys/{id}/revoke",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/api-keys/{id}/revoke",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "api-keys",
+                "id",
+                "revoke"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/api-keys/{id}/rotate",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/api-keys/{id}/rotate",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "api-keys",
+                "id",
+                "rotate"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/approvals",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/approvals",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "approvals"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/approvals/{id}/approve",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/approvals/{id}/approve",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "approvals",
+                "id",
+                "approve"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/approvals/{id}/deny",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/approvals/{id}/deny",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "approvals",
+                "id",
+                "deny"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/assistant/insights",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/assistant/insights",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "assistant",
+                "insights"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/audit-events",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/audit-events",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "audit-events"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/auth/me",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/auth/me",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "auth",
+                "me"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/billing/entitlements",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/billing/entitlements",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "billing",
+                "entitlements"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/billing/receipts",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/billing/receipts",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "billing",
+                "receipts"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/billing/receipts/{provider}/{event_id}",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/billing/receipts/{provider}/{event_id}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "billing",
+                "receipts",
+                "provider",
+                "event_id"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/billing/subscription",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/billing/subscription",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "billing",
+                "subscription"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/billing/usage-totals",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/billing/usage-totals",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "billing",
+                "usage-totals"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/connector-manifests",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/connector-manifests",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "connector-manifests"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/connectors",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/connectors",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "connectors"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/connectors",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/connectors",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "connectors"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/connectors/test",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/connectors/test",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "connectors",
+                "test"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/connectors/{connector_id}",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/connectors/{connector_id}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "connectors",
+                "connector_id"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/connectors/{connector_id}/disable",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/connectors/{connector_id}/disable",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "connectors",
+                "connector_id",
+                "disable"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/connectors/{connector_id}/oauth/authorize",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/connectors/{connector_id}/oauth/authorize",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "connectors",
+                "connector_id",
+                "oauth",
+                "authorize"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/connectors/{connector_id}/probe",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/connectors/{connector_id}/probe",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "connectors",
+                "connector_id",
+                "probe"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/data-sources",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/data-sources",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "data-sources"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/data-sources",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/data-sources",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "data-sources"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/data-sources/{id}",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/data-sources/{id}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "data-sources",
+                "id"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/data-sources/{id}/documents",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/data-sources/{id}/documents",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "data-sources",
+                "id",
+                "documents"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/data-sources/{id}/sync",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/data-sources/{id}/sync",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "data-sources",
+                "id",
+                "sync"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/documents/upload",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/documents/upload",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "documents",
+                "upload"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/documents/{id}",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/documents/{id}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "documents",
+                "id"
+              ]
+            }
+          }
+        },
+        {
+          "name": "DELETE /v1/documents/{id}",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/documents/{id}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "documents",
+                "id"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/executions",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/executions",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "executions"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/executions/{execution_id}",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/executions/{execution_id}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "executions",
+                "execution_id"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/executions/{execution_id}/cancel",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/executions/{execution_id}/cancel",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "executions",
+                "execution_id",
+                "cancel"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/executions/{execution_id}/pause",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/executions/{execution_id}/pause",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "executions",
+                "execution_id",
+                "pause"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/executions/{execution_id}/resume",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/executions/{execution_id}/resume",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "executions",
+                "execution_id",
+                "resume"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/executions/{execution_id}/start",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/executions/{execution_id}/start",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "executions",
+                "execution_id",
+                "start"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/executions/{execution_id}/steps",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/executions/{execution_id}/steps",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "executions",
+                "execution_id",
+                "steps"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/health/live",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/health/live",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "health",
+                "live"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/health/ready",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/health/ready",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "health",
+                "ready"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/inbound-webhooks",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/inbound-webhooks",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "inbound-webhooks"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/inbound-webhooks",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/inbound-webhooks",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "inbound-webhooks"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/inbound-webhooks/{endpoint_id}",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/inbound-webhooks/{endpoint_id}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "inbound-webhooks",
+                "endpoint_id"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/inbound-webhooks/{endpoint_id}/disable",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/inbound-webhooks/{endpoint_id}/disable",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "inbound-webhooks",
+                "endpoint_id",
+                "disable"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/inbound-webhooks/{endpoint_id}/enable",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/inbound-webhooks/{endpoint_id}/enable",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "inbound-webhooks",
+                "endpoint_id",
+                "enable"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/memberships",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/memberships",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "memberships"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/notifications/recipients/{recipient_id}",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/notifications/recipients/{recipient_id}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "notifications",
+                "recipients",
+                "recipient_id"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/notifications/recipients/{recipient_id}/{notification_id}/archive",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/notifications/recipients/{recipient_id}/{notification_id}/archive",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "notifications",
+                "recipients",
+                "recipient_id",
+                "notification_id",
+                "archive"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/notifications/recipients/{recipient_id}/{notification_id}/read",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/notifications/recipients/{recipient_id}/{notification_id}/read",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "notifications",
+                "recipients",
+                "recipient_id",
+                "notification_id",
+                "read"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/organizations",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/organizations",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "organizations"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/organizations",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/organizations",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "organizations"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/policies",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/policies",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "policies"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/policies",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/policies",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "policies"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/policies/{id}",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/policies/{id}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "policies",
+                "id"
+              ]
+            }
+          }
+        },
+        {
+          "name": "PATCH /v1/policies/{id}",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/policies/{id}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "policies",
+                "id"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/policies/{id}/evaluate",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/policies/{id}/evaluate",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "policies",
+                "id",
+                "evaluate"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/policies/{id}/publish",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/policies/{id}/publish",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "policies",
+                "id",
+                "publish"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/policies/{id}/rollback",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/policies/{id}/rollback",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "policies",
+                "id",
+                "rollback"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/projects",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/projects",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "projects"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/projects/{project_id}/executions",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/projects/{project_id}/executions",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "projects",
+                "project_id",
+                "executions"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/public/inbound-webhooks/{route_id}",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/public/inbound-webhooks/{route_id}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "public",
+                "inbound-webhooks",
+                "route_id"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/public/oauth/{provider}/callback",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/public/oauth/{provider}/callback",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "public",
+                "oauth",
+                "provider",
+                "callback"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/quotas",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/quotas",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "quotas"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/rollbacks",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/rollbacks",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "rollbacks"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/schedules",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/schedules",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "schedules"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/schedules",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/schedules",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "schedules"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/schedules/{schedule_id}",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/schedules/{schedule_id}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "schedules",
+                "schedule_id"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/schedules/{schedule_id}/disable",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/schedules/{schedule_id}/disable",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "schedules",
+                "schedule_id",
+                "disable"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/schedules/{schedule_id}/pause",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/schedules/{schedule_id}/pause",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "schedules",
+                "schedule_id",
+                "pause"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/schedules/{schedule_id}/resume",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/schedules/{schedule_id}/resume",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "schedules",
+                "schedule_id",
+                "resume"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/search",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/search",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "search"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/stream",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/stream",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "stream"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/tenants",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/tenants",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "tenants"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/tenants",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/tenants",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "tenants"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/tools",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/tools",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "tools"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/tools",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/tools",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "tools"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/tools/{id}",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/tools/{id}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "tools",
+                "id"
+              ]
+            }
+          }
+        },
+        {
+          "name": "PATCH /v1/tools/{id}",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/tools/{id}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "tools",
+                "id"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/usage",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/usage",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "usage"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/usage/summary",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/usage/summary",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "usage",
+                "summary"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/users",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/users",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "users"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/webhooks",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/webhooks",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "webhooks"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/webhooks",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/webhooks",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "webhooks"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/webhooks/{id}/deliveries",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/webhooks/{id}/deliveries",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "webhooks",
+                "id",
+                "deliveries"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/webhooks/{id}/deliveries/{delivery_id}/replay",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/webhooks/{id}/deliveries/{delivery_id}/replay",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "webhooks",
+                "id",
+                "deliveries",
+                "delivery_id",
+                "replay"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/webhooks/{webhook_id}/disable",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/webhooks/{webhook_id}/disable",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "webhooks",
+                "webhook_id",
+                "disable"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/webhooks/{webhook_id}/enable",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/webhooks/{webhook_id}/enable",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "webhooks",
+                "webhook_id",
+                "enable"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/workflows",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/workflows",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "workflows"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/workflows",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/workflows",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "workflows"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/workflows/{workflow_id}",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/workflows/{workflow_id}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "workflows",
+                "workflow_id"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/workflows/{workflow_id}/disable",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/workflows/{workflow_id}/disable",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "workflows",
+                "workflow_id",
+                "disable"
+              ]
+            }
+          }
+        },
+        {
+          "name": "PUT /v1/workflows/{workflow_id}/graph",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/workflows/{workflow_id}/graph",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "workflows",
+                "workflow_id",
+                "graph"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/workflows/{workflow_id}/publish",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/workflows/{workflow_id}/publish",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "workflows",
+                "workflow_id",
+                "publish"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/workflows/{workflow_id}/versions",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/workflows/{workflow_id}/versions",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "workflows",
+                "workflow_id",
+                "versions"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/workflows/{workflow_id}/versions/{version}/rollback",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/workflows/{workflow_id}/versions/{version}/rollback",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "workflows",
+                "workflow_id",
+                "versions",
+                "version",
+                "rollback"
+              ]
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://127.0.0.1:8080"
+    },
+    {
+      "key": "api_token",
+      "value": "dev-token"
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "schedule_id": "f8d0f1c2-d67a-4512-8c7d-9be912f8e111",
+  "tenant_id": "3f7d9b1c-2412-4b62-9f93-84a4d01f6022",
+  "planned_at": "2026-09-30T00:00:00.000Z",
+  "task_template": {
+    "operation": "execution.run",
+    "input": {
+      "beat": true
+    }
+  }
+}
