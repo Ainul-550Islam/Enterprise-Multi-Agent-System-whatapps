@@ -63,7 +63,7 @@ passed=1151  failed=0  ignored=13  binaries=71
 RUST_WS_EXIT=0
 ```
 
-Run with `CARGO_PROFILE_TEST_DEBUG=0` because 71 debug binaries exceed the sandbox's 25 GB disk — a build-artifact sizing choice that cannot alter test outcomes. The same 1151 tests execute.
+**Run with no flags and no overrides**: `cargo test --workspace --locked`, full debug info, producing 15 GB of artifacts. The earlier `CARGO_PROFILE_TEST_DEBUG=0` accommodation has been removed — it is no longer used anywhere.
 
 ---
 
@@ -191,4 +191,4 @@ Debian 13 · rustc 1.98.1 · Python 3.13.16 · PostgreSQL 17.11 + pgvector 0.8.0
 
 Sixteen defects fixed. Five container images build, start, and report `healthy` — and the healthchecks are genuine now, not decorative: before this work, **four of the five could never have reported healthy at all**, for four different reasons (a non-existent grpc API on the wrong port, a bash-only redirect under dash, an uninstalled `pgrep`, and a discarded `|| exit 1`). Each one silently marked a perfectly working service as failing.
 
-The one accommodation, stated plainly: the Rust suite runs with `CARGO_PROFILE_TEST_DEBUG=0` to fit 71 test binaries on a 25 GB disk. Same tests, smaller artifacts.
+No accommodations remain. The Rust suite runs exactly as `cargo test --workspace --locked`, with full debug info.
