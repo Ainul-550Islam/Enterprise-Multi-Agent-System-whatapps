@@ -7,8 +7,10 @@
 //! Python ingestion/RAG plane; it does not grant Python SQL access to any
 //! Rust-owned table. Production transport lives in `mas-ai-bridge`.
 
+#[cfg(any(test, feature = "dev-bridges"))]
 use std::collections::BTreeMap;
 use std::fmt;
+#[cfg(any(test, feature = "dev-bridges"))]
 use std::sync::Mutex;
 
 use async_trait::async_trait;
@@ -18,6 +20,10 @@ use mas_common::result::Result;
 use mas_common::timestamps::Timestamp;
 use mas_orchestration::cancellation::CancellationToken;
 use serde_json::Value;
+// Required only by the in-memory adapter, which is compiled for tests and for
+// the `dev-bridges` feature. Importing unconditionally warns in a plain
+// production build, where no digest is ever computed locally.
+#[cfg(any(test, feature = "dev-bridges"))]
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -247,11 +253,13 @@ pub struct DataHubPurgeDocumentResult {
 /// lane and tests. It validates authoritative scope and exact digests, keeps
 /// only derived chunk counts, and never pretends to be a production vector
 /// store. Durable composition always uses `mas-ai-bridge::GrpcDataHubBridge`.
+#[cfg(any(test, feature = "dev-bridges"))]
 #[derive(Debug, Default)]
 pub struct InMemoryDataHubBridge {
     chunks: Mutex<BTreeMap<(TenantId, Uuid), u32>>,
 }
 
+#[cfg(any(test, feature = "dev-bridges"))]
 impl InMemoryDataHubBridge {
     /// Creates an empty local bridge.
     #[must_use]
@@ -260,6 +268,7 @@ impl InMemoryDataHubBridge {
     }
 }
 
+#[cfg(any(test, feature = "dev-bridges"))]
 #[async_trait]
 impl DataHubBridgePort for InMemoryDataHubBridge {
     fn name(&self) -> &'static str {

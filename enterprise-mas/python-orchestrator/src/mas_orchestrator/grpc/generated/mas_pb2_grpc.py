@@ -1263,23 +1263,31 @@ class AgentBridgeApi:
 
 
 class DataHubBridgeApiStub:
-    """===========================================================================
-    Data Hub bridge — Rust-owned ingestion authority, Python-owned RAG plane
-    ===========================================================================
+    """=========================================================================
+    Data Hub bridge
+    =========================================================================
 
-    Rust remains authoritative for tenant scope, source/document metadata,
-    authorization and audit. These messages carry only a validated snapshot to
-    the Python ingestion/RAG plane; nothing here grants Python SQL access to a
-    Rust-owned table.
+    The second Python-facing surface: source synchronization and document
+    ingestion for the RAG plane. Every request below uses the same
+    authentication envelope as `AgentBridgeApi` — a bearer service token in
+    metadata, the body-bound `x-mas-internal-signature` v2 HMAC over the exact
+    request bytes, and the authoritative tenant/organization identity carried
+    *in the body* so Python can reconcile it against the signed metadata.
 
-    The Python side (`mas_orchestrator.grpc.data_hub_servicer`) authenticates
-    every call with the same AgentBridge rules — bearer bearer token, body-bound
-    HMAC signature, protocol version negotiation, deadline enforcement and the
-    per-operation scope — so a caller that can reach `AgentBridgeApi` but holds
-    no `data_hub_*` scope is refused here.
+    It must NOT:
+    • carry secret material — only opaque secret *references*;
+    • let a caller name a tenant that Rust did not sign into the body.
 
-    Field numbering is append-only: this service shipped after AgentBridgeApi, so
-    every message starts at 1 and no field is ever renumbered or reused.
+    The identity field reuses `ServiceIdentityMsg` rather than declaring a
+    Data-Hub-specific twin: the shape is identical, and two structurally equal
+    messages would be two things to keep in sync for no benefit.
+
+    Source synchronization and document ingestion for the RAG plane.
+
+    Every request below uses the same authentication envelope as
+    `AgentBridgeApi`: a bearer service token in metadata, the body-bound
+    `x-mas-internal-signature` v2 HMAC over the exact request bytes, and the
+    authoritative tenant/organization identity carried *in the body*.
     """
 
     def __init__(self, channel):
@@ -1311,48 +1319,63 @@ class DataHubBridgeApiStub:
 
 
 class DataHubBridgeApiServicer:
-    """===========================================================================
-    Data Hub bridge — Rust-owned ingestion authority, Python-owned RAG plane
-    ===========================================================================
+    """=========================================================================
+    Data Hub bridge
+    =========================================================================
 
-    Rust remains authoritative for tenant scope, source/document metadata,
-    authorization and audit. These messages carry only a validated snapshot to
-    the Python ingestion/RAG plane; nothing here grants Python SQL access to a
-    Rust-owned table.
+    The second Python-facing surface: source synchronization and document
+    ingestion for the RAG plane. Every request below uses the same
+    authentication envelope as `AgentBridgeApi` — a bearer service token in
+    metadata, the body-bound `x-mas-internal-signature` v2 HMAC over the exact
+    request bytes, and the authoritative tenant/organization identity carried
+    *in the body* so Python can reconcile it against the signed metadata.
 
-    The Python side (`mas_orchestrator.grpc.data_hub_servicer`) authenticates
-    every call with the same AgentBridge rules — bearer bearer token, body-bound
-    HMAC signature, protocol version negotiation, deadline enforcement and the
-    per-operation scope — so a caller that can reach `AgentBridgeApi` but holds
-    no `data_hub_*` scope is refused here.
+    It must NOT:
+    • carry secret material — only opaque secret *references*;
+    • let a caller name a tenant that Rust did not sign into the body.
 
-    Field numbering is append-only: this service shipped after AgentBridgeApi, so
-    every message starts at 1 and no field is ever renumbered or reused.
+    The identity field reuses `ServiceIdentityMsg` rather than declaring a
+    Data-Hub-specific twin: the shape is identical, and two structurally equal
+    messages would be two things to keep in sync for no benefit.
+
+    Source synchronization and document ingestion for the RAG plane.
+
+    Every request below uses the same authentication envelope as
+    `AgentBridgeApi`: a bearer service token in metadata, the body-bound
+    `x-mas-internal-signature` v2 HMAC over the exact request bytes, and the
+    authoritative tenant/organization identity carried *in the body*.
     """
 
     def SyncSource(self, request, context):
-        """Synchronizes one Rust-authorized source and indexes its changed items.
+        """Enumerates a Rust-authorized source and indexes everything that changed
+        since `cursor`. Bounded by the caller's deadline; partial progress is
+        reported rather than rolled back, because the next sync resumes from the
+        returned cursor.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def IngestDocument(self, request, context):
-        """Indexes one bounded upload/discovered document under Rust's tenant id.
+        """Indexes one already-authorized document (upload, discovered item or
+        fetched page) under the tenant's RAG partition.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def PurgeDocument(self, request, context):
-        """Removes only the derived vectors/chunks for one scoped document.
+        """Removes exactly one tenant/document pair from the RAG plane. Deleting
+        catalogue state is Rust's job; this only drops derived vectors.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def Health(self, request, context):
-        """Readiness of the Python Data Hub ingestion plane.
+        """Secret-free readiness of the ingestion plane. Unauthenticated for the same
+        reason `AgentBridgeApi.Health` is: a supervisor probe has no tenant data
+        to protect and the reply carries a boolean and a static string.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -1390,23 +1413,31 @@ def add_DataHubBridgeApiServicer_to_server(servicer, server):
 
  # This class is part of an EXPERIMENTAL API.
 class DataHubBridgeApi:
-    """===========================================================================
-    Data Hub bridge — Rust-owned ingestion authority, Python-owned RAG plane
-    ===========================================================================
+    """=========================================================================
+    Data Hub bridge
+    =========================================================================
 
-    Rust remains authoritative for tenant scope, source/document metadata,
-    authorization and audit. These messages carry only a validated snapshot to
-    the Python ingestion/RAG plane; nothing here grants Python SQL access to a
-    Rust-owned table.
+    The second Python-facing surface: source synchronization and document
+    ingestion for the RAG plane. Every request below uses the same
+    authentication envelope as `AgentBridgeApi` — a bearer service token in
+    metadata, the body-bound `x-mas-internal-signature` v2 HMAC over the exact
+    request bytes, and the authoritative tenant/organization identity carried
+    *in the body* so Python can reconcile it against the signed metadata.
 
-    The Python side (`mas_orchestrator.grpc.data_hub_servicer`) authenticates
-    every call with the same AgentBridge rules — bearer bearer token, body-bound
-    HMAC signature, protocol version negotiation, deadline enforcement and the
-    per-operation scope — so a caller that can reach `AgentBridgeApi` but holds
-    no `data_hub_*` scope is refused here.
+    It must NOT:
+    • carry secret material — only opaque secret *references*;
+    • let a caller name a tenant that Rust did not sign into the body.
 
-    Field numbering is append-only: this service shipped after AgentBridgeApi, so
-    every message starts at 1 and no field is ever renumbered or reused.
+    The identity field reuses `ServiceIdentityMsg` rather than declaring a
+    Data-Hub-specific twin: the shape is identical, and two structurally equal
+    messages would be two things to keep in sync for no benefit.
+
+    Source synchronization and document ingestion for the RAG plane.
+
+    Every request below uses the same authentication envelope as
+    `AgentBridgeApi`: a bearer service token in metadata, the body-bound
+    `x-mas-internal-signature` v2 HMAC over the exact request bytes, and the
+    authoritative tenant/organization identity carried *in the body*.
     """
 
     @staticmethod

@@ -49,18 +49,15 @@ pub mod tool_runner;
 pub use agent_bridge::InMemoryAgentBridge;
 pub use agent_bridge::{
     AgentBridge, AgentRunRequest, AgentRunStatus, AgentRunVerdict, AgentRuntimeConfiguration,
-    AgentRuntimeLimits, AgentRuntimeSnapshot, AgentRuntimeSnapshotResolver,
-    AgentSnapshotMetadataSource, AgentUsage, CANCELLATION_CODE,
+    AgentRuntimeLimits, AgentRuntimeSnapshot, AgentRuntimeSnapshotResolver, AgentUsage,
+    CANCELLATION_CODE,
 };
-// The Data Hub port is a first-class production seam: `mas-ai-bridge` implements
-// it for gRPC and `mas-api` composes either that or the in-memory bridge for
-// local bring-up. The in-memory implementation is *not* `dev-bridges`-gated for
-// the same reason `InMemoryToolBridge` is not: `mas-api` does not enable that
-// feature, and the bridge carries no provider/AI behaviour that could leak.
+#[cfg(any(test, feature = "dev-bridges"))]
+pub use data_hub_bridge::InMemoryDataHubBridge;
 pub use data_hub_bridge::{
     DataHubBridgePort, DataHubCallContext, DataHubDocumentIngestionResult,
     DataHubIngestDocumentRequest, DataHubPurgeDocumentRequest, DataHubPurgeDocumentResult,
-    DataHubSourceKind, DataHubSyncSourceRequest, DataHubSyncSourceResult, InMemoryDataHubBridge,
+    DataHubSourceKind, DataHubSyncSourceRequest, DataHubSyncSourceResult,
 };
 pub use executor::{Executor, ExecutorConfig, RunOutcome, StepStorePort};
 pub use mas_orchestration::checkpoint::NodeExecutionState;

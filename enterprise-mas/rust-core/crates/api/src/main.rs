@@ -32,6 +32,11 @@
 //! * `MAS_API_HTTP_ADDR` (default `0.0.0.0:8080`)
 //! * `MAS_API_GRPC_ADDR` (default `0.0.0.0:50051`)
 //! * `MAS_DEV_TOKENS` (`token:subject:kind,...`; only with `--dev-inmemory`)
+//!
+//! Flags:
+//! * `--dev-inmemory` — the stateless local lane described above.
+//! * `--health` — probe mode for the container `HEALTHCHECK`: prints `ok` and
+//!   exits 0 without loading configuration or connecting to anything.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -60,8 +65,25 @@ mod inbound_webhook_composition;
 mod integration_composition;
 mod oauth_composition;
 
+/// Container/local health probe: `mas-api --health`.
+///
+/// This exists for the image `HEALTHCHECK` and for liveness probing of a
+/// process whose listeners may not be ready yet. It performs no configuration
+/// loading and touches no database, so it answers one question only — "is this
+/// process able to execute at all" — and always exits 0. Readiness (database
+/// reachability, migration state) stays on `GET /v1/health/ready`, which is
+/// the surface that is allowed to fail.
+fn health_probe_requested() -> bool {
+    std::env::args().skip(1).any(|arg| arg == "--health")
+}
+
 #[tokio::main]
 async fn main() {
+    if health_probe_requested() {
+        println!("mas-api: ok");
+        return;
+    }
+
     std::process::exit(match run().await {
         Ok(0) => 0,
         Ok(_) => 0,

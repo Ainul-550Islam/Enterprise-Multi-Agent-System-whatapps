@@ -34,17 +34,18 @@ from __future__ import annotations
 
 import logging
 import threading
-from collections.abc import Mapping
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Final
 
-from mas_orchestrator.contracts.errors import (
-    AgentNotFoundError,
-    ConfigurationError,
-    InvalidRequestError,
-)
+# `AgentKind` is imported at runtime, not under TYPE_CHECKING: `register_builtin`
+# validates the kind on the template it is handed, and that check would raise
+# NameError instead of ConfigurationError if the name only existed for type
+# checkers.
+from mas_orchestrator.agents.base import AgentKind
+from mas_orchestrator.contracts.errors import AgentNotFoundError, ConfigurationError
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator, Sequence
+    from collections.abc import Callable, Iterator, Mapping, Sequence
 
     from mas_orchestrator.agents.base import AgentSpec, BaseAgent
     from mas_orchestrator.agents.factory import AgentFactory
@@ -128,6 +129,9 @@ def materialise_catalog(
             allowed_tools=frozenset(str(item) for item in _sequence(template, "allowed_tools")),
             system_prompt=str(template.get("system_prompt", "")),
             tags=tuple(str(item) for item in _sequence(template, "tags")),
+            # Only ever true where the product template sets it. A tenant
+            # cannot promote its own spec to read-only, and — more importantly
+            # — cannot demote a builtin out of it.
             read_only=bool(template.get("read_only", False)),
         )
         limits = template.get("limits")
@@ -210,19 +214,56 @@ class TenantScopedAgentRegistry:
         self._catalog: tuple[Mapping[str, object], ...] = tuple(catalog)
         self._default_agent_id = default_agent_id
         self._logger = logger or _LOGGER
-        self._lock = threading.Lock()
+        # Reentrant: this registry's own read-only accessors (`catalog_ids`,
+        # `specs_for`) take the lock, and several mutating paths legitimately
+        # call them while already holding it. With a plain `Lock` those paths
+        # deadlock instead of raising — the process simply stops, which is the
+        # worst possible failure mode for a startup-time registration path.
+        self._lock = threading.RLock()
         self._by_tenant: dict[str, tuple[AgentSpec, ...]] = {}
         # Bound after construction: the factory needs the model router, and the
         # router needs this registry. Declared here so `build` has no attribute
         # that only sometimes exists.
         self._factory: AgentFactory | None = None
+        # Product-owned templates registered at startup. Closed once the
+        # factory is bound: after that point the catalog is what requests are
+        # served from, and a late `register_builtin` could change the meaning
+        # of an in-flight agent id.
+        self._builtins: list[Mapping[str, object]] = []
+        self._builtins_closed = False
 
     # --- introspection ------------------------------------------------------
 
     @property
     def catalog_ids(self) -> frozenset[str]:
-        """The agent ids in the catalog, across all tenants."""
-        return frozenset(str(entry["agent_id"]) for entry in self._catalog)
+        """The agent ids this registry serves, across all tenants.
+
+        Includes product-owned builtins registered through
+        :meth:`register_builtin`: they are part of the catalog every tenant
+        receives, so leaving them out would let a router policy refuse an agent
+        the registry will happily build.
+        """
+        return frozenset(str(entry["agent_id"]) for entry in self._all_templates())
+
+    def _all_templates_unlocked(self) -> tuple[Mapping[str, object], ...]:
+        """The catalog plus builtins. Caller must hold ``_lock``.
+
+        Split from :meth:`_all_templates` because ``threading.Lock`` is not
+        reentrant: every caller that already holds the lock and re-entered the
+        locking version would deadlock. Keeping the split explicit (and named)
+        makes that requirement impossible to miss at the call site.
+        """
+        return self._catalog + tuple(self._builtins)
+
+    def _all_templates(self) -> tuple[Mapping[str, object], ...]:
+        """The configured catalog followed by registered builtins.
+
+        Configured entries come first so they keep their catalog position (the
+        default agent is resolved by id, but ordering is observable through
+        ``specs_for`` and is worth keeping stable).
+        """
+        with self._lock:
+            return self._all_templates_unlocked()
 
     @property
     def default_agent_id(self) -> str:
@@ -308,7 +349,7 @@ class TenantScopedAgentRegistry:
             if cached is not None:
                 return cached
 
-            specs = materialise_catalog(self._catalog, tenant_id)
+            specs = materialise_catalog(self._all_templates_unlocked(), tenant_id)
             self._by_tenant[tenant_id] = specs
             self._logger.info(
                 "agent catalog materialised for tenant",
@@ -393,79 +434,87 @@ class TenantScopedAgentRegistry:
 
     # --- composition --------------------------------------------------------
 
+    def register_builtin(self, template: Mapping[str, object]) -> None:
+        """Adds a product-owned agent template that every tenant receives.
+
+        Args:
+            template: A catalog template, in the same shape as
+                :attr:`catalog` entries.
+
+        Raises:
+            ConfigurationError: If registration is already closed, the
+                template is malformed, or its ``agent_id`` collides with the
+                configured catalog. Every one of those is a startup error: a
+                builtin that silently failed to register would be missing for
+                every tenant, and the first sign of it would be a 404 in
+                production.
+
+        Why templates and not specs: a builtin must materialise *per tenant*
+        exactly like the configured catalog, otherwise the same agent id would
+        carry one tenant's id for that tenant and none for the others.
+        """
+        if not template.get("agent_id"):
+            raise ConfigurationError(
+                "a builtin agent template must declare an agent_id",
+                details={"field": "agent_id"},
+            )
+        agent_id = str(template["agent_id"])
+        missing = [key for key in ("name", "slug", KIND_KEY) if key not in template]
+        if missing:
+            raise ConfigurationError(
+                "builtin agent template is missing required fields",
+                details={"agent_id": agent_id, "missing": missing},
+            )
+        if not isinstance(template[KIND_KEY], AgentKind):
+            raise ConfigurationError(
+                "builtin agent template has a non-AgentKind kind",
+                details={"agent_id": agent_id, "kind": repr(template[KIND_KEY])},
+            )
+
+        with self._lock:
+            if self._builtins_closed:
+                raise ConfigurationError(
+                    "builtin agents must be registered before registry startup",
+                    details={"agent_id": agent_id},
+                )
+            # Read `self._catalog` directly rather than calling `catalog_ids`:
+            # this block already holds `self._lock`, and `catalog_ids` takes it
+            # again. `threading.Lock` is not reentrant, so that would deadlock
+            # the first time a builtin was registered.
+            if any(str(entry["agent_id"]) == agent_id for entry in self._catalog):
+                raise ConfigurationError(
+                    "a builtin agent may not shadow a configured catalog agent",
+                    details={"agent_id": agent_id},
+                )
+            if any(str(entry["agent_id"]) == agent_id for entry in self._builtins):
+                raise ConfigurationError(
+                    "a builtin agent with this id is already registered",
+                    details={"agent_id": agent_id},
+                )
+            self._builtins.append(MappingProxyType(dict(template)))
+            # Drop any materialised tenants so the next access sees the new
+            # template. Registration happens at startup only, so this is an
+            # empty dict in practice; clearing it keeps the invariant explicit
+            # rather than relying on call ordering.
+            self._by_tenant.clear()
+
     def is_read_only(self, tenant_id: str, agent_id: str) -> bool:
-        """Whether *agent_id* is a platform-owned, read-only agent.
+        """Whether *agent_id* is a read-only agent for *tenant_id*.
 
         Args:
             tenant_id: The owning tenant.
             agent_id: The agent to inspect.
 
         Returns:
-            ``True`` only when the agent exists for that tenant and its spec is
-            read-only. An unknown agent answers ``False`` rather than raising:
-            the question asked is "may this be mutated?", and an agent that does
-            not exist certainly may not.
+            ``True`` only when the agent exists and its spec is read-only.
+            An unknown agent is reported as *not* read-only: this predicate
+            answers "may I assume this agent cannot mutate anything", and the
+            safe answer for an id nobody has heard of is no. Callers that need
+            "does it exist" ask :meth:`has`.
         """
-        try:
-            return self.spec(tenant_id, agent_id).read_only
-        except (InvalidRequestError, AgentNotFoundError):
+        if not self.has(tenant_id, agent_id):
             return False
-
-    def register_builtin(self, template: Mapping[str, object]) -> None:
-        """Adds a product-owned agent template to the catalog.
-
-        Only templates that are explicitly read-only may be registered this
-        way: the whole point of a builtin is that the platform owns it. The
-        hook is closed as soon as composition finishes — binding the factory or
-        materialising any tenant's catalog marks startup as over.
-
-        Args:
-            template: A catalog entry. Must carry ``read_only: True``.
-
-        Raises:
-            ConfigurationError: If the template is not read-only, if it is
-                malformed, if it collides with an existing agent id, or if
-                startup has already completed.
-        """
-        # Startup closure is checked first: once composition has finished, no
-        # template is acceptable, so reporting a content problem would suggest
-        # that fixing the template would make the registration work.
-        with self._lock:
-            if self._factory is not None or self._by_tenant:
-                raise ConfigurationError(
-                    "builtin agents must be registered before registry startup",
-                    details={"agent_id": str(template.get("agent_id", ""))},
-                )
-        if not isinstance(template, Mapping):
-            raise ConfigurationError(
-                "a builtin agent template must be a mapping",
-                details={"field": "template"},
-            )
-        if template.get("read_only") is not True:
-            raise ConfigurationError(
-                "a builtin agent template must declare read_only: True",
-                details={"field": "read_only"},
-            )
-        missing = [key for key in ("agent_id", "name", "slug", KIND_KEY) if key not in template]
-        if missing:
-            raise ConfigurationError(
-                "builtin agent template is missing required fields",
-                details={"missing": missing},
-            )
-        agent_id = str(template["agent_id"])
-        with self._lock:
-            if any(str(entry["agent_id"]) == agent_id for entry in self._catalog):
-                raise ConfigurationError(
-                    "builtin agent id collides with an existing catalog entry",
-                    details={"agent_id": agent_id},
-                )
-            # Freeze a private copy so a caller that keeps a reference to its
-            # mapping cannot mutate the catalog after registration.
-            self._catalog = (*self._catalog, dict(template))
-        self._logger.info(
-            "builtin agent registered",
-            extra={"event": "agents.builtin_registered", "agent_id": agent_id},
-        )
+        return self.spec(tenant_id, agent_id).read_only
 
     def bind_factory(self, factory: AgentFactory) -> None:
         """Binds the factory used by :meth:`build`.
@@ -482,9 +531,13 @@ class TenantScopedAgentRegistry:
             if self._factory is not None:
                 raise ConfigurationError(
                     "an agent factory is already bound to this registry",
-                    details={"catalog": sorted(self.catalog_ids)},
+                    details={"catalog": sorted(str(e["agent_id"]) for e in self._catalog)},
                 )
             self._factory = factory
+            # From here on the catalog is frozen: the factory is what serves
+            # requests, and a builtin registered now would exist for tenants
+            # materialised later but not for any already in use.
+            self._builtins_closed = True
 
     def default_spec(self, tenant_id: str) -> AgentSpec:
         """The spec :data:`default_agent_id` resolves to for a tenant.

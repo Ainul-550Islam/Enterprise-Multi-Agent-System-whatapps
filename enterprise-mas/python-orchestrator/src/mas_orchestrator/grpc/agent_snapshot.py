@@ -73,7 +73,7 @@ def parse_agent_snapshot(
     expected_tenant_id: str,
     expected_organization_id: str,
     expected_project_id: str,
-    expected_agent_version_id: str | None,
+    expected_agent_version_id: str,
 ) -> ValidatedAgentSnapshot:
     """Validates a wire snapshot and builds its exact immutable ``AgentSpec``.
 
@@ -83,12 +83,7 @@ def parse_agent_snapshot(
         expected_tenant_id: Authoritative tenant in the protobuf request.
         expected_organization_id: Authoritative organization in the request.
         expected_project_id: Authoritative project in the request.
-        expected_agent_version_id: Exact pinned version id in the request, or
-            ``None`` when the request pins no version. "No pin" is a real
-            caller intent — run the agent's current published version — and is
-            not the same thing as a pin that disagrees with the snapshot.
-            Treating it as an absent value rather than validating it as a UUID
-            is what keeps an unpinned run possible at all.
+        expected_agent_version_id: Exact pinned version id in the request.
 
     Returns:
         The strictly validated snapshot projected to a runtime spec.
@@ -132,12 +127,6 @@ def parse_agent_snapshot(
     parsed_identity: dict[str, str] = {}
     for field, expected in identity.items():
         actual = _uuid(snapshot[field], field)
-        # An absent expected value means the caller expressed no constraint on
-        # this field (only possible for the version pin). The snapshot value is
-        # still parsed above, so it must still be a canonical UUID.
-        if expected is None:
-            parsed_identity[field] = actual
-            continue
         expected_value = _uuid(expected, field)
         if actual != expected_value:
             raise InvalidRequestError(

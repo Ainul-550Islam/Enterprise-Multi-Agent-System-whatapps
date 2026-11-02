@@ -17,10 +17,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Final
 
 from mas_orchestrator.agents.base import AgentKind, AgentSpec, BaseAgent
-from mas_orchestrator.agents.builtin.platform_assistant import (
-    PLATFORM_ASSISTANT_AGENT_ID,
-    PlatformAssistantAgent,
-)
+from mas_orchestrator.agents.builtin.platform_assistant import PLATFORM_ASSISTANT_AGENT_ID
 from mas_orchestrator.agents.executor import AgentExecutor, AgentRunConfig
 from mas_orchestrator.agents.supervisor import SupervisorAgent
 from mas_orchestrator.contracts.errors import ConfigurationError
@@ -78,11 +75,40 @@ class AgentFactory:
 
         Raises:
             ConfigurationError: If the spec's kind needs a collaborator that
-                was not supplied, or if a product-owned spec does not satisfy
-                the stricter contract of its builtin implementation.
+                was not supplied.
         """
+        # Product-owned builtins dispatch before the generic kinds below. The
+        # id is the dispatch key, not a flag on the spec: a caller cannot
+        # rename its own agent to take this branch, and the constructor
+        # re-checks every property it depends on (read-only, tool-free,
+        # standard) so a spec that reaches it by another route is refused
+        # rather than run with weaker assumptions.
         if spec.agent_id == PLATFORM_ASSISTANT_AGENT_ID:
-            return self._build_platform_assistant(spec)
+            if not spec.read_only:
+                # The assistant's whole safety story is that it cannot mutate
+                # anything. Building it from a mutable spec would produce an
+                # assistant whose answers may be based on a write it should not
+                # have made.
+                raise ConfigurationError(
+                    "the platform assistant must be configured as a read-only standard agent",
+                    details={"agent_id": spec.agent_id, "read_only": spec.read_only},
+                )
+            from mas_orchestrator.agents.builtin.platform_assistant import (
+                PlatformAssistantAgent,
+            )
+
+            return PlatformAssistantAgent(
+                spec,
+                AgentExecutor(
+                    spec,
+                    router=self._router,
+                    provider_for=self._provider_for,
+                    tool_executor=self._tool_executor,
+                    tool_registry=self._tool_registry,
+                    config=config,
+                    ledger=ledger,
+                ),
+            )
 
         if spec.kind is AgentKind.SUPERVISOR:
             if self._agent_registry is None:
@@ -113,48 +139,6 @@ class AgentFactory:
             tool_registry=self._tool_registry,
             ledger=ledger,
             config=config,
-        )
-
-    def _build_platform_assistant(self, spec: AgentSpec) -> BaseAgent:
-        """Builds the product-owned read-only assistant.
-
-        The builtin is stricter than an ordinary spec: it must be a read-only,
-        standard-kind, tool-free agent. Those constraints are what make it safe
-        to expose to every tenant, so a spec that violates one is a
-        configuration error rather than something to paper over.
-
-        Args:
-            spec: The agent definition to build.
-
-        Returns:
-            A ``PlatformAssistantAgent``.
-
-        Raises:
-            ConfigurationError: If the spec does not satisfy the builtin
-                contract.
-        """
-        if spec.kind is not AgentKind.STANDARD or spec.allowed_tools or not spec.read_only:
-            raise ConfigurationError(
-                "the platform assistant must be a read-only standard agent with no tools",
-                details={
-                    "agent_id": spec.agent_id,
-                    "kind": spec.kind.value,
-                    "allowed_tools": sorted(spec.allowed_tools),
-                    "read_only": spec.read_only,
-                },
-            )
-        return PlatformAssistantAgent(
-            spec,
-            AgentExecutor(
-                spec,
-                router=self._router,
-                provider_for=self._provider_for,
-                # Explicitly absent: a no-tool agent must not be handed a tool
-                # executor, because that is the only thing that can turn a
-                # "tool-free" spec into an agent that calls tools.
-                tool_executor=None,
-                tool_registry=None,
-            ),
         )
 
     def factory_for(

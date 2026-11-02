@@ -6,7 +6,9 @@ metadata:
     {{- include "enterprise-mas.labels" . | nindent 4 }}
     component: api
 spec:
+  {{- if not .Values.hpa.enabled }}
   replicas: {{ .Values.api.replicaCount }}
+  {{- end }}
   selector:
     matchLabels:
       {{- include "enterprise-mas.selectorLabels" . | nindent 6 }}
@@ -18,11 +20,13 @@ spec:
         component: api
     spec:
       securityContext:
-        {{- toYaml .Values.securityContext | nindent 8 }}
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
         - name: api
           image: "{{ .Values.image.registry }}/{{ .Values.image.repository }}-{{ .Values.api.image }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 14 }}
           ports:
             - containerPort: 8080
               name: http

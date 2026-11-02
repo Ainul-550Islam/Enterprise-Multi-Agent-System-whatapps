@@ -1,34 +1,48 @@
-# PURPOSE: Body-bound, time-bounded internal service authentication for the
-# Rust Core -> Python orchestrator bridge.
+# PURPOSE: Body-bound, time-bounded, replay-safe internal service
+# authentication for the Rust Core -> Python orchestrator bridge (scheme v2).
 #
 # Owning layer: `mas_orchestrator.security` (the Python process edge).
 #
 # Production responsibility: verify that an inbound bridge call was made by a
 # platform service that holds the shared secret, that the call was made in the
-# last `MAX_SKEW_SECONDS`, and that the exact bytes now being processed are the
-# bytes that were signed.
+# last `MAX_SKEW_SECONDS`, that the exact bytes now being processed are the
+# bytes that were signed, and — through the returned nonce — that this exact
+# request has not already been consumed by a durable replay receipt store.
 #
-# Security boundary: this scheme proves *which service* called and that the
-# message was not tampered with in flight. It does NOT establish tenancy —
-# the tenant is authoritative data supplied by Rust in the request body, and
-# Python validates it against the resolved scope. Network reachability is
-# never an identity.
+# Security boundary: this scheme proves *which service* called, that the
+# message was not tampered with in flight, and (with the replay guard) that it
+# is not a replay. It does NOT establish tenancy — the tenant is authoritative
+# data supplied by Rust in the request body, and Python validates it against
+# the resolved scope. Network reachability is never an identity.
 #
 # It must NOT:
 #   • accept a signature over anything other than the exact request bytes;
-#   • accept a timestamp outside the skew window (replay defence);
+#   • accept a timestamp outside the skew window;
 #   • accept a caller that is not on the allowlist;
+#   • accept a v1 (timestamp-only, nonce-free) signature — there is no
+#     downgrade path, because v1 has no replay defence at all;
 #   • distinguish "missing header" from "wrong secret" in the error it raises —
 #     every failure is the same `AuthenticationError`, so a prober learns
 #     nothing;
 #   • log, render, or include the secret in any exception detail.
 #
 # The scheme is byte-for-byte compatible with
-# `mas-security::internal_service` (Rust):
+# `mas-security::internal_service` (Rust) and with
+# `rust-core/docs/internal-service-authentication-v2.md`:
 #
-#     body_digest = hex(SHA256(body))
-#     signed_message = "v1:" + service + ":" + unix_millis + ":" + body_digest
-#     signature = signed_message prefix + hex(HMAC_SHA256(secret, signed_message))
+#     body_digest    = hex(SHA256(body))
+#     signed_message = "v2:" + service + ":" + unix_millis + ":" + nonce + ":" + body_digest
+#     signature      = signed_message + ":" + hex(HMAC_SHA256(secret, signed_message))
+#
+# Deterministic cross-language vector (asserted by both sides' test suites):
+#
+#     secret:    s3cr3t
+#     service:   mas-api
+#     millis:    1700000000000
+#     nonce:     0123456789abcdefghijklmnopqrstuv
+#     body:      {"a":1}
+#     signature: v2:mas-api:1700000000000:0123456789abcdefghijklmnopqrstuv:
+#                ad29671c18b6926ff5c86fa205004b7b9e8675b6324bef6459aedead1e775766
 
 from __future__ import annotations
 
@@ -44,10 +58,16 @@ from typing import Final
 from mas_orchestrator.contracts.errors import AuthenticationError
 
 __all__ = [
+    "DEFAULT_ALLOWED_CALLERS",
+    "MAX_NONCE_LENGTH",
     "MAX_SKEW_SECONDS",
+    "MIN_NONCE_LENGTH",
     "SERVICE_HEADER",
     "SIGNATURE_HEADER",
+    "SIGNATURE_VERSION",
     "InternalServiceIdentity",
+    "new_nonce",
+    "now_millis",
     "signed_internal_signature",
     "verify_internal_signature",
 ]
@@ -58,36 +78,35 @@ SIGNATURE_HEADER: Final[str] = "x-mas-internal-signature"
 #: Metadata key carrying the calling service's claimed id.
 SERVICE_HEADER: Final[str] = "x-mas-internal-service"
 
+#: The only accepted signature version. v1 is refused, deliberately.
+SIGNATURE_VERSION: Final[str] = "v2"
+
 #: Largest acceptable clock skew, in seconds.
 #:
 #: 60 seconds is deliberately tight: it bounds the window in which a captured
 #: request can be replayed, while tolerating ordinary clock drift between two
-#: hosts in the same cluster.
+#: hosts in the same cluster. A receipt store therefore has to remember a
+#: nonce only until ``signed_at + MAX_SKEW``; after that the freshness check
+#: rejects every use anyway.
 MAX_SKEW_SECONDS: Final[int] = 60
+
+#: Accepted nonce length band. Mirrors Rust's `MIN_NONCE_LEN`/`MAX_NONCE_LEN`
+#: and accommodates a 24-byte URL-safe base64 value (32 characters, no
+#: padding) as well as any shorter test vector down to 22 characters.
+MIN_NONCE_LENGTH: Final[int] = 22
+MAX_NONCE_LENGTH: Final[int] = 128
 
 #: Only these services may call the orchestrator's internal endpoints.
 DEFAULT_ALLOWED_CALLERS: Final[frozenset[str]] = frozenset({"mas-api", "mas-worker"})
 
-#: Signature version. Version one is deliberately refused rather than retained
-#: as an insecure downgrade path: v1 bound only the timestamp, so any captured
-#: call stayed replayable for the whole skew window. v2 puts a random nonce
-#: inside the MAC, and the receiver must consume that nonce exactly once in a
-#: durable receipt store (see ``security/internal_replay.py``).
-SIGNATURE_VERSION: Final[str] = "v2"
-
-#: Bounds enforced by the Rust implementation (`MIN_NONCE_LEN`/`MAX_NONCE_LEN`
-#: in `crates/security/src/internal_service.rs`). A nonce outside them is
-#: rejected on both sides, so the two implementations cannot drift.
-MIN_NONCE_LEN: Final[int] = 22
-MAX_NONCE_LEN: Final[int] = 128
-
-#: Number of random bytes behind a generated nonce (base64url, unpadded).
-NONCE_BYTES: Final[int] = 24
-
+#: `v2:<service>:<millis>:<nonce>:<64 hex chars>`. Every group is bounded so a
+#: hostile header cannot make the regex do work proportional to its length.
 _SIGNATURE_RE: Final[re.Pattern[str]] = re.compile(
-    r"\Av2:([A-Za-z0-9_-]{1,64}):(\d{1,20}):([A-Za-z0-9_-]{1,128}):([0-9a-f]{64})\Z"
+    r"\Av2:([A-Za-z0-9_-]{1,64}):(\d{1,20}):([A-Za-z0-9_-]{22,128}):([0-9a-f]{64})\Z"
 )
-_NONCE_RE: Final[re.Pattern[str]] = re.compile(r"\A[A-Za-z0-9_-]+\Z")
+
+#: Alphabet a nonce may use. Mirrors Rust's `valid_nonce`.
+_NONCE_CHARSET: Final[re.Pattern[str]] = re.compile(r"\A[A-Za-z0-9_-]+\Z")
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,30 +116,30 @@ class InternalServiceIdentity:
     Attributes:
         service: The calling service id, proven against the allowlist.
         signed_at_ms: The timestamp the caller signed, in epoch milliseconds.
-        nonce: The signed random request identity. The caller of
-            :func:`verify_internal_signature` **must** consume it exactly once
-            in a durable receipt store before doing any work; verification
-            alone proves authenticity, not first use.
-        expires_at_ms: When the receipt may be discarded. A nonce is only
-            useful through the accepted skew window, so this is
-            ``signed_at_ms + MAX_SKEW_SECONDS``. It is computed from the signed
-            timestamp rather than the local clock so a receipt outlives the
-            whole window in which the signed request could still be replayed.
+        nonce: The signed random request identity. It must be consumed exactly
+            once by a durable replay guard before application work begins.
     """
 
     service: str
     signed_at_ms: int
-    nonce: str = ""
-    expires_at_ms: int = 0
+    nonce: str
 
-    def __post_init__(self) -> None:
-        """Derives the receipt expiry when the caller did not supply one."""
-        if self.expires_at_ms == 0 and self.signed_at_ms:
-            object.__setattr__(self, "expires_at_ms", self.signed_at_ms + MAX_SKEW_SECONDS * 1000)
+    @property
+    def expires_at_ms(self) -> int:
+        """When this nonce stops being acceptable at all.
+
+        The freshness window already rejects anything older, so a receipt
+        store only has to remember the nonce until then. Keeping a receipt
+        for a nonce whose every use would be refused is pure garbage.
+        """
+        return self.signed_at_ms + MAX_SKEW_SECONDS * 1000
 
     def __str__(self) -> str:
-        """Renders the service and timestamp — never key material."""
-        return f"InternalServiceIdentity(service={self.service}, signed_at_ms={self.signed_at_ms})"
+        """Renders the service, timestamp and nonce — never key material."""
+        return (
+            f"InternalServiceIdentity(service={self.service}, "
+            f"signed_at_ms={self.signed_at_ms}, nonce={self.nonce})"
+        )
 
 
 def _body_digest(body: bytes) -> str:
@@ -139,26 +158,21 @@ def _mac(secret: bytes, service: str, signed_at_ms: int, nonce: str, body: bytes
     The signed message is
     ``v2:<service>:<millis>:<nonce>:<hex sha256(body)>`` — the same string the
     signature header begins with, so a reader comparing the two can see at a
-    glance that the version, service, timestamp and nonce are all inside the
-    MAC and not merely adjacent to it.
-
-    This is byte-identical to ``mac`` in
-    `crates/security/src/internal_service.rs`; the cross-language vectors in
-    ``tests/security/test_internal_service.py`` pin both directions.
+    glance that the version, service, timestamp, nonce and body digest are all
+    inside the MAC and not merely adjacent to it.
     """
-    message = f"{SIGNATURE_VERSION}:{service}:{signed_at_ms}:{nonce}:{_body_digest(body)}".encode()
+    message = f"v2:{service}:{signed_at_ms}:{nonce}:{_body_digest(body)}".encode()
     return hmac.new(secret, message, hashlib.sha256).hexdigest()
 
 
 def new_nonce() -> str:
-    """Returns a fresh random request nonce (base64url, unpadded).
+    """Returns a fresh 24-byte URL-safe nonce without padding (32 characters).
 
-    24 random bytes give 192 bits of entropy, so a collision is not a
-    practical concern and guessing one is infeasible. Unpadded URL-safe base64
-    keeps the value header-safe and inside the 22-128 character bound the Rust
-    verifier enforces.
+    Uses :mod:`secrets`, not :mod:`random`: a predictable nonce would let an
+    attacker pre-compute a receipt collision and replay a captured request
+    inside the freshness window.
     """
-    return base64.urlsafe_b64encode(secrets.token_bytes(NONCE_BYTES)).decode().rstrip("=")
+    return base64.urlsafe_b64encode(secrets.token_bytes(24)).rstrip(b"=").decode("ascii")
 
 
 def signed_internal_signature(
@@ -169,26 +183,41 @@ def signed_internal_signature(
     *,
     nonce: str | None = None,
 ) -> str:
-    """Builds a v2 signature header value.
+    """Builds a signature header value.
 
     Args:
         secret: The shared secret.
         service: The calling service id.
         signed_at_ms: Signing time, in epoch milliseconds.
         body: The exact bytes that will be transmitted.
-        nonce: A nonce to embed. ``None`` generates a fresh random one, which
-            is what production callers must use; a supplied value exists only
-            for the deterministic cross-language vectors.
+        nonce: The request nonce. Omitted by production call sites so a fresh
+            random one is generated per call; supplied only to reproduce a
+            deterministic cross-language vector.
 
     Returns:
-        A header value of the form
-        ``v2:<service>:<millis>:<nonce>:<hex mac>``.
+        A header value of the form ``v2:<service>:<millis>:<nonce>:<hex mac>``.
+
+    Raises:
+        AuthenticationError: If a supplied nonce is outside the accepted band
+            or charset. A caller-chosen nonce is exactly the replay vector
+            this scheme exists to close, so a malformed one fails closed
+            rather than being silently replaced.
     """
     raw = secret.encode("utf-8") if isinstance(secret, str) else secret
-    chosen = nonce if nonce is not None else new_nonce()
+    request_nonce = new_nonce() if nonce is None else nonce
+    if not MIN_NONCE_LENGTH <= len(request_nonce) <= MAX_NONCE_LENGTH:
+        raise AuthenticationError(
+            "internal service nonce is outside the accepted length band",
+            details={"reason": "invalid_nonce"},
+        )
+    if not _NONCE_CHARSET.fullmatch(request_nonce):
+        raise AuthenticationError(
+            "internal service nonce contains characters outside the accepted alphabet",
+            details={"reason": "invalid_nonce"},
+        )
     return (
-        f"{SIGNATURE_VERSION}:{service}:{signed_at_ms}:{chosen}:"
-        f"{_mac(raw, service, signed_at_ms, chosen, body)}"
+        f"v2:{service}:{signed_at_ms}:{request_nonce}:"
+        f"{_mac(raw, service, signed_at_ms, request_nonce, body)}"
     )
 
 
@@ -200,7 +229,13 @@ def verify_internal_signature(
     body: bytes,
     allowed_callers: frozenset[str] | set[str] = DEFAULT_ALLOWED_CALLERS,
 ) -> InternalServiceIdentity:
-    """Verifies an inbound internal call.
+    """Verifies an inbound internal call's cryptographic facts.
+
+    This function proves *authenticity and freshness*. It does not prove
+    single use: the caller must atomically consume
+    :attr:`InternalServiceIdentity.nonce` in a durable receipt store before
+    doing any work. Accepting a request without that consumption is the replay
+    hole v2 exists to close.
 
     Args:
         secret: The shared secret. An empty secret fails closed: no call can
@@ -213,7 +248,7 @@ def verify_internal_signature(
         allowed_callers: Service ids permitted to call this process.
 
     Returns:
-        The proven identity.
+        The proven identity, including the nonce to consume.
 
     Raises:
         AuthenticationError: For every failure mode — missing header,
@@ -240,12 +275,6 @@ def verify_internal_signature(
 
     claimed_service, millis_text, nonce, presented_mac = match.groups()
 
-    # A nonce outside the agreed bounds is refused for the same reason a
-    # missing one is: the value is about to become a durable receipt key, so
-    # an unbounded one is an input-validation hole on both sides.
-    if not (MIN_NONCE_LEN <= len(nonce) <= MAX_NONCE_LEN) or _NONCE_RE.match(nonce) is None:
-        raise refusal
-
     # The service id in the signature and in the header must agree. If they
     # do not, one of them was spliced in transit.
     if not hmac.compare_digest(claimed_service, service):
@@ -271,7 +300,6 @@ def verify_internal_signature(
         service=claimed_service,
         signed_at_ms=signed_at_ms,
         nonce=nonce,
-        expires_at_ms=signed_at_ms + MAX_SKEW_SECONDS * 1000,
     )
 
 

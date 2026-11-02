@@ -307,51 +307,14 @@ fn miskeyed_bridge(port: u16) -> GrpcAgentBridgeConfig {
     }
 }
 
-/// The immutable snapshot the stub runtime executes.
+/// Builds a properly scoped run request, including the immutable agent snapshot
+/// the Python boundary now requires.
 ///
-/// Python refuses a run without one: Rust is the sole authority on which agent
-/// version executes, so a run that carried no snapshot would have to fall back
-/// to Python's local catalog and could execute a different version than the
-/// one Rust resolved. Every request in this suite therefore pins a real
-/// snapshot, scoped to the same agent and tenant the request was built from —
-/// the runtime re-checks that agreement on arrival.
-///
-/// `configuration_checksum` is a fixed 64-character lowercase hex literal
-/// because the Python parser validates both the length and the alphabet before
-/// it will materialize a speculative execution plan.
-fn snapshot(agent_id: AgentId, context: &RuntimeContext) -> AgentRuntimeSnapshot {
-    AgentRuntimeSnapshot {
-        agent_id,
-        tenant_id: context.tenant_id(),
-        organization_id: context.organization_id(),
-        project_id: context.project_id(),
-        agent_version_id: AgentVersionId::new(),
-        version_number: 1,
-        configuration_checksum: "62a7419d8090f1ea8fd6370f1f3a036047a5b0b8e49f74262ab51f794ba441ba"
-            .to_owned(),
-        name: "E2E Echo Agent".to_owned(),
-        slug: "e2e-echo".to_owned(),
-        kind: "standard".to_owned(),
-        status: "active".to_owned(),
-        origin: "user".to_owned(),
-        read_only: false,
-        configuration: AgentRuntimeConfiguration {
-            description: Some("Echoes the prompt for the cross-language suite".to_owned()),
-            model_hint: Some("stub/echo".to_owned()),
-            system_prompt: "Echo the user's prompt back verbatim.".to_owned(),
-            limits: AgentRuntimeLimits {
-                max_steps: 5,
-                max_tool_calls: 0,
-                max_delegation_depth: 0,
-                timeout_seconds: None,
-            },
-            tags: vec!["e2e".to_owned()],
-            allowed_tools: Vec::new(),
-        },
-    }
-}
-
-/// Builds a properly scoped run request.
+/// In production `ResolvedAgentBridge` fills these two fields from the
+/// tenant-scoped published version. This test intentionally drives the raw
+/// `GrpcAgentBridge`, so it must construct the same pair by hand — otherwise it
+/// would exercise a request shape the wire contract no longer allows, and its
+/// "successful" verdicts would prove nothing about the real path.
 fn request() -> AgentRunRequest {
     let context = RuntimeContext::new(
         TenantId::new(),
@@ -362,19 +325,57 @@ fn request() -> AgentRunRequest {
     )
     .expect("context");
 
-    let agent_id = AgentId::new();
     let mut request = AgentRunRequest::from_context(
         &context,
-        agent_id,
+        AgentId::new(),
         serde_json::json!({"prompt": "hello from rust"}),
         ResourceLimits::default(),
         &TokenBudget::unlimited(),
     )
     .expect("request");
 
-    request.agent_snapshot = Some(snapshot(agent_id, &context));
-
+    let snapshot = snapshot_for(&request);
+    request.agent_version = Some(snapshot.agent_version_id.to_string());
+    request.agent_snapshot = Some(snapshot);
     request
+}
+
+/// Builds a valid, executable snapshot for the identities in *request*.
+fn snapshot_for(request: &AgentRunRequest) -> AgentRuntimeSnapshot {
+    let snapshot = AgentRuntimeSnapshot {
+        agent_id: request.agent_id,
+        tenant_id: request.tenant_id.expect("tenant"),
+        organization_id: request.organization_id.expect("organization"),
+        project_id: request.project_id.expect("project"),
+        agent_version_id: AgentVersionId::new(),
+        version_number: 1,
+        // A real lowercase-hex SHA-256; the Python validator rejects anything
+        // that is not exactly 64 lowercase hex characters.
+        configuration_checksum: "a".repeat(64),
+        name: "E2E Agent".to_owned(),
+        slug: "e2e-agent".to_owned(),
+        // Standard, active, tenant-owned: the only combination Python executes
+        // without further authorization decisions of its own.
+        kind: "standard".to_owned(),
+        status: "active".to_owned(),
+        origin: "user".to_owned(),
+        read_only: false,
+        configuration: AgentRuntimeConfiguration {
+            description: Some("cross-language end-to-end agent".to_owned()),
+            model_hint: Some("provider/model-test".to_owned()),
+            system_prompt: "Answer briefly.".to_owned(),
+            limits: AgentRuntimeLimits {
+                max_steps: 4,
+                max_tool_calls: 0,
+                max_delegation_depth: 0,
+                timeout_seconds: None,
+            },
+            tags: vec!["e2e".to_owned()],
+            allowed_tools: Vec::new(),
+        },
+    };
+    snapshot.validate().expect("valid snapshot");
+    snapshot
 }
 
 /// Converts an unavailable bridge prerequisite into a visible test failure.
@@ -472,18 +473,23 @@ fn scoped_request(
     .expect("context")
     .with_request_id(request_id);
 
-    let agent_id = AgentId::new();
     let mut request = AgentRunRequest::from_context(
         &context,
-        agent_id,
+        AgentId::new(),
         serde_json::json!({"prompt": "hello from rust"}),
         ResourceLimits::default(),
         &TokenBudget::unlimited(),
     )
     .expect("request");
-    request.agent_snapshot = Some(snapshot(agent_id, &context));
     request.task_id = Some(TaskId::from_uuid(task_id));
     request.task_attempt_id = Some(TaskAttemptId::from_uuid(task_attempt_id));
+
+    // Same snapshot wiring as `request()`: the raw bridge does not resolve one,
+    // and the Python boundary refuses a run without it and without the pinned
+    // version id that must agree with it.
+    let snapshot = snapshot_for(&request);
+    request.agent_version = Some(snapshot.agent_version_id.to_string());
+    request.agent_snapshot = Some(snapshot);
     request
 }
 

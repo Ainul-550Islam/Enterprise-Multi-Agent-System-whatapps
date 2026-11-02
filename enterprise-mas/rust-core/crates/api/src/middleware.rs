@@ -147,28 +147,11 @@ pub async fn authenticated_layer(
     };
 
     // Global operations are an explicit platform-admin lane, not a fallback
-    // for ordinary callers without a tenant.
-    //
-    // It must *not* swallow an admin that does have a home tenant. That admin
-    // still writes tenant-owned rows (a plan override, a subscription), and
-    // every such table is `ENABLE` + `FORCE ROW LEVEL SECURITY` against
-    // `app.current_tenant`. Returning early skipped scope resolution, so no
-    // GUC was ever armed and the policy refused the insert — `new row violates
-    // row-level security policy for table "subscriptions"` — as a 403 on an
-    // operation the caller is entitled to perform. Worse, the refusal was
-    // indistinguishable from the *cross-tenant* refusal the tests assert, so
-    // the suite could not tell "we forgot to arm the scope" from "we correctly
-    // stopped a cross-tenant write".
-    //
-    // So the untenanted lane is reserved for an admin with genuinely no tenant
-    // binding: only such a principal has nothing to scope. An admin with a home
-    // tenant falls through and is scoped to that tenant, which is exactly the
-    // confinement the policies exist to enforce.
-    let has_home_tenant = principal.tenant_id.is_some();
+    // for ordinary callers without a tenant. Keep it untenanted: every
+    // tenant-owned handler still requires a resolved scope before use.
     if claims.tenant.is_none()
         && claims.organization.is_none()
         && claims.project.is_none()
-        && !has_home_tenant
         && principal.is_usable()
         && principal.scopes.permits("platform:admin")
     {

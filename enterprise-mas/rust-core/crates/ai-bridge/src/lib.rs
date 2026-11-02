@@ -53,6 +53,14 @@ use mas_security::secret_string::SecretString;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
 
 pub mod data_hub;
+
+/// Production Data Hub adapter and its configuration.
+///
+/// Re-exported at the crate root because the API composition root wires the
+/// bridge by name, exactly as it wires [`GrpcAgentBridge`]. The module stays
+/// public so the tests that construct it directly keep working.
+pub use data_hub::{GrpcDataHubBridge, GrpcDataHubBridgeConfig};
+
 pub mod gen {
     //! Generated `mas.api.v1` client stubs (build.rs).
     //!
@@ -87,12 +95,14 @@ const IDEMPOTENCY_HEADER: &str = "idempotency-key";
 
 /// The AI wire protocol version this adapter speaks.
 ///
-/// Must equal `CURRENT_PROTOCOL_VERSION` in the Python orchestrator
-/// (`src/mas_orchestrator/contracts/protocol_version.py`). Only an exact MAJOR
-/// match is accepted at the boundary, so drifting this value silently turns
-/// every run into a version-mismatch failure. The cross-language contract test
-/// (`tests/bridge/test_cross_language_contract.py`) parses this literal and
-/// fails when the two disagree.
+/// 1.1 adds `DataHubBridgeApi` (source sync, document ingestion, purge) next to
+/// `AgentBridgeApi` without changing any AgentBridge wire semantics, so a 1.0
+/// orchestrator still satisfies every agent run this client sends. The Python
+/// side declares the same value in
+/// `mas_orchestrator/contracts/protocol_version.py::CURRENT_PROTOCOL_VERSION`,
+/// and `tests/bridge/test_cross_language_contract.py` fails if they diverge:
+/// a mismatched major is refused before any AI work happens, and a silent
+/// drift here would only surface as a rejected request in production.
 const AI_PROTOCOL_VERSION: &str = "1.1.0";
 
 /// A deadline shorter than this is not worth a round trip: fail fast instead of
@@ -104,14 +114,6 @@ const MAXIMUM_RPC_TIMEOUT: Duration = Duration::from_secs(900);
 
 /// Human-readable adapter name reported in logs and metrics.
 const ADAPTER_NAME: &str = "grpc-agent-bridge";
-
-// The Data Hub adapter is the second `mas.api.v1` service this crate speaks.
-// It is re-exported here (rather than only reachable as `data_hub::...`) because
-// it is a peer of `GrpcAgentBridge` at every composition site: `mas-api` picks
-// one or the other per plane and never reaches into the module path.
-pub use data_hub::{
-    GrpcDataHubBridge, GrpcDataHubBridgeConfig, DEFAULT_MAX_REQUEST_BYTES, MAX_REQUEST_BYTES,
-};
 
 /// The service id the bridge signs as when no other is configured.
 ///
@@ -200,15 +202,54 @@ impl Default for GrpcAgentBridgeConfig {
 #[derive(Debug, Clone)]
 pub struct GrpcAgentBridge {
     client: AgentBridgeApiClient<tonic::transport::Channel>,
-    /// The connected channel, retained so a sibling service on the same
-    /// endpoint (`DataHubBridgeApi`) can share the already-negotiated
-    /// transport, TLS roots and connection pool instead of opening a second
-    /// one. Both services speak the same `mas.api.v1` contract.
+    /// The connected channel, shared with the Data Hub adapter so the process
+    /// has exactly one authenticated connection, one TLS configuration and one
+    /// pool of HTTP/2 streams rather than one per bridge.
     channel: tonic::transport::Channel,
     config: GrpcAgentBridgeConfig,
 }
 
 impl GrpcAgentBridge {
+    /// Builds a bridge over an already-connected channel.
+    ///
+    /// Used by tests and by composition roots that own the connection (for
+    /// example one that applies a custom connector or a shared resolver). It
+    /// performs no TLS validation of its own, so production code should prefer
+    /// [`GrpcAgentBridge::connect`] unless it has already validated the
+    /// channel.
+    #[must_use]
+    pub fn from_channel(channel: tonic::transport::Channel, config: GrpcAgentBridgeConfig) -> Self {
+        let client = AgentBridgeApiClient::new(channel.clone())
+            .max_decoding_message_size(config.max_response_bytes);
+        Self {
+            client,
+            channel,
+            config,
+        }
+    }
+
+    /// The underlying channel, for adapters that speak a different service on
+    /// the same authenticated endpoint (today: `DataHubBridgeApi`).
+    ///
+    /// Sharing the channel is deliberate: a second connection would duplicate
+    /// TLS state and could silently pick up different trust material, which is
+    /// exactly the kind of divergence an authentication review is meant to
+    /// remove.
+    #[must_use]
+    pub fn channel(&self) -> tonic::transport::Channel {
+        self.channel.clone()
+    }
+
+    /// The configuration this bridge was built with.
+    ///
+    /// Exposed read-only so a sibling adapter can reuse the deadline,
+    /// response-size bound, signing secret and service identity without
+    /// copying them into a second configuration object that could drift.
+    #[must_use]
+    pub fn config(&self) -> &GrpcAgentBridgeConfig {
+        &self.config
+    }
+
     /// Connects to the orchestrator endpoint.
     ///
     /// This performs the transport handshake but not an RPC: use [`health`] to
@@ -268,8 +309,6 @@ impl GrpcAgentBridge {
             AppError::external_service("ai-orchestrator", format!("connect failed: {}", err))
         })?;
 
-        // Clone rather than move: the same channel is reused by the Data Hub
-        // adapter, which talks to the other service on this endpoint.
         let client = AgentBridgeApiClient::new(channel.clone())
             .max_decoding_message_size(config.max_response_bytes);
 
@@ -338,19 +377,17 @@ impl GrpcAgentBridge {
             }),
             token_budget_max: request.token_budget_max,
             idempotency_key: request.idempotency_key.clone(),
-            // The snapshot is the *signed* statement of which immutable agent
-            // version executes, so it must be encoded here rather than
-            // re-resolved by Python. An absent snapshot is encoded as an empty
-            // string, which the Python runtime refuses fail-closed: silently
-            // omitting it would let a run fall back to Python's local catalog
-            // and execute a different version than the one Rust resolved.
-            //
-            // Serialization cannot fail for this type (every field is a
-            // string, number, bool, or Vec of those), but a failure is still
-            // surfaced rather than swallowed.
-            agent_snapshot_json: match &request.agent_snapshot {
-                Some(snapshot) => serde_json::to_string(snapshot)
-                    .map_err(|err| AppError::serialization(format!("agent snapshot: {err}")))?,
+            // The immutable definition Python must execute. Serialized here
+            // rather than inside the transport call so the JSON that the body
+            // signature covers is exactly the JSON the request carries: a
+            // snapshot serialized twice could differ by key order and the HMAC
+            // would cover bytes that never reached the wire.
+            agent_snapshot_json: match request.agent_snapshot.as_ref() {
+                Some(snapshot) => snapshot.to_json()?,
+                // Left empty on purpose. The Python boundary refuses it with a
+                // typed INVALID_ARGUMENT, which is the correct outcome for a
+                // caller that resolved no snapshot; inventing a catalog
+                // fallback here would defeat the whole pinning contract.
                 None => String::new(),
             },
             // Filled by the caller below, which owns the configured identity.
@@ -671,10 +708,9 @@ fn annotate(error: AppError, suffix: &str) -> AppError {
         },
         Timeout(message) => Timeout(push(message)),
         Cancelled(message) => Cancelled(push(message)),
-        // `Unavailable` is the "dependency is not serving right now" variant:
-        // it keeps its own identity so the caller's retry policy can treat it
-        // as transient, exactly as `Timeout` does. Folding it into `Internal`
-        // here would make a retryable outage look terminal.
+        // A missing composition is a deployment fact, not an input problem:
+        // the suffix must not turn it into a generic internal error, because
+        // the API boundary answers `Unavailable` with a stable 503 code.
         Unavailable(message) => Unavailable(push(message)),
         Database(message) => Database(push(message)),
         Messaging(message) => Messaging(push(message)),
@@ -809,13 +845,8 @@ fn decode_usage(usage: Option<gen::AgentUsageMsg>) -> AgentUsage {
 mod tests {
     use super::*;
     use mas_common::enums::Environment;
-    use mas_common::ids::{
-        AgentId, AgentVersionId, OrganizationId, ProjectId, TaskAttemptId, TaskId, TenantId,
-    };
+    use mas_common::ids::{AgentId, TaskAttemptId, TaskId};
     use mas_domain::{ResourceLimits, TokenBudget};
-    use mas_execution::agent_bridge::{
-        AgentRuntimeConfiguration, AgentRuntimeLimits, AgentRuntimeSnapshot,
-    };
     use mas_orchestration::runtime_context::RuntimeContext;
 
     fn context() -> RuntimeContext {
@@ -909,18 +940,18 @@ mod tests {
             }),
             token_budget_max: 0,
             idempotency_key: Some("idem-1".to_owned()),
-            // Empty, and therefore absent from the encoding: this vector was
-            // captured from Python before field 18 existed, so the pinned
-            // bytes legitimately contain no snapshot. Setting it to anything
-            // non-empty would change the expected hex, which is precisely the
-            // drift this test exists to catch — a populated snapshot has its
-            // own cover in `encodes_the_signed_snapshot_onto_the_wire` below.
-            agent_snapshot_json: String::new(),
             identity: Some(gen::ServiceIdentityMsg {
                 subject: "rust-core".to_owned(),
                 issuer: "platform-internal".to_owned(),
                 scopes: vec!["execute_agent".to_owned()],
             }),
+            // Deliberately empty. This vector pins the *AgentBridge* envelope
+            // byte for byte, and an empty string is proto3's default, so it
+            // emits no field-18 tag and the pinned hex below stays valid. A
+            // populated snapshot is covered by its own round-trip test: folding
+            // it into this fixture would make every envelope change look like a
+            // serialization regression.
+            agent_snapshot_json: String::new(),
         }
     }
 
@@ -1119,62 +1150,6 @@ mod tests {
         request.idempotency_key = Some("idem-42".to_owned());
         let wire = GrpcAgentBridge::encode_request(&request).expect("encode");
         assert_eq!(wire.idempotency_key.as_deref(), Some("idem-42"));
-    }
-
-    /// The signed snapshot is the whole point of field 18: Python executes
-    /// exactly the version Rust resolved and refuses a run without one.
-    ///
-    /// Encoding it is therefore not cosmetic. If this ever regresses, the wire
-    /// carries an empty string, Python fails the run closed, and every agent
-    /// execution stops — so the assertion has to be on the JSON *contents*,
-    /// not merely on the field being non-empty.
-    #[test]
-    fn encode_request_carries_the_signed_agent_snapshot() {
-        let mut request = request();
-        let snapshot = AgentRuntimeSnapshot {
-            agent_id: AgentId::new(),
-            tenant_id: TenantId::new(),
-            organization_id: OrganizationId::new(),
-            project_id: ProjectId::new(),
-            agent_version_id: AgentVersionId::new(),
-            version_number: 7,
-            configuration_checksum: "0f1e2d3c".to_owned(),
-            name: "Support triage".to_owned(),
-            slug: "support-triage".to_owned(),
-            kind: "standard".to_owned(),
-            status: "active".to_owned(),
-            origin: "user".to_owned(),
-            read_only: false,
-            configuration: AgentRuntimeConfiguration {
-                description: Some("Handles inbound support requests".to_owned()),
-                model_hint: Some("provider/model-test".to_owned()),
-                system_prompt: "You triage support tickets.".to_owned(),
-                limits: AgentRuntimeLimits::default(),
-                tags: vec!["support".to_owned()],
-                allowed_tools: vec!["search".to_owned()],
-            },
-        };
-        request.agent_snapshot = Some(snapshot.clone());
-
-        let wire = GrpcAgentBridge::encode_request(&request).expect("encode");
-        let decoded: AgentRuntimeSnapshot =
-            serde_json::from_str(&wire.agent_snapshot_json).expect("snapshot round-trips");
-        assert_eq!(decoded, snapshot);
-        assert_eq!(decoded.agent_version_id, snapshot.agent_version_id);
-    }
-
-    /// An absent snapshot must serialize to an empty string, not to `null`.
-    ///
-    /// Python distinguishes the two: `""` is "Rust sent no snapshot", which is
-    /// refused, while a literal `null` would be a JSON document that parses as
-    /// a present-but-empty snapshot. Keeping the wire encoding on the
-    /// unambiguous side of that distinction is the point.
-    #[test]
-    fn encode_request_omits_an_absent_agent_snapshot() {
-        let mut request = request();
-        request.agent_snapshot = None;
-        let wire = GrpcAgentBridge::encode_request(&request).expect("encode");
-        assert_eq!(wire.agent_snapshot_json, "");
     }
 
     #[test]

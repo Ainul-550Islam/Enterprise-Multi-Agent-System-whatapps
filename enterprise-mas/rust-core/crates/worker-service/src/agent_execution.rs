@@ -597,7 +597,8 @@ mod tests {
     use super::*;
     use mas_common::error::AppError;
     use mas_common::ids::{
-        AgentId, ExecutionId, OrganizationId, ProjectId, TaskAttemptId, TaskId, TenantId,
+        AgentId, AgentVersionId, ExecutionId, OrganizationId, ProjectId, TaskAttemptId, TaskId,
+        TenantId,
     };
     use mas_execution::agent_bridge::{AgentRunVerdict, AgentUsage};
     // `execute` comes from the trait, not from an inherent impl: the handler is
@@ -614,6 +615,7 @@ mod tests {
             serde_json::json!({"prompt": "hello"}),
             Some(ExecutionId::new()),
             Some(AgentId::new()),
+            Some(AgentVersionId::new()),
             None,
             "idem-1".to_owned(),
             mas_common::enums::TaskPriority::Normal,
@@ -967,9 +969,47 @@ mod tests {
         assert!(rendered.contains(PATH_TOKEN), "names the key: {rendered}");
     }
 
+    /// Serialises tests that mutate the process environment.
+    ///
+    /// `std::env` is process-global, so two tests that remove/restore `MAS_ENV`
+    /// concurrently observe each other's writes and one of them sees the wrong
+    /// environment. Every test using `EnvGuard` must take this lock for the
+    /// whole body.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Clears `MAS_ENV` for the duration of a test and restores it on drop.
+    ///
+    /// `Merger::string` resolves `env → file.path → default`, so an inherited
+    /// `MAS_ENV` (scripts/check.sh exports `MAS_ENV=test`) silently overrides
+    /// the `environment = "production"` table these tests build, and the
+    /// production assertions then test the wrong configuration.
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn remove(key: &'static str) -> Self {
+            let previous = std::env::var(key).ok();
+            std::env::remove_var(key);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
     #[test]
     fn production_settings_require_https_transport() {
         use mas_common::config::Merger;
+        let _serialised = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::remove("MAS_ENV");
         let mut table = toml::Table::new();
         table.insert(
             "environment".to_owned(),
@@ -998,6 +1038,8 @@ mod tests {
     #[test]
     fn production_settings_require_the_python_shared_signing_secret() {
         use mas_common::config::Merger;
+        let _serialised = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::remove("MAS_ENV");
         let mut table = toml::Table::new();
         table.insert(
             "environment".to_owned(),

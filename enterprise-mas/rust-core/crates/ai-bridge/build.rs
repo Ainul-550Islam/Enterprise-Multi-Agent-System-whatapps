@@ -18,9 +18,13 @@ fn main() {
     std::env::set_var("PROTOC", &protoc);
     println!("cargo:rerun-if-changed=../../crates/api/proto/mas/api/v1/mas.proto");
     tonic_build::configure()
-        // We call Python; we never serve this service from Rust.
+        // We call Python; we never serve either service from Rust.
         .build_server(false)
         .build_client(true)
+        // Both surfaces live in this one file: `DataHubBridgeApi` imports the
+        // shared `Empty` from the same package, so splitting the contract into
+        // two files would put two generated modules in one Rust module and
+        // collide on the package descriptor.
         .compile_protos(
             &["../../crates/api/proto/mas/api/v1/mas.proto"],
             &["../../crates/api/proto"],

@@ -1,3 +1,22 @@
+# PURPOSE: NetworkPolicy set for the enterprise-mas chart.
+#
+# Default deny everything, then allow exactly the flows the workloads need.
+#
+# Two facts drive the shape of these rules:
+#
+#   1. PostgreSQL and NATS are NOT part of this chart. They are managed
+#      services elsewhere in the cluster (or outside it), which is why the
+#      chart has no postgres/nats Deployment. An egress rule that selects a
+#      `component: postgres` pod in *this* namespace therefore matches nothing
+#      and silently blocks the database. External dependencies are allowed by
+#      namespace selector instead, on their well-known ports.
+#
+#   2. A default-deny that includes Egress also blocks DNS. Without an explicit
+#      allow to the cluster resolver, every pod fails to resolve `-postgres`,
+#      `-nats` and `-orchestrator`, and the release never becomes ready. The
+#      allow-dns policy below is what makes the rest of these rules usable.
+{{- if .Values.networkPolicy.enabled }}
+# ── Default deny ────────────────────────────────────────────────────────────
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -9,9 +28,31 @@ spec:
   policyTypes:
     - Ingress
     - Egress
-  # Default deny all ingress/egress; specific allow rules below.
-
 ---
+# ── DNS: required by every pod, or nothing resolves ─────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "enterprise-mas.fullname" . }}-allow-dns
+  labels:
+    {{- include "enterprise-mas.labels" . | nindent 4 }}
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    # kube-dns / CoreDNS in kube-system.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+---
+# ── api: inbound from the ingress gateway ───────────────────────────────────
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -27,45 +68,49 @@ spec:
     - Ingress
   ingress:
     - from:
-        - namespaceSelector: {}   # ingress gateway (when enabled)
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.ingressNamespace }}
       ports:
         - port: 8080
           protocol: TCP
-
+        - port: 50051
+          protocol: TCP
 ---
+# ── orchestrator: inbound from the Rust workloads only ──────────────────────
+# The bridge port is private. Nothing outside this release may reach it.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: {{ include "enterprise-mas.fullname" . }}-allow-to-postgres-nats
+  name: {{ include "enterprise-mas.fullname" . }}-allow-ingress-orchestrator
   labels:
     {{- include "enterprise-mas.labels" . | nindent 4 }}
 spec:
   podSelector:
     matchLabels:
-      component: api
+      {{- include "enterprise-mas.selectorLabels" . | nindent 6 }}
+      component: orchestrator
   policyTypes:
-    - Egress
-  egress:
-    - to:
+    - Ingress
+  ingress:
+    - from:
         - podSelector:
             matchLabels:
-              component: postgres
-      ports:
-        - port: 5432
-          protocol: TCP
-    - to:
+              {{- include "enterprise-mas.selectorLabels" . | nindent 14 }}
+              component: api
         - podSelector:
             matchLabels:
-              component: nats
+              {{- include "enterprise-mas.selectorLabels" . | nindent 14 }}
+              component: worker
       ports:
-        - port: 4222
+        - port: 9100
           protocol: TCP
-
 ---
+# ── egress: api ─────────────────────────────────────────────────────────────
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: {{ include "enterprise-mas.fullname" . }}-allow-to-orchestrator
+  name: {{ include "enterprise-mas.fullname" . }}-egress-api
   labels:
     {{- include "enterprise-mas.labels" . | nindent 4 }}
 spec:
@@ -76,11 +121,97 @@ spec:
   policyTypes:
     - Egress
   egress:
+    {{- include "enterprise-mas.dataEgress" . | nindent 4 }}
     - to:
         - podSelector:
             matchLabels:
-              {{- include "enterprise-mas.selectorLabels" $ | nindent 14 }}
+              {{- include "enterprise-mas.selectorLabels" . | nindent 14 }}
               component: orchestrator
       ports:
         - port: 9100
           protocol: TCP
+---
+# ── egress: worker (postgres, nats, orchestrator) ───────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "enterprise-mas.fullname" . }}-egress-worker
+  labels:
+    {{- include "enterprise-mas.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "enterprise-mas.selectorLabels" . | nindent 6 }}
+      component: worker
+  policyTypes:
+    - Egress
+  egress:
+    {{- include "enterprise-mas.dataEgress" . | nindent 4 }}
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "enterprise-mas.selectorLabels" . | nindent 14 }}
+              component: orchestrator
+      ports:
+        - port: 9100
+          protocol: TCP
+---
+# ── egress: scheduler (postgres, nats, api) ─────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "enterprise-mas.fullname" . }}-egress-scheduler
+  labels:
+    {{- include "enterprise-mas.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "enterprise-mas.selectorLabels" . | nindent 6 }}
+      component: scheduler
+  policyTypes:
+    - Egress
+  egress:
+    {{- include "enterprise-mas.dataEgress" . | nindent 4 }}
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "enterprise-mas.selectorLabels" . | nindent 14 }}
+              component: api
+      ports:
+        - port: 8080
+          protocol: TCP
+---
+# ── egress: orchestrator (postgres for the RAG plane only) ──────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "enterprise-mas.fullname" . }}-egress-orchestrator
+  labels:
+    {{- include "enterprise-mas.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "enterprise-mas.selectorLabels" . | nindent 6 }}
+      component: orchestrator
+  policyTypes:
+    - Egress
+  egress:
+    {{- include "enterprise-mas.dataEgress" . | nindent 4 }}
+---
+# ── egress: migrate job (postgres only, and only until it completes) ────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "enterprise-mas.fullname" . }}-egress-migrate
+  labels:
+    {{- include "enterprise-mas.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "enterprise-mas.selectorLabels" . | nindent 6 }}
+      component: migrate
+  policyTypes:
+    - Egress
+  egress:
+    {{- include "enterprise-mas.dataEgress" . | nindent 4 }}
+{{- end }}

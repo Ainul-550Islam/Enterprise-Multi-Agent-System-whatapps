@@ -32,12 +32,15 @@ use mas_common::ids::{
 };
 use mas_common::result::Result;
 use mas_common::timestamps::Timestamp;
+use mas_domain::agent::{Agent, AgentKind, AgentOrigin};
+use mas_domain::agent_version::AgentVersion;
 use mas_orchestration::cancellation::CancellationToken;
 use mas_orchestration::runtime_context::RuntimeContext;
 use mas_orchestration::timeout::Deadline;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;
+use std::str::FromStr;
 use std::time::Duration;
 
 /// Final status of an agent run.
@@ -68,296 +71,6 @@ impl AgentUsage {
     #[must_use]
     pub const fn total_tokens(&self) -> u64 {
         self.tokens_input.saturating_add(self.tokens_output)
-    }
-}
-
-/// Execution limits the Python runtime must honour for one agent.
-///
-/// This is the *agent-defined* envelope, distinct from the per-run
-/// [`mas_domain::ResourceLimits`] carried by [`AgentRunRequest`]: these values
-/// come from the immutable agent version, while the request limits come from
-/// the caller and the platform's own budgets. The runtime enforces whichever
-/// is tighter.
-///
-/// It is serialized field-for-field into `configuration.limits` of the signed
-/// runtime snapshot, so the JSON names are contract (`snake_case`, no renames).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct AgentRuntimeLimits {
-    /// Maximum number of execution steps the agent may take.
-    pub max_steps: u32,
-    /// Maximum tool invocations. `0` means "no tool use permitted".
-    pub max_tool_calls: u32,
-    /// Maximum delegation depth for supervisor agents.
-    pub max_delegation_depth: u32,
-    /// Wall-clock timeout for one run, in seconds. `None` means "inherit the
-    /// request deadline"; it is serialized as JSON `null` rather than omitted
-    /// because the runtime's snapshot schema is closed (unknown *and* missing
-    /// keys are both rejected).
-    pub timeout_seconds: Option<f64>,
-}
-
-impl Default for AgentRuntimeLimits {
-    fn default() -> Self {
-        Self {
-            max_steps: 100,
-            max_tool_calls: 50,
-            max_delegation_depth: 0,
-            timeout_seconds: None,
-        }
-    }
-}
-
-/// The agent configuration an executable runtime needs, projected from the
-/// immutable [`mas_domain::AgentVersion`] rather than from live mutable state.
-///
-/// The field set is the closed `configuration` object of the runtime snapshot
-/// schema (`grpc/agent_snapshot.py`); adding or removing a field is a protocol
-/// change on both sides.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct AgentRuntimeConfiguration {
-    /// Operator-facing description.
-    pub description: Option<String>,
-    /// Opaque model/endpoint reference resolved by the Python runtime. Rust
-    /// never interprets it.
-    pub model_hint: Option<String>,
-    /// The versioned system prompt.
-    pub system_prompt: String,
-    /// Agent-defined execution limits.
-    pub limits: AgentRuntimeLimits,
-    /// Free-form tags.
-    pub tags: Vec<String>,
-    /// Tool identifiers the agent is permitted to invoke. The Python runtime
-    /// rejects unknown tools and Rust enforces the same list at the tool
-    /// permission boundary.
-    pub allowed_tools: Vec<String>,
-}
-
-/// A closed, tenant-scoped, immutable view of one agent version.
-///
-/// The worker resolves this from PostgreSQL inside an authoritative-scope
-/// transaction and pins it onto the outbound run, so the Python runtime never
-/// falls back to its own catalog for agent definitions. That is what keeps
-/// Rust the sole authority on which agent version actually executes.
-///
-/// The JSON projection of this struct is the signed `agent_snapshot_json`
-/// body; its schema is closed (`deny_unknown_fields` on the way out is the
-/// Python parser's job, but this struct must serialize exactly the documented
-/// keys and nothing else).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct AgentRuntimeSnapshot {
-    /// Agent identity.
-    pub agent_id: AgentId,
-    /// Authoritative tenant scope the agent belongs to.
-    pub tenant_id: TenantId,
-    /// Authoritative organization scope.
-    pub organization_id: OrganizationId,
-    /// Authoritative project scope.
-    pub project_id: ProjectId,
-    /// The exact immutable version being executed.
-    pub agent_version_id: AgentVersionId,
-    /// Monotonic per-agent version number, `>= 1`.
-    pub version_number: u64,
-    /// Lowercase hex SHA-256 of the versioned configuration.
-    pub configuration_checksum: String,
-    /// Human-readable name.
-    pub name: String,
-    /// URL-safe slug.
-    pub slug: String,
-    /// Agent kind as its canonical wire string (`standard`, `supervisor`,
-    /// `tool_user`).
-    pub kind: String,
-    /// Lifecycle status as its canonical wire string. Only `active` is
-    /// executable; the runtime rejects anything else.
-    pub status: String,
-    /// Ownership class (`user` or `system`).
-    pub origin: String,
-    /// Whether the agent is platform-owned and therefore immutable for the
-    /// tenant. Derived from `origin`, not stored separately.
-    pub read_only: bool,
-    /// The versioned runtime configuration.
-    pub configuration: AgentRuntimeConfiguration,
-}
-
-/// Source of the versioned configuration that an [`AgentRuntimeConfiguration`]
-/// is projected from.
-///
-/// The published `configuration_snapshot` JSON is written by the agent-publish
-/// use case and is the authoritative record of what was published. It is
-/// therefore the only input this projection accepts: reading the live mutable
-/// [`mas_domain::Agent`] instead would let a post-publish edit silently change
-/// what "version N" means.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AgentSnapshotMetadataSource<'a> {
-    /// The versioned, immutable snapshot document.
-    PublishedSnapshot(&'a serde_json::Value),
-}
-
-impl AgentRuntimeConfiguration {
-    /// Projects the closed runtime configuration out of a published version
-    /// snapshot.
-    ///
-    /// Recognised keys (all optional except `system_prompt`):
-    /// `description`, `model_hint`, `system_prompt`, `limits`, `tags`,
-    /// `allowed_tools`.
-    ///
-    /// A document that is not a JSON object is refused rather than coerced.
-    /// Missing optional fields take their documented defaults; a missing or
-    /// non-string `system_prompt` is an error, because silently running an
-    /// agent with an empty system prompt would be a behavioural change nobody
-    /// asked for.
-    pub fn from_published_snapshot(
-        snapshot: AgentSnapshotMetadataSource<'_>,
-    ) -> Result<AgentRuntimeConfiguration> {
-        let AgentSnapshotMetadataSource::PublishedSnapshot(document) = snapshot;
-        let object = document.as_object().ok_or_else(|| {
-            AppError::invalid_field(
-                "configuration_snapshot",
-                "invalid_type",
-                "published agent configuration must be a JSON object",
-            )
-        })?;
-
-        let optional_string = |key: &str| -> Result<Option<String>> {
-            match object.get(key) {
-                None | Some(serde_json::Value::Null) => Ok(None),
-                Some(serde_json::Value::String(value)) => Ok(Some(value.clone())),
-                Some(_) => Err(AppError::invalid_field(
-                    "configuration_snapshot",
-                    "invalid_type",
-                    format!("agent configuration field `{key}` must be a string"),
-                )),
-            }
-        };
-
-        let system_prompt = match object.get("system_prompt") {
-            Some(serde_json::Value::String(value)) => value.clone(),
-            Some(_) => {
-                return Err(AppError::invalid_field(
-                    "configuration_snapshot",
-                    "invalid_type",
-                    "agent configuration field `system_prompt` must be a string",
-                ))
-            },
-            None => {
-                return Err(AppError::invalid_field(
-                    "configuration_snapshot",
-                    "missing",
-                    "published agent configuration has no system_prompt",
-                ))
-            },
-        };
-
-        let string_list = |key: &str| -> Result<Vec<String>> {
-            match object.get(key) {
-                None | Some(serde_json::Value::Null) => Ok(Vec::new()),
-                Some(serde_json::Value::Array(items)) => items
-                    .iter()
-                    .map(|item| {
-                        item.as_str().map(str::to_owned).ok_or_else(|| {
-                            AppError::invalid_field(
-                                "configuration_snapshot",
-                                "invalid_type",
-                                format!("agent configuration list `{key}` must contain strings"),
-                            )
-                        })
-                    })
-                    .collect(),
-                Some(_) => Err(AppError::invalid_field(
-                    "configuration_snapshot",
-                    "invalid_type",
-                    format!("agent configuration field `{key}` must be a list of strings"),
-                )),
-            }
-        };
-
-        let limits = match object.get("limits") {
-            None | Some(serde_json::Value::Null) => AgentRuntimeLimits::default(),
-            Some(value) => serde_json::from_value(value.clone()).map_err(|error| {
-                AppError::invalid_field(
-                    "configuration_snapshot",
-                    "invalid_type",
-                    format!("agent configuration `limits` is malformed: {error}"),
-                )
-            })?,
-        };
-
-        Ok(Self {
-            description: optional_string("description")?,
-            model_hint: optional_string("model_hint")?,
-            system_prompt,
-            limits,
-            tags: string_list("tags")?,
-            allowed_tools: string_list("allowed_tools")?,
-        })
-    }
-}
-
-impl AgentRuntimeSnapshot {
-    /// Projects an executable snapshot from the loaded aggregate and the
-    /// selected immutable version.
-    ///
-    /// Both aggregates are rechecked here, so a caller that forgets to filter
-    /// cannot produce a snapshot whose identity disagrees with its own
-    /// version: the version must belong to the agent, and the agent must be
-    /// executable.
-    pub fn from_domain(
-        agent: &mas_domain::Agent,
-        version: &mas_domain::AgentVersion,
-    ) -> Result<Self> {
-        if version.agent_id() != agent.id {
-            return Err(AppError::validation(
-                "selected agent version does not belong to the resolved agent",
-            ));
-        }
-        if !agent.is_executable() {
-            return Err(AppError::validation(
-                "agent is not executable in its current lifecycle state",
-            ));
-        }
-        if version.version_number() == 0 {
-            return Err(AppError::validation(
-                "agent version number must be positive",
-            ));
-        }
-        let configuration = AgentRuntimeConfiguration::from_published_snapshot(
-            AgentSnapshotMetadataSource::PublishedSnapshot(version.configuration_snapshot()),
-        )?;
-        let read_only = agent.origin == mas_domain::AgentOrigin::System;
-        Ok(Self {
-            agent_id: agent.id,
-            tenant_id: agent.tenant_id,
-            organization_id: agent.organization_id,
-            project_id: agent.project_id,
-            agent_version_id: version.id(),
-            version_number: version.version_number(),
-            configuration_checksum: version.configuration_checksum().to_owned(),
-            name: agent.name.clone(),
-            slug: agent.slug.as_str().to_owned(),
-            kind: agent.kind.as_str().to_owned(),
-            status: agent.status.as_str().to_owned(),
-            origin: agent.origin.as_str().to_owned(),
-            read_only,
-            configuration,
-        })
-    }
-
-    /// Serialises the snapshot into the closed JSON body the Python runtime
-    /// validates, and enforces the same 512 KiB ceiling it enforces so an
-    /// oversized snapshot fails here (with the caller's identity in the log)
-    /// rather than across the wire.
-    pub fn to_wire_json(&self) -> Result<String> {
-        const MAX_SNAPSHOT_BYTES: usize = 512 * 1024;
-        let encoded = serde_json::to_string(self).map_err(|error| {
-            AppError::serialization(format!("agent runtime snapshot JSON: {error}"))
-        })?;
-        if encoded.len() > MAX_SNAPSHOT_BYTES {
-            return Err(AppError::validation(format!(
-                "agent runtime snapshot is {} bytes; the runtime accepts at most {}",
-                encoded.len(),
-                MAX_SNAPSHOT_BYTES
-            )));
-        }
-        Ok(encoded)
     }
 }
 
@@ -414,14 +127,15 @@ pub struct AgentRunRequest {
     /// deduplication requested", which is legal for one-shot runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
-
-    /// The Rust-resolved, signed agent snapshot pinned to this run.
+    /// Immutable, tenant-scoped agent definition resolved by Rust for *this*
+    /// run.
     ///
-    /// A production adapter MUST populate this before crossing the trust
-    /// boundary and the Python runtime refuses a run without one. It is
-    /// optional in the type so that in-process callers which never cross the
-    /// boundary (workflow node executors, unit fixtures) need not fabricate a
-    /// snapshot they did not resolve.
+    /// This is the only source Python may execute from: it carries the exact
+    /// published version, its configuration and its ceilings, so Python never
+    /// substitutes a process-local catalog entry for a Rust-owned agent id.
+    /// The canonical worker path fills it through
+    /// [`AgentRuntimeSnapshotResolver`]; a request that reaches the wire
+    /// without it is refused by the Python boundary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_snapshot: Option<AgentRuntimeSnapshot>,
 
@@ -462,9 +176,9 @@ impl AgentRunRequest {
             // idempotency key of its own; deduplication for dispatched work is
             // set by the caller that owns the durable task.
             idempotency_key: None,
-            // A workflow node execution resolves its agent in-process; the
-            // cross-boundary worker path attaches the snapshot through
-            // `ResolvedAgentBridge` instead.
+            // Filled by the canonical worker decorator
+            // (`ResolvedAgentBridge`), which resolves the tenant-scoped
+            // published version before this request reaches the wire.
             agent_snapshot: None,
             cancellation: context.cancellation().child(),
         })
@@ -527,24 +241,6 @@ pub enum AgentRunVerdict {
     },
 }
 
-/// Resolves the immutable agent snapshot a run must execute against.
-///
-/// This is a separate port from [`AgentBridge`] on purpose: resolving the
-/// snapshot is a Rust-owned, tenant-scoped database read, while running the
-/// agent crosses into Python. Keeping them apart lets the transport adapter
-/// stay purely a transport, and lets the worker wrap any bridge with a
-/// resolver without the bridge knowing where snapshots come from.
-#[async_trait::async_trait]
-pub trait AgentRuntimeSnapshotResolver: Send + Sync + fmt::Debug {
-    /// Resolves the exact version the request asked for (or the current
-    /// published version when the request pins none).
-    ///
-    /// Implementations must already be inside an RLS-armed transaction or open
-    /// one, and must recheck every identifier in the returned snapshot against
-    /// the request scope.
-    async fn resolve(&self, request: &AgentRunRequest) -> Result<AgentRuntimeSnapshot>;
-}
-
 /// The bridge port.
 #[async_trait::async_trait]
 pub trait AgentBridge: Send + Sync + fmt::Debug {
@@ -559,6 +255,448 @@ pub trait AgentBridge: Send + Sync + fmt::Debug {
     async fn health(&self) -> Result<()> {
         Ok(())
     }
+}
+
+// =============================================================================
+// Rust-owned runtime snapshot
+// =============================================================================
+//
+// PURPOSE:
+// The immutable, tenant-scoped agent definition Rust resolves for one run and
+// hands to Python. Rust owns the agent catalog, the published versions and the
+// authorization decision; Python owns execution only. A snapshot is therefore
+// the *only* input from which Python may execute an agent — it may never
+// substitute a process-local catalog entry for a Rust agent id.
+//
+// The wire projection of this structure is `agent_snapshot_json` on
+// `AgentRunRequest` (mas/api/v1/mas.proto) and the closed schema enforced by
+// `mas_orchestrator.grpc.agent_snapshot` on the Python side. The two must be
+// changed together; the Python validator rejects unknown or missing fields, so
+// a silent divergence fails closed rather than degrading.
+
+/// Resource ceilings a snapshot may impose on one execution.
+///
+/// Mirrors `mas_orchestrator.agents.base.AgentLimits`. Kept separate from
+/// [`mas_domain::ResourceLimits`] because these are *runtime* ceilings enforced
+/// inside the AI process, while `ResourceLimits` is the platform envelope that
+/// also governs scheduling and payload size.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct AgentRuntimeLimits {
+    /// Maximum model/tool steps.
+    pub max_steps: u32,
+    /// Maximum tool invocations (`0` = the agent may not call tools at all).
+    pub max_tool_calls: u32,
+    /// Maximum delegation depth (`0` = may not delegate).
+    pub max_delegation_depth: u32,
+    /// Optional wall-clock ceiling for the agent's own work, in seconds.
+    ///
+    /// Always serialized, including as `null`. The Python boundary validates
+    /// the snapshot against a *closed* schema: a missing key is rejected
+    /// exactly like an unknown one, so omitting this when absent would make
+    /// every snapshot without an explicit timeout undeliverable. "Absent" is
+    /// therefore encoded as an explicit `null` rather than by omission.
+    pub timeout_seconds: Option<f64>,
+}
+
+impl Default for AgentRuntimeLimits {
+    fn default() -> Self {
+        Self {
+            max_steps: 25,
+            max_tool_calls: 50,
+            max_delegation_depth: 2,
+            timeout_seconds: None,
+        }
+    }
+}
+
+impl AgentRuntimeLimits {
+    /// Rejects values the Python boundary would refuse anyway, so a
+    /// misconfiguration is caught at resolution time rather than as a failed
+    /// model call later.
+    fn validate(&self) -> Result<()> {
+        if self.max_steps == 0 {
+            return Err(AppError::invalid_field(
+                "limits.max_steps",
+                "out_of_range",
+                "max_steps must be at least 1",
+            ));
+        }
+        if let Some(seconds) = self.timeout_seconds {
+            if !seconds.is_finite() || seconds <= 0.0 {
+                return Err(AppError::invalid_field(
+                    "limits.timeout_seconds",
+                    "out_of_range",
+                    "timeout_seconds must be a finite positive number",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The versioned configuration of an agent, as published.
+///
+/// `Default` is derived: every field's default is its own zero value, so a
+/// hand-written implementation would only be a second place for the two to
+/// drift apart.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AgentRuntimeConfiguration {
+    /// Optional human-readable description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Opaque model reference resolved by Python's model catalog.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_hint: Option<String>,
+    /// The agent's instructions.
+    #[serde(default)]
+    pub system_prompt: String,
+    /// Runtime ceilings.
+    pub limits: AgentRuntimeLimits,
+    /// Free-form labels.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Tool ids the agent may call.
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
+}
+
+impl AgentRuntimeConfiguration {
+    /// Rejects a configuration Python would refuse: a system prompt beyond the
+    /// Python-side byte ceiling, a blank model hint, an unbounded tool list, or
+    /// limits a read-only agent must not carry.
+    fn validate(&self, read_only: bool) -> Result<()> {
+        const MAX_SYSTEM_PROMPT_BYTES: usize = 128 * 1024;
+        const MAX_ALLOWED_TOOLS: usize = 128;
+
+        if self.system_prompt.len() > MAX_SYSTEM_PROMPT_BYTES {
+            return Err(AppError::invalid_field(
+                "configuration.system_prompt",
+                "too_long",
+                "system prompt exceeds the 128 KiB runtime ceiling",
+            ));
+        }
+        if let Some(model_hint) = self.model_hint.as_deref() {
+            if model_hint.trim().is_empty() {
+                return Err(AppError::invalid_field(
+                    "configuration.model_hint",
+                    "blank",
+                    "model_hint must not be blank when present",
+                ));
+            }
+        }
+        if self.allowed_tools.len() > MAX_ALLOWED_TOOLS {
+            return Err(AppError::invalid_field(
+                "configuration.allowed_tools",
+                "too_many",
+                "allowed_tools exceeds the runtime ceiling",
+            ));
+        }
+        if read_only && (!self.allowed_tools.is_empty() || self.limits.max_tool_calls != 0) {
+            return Err(AppError::invalid_field(
+                "configuration.allowed_tools",
+                "forbidden",
+                "a read-only agent may not be granted tools",
+            ));
+        }
+        self.limits.validate()
+    }
+}
+
+/// An immutable, tenant-scoped agent definition resolved for exactly one run.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentRuntimeSnapshot {
+    /// Agent id this snapshot was resolved for.
+    pub agent_id: AgentId,
+    /// Authoritative tenant. Python reconciles this against the request.
+    pub tenant_id: TenantId,
+    /// Authoritative organization.
+    pub organization_id: OrganizationId,
+    /// Authoritative project.
+    pub project_id: ProjectId,
+    /// Exact published version id.
+    pub agent_version_id: AgentVersionId,
+    /// Monotonic version number (`>= 1`).
+    pub version_number: u64,
+    /// Lowercase-hex SHA-256 of the published configuration payload.
+    pub configuration_checksum: String,
+    /// Display name.
+    pub name: String,
+    /// URL-safe identifier.
+    pub slug: String,
+    /// `standard`, `supervisor` or `tool_user`.
+    pub kind: String,
+    /// Lifecycle status; only `active` is executable.
+    pub status: String,
+    /// `user` (tenant-managed) or `system` (platform-owned).
+    pub origin: String,
+    /// `true` for platform-owned agents, which may never use tools.
+    pub read_only: bool,
+    /// The versioned configuration.
+    pub configuration: AgentRuntimeConfiguration,
+}
+
+impl AgentRuntimeSnapshot {
+    /// Builds the snapshot for one published version of one agent.
+    ///
+    /// Every field is a projection of the Rust-owned aggregates; nothing is
+    /// derived from caller input, which is what makes the resulting snapshot
+    /// safe to treat as authoritative on the Python side.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error when the agent is not executable, when the
+    /// version does not belong to the agent, or when the projected
+    /// configuration would be refused by the Python boundary.
+    pub fn from_domain(agent: &Agent, version: &AgentVersion) -> Result<Self> {
+        if version.agent_id() != agent.id {
+            return Err(AppError::invalid_field(
+                "agent_version_id",
+                "ownership",
+                "published version does not belong to the agent",
+            ));
+        }
+        if agent.status != mas_common::enums::AgentStatus::Active {
+            return Err(AppError::conflict(format!(
+                "agent '{}' is not executable in status '{}'",
+                agent.id, agent.status
+            )));
+        }
+
+        let origin = agent.origin;
+        let read_only = origin == AgentOrigin::System;
+        let configuration = AgentRuntimeConfiguration::from_published(
+            &agent.config,
+            version.configuration_snapshot(),
+            read_only,
+        )?;
+        configuration.validate(read_only)?;
+
+        Ok(Self {
+            agent_id: agent.id,
+            tenant_id: agent.tenant_id,
+            organization_id: agent.organization_id,
+            project_id: agent.project_id,
+            agent_version_id: version.id(),
+            version_number: version.version_number(),
+            configuration_checksum: version.configuration_checksum().to_owned(),
+            name: agent.name.clone(),
+            slug: agent.slug.as_str().to_owned(),
+            kind: agent.kind.as_str().to_owned(),
+            status: agent.status.as_str().to_owned(),
+            origin: origin.as_str().to_owned(),
+            read_only,
+            configuration,
+        })
+    }
+
+    /// Validates a snapshot that was assembled elsewhere (tests, rehydration).
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error for a nil id, a zero version number, a
+    /// malformed checksum, an unknown kind/origin pair, or an inconsistent
+    /// read-only flag.
+    pub fn validate(&self) -> Result<()> {
+        for (field, nil) in [
+            ("agent_id", self.agent_id.is_nil()),
+            ("tenant_id", self.tenant_id.is_nil()),
+            ("organization_id", self.organization_id.is_nil()),
+            ("project_id", self.project_id.is_nil()),
+            ("agent_version_id", self.agent_version_id.is_nil()),
+        ] {
+            if nil {
+                return Err(AppError::invalid_field(
+                    field,
+                    "required",
+                    "must be concrete",
+                ));
+            }
+        }
+        if self.version_number == 0 {
+            return Err(AppError::invalid_field(
+                "version_number",
+                "out_of_range",
+                "version numbers start at 1",
+            ));
+        }
+        if self.configuration_checksum.len() != 64
+            || !self
+                .configuration_checksum
+                .chars()
+                .all(|value| value.is_ascii_hexdigit() && !value.is_ascii_uppercase())
+        {
+            return Err(AppError::invalid_field(
+                "configuration_checksum",
+                "invalid_format",
+                "checksum must be lowercase hex-encoded SHA-256",
+            ));
+        }
+        if AgentKind::from_str(&self.kind).is_err() {
+            return Err(AppError::invalid_field(
+                "kind",
+                "unknown",
+                "snapshot kind is not an agent kind",
+            ));
+        }
+        if self.kind == AgentKind::Supervisor.as_str() {
+            return Err(AppError::invalid_field(
+                "kind",
+                "unsupported",
+                "supervisor snapshots require pinned delegated-agent snapshots",
+            ));
+        }
+        if AgentOrigin::from_str(&self.origin).is_err() {
+            return Err(AppError::invalid_field(
+                "origin",
+                "unknown",
+                "snapshot origin is not an agent origin",
+            ));
+        }
+        if self.status != mas_common::enums::AgentStatus::Active.as_str() {
+            return Err(AppError::invalid_field(
+                "status",
+                "not_executable",
+                "snapshot status is not executable",
+            ));
+        }
+        if self.read_only != (self.origin == AgentOrigin::System.as_str()) {
+            return Err(AppError::invalid_field(
+                "read_only",
+                "inconsistent",
+                "read_only must agree with the agent origin",
+            ));
+        }
+        self.configuration.validate(self.read_only)
+    }
+
+    /// The snapshot as the JSON string carried on the wire.
+    ///
+    /// # Errors
+    ///
+    /// Returns a serialization error only if this type gains a field that
+    /// cannot be represented in JSON; callers should treat that as a defect,
+    /// not as an input problem.
+    pub fn to_json(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|error| AppError::serialization(format!("agent runtime snapshot: {error}")))
+    }
+}
+
+impl AgentRuntimeConfiguration {
+    /// Projects the agent's stored configuration and published snapshot onto
+    /// the runtime shape.
+    ///
+    /// The published version snapshot is authoritative for prompt, tools and
+    /// tags — that is what "pinned version" means — while the agent aggregate
+    /// supplies the description and the model hint when the version does not
+    /// carry one.
+    fn from_published(
+        config: &mas_domain::agent::AgentConfig,
+        published: &Value,
+        read_only: bool,
+    ) -> Result<Self> {
+        let object = published.as_object().ok_or_else(|| {
+            AppError::invalid_field(
+                "configuration_snapshot",
+                "invalid_format",
+                "published configuration snapshot must be a JSON object",
+            )
+        })?;
+
+        let system_prompt = optional_string(object.get("system_prompt"))?.unwrap_or_default();
+        let model_hint =
+            optional_string(object.get("model_hint"))?.or_else(|| config.model_hint.clone());
+        let description =
+            optional_string(object.get("description"))?.or_else(|| config.description.clone());
+        let allowed_tools = string_list(object.get("allowed_tools"))?;
+        let tags = string_list(object.get("tags"))?;
+
+        let limits = match object.get("limits") {
+            Some(value) if !value.is_null() => {
+                serde_json::from_value::<AgentRuntimeLimits>(value.clone()).map_err(|error| {
+                    AppError::invalid_field(
+                        "configuration.limits",
+                        "invalid_format",
+                        format!("published limits are not runtime limits: {error}"),
+                    )
+                })?
+            },
+            _ => AgentRuntimeLimits {
+                max_steps: config.resource_limits.max_steps.max(1),
+                max_tool_calls: if read_only {
+                    0
+                } else {
+                    config.resource_limits.max_tool_calls
+                },
+                max_delegation_depth: AgentRuntimeLimits::default().max_delegation_depth,
+                timeout_seconds: None,
+            },
+        };
+
+        Ok(Self {
+            description,
+            model_hint,
+            system_prompt,
+            limits,
+            tags,
+            allowed_tools,
+        })
+    }
+}
+
+/// Reads an optional JSON string, refusing a non-string value.
+fn optional_string(value: Option<&Value>) -> Result<Option<String>> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) => Ok(Some(text.clone())),
+        Some(_) => Err(AppError::invalid_field(
+            "configuration",
+            "invalid_format",
+            "expected a JSON string",
+        )),
+    }
+}
+
+/// Reads an optional JSON array of strings, refusing a non-array value.
+fn string_list(value: Option<&Value>) -> Result<Vec<String>> {
+    match value {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| {
+                item.as_str().map(str::to_owned).ok_or_else(|| {
+                    AppError::invalid_field(
+                        "configuration",
+                        "invalid_format",
+                        "expected an array of strings",
+                    )
+                })
+            })
+            .collect(),
+        Some(_) => Err(AppError::invalid_field(
+            "configuration",
+            "invalid_format",
+            "expected an array of strings",
+        )),
+    }
+}
+
+/// Resolves the immutable agent snapshot a run must carry.
+///
+/// Implemented by the worker over the RLS-armed agent catalog. It exists as a
+/// port so the execution layer can depend on the *capability* rather than on
+/// persistence, and so a test can substitute a fixed resolver without a
+/// database.
+#[async_trait::async_trait]
+pub trait AgentRuntimeSnapshotResolver: Send + Sync + fmt::Debug {
+    /// Resolves the snapshot for one authorized request.
+    ///
+    /// # Errors
+    ///
+    /// Implementations return a not-found error when the agent or version does
+    /// not exist *inside the request's scope*, and a validation error when the
+    /// request is missing its authoritative scope.
+    async fn resolve(&self, request: &AgentRunRequest) -> Result<AgentRuntimeSnapshot>;
 }
 
 // =============================================================================

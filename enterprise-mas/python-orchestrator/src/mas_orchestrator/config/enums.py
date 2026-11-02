@@ -116,6 +116,22 @@ class VectorBackend(StrEnum):
     DISABLED = "disabled"
 
 
+class DataSourceKind(StrEnum):
+    """Data Hub source adapter, mirroring the Rust ``DataSourceKind``.
+
+    These strings cross the bridge verbatim: Rust serialises
+    ``mas_common::string_enum!` members with ``as_str()`` and Python parses the
+    value it receives. Values must therefore stay byte-identical to the Rust
+    declarations in ``crates/domain/src/data_source.rs`` — ``"upload"``,
+    ``"object_storage"`` and ``"web"`` — because a rename on either side is a
+    silent data-plane break rather than a type error.
+    """
+
+    UPLOAD = "upload"
+    OBJECT_STORAGE = "object_storage"
+    WEB = "web"
+
+
 class ToolExecutionMode(StrEnum):
     """How tool code execution is performed.
 
@@ -146,29 +162,6 @@ class GuardrailFailureMode(StrEnum):
     def denies_execution(self) -> bool:
         """Whether this mode stops the execution."""
         return self is GuardrailFailureMode.FAIL_CLOSED
-
-
-class DataSourceKind(StrEnum):
-    """Kinds of source the Data Hub ingestion plane can synchronize.
-
-    This enum is *contract* in the same sense as the rest of this module: the
-    values travel as `source_kind` on every `DataHubBridgeApi` request and are
-    recorded in the `data_hub_sources` row Rust owns. They therefore match
-    ``mas_execution::data_hub_bridge::DataHubSourceKind`` byte-for-byte, and a
-    value that is not one of these three is rejected by the servicer rather
-    than defaulted (see ``_source_kind`` in ``grpc/data_hub_servicer.py``).
-
-    ``UPLOAD`` documents were pushed through the Rust API and are bounded by
-    the (smaller) upload limit; the other two are discovered by an adapter and
-    are bounded by the general document limit.
-    """
-
-    #: A file uploaded through the Rust API and placed in authorized storage.
-    UPLOAD = "upload"
-    #: An S3-compatible object-storage source.
-    OBJECT_STORAGE = "object_storage"
-    #: A bounded, allow-listed web crawler.
-    WEB = "web"
 
 
 __all__ = [

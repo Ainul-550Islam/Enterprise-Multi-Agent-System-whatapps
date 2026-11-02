@@ -90,8 +90,8 @@ impl GrpcDataHubBridge {
                 "Data Hub max_request_bytes must be between 1 and {MAX_REQUEST_BYTES}"
             )));
         }
-        let client = DataHubBridgeApiClient::new(agent_bridge.channel.clone())
-            .max_decoding_message_size(agent_bridge.config.max_response_bytes)
+        let client = DataHubBridgeApiClient::new(agent_bridge.channel())
+            .max_decoding_message_size(agent_bridge.config().max_response_bytes)
             .max_encoding_message_size(max_request_bytes);
         Ok(Self {
             client,
@@ -100,9 +100,16 @@ impl GrpcDataHubBridge {
         })
     }
 
-    /// Configured service identity shared with AgentBridge.
+    /// Configured service identity, asserted in the body of every call.
+    ///
+    /// Built from the same configuration the AgentBridge adapter uses, so one
+    /// subject, one issuer and one scope list govern both services.
     fn identity(&self) -> ServiceIdentityMsg {
-        self.agent_bridge.identity()
+        ServiceIdentityMsg {
+            subject: self.agent_bridge.config().service_subject.clone(),
+            issuer: self.agent_bridge.config().service_issuer.clone(),
+            scopes: self.agent_bridge.config().service_scopes.clone(),
+        }
     }
 
     /// Computes the RPC timeout from the request's absolute deadline.
@@ -116,7 +123,7 @@ impl GrpcDataHubBridge {
             Duration::from_millis(remaining).clamp(MINIMUM_RPC_TIMEOUT, MAXIMUM_RPC_TIMEOUT);
         bounded.min(
             self.agent_bridge
-                .config
+                .config()
                 .default_timeout
                 .max(MINIMUM_RPC_TIMEOUT),
         )
@@ -138,17 +145,17 @@ impl GrpcDataHubBridge {
             ORGANIZATION_HEADER,
             &context.organization_id.to_string(),
         )?;
-        if let Some(token) = self.agent_bridge.config.bearer_token.as_ref() {
+        if let Some(token) = self.agent_bridge.config().bearer_token.as_ref() {
             insert_metadata(
                 metadata,
                 AUTHORIZATION_HEADER,
                 &format!("Bearer {}", token.expose()),
             )?;
         }
-        if let Some(secret) = self.agent_bridge.config.internal_signing_secret.as_ref() {
+        if let Some(secret) = self.agent_bridge.config().internal_signing_secret.as_ref() {
             let signature = mas_security::internal_service::sign(
                 secret.expose().as_bytes(),
-                &self.agent_bridge.config.internal_service_id,
+                &self.agent_bridge.config().internal_service_id,
                 &Timestamp::now(),
                 body,
             );
@@ -160,7 +167,7 @@ impl GrpcDataHubBridge {
             insert_metadata(
                 metadata,
                 mas_security::internal_service::SERVICE_HEADER,
-                &self.agent_bridge.config.internal_service_id,
+                &self.agent_bridge.config().internal_service_id,
             )?;
         }
         insert_metadata(metadata, CORRELATION_HEADER, &context.correlation_id)?;
@@ -323,7 +330,7 @@ impl DataHubBridgePort for GrpcDataHubBridge {
             changed_count: reply.changed_count,
             indexed_count: reply.indexed_count,
             failed_count: reply.failed_count,
-            next_cursor: reply.next_cursor.filter(|cursor| !cursor.is_empty()),
+            next_cursor: nonempty(reply.next_cursor),
             errors: reply.errors,
         })
     }
@@ -497,7 +504,6 @@ fn validate_non_secret_config(value: &serde_json::Value) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gen::agent_bridge_api_client::AgentBridgeApiClient;
     use mas_common::ids::{OrganizationId, ProjectId, TenantId};
     use mas_common::timestamps::Timestamp;
     use mas_execution::data_hub_bridge::DataHubSourceKind;
@@ -517,11 +523,7 @@ mod tests {
 
     fn adapter() -> GrpcDataHubBridge {
         let channel = Channel::from_static("http://127.0.0.1:1").connect_lazy();
-        let agent_bridge = GrpcAgentBridge {
-            client: AgentBridgeApiClient::new(channel.clone()),
-            channel: channel.clone(),
-            config: GrpcAgentBridgeConfig::default(),
-        };
+        let agent_bridge = GrpcAgentBridge::from_channel(channel, GrpcAgentBridgeConfig::default());
         GrpcDataHubBridge::from_agent_bridge(agent_bridge, DEFAULT_MAX_REQUEST_BYTES)
             .expect("shared AgentBridge composition")
     }

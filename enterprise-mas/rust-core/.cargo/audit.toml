@@ -1,0 +1,29 @@
+# PURPOSE: cargo-audit configuration for the rust-core workspace.
+#
+# Owning layer: supply-chain governance (see deny.toml for the cargo-deny
+# policy; this file covers `cargo audit`, which the security workflow runs).
+#
+# `cargo audit` scans every entry in Cargo.lock. Unlike `cargo deny`, it does
+# not resolve features, so it flags optional dependencies that no enabled
+# feature ever selects. The single entry below is that case, and it is
+# recorded — not silenced — with the evidence needed to re-verify it.
+
+[advisories]
+ignore = [
+  # RUSTSEC-2023-0071 — rsa 0.9.10, "Marvin Attack" (timing sidechannel).
+  # There is no fixed release upstream ("No fixed upgrade is available").
+  #
+  # Not reachable from this workspace:
+  #   • rsa is a dependency of sqlx-mysql, which sqlx-macros-core declares as
+  #     an OPTIONAL dependency (optional = true in its manifest).
+  #   • The workspace selects sqlx with default-features = false and only the
+  #     "postgres" backend, so the "mysql" feature is never enabled.
+  #     Verify: cargo tree -e features -p mas-persistence | grep 'sqlx feature'
+  #     Resolved set contains "sqlx-postgres" and never "sqlx-mysql".
+  #   • cargo tree -i sqlx-mysql  -> nothing depends on it
+  #   • In a full `cargo test --workspace --locked` build neither rsa nor
+  #     sqlx-mysql is ever compiled.
+  #
+  # Re-evaluate if a MySQL backend is ever enabled or a fixed rsa ships.
+  "RUSTSEC-2023-0071",
+]

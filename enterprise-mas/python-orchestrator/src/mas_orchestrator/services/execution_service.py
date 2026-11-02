@@ -34,7 +34,7 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final, Protocol, runtime_checkable
 
-from mas_orchestrator.agents.base import AgentState, Termination
+from mas_orchestrator.agents.base import AgentSpec, AgentState, Termination
 from mas_orchestrator.agents.runtime import AgentRuntime, ExecutionResult
 from mas_orchestrator.contracts.errors import (
     ConfigurationError,
@@ -130,10 +130,11 @@ class ExecutionRequest:
         agent_id: Run a specific agent rather than selecting one.
         state: Optional starting state.
         protocol_version: The protocol version claimed by the caller.
-        agent_snapshot: The Rust-resolved, immutable agent snapshot to execute.
-            When present the runtime materialises *this* definition instead of
-            consulting its own catalog, so Rust remains the sole authority on
-            which agent version runs.
+        agent_spec: An immutable agent definition resolved by the caller
+            (from a Rust-owned snapshot) that the runtime must execute instead
+            of resolving one from its own catalog. Supplied by the bridge for
+            every signed run; ``None`` means "resolve it yourself", which is
+            only correct for in-process callers such as tests and the CLI.
     """
 
     request: str
@@ -142,7 +143,7 @@ class ExecutionRequest:
     agent_id: str | None = None
     state: AgentState | None = None
     protocol_version: str = str(CURRENT_PROTOCOL_VERSION)
-    agent_snapshot: Any | None = None
+    agent_spec: AgentSpec | None = None
 
     def __post_init__(self) -> None:
         if not self.request.strip():
@@ -250,18 +251,16 @@ class ExecutionService:
                 state=request.state,
                 cancel_event=cancel_event,
                 agent_id=request.agent_id,
-                # The snapshot is authoritative when Rust supplied one: the
-                # runtime then skips its own catalog, so the executed version is
-                # exactly the one Rust resolved and signed.
-                agent_spec=getattr(request.agent_snapshot, "spec", None),
+                agent_spec=request.agent_spec,
             )
         except asyncio.CancelledError:
-            # Native task cancellation must propagate. Converting it into a
-            # normal result would let the caller keep running inside a
-            # cancellation scope it has already left, and the gRPC/process edge
-            # would never learn the work was interrupted. The cancellation
-            # event is still recorded first, so the observable side effect is
-            # not lost when the exception unwinds.
+            # Record the cancellation for observers, then let it propagate.
+            # Converting it into a normal result would leave the task alive:
+            # `asyncio.CancelledError` is how a task is told to stop, and a
+            # coroutine that catches it and returns has effectively refused.
+            # The caller would then continue executing past its own
+            # cancellation scope, and provider/tool work would keep running
+            # under a request nobody is waiting for any more.
             await self._emit(
                 cancellation(
                     tenant_id=context.tenant_id,

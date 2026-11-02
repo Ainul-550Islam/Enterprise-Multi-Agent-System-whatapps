@@ -28,8 +28,10 @@ import pytest
 from mas_orchestrator.grpc.generated import mas_api_pb2 as pb
 from mas_orchestrator.grpc.generated import mas_api_pb2_grpc as pbg
 
-# The wire protocol version both sides must agree on.
-EXPECTED_PROTOCOL_VERSION = "1.0.0"
+# The wire protocol version both sides must agree on. 1.1 adds the Data Hub
+# bridge surface without changing AgentBridge semantics; the Rust constant in
+# `crates/ai-bridge/src/lib.rs` is the other half of this assertion.
+EXPECTED_PROTOCOL_VERSION = "1.1.0"
 
 
 class TestAgentBridgeServiceShape:
@@ -81,8 +83,11 @@ class TestAgentRunRequestShape:
             "idempotency_key",
             "identity",
             "task_attempt_id",
-            # Appended after v1.0: the Rust-resolved immutable agent snapshot
-            # (see `AgentRuntimeSnapshot` in `crates/execution/src/agent_bridge.rs`).
+            # Field 18. Rust publishes the immutable agent snapshot it resolved
+            # for exactly this (agent, version) pair; Python executes that and
+            # never falls back to its own catalog. Listed here so a future proto
+            # edit cannot add, remove or reorder a field without this contract
+            # test having to be updated deliberately.
             "agent_snapshot_json",
         ]
 

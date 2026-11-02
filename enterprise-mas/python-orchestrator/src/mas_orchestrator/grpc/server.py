@@ -6,10 +6,12 @@
 
 """Server bootstrap for the inbound Rust → Python gRPC surface.
 
-The orchestrator exposes exactly one service to Rust on this port:
-``AgentBridgeApi``. Keeping the surface narrow is deliberate — every additional
-service is another place a caller could arrive without the identity checks the
-servicer enforces.
+The orchestrator exposes exactly two services to Rust on this port:
+``AgentBridgeApi`` (agent execution) and ``DataHubBridgeApi`` (source sync,
+document ingestion, purge). Keeping the surface narrow is deliberate — every
+additional service is another place a caller could arrive without the identity
+checks the servicer enforces — and both servicers share one authentication
+boundary rather than each growing its own.
 
 Three properties this module is responsible for:
 
@@ -21,6 +23,11 @@ Three properties this module is responsible for:
   of the process, so an in-flight agent run is drained rather than severed. The
   coordinator reports what was abandoned instead of the process exiting as
   though nothing was left behind.
+* **No leaked resources on a failed start.** If the data-hub plane fails its
+  startup, or the socket cannot be bound, or the aio server cannot start, every
+  resource the caller handed over is closed before the exception propagates.
+  A half-started process that has already opened database pools but never
+  listens is the worst of both worlds: it holds connections and serves nothing.
 * **No silent bind fallback.** Binding to the configured address either works
   or raises. There is no "try the port, else pick another" path, because a
   service listening somewhere other than where its clients are configured to
@@ -29,29 +36,31 @@ Three properties this module is responsible for:
 
 from __future__ import annotations
 
-import inspect
 import logging
+from collections.abc import Iterable  # noqa: TC003  used in a runtime signature
 from concurrent import futures
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Final, Protocol, runtime_checkable
 
 from mas_orchestrator.config.enums import Environment, TransportSecurity
 from mas_orchestrator.grpc.generated import mas_api_pb2_grpc
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
-
     from grpc import aio
 
     from mas_orchestrator.config.settings import ServiceSettings
     from mas_orchestrator.grpc.agent_bridge_servicer import AgentBridgeServicer
+    from mas_orchestrator.grpc.data_hub_servicer import DataHubBridgeServicer
     from mas_orchestrator.services.lifecycle import ShutdownCoordinator
 
 _LOGGER: Final[logging.Logger] = logging.getLogger(__name__)
 
 __all__ = [
+    "AGENT_BRIDGE_SERVICE_NAME",
+    "DATA_HUB_BRIDGE_SERVICE_NAME",
     "DEFAULT_MAX_CONCURRENT_RPCS",
     "GRACEFUL_STOP_SECONDS",
+    "Closeable",
     "GrpcServer",
     "GrpcServerConfig",
 ]
@@ -71,6 +80,23 @@ DEFAULT_MAX_RECEIVE_BYTES: Final[int] = 4 * 1024 * 1024
 
 #: Ceiling on an outbound message.
 DEFAULT_MAX_SEND_BYTES: Final[int] = 8 * 1024 * 1024
+
+#: Fully-qualified names of the services this server registers, in registration
+#: order. Reported as a JSON array in the startup log so an operator can see
+#: exactly which surfaces are live, and so a deployment that forgot to enable
+#: the data-hub plane is visible in one line rather than in a later 12
+#: ``UNIMPLEMENTED``.
+AGENT_BRIDGE_SERVICE_NAME: Final[str] = "mas.api.v1.AgentBridgeApi"
+DATA_HUB_BRIDGE_SERVICE_NAME: Final[str] = "mas.api.v1.DataHubBridgeApi"
+
+
+@runtime_checkable
+class Closeable(Protocol):
+    """Anything the runtime bundle owns that must be released on failure."""
+
+    async def aclose(self) -> None:
+        """Releases the resource. Must be safe to call on a partial start."""
+        ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,10 +218,19 @@ class GrpcServerConfig:
 
 
 class GrpcServer:
-    """Owns the gRPC server exposing ``AgentBridgeApi``.
+    """Owns the gRPC server exposing the inbound Rust → Python surface.
 
     Args:
-        servicer: The bridge servicer to register.
+        servicer: The agent bridge servicer, serving ``AgentBridgeApi``.
+        data_hub_servicer: The Data Hub servicer, serving ``DataHubBridgeApi``.
+            ``None`` when the data-hub plane is disabled by configuration; the
+            service is then simply not registered and Rust's calls to it fail
+            as ``UNIMPLEMENTED`` rather than being served by a half-wired
+            implementation.
+        closeables: Runtime resources owned by the caller's bundle (database
+            pools, HTTP clients). They are closed in reverse order if startup
+            fails part-way, so a process that never listens does not hold
+            connections open.
         config: Transport settings.
         logger: Logger override, for tests.
     """
@@ -204,31 +239,26 @@ class GrpcServer:
         self,
         *,
         servicer: AgentBridgeServicer,
-        data_hub_servicer: Any | None = None,
-        closeables: Sequence[Any] = (),
+        data_hub_servicer: DataHubBridgeServicer | None = None,
+        closeables: Iterable[Closeable] = (),
         config: GrpcServerConfig | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
-        """
-        Args:
-            servicer: The ``AgentBridgeApi`` servicer.
-            data_hub_servicer: The optional ``DataHubBridgeApi`` servicer. When
-                absent the service is simply not registered, so a deployment
-                without a RAG plane still serves agent runs.
-            closeables: Resources that own lifetimes beyond this server (the
-                agent runtime, the Data Hub service's database pools). They are
-                closed if startup fails *after* they were opened and before the
-                listener is bound, so a failed boot never leaks them.
-            config: Transport configuration.
-            logger: Logger override, for tests.
-        """
         self._servicer = servicer
         self._data_hub_servicer = data_hub_servicer
-        self._closeables: tuple[Any, ...] = tuple(closeables)
+        self._closeables: tuple[Closeable, ...] = tuple(closeables)
         self._config = config or GrpcServerConfig()
         self._logger = logger or _LOGGER
         self._server: aio.Server | None = None
         self._bound_port: int | None = None
+
+    @property
+    def service_names(self) -> list[str]:
+        """The services this server will register, in registration order."""
+        names = [AGENT_BRIDGE_SERVICE_NAME]
+        if self._data_hub_servicer is not None:
+            names.append(DATA_HUB_BRIDGE_SERVICE_NAME)
+        return names
 
     @property
     def config(self) -> GrpcServerConfig:
@@ -249,16 +279,43 @@ class GrpcServer:
         """Whether the server has been started and not yet stopped."""
         return self._server is not None
 
+    async def _close_runtime_resources(self) -> None:
+        """Closes every caller-owned resource, logging rather than raising.
+
+        Called only on a failed start. One closeable failing must not prevent
+        the others from being released, and it must not mask the exception that
+        is already propagating: the startup error is the one an operator needs
+        to see.
+        """
+        for closeable in reversed(self._closeables):
+            try:
+                await closeable.aclose()
+            except Exception:
+                self._logger.exception(
+                    "failed to close a runtime resource during aborted startup",
+                    extra={
+                        "event": "bridge.startup_cleanup_failed",
+                        "resource": type(closeable).__name__,
+                    },
+                )
+
     async def start(self) -> int:
-        """Builds the server, registers the service and binds the socket.
+        """Runs data-hub startup, builds the server, registers and binds.
 
         Returns:
             The bound port.
 
         Raises:
+            Exception: Whatever the data-hub plane raised during ``startup()``,
+                after every caller-owned resource has been closed.
             DependencyUnavailableError: If the socket cannot be bound. The
                 cause is logged, but the port and host are reported rather
                 than any credential or configuration value.
+
+        The data-hub plane opens its database pools in ``startup()`` *before*
+        the socket is bound. That ordering is deliberate: pools that cannot be
+        opened must fail the boot while nothing is listening yet, rather than
+        after the bridge has already started advertising itself as ready.
         """
         from grpc import aio
 
@@ -267,6 +324,13 @@ class GrpcServer:
             ServerTransportConfig,
             build_server_credentials,
         )
+
+        if self._data_hub_servicer is not None:
+            try:
+                await self._data_hub_servicer.startup()
+            except Exception:
+                await self._close_runtime_resources()
+                raise
 
         server_credentials = build_server_credentials(
             ServerTransportConfig(
@@ -278,18 +342,6 @@ class GrpcServer:
                 require_client_certificate=self._config.require_client_certificate,
             )
         )
-
-        # Startup hooks run *before* the socket is bound: a Data Hub whose
-        # database pool cannot open must fail the boot rather than accept calls
-        # it cannot serve. Any resource already opened is closed on the way out
-        # so the failure leaves nothing behind.
-        try:
-            data_hub_startup = getattr(self._data_hub_servicer, "startup", None)
-            if data_hub_startup is not None:
-                await data_hub_startup()
-        except Exception as error:
-            await self._close_startup_resources()
-            raise RuntimeError("data hub startup failed") from error
 
         server = aio.server(
             migration_thread_pool=futures.ThreadPoolExecutor(
@@ -303,17 +355,18 @@ class GrpcServer:
                 ("grpc.so_reuseport", 0),
             ),
         )
-        # The generated registrar is untyped; the call is a no-op on failure
-        # because binding below is what actually validates the address.
+        # Both registrars are reached through ``mas_pb2_grpc``: the Data Hub
+        # one is re-exported there by ``scripts/generate_proto.sh`` so there is
+        # a single module that knows the full registered surface. The generated
+        # registrars are untyped; the calls are no-ops on failure because
+        # binding below is what actually validates the address.
         mas_api_pb2_grpc.add_AgentBridgeApiServicer_to_server(  # type: ignore[no-untyped-call]
             self._servicer, server
         )
-        services = ["mas.api.v1.AgentBridgeApi"]
         if self._data_hub_servicer is not None:
             mas_api_pb2_grpc.add_DataHubBridgeApiServicer_to_server(  # type: ignore[no-untyped-call]
                 self._data_hub_servicer, server
             )
-            services.append("mas.api.v1.DataHubBridgeApi")
 
         try:
             if server_credentials is None:
@@ -322,7 +375,7 @@ class GrpcServer:
                 bound = server.add_secure_port(self._config.address, server_credentials)
         except OSError as error:
             await server.stop(0)
-            await self._close_startup_resources()
+            await self._close_runtime_resources()
             # Reports the address, never the configuration: a bind failure is
             # an operational fault, and the fix is to free the port or change
             # the configured address.
@@ -333,7 +386,7 @@ class GrpcServer:
 
         if bound == 0:
             await server.stop(0)
-            await self._close_startup_resources()
+            await self._close_runtime_resources()
             raise DependencyUnavailableError(
                 f"cannot bind the agent bridge server to {self._config.address}",
                 details={"host": self._config.host, "port": self._config.port},
@@ -341,10 +394,16 @@ class GrpcServer:
 
         try:
             await server.start()
-        except Exception as error:
+        except BaseException:
+            # The listener exists but the aio server never came up. Stop it so
+            # the port is released, then release the runtime resources: this is
+            # the one window where both a socket and pools are held.
             await server.stop(0)
-            await self._close_startup_resources()
-            raise RuntimeError("aio server start failed") from error
+            self._server = None
+            self._bound_port = None
+            await self._close_runtime_resources()
+            raise
+
         self._server = server
         self._bound_port = bound
 
@@ -365,40 +424,16 @@ class GrpcServer:
                 "event": "bridge.listening",
                 "address": self._config.address,
                 "bound_port": bound,
-                "services": services,
+                # A list, not a string: structured-log consumers index it, and
+                # an operator reading logs should see one entry per live
+                # surface rather than a comma-joined blob.
+                "services": self.service_names,
                 "transport_security": self._config.transport_security.value,
                 "max_concurrent_rpcs": self._config.max_concurrent_rpcs,
                 "max_receive_bytes": self._config.max_receive_bytes,
             },
         )
         return bound
-
-    async def _close_startup_resources(self) -> None:
-        """Closes every closeable exactly once, best-effort.
-
-        Shutdown order is the reverse of startup order so a resource that
-        depends on another is torn down first. A close failure is logged and
-        does not mask the original startup error, which is what the caller
-        actually needs to see.
-        """
-        while self._closeables:
-            resource = self._closeables[-1]
-            self._closeables = self._closeables[:-1]
-            close = getattr(resource, "aclose", None) or getattr(resource, "close", None)
-            if close is None:
-                continue
-            try:
-                outcome = close()
-                if inspect.isawaitable(outcome):
-                    await outcome
-            except Exception:  # shutdown must not mask the cause
-                self._logger.warning(
-                    "failed to close a startup resource",
-                    extra={
-                        "event": "bridge.close_failed",
-                        "resource": type(resource).__name__,
-                    },
-                )
 
     async def stop(self) -> None:
         """Stops the server, giving in-flight calls a grace period.

@@ -60,11 +60,11 @@ class ServiceScope(StrEnum):
     INVOKE_API = "invoke_api"
     #: May read health/readiness.
     READ_HEALTH = "read_health"
-    #: May synchronize a Rust-authorized Data Hub source.
+    #: May synchronize a Rust-authorized Data Hub source into the RAG plane.
     DATA_HUB_SYNC = "data_hub_sync"
-    #: May ingest one bounded document into the RAG plane.
+    #: May ingest a single authorized document into the RAG plane.
     DATA_HUB_INGEST = "data_hub_ingest"
-    #: May purge one document's derived vectors/chunks.
+    #: May purge a document's derived vectors from the RAG plane.
     DATA_HUB_PURGE = "data_hub_purge"
 
 

@@ -12,11 +12,15 @@ This package contains the transport between Python and the Rust Core:
 * :mod:`mas_orchestrator.grpc.channel` — secure channel creation and lifecycle.
 * :mod:`mas_orchestrator.grpc.client` — authenticated, deadline-aware client.
 * :mod:`mas_orchestrator.grpc.metadata` — correlation/tenancy propagation rules.
-* :mod:`mas_orchestrator.grpc.errors` — bidirectional status<->error mapping.
+* :mod:`mas_orchestrator.grpc.errors` — bidirectional status<->error mapping,
+  including the structured ``details`` payloads carried on abort metadata.
 * :mod:`mas_orchestrator.grpc.agent_bridge_servicer` — production
-  ``AgentBridgeApi`` servicer: the inbound Rust → Python trust boundary.
+  ``AgentBridgeApi`` servicer: the inbound Rust → Python trust boundary for
+  agent execution.
+* :mod:`mas_orchestrator.grpc.data_hub_servicer` — the second inbound servicer,
+  ``DataHubBridgeApi``, serving source sync, document ingestion and purge.
 * :mod:`mas_orchestrator.grpc.server` — server bootstrap, message bounds and
-  orderly shutdown for that surface.
+  orderly shutdown for both surfaces.
 * :mod:`mas_orchestrator.grpc.generated` — protobuf bindings generated from the
   authoritative Rust ``.proto``. Never hand-edited.
 

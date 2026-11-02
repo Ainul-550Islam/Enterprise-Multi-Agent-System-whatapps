@@ -17,7 +17,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 description = "Scheduler tick driver process: interval-driven runtime, dispatch adapters, in-flight ledger, completion listener"
-license = "Proprietary"
+license = "LicenseRef-Proprietary"
 
 [lib]
 name = "mas_scheduler_service"

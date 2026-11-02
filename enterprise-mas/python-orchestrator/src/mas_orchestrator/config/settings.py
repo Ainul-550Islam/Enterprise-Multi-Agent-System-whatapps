@@ -31,9 +31,7 @@ Loading order (later wins), matching the Rust Core convention:
 
 from __future__ import annotations
 
-import json
 import os
-import typing
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Final
@@ -41,6 +39,7 @@ from typing import Any, Final
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
 from mas_orchestrator.config.enums import (
+    DataSourceKind,
     Environment,
     GuardrailFailureMode,
     LogFormat,
@@ -339,63 +338,6 @@ class MemorySettings(_Frozen):
     enforce_tenant_filters: bool = True
 
 
-class DataHubSettings(_Frozen):
-    """Source-synchronization and document-ingestion bounds.
-
-    These are the *policy* limits the Data Hub enforces on every request Rust
-    sends. They are separate from :class:`RagSettings` because they bound what
-    may enter the pipeline (bytes, page counts, MIME and source kinds) whereas
-    RAG settings govern what the pipeline then does with it (chunking,
-    retrieval, reranking).
-
-    Every field is a hard ceiling, never a hint: an oversized document is
-    refused with a typed error rather than truncated, because a silently
-    truncated document would be indexed and then cited as if it were complete.
-    """
-
-    #: Whether the Data Hub plane is available. Disabled by default: no source
-    #: adapter or vector backend exists until one is explicitly selected.
-    enabled: bool = False
-
-    #: Ceiling for a document uploaded through the Rust API.
-    max_upload_bytes: int = Field(default=16 * 1024 * 1024, ge=1, le=256 * 1024 * 1024)
-
-    #: Ceiling for a document discovered by a source adapter.
-    max_document_bytes: int = Field(default=32 * 1024 * 1024, ge=1, le=256 * 1024 * 1024)
-
-    #: Total bytes one bounded sync may read from a source.
-    max_sync_bytes: int = Field(default=256 * 1024 * 1024, ge=1, le=4 * 1024 * 1024 * 1024)
-
-    #: Documents one bounded sync may discover.
-    max_pages_per_sync: int = Field(default=500, ge=1, le=10_000)
-
-    #: MIME types the ingestion parser is allowed to decode. An unlisted type
-    #: is refused rather than passed through to a parser that might guess.
-    allowed_mime_types: tuple[str, ...] = (
-        "text/plain",
-        "text/markdown",
-        "text/html",
-        "application/pdf",
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    )
-
-    #: Source kinds adapters may synchronize.
-    allowed_source_kinds: tuple[str, ...] = ("upload", "object_storage", "web")
-
-    @field_validator("allowed_mime_types", "allowed_source_kinds")
-    @classmethod
-    def _reject_empty_allow_lists(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        """Refuses an empty allow-list.
-
-        An empty list is ambiguous: it reads as "allow nothing" but is just as
-        often a half-finished configuration. Failing at load time names the
-        problem where it can be fixed.
-        """
-        if not value:
-            raise ValueError("an allow-list must name at least one value")
-        return value
-
-
 class RagSettings(_Frozen):
     """Retrieval-augmented generation configuration."""
 
@@ -429,6 +371,28 @@ class RagSettings(_Frozen):
     #: Whether security filtering is applied after retrieval as well as before.
     post_retrieval_security_filter: bool = True
 
+    #: Secret reference holding the RAG-plane database URL. Required when
+    #: ``vector_backend`` is ``PGVECTOR``; a plain committed URL is never used,
+    #: because the RAG role's password must not live in configuration.
+    database_url_secret_ref: str | None = Field(default=None, max_length=512)
+
+    #: Dedicated database role the RAG plane must authenticate as. Pinned to
+    #: ``mas_rag`` by :class:`~mas_orchestrator.rag.pgvector_index.PgVectorIndex`;
+    #: exposing it here lets validation name the field that must change rather
+    #: than failing later inside the pool constructor.
+    database_role: str = Field(default="mas_rag", min_length=1, max_length=63)
+
+    #: Embedding model identifier when a provider-backed embedder is used.
+    embedding_model: str = Field(default="text-embedding-3-small", min_length=1, max_length=128)
+
+    #: Secret reference for the embedding provider credential.
+    embedding_api_key_secret_ref: str | None = Field(default=None, max_length=512)
+
+    #: Whether to use the deterministic hashing embedder. Development and test
+    #: only: it captures lexical overlap, not meaning, and is refused in
+    #: production by ``config/validation.py``.
+    use_hashing_embedder: bool = False
+
     @model_validator(mode="after")
     def _chunk_window_sane(self) -> RagSettings:
         """Rejects an overlap that consumes the entire chunk window."""
@@ -439,6 +403,58 @@ class RagSettings(_Frozen):
             message = "rag.rerank_top_k must not exceed rag.retrieval_top_k"
             raise ValueError(message)
         return self
+
+
+class DataHubSettings(_Frozen):
+    """Data Hub ingestion limits applied before content reaches the RAG plane.
+
+    Every bound here mirrors a Rust-side limit rather than inventing a second
+    policy: Rust has already refused anything larger before signing a bridge
+    request, so a Python limit that was *higher* would be dead code, and one
+    that was lower would reject traffic Rust considers valid. These exist to
+    bound work the Python side does on already-authorized input — an
+    unreachable Rust regression must not turn into unbounded parsing here.
+    """
+
+    #: Source adapters this deployment is allowed to run. Rust's own
+    #: allow-list is authoritative; this is defence in depth, so a source kind
+    #: Rust does not yet authorize cannot be reached by calling Python directly.
+    allowed_source_kinds: frozenset[DataSourceKind] = Field(
+        default_factory=lambda: frozenset(
+            {DataSourceKind.UPLOAD, DataSourceKind.OBJECT_STORAGE, DataSourceKind.WEB}
+        )
+    )
+
+    #: MIME types admitted for ingestion. Anything else is refused before the
+    #: parser (the least trusted component) ever sees the bytes.
+    allowed_mime_types: frozenset[str] = Field(
+        default_factory=lambda: frozenset(
+            {
+                "application/pdf",
+                "application/json",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "text/csv",
+                "text/html",
+                "text/markdown",
+                "text/plain",
+            }
+        )
+    )
+
+    #: Ceiling for a document arriving through Rust-authorized storage.
+    max_upload_bytes: int = Field(default=15 * 1024 * 1024, ge=1, le=64 * 1024 * 1024)
+
+    #: Ceiling for a document fetched from a source adapter (crawl, object
+    #: storage). Deliberately the same bound as an upload: the transport
+    #: differs, the trust level does not.
+    max_document_bytes: int = Field(default=15 * 1024 * 1024, ge=1, le=64 * 1024 * 1024)
+
+    #: Maximum documents admitted by a single synchronization, which bounds
+    #: both the work and the size of the reply Rust has to hold.
+    max_pages_per_sync: int = Field(default=500, ge=1, le=10_000)
+
+    #: Maximum total bytes admitted by a single synchronization.
+    max_sync_bytes: int = Field(default=64 * 1024 * 1024, ge=1, le=1024 * 1024 * 1024)
 
 
 class GuardrailSettings(_Frozen):
@@ -649,16 +665,8 @@ def _env_overrides(prefix: str = ENV_PREFIX) -> Mapping[str, Any]:
 
     ``MAS_ORCH_RUST_CORE__ENDPOINT=host:500`` becomes
     ``{"rust_core": {"endpoint": "host:500"}}`` using a double underscore as
-    the nesting separator.
-
-    Values arrive as strings, and Pydantic v2 coerces them to the declared
-    scalar types (``int``, ``bool``, enum members) — but **not** to
-    ``tuple[str, ...]``: a JSON array looks like a string to the validator and
-    is rejected with ``tuple_type`` however it is quoted. Collection values are
-    therefore decoded here, so ``MAS_ORCH_PROVIDERS__ENABLED_PROVIDERS=["openai"]``
-    and ``MAS_ORCH_PROVIDERS__ENABLED_PROVIDERS=openai,anthropic`` both work.
-    Without this, any list-valued setting is unreachable from the environment,
-    which makes a container deployment unable to name a model provider at all.
+    the nesting separator. Values are strings; Pydantic coerces them to the
+    declared field types.
 
     Args:
         prefix: Environment variable prefix to scan for.
@@ -686,94 +694,8 @@ def _env_overrides(prefix: str = ENV_PREFIX) -> Mapping[str, Any]:
             cursor = nested
         leaf = parts[-1]
         if leaf:
-            cursor[leaf] = _decode_env_value(raw_value, _field_at(parts[:-1], leaf))
+            cursor[leaf] = raw_value
     return overrides
-
-
-def _field_at(path: list[str], leaf: str) -> Any:
-    """Resolves the Pydantic field a nested override path names.
-
-    Args:
-        path: The parent path segments, outermost first.
-        leaf: The final key.
-
-    Returns:
-        The ``FieldInfo`` for the field, or ``None`` when the path does not
-        resolve (an unknown key, which the model rejects as a typo).
-    """
-    model: Any = Settings
-    for segment in [*path, leaf]:
-        fields = getattr(model, "model_fields", None)
-        if not fields or segment not in fields:
-            return None
-        info = fields[segment]
-        if segment == leaf:
-            return info
-        model = _strip_annotation(info.annotation)
-    return None
-
-
-def _decode_env_value(raw: str, field: Any) -> Any:
-    """Decodes an environment value according to the field it will fill.
-
-    The target field decides the shape, not the string. A bare ``openai`` is a
-    one-element collection for ``tuple[str, ...]`` and a plain scalar for
-    ``str``; guessing from the string alone would make ``"19200"`` a list and
-    break every scalar setting.
-
-    Args:
-        raw: The environment variable value.
-        field: The ``FieldInfo`` the value is destined for, or ``None`` when the
-            path names no field (which is a typo the model will reject).
-
-    Returns:
-        The decoded value: a list or mapping for a collection-typed field, the
-        raw string otherwise.
-    """
-    if field is None:
-        return raw
-    annotation = _strip_annotation(field.annotation)
-    if typing.get_origin(annotation) in (tuple, list, set, frozenset):
-        return _as_collection(raw)
-    return raw
-
-
-def _strip_annotation(annotation: Any) -> Any:
-    """Removes ``Optional``/``Union[X, None]`` wrappers from a field type.
-
-    Args:
-        annotation: The declared field annotation.
-
-    Returns:
-        The remaining type, or the original annotation when it is not a union.
-    """
-    args = [arg for arg in typing.get_args(annotation) if arg is not type(None)]
-    if typing.get_origin(annotation) in (typing.Union,) and len(args) == 1:
-        return args[0]
-    return annotation
-
-
-def _as_collection(raw: str) -> Any:
-    """Decodes a collection value from JSON or a comma-separated list.
-
-    Args:
-        raw: The environment variable value.
-
-    Returns:
-        A decoded JSON document, a list split on commas, or a one-element list
-        for a bare value.
-    """
-    text = raw.strip()
-    if text.startswith(("[", "{")):
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            # Not JSON after all (a credential starting with `[`, say). The
-            # shell spelling still applies.
-            pass
-    if "," in text:
-        return [part.strip() for part in text.split(",") if part.strip()]
-    return [text]
 
 
 def _deep_merge(base: Mapping[str, Any], overlay: Mapping[str, Any]) -> dict[str, Any]:
@@ -861,6 +783,7 @@ __all__ = [
     "DEFAULT_MAX_TOOL_RESULT_BYTES",
     "ENV_PREFIX",
     "AgentRuntimeSettings",
+    "DataHubSettings",
     "GuardrailSettings",
     "MemorySettings",
     "ObservabilitySettings",

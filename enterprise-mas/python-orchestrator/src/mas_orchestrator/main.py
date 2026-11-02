@@ -47,11 +47,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final
 
 from mas_orchestrator.config.settings import load_settings
-
-# Imported at module level (not inside `bootstrap`) so a test can substitute it
-# to prove the cross-field gate really runs. An import inside the function
-# would be shadow-proof but patch-proof too, and the gate would then be
-# untestable — which is how a configuration check silently stops running.
 from mas_orchestrator.config.validation import validate_settings_or_raise
 from mas_orchestrator.grpc.agent_bridge_servicer import (
     AgentBridgeServicer,
@@ -139,6 +134,9 @@ def bootstrap(
         A :class:`Bootstrap`.
 
     Raises:
+        ConfigurationError: When the loaded configuration violates a rule that
+            pydantic cannot express per field (a disabled provider alongside
+            enabled agents, plaintext transport in production, and so on).
         Exception: Propagated from settings loading. Callers must let it
             propagate: a misconfigured process must not start.
     """
@@ -147,10 +145,11 @@ def bootstrap(
     resolved = Environment(environment) if environment else None
     settings = load_settings(environment=resolved)
 
-    # Cross-field validation runs *before* anything is constructed from the
-    # settings. A process that starts on inconsistent configuration and only
-    # discovers it on the first request has already begun serving under it;
-    # refusing here means a bad deployment never reaches a listener.
+    # Cross-field rules run here, before any object is constructed from the
+    # settings. A process that starts with configuration that is invalid *in
+    # combination* has already begun serving under it by the time the first
+    # request discovers the problem, and the failure then looks like a bug in
+    # whatever path happened to hit it first.
     validate_settings_or_raise(settings)
 
     configure_logging(
@@ -251,20 +250,22 @@ def build_bridge_server(
             require_internal_signature=settings.is_production,
         ),
     )
-    # The Data Hub servicer reuses this same AgentBridge servicer for
-    # authentication, body-signature verification, scope checks and deadline
-    # handling, so there is exactly one trust boundary rather than a second,
-    # subtly different one next to it.
-    data_hub_servicer = None
-    if bundle.data_hub_service is not None:
-        data_hub_servicer = DataHubBridgeServicer(
-            service=bundle.data_hub_service,
-            agent_bridge=servicer,
-        )
-
+    # The Data Hub servicer deliberately takes the *same* AgentBridgeServicer
+    # instance as its authentication boundary rather than its own token
+    # resolver, metadata parser or HMAC implementation. Two copies of that
+    # logic would be two places for the signature check to drift, and the
+    # second copy is the one nobody reviews.
+    data_hub_servicer = DataHubBridgeServicer(
+        service=bundle.data_hub_service,
+        agent_bridge=servicer,
+    )
     server = GrpcServer(
         servicer=servicer,
         data_hub_servicer=data_hub_servicer,
+        # The bundle owns the provider transports and the Data Hub pools. Handing
+        # it to the server means a start that fails after opening them closes
+        # them again, instead of leaving a non-listening process holding
+        # connections for the lifetime of its crash loop.
         closeables=(bundle,),
         config=GrpcServerConfig.from_service_settings(
             settings.service,

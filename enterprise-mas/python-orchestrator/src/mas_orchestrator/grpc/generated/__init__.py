@@ -16,4 +16,7 @@ from __future__ import annotations
 from . import mas_pb2 as mas_api_pb2
 from . import mas_pb2_grpc as mas_api_pb2_grpc
 
-__all__ = ["mas_api_pb2", "mas_api_pb2_grpc"]
+__all__ = [
+    "mas_api_pb2",
+    "mas_api_pb2_grpc",
+]

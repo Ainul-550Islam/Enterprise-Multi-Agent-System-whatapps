@@ -33,6 +33,10 @@ else
   RUST_CORE="${LEGACY_RUST_CORE}"
 fi
 
+# One file holds both surfaces: `AgentBridgeApi` and `DataHubBridgeApi`, with
+# the Data Hub messages appended to the same package. They are generated
+# together because a second file in `mas.api.v1` would produce a second Rust
+# module that collides with this one on the package descriptor.
 PROTO_REL="crates/api/proto/mas/api/v1/mas.proto"
 PROTO_PATH="${RUST_CORE}/${PROTO_REL}"
 PROTO_ROOT="${RUST_CORE}/crates/api/proto"
@@ -45,9 +49,14 @@ if [[ ! -f "${PROTO_PATH}" ]]; then
   exit 1
 fi
 
-if ! python3 -c "import grpc_tools.protoc" >/dev/null 2>&1; then
-  echo "error: grpcio-tools is not installed" >&2
-  echo "hint: python3 -m pip install 'grpcio-tools>=1.84'" >&2
+# Interpreter holding grpcio-tools. Defaults to `python3` but honours
+# $PYTHON_BIN so the caller (a venv, CI, or check.sh) can point at the
+# environment that actually has the toolchain installed.
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+
+if ! "${PYTHON_BIN}" -c "import grpc_tools.protoc" >/dev/null 2>&1; then
+  echo "error: grpcio-tools is not installed for ${PYTHON_BIN}" >&2
+  echo "hint: ${PYTHON_BIN} -m pip install 'grpcio-tools>=1.84'" >&2
   exit 1
 fi
 
@@ -59,7 +68,7 @@ mkdir -p "${OUT_DIR}"
 STAGING="$(mktemp -d)"
 trap 'rm -rf "${STAGING}"' EXIT
 
-python3 -m grpc_tools.protoc \
+"${PYTHON_BIN}" -m grpc_tools.protoc \
   --proto_path="${PROTO_ROOT}" \
   --python_out="${STAGING}" \
   --grpc_python_out="${STAGING}" \
@@ -67,9 +76,25 @@ python3 -m grpc_tools.protoc \
   "${PROTO_PATH}"
 
 # protoc preserves the proto package path; flatten into the generated package.
-find "${STAGING}" -name '*.py' -o -name '*.pyi' | while read -r generated; do
-  cp "${generated}" "${OUT_DIR}/$(basename "${generated}")"
-done
+# `-print0`/`read -d ''` because the staging path is a mktemp directory and a
+# path containing whitespace must not silently split into two arguments.
+find "${STAGING}" -type f \( -name '*.py' -o -name '*.pyi' \) -print0 |
+  while IFS= read -r -d '' generated; do
+    cp "${generated}" "${OUT_DIR}/$(basename "${generated}")"
+  done
+
+# Remove bindings this run did not produce. A module left over from an earlier
+# contract (a split-out `.proto` that has since been merged into `mas.proto`)
+# stays importable and will be imported by something months later, so stale
+# output is deleted rather than left in place.
+find "${OUT_DIR}" -maxdepth 1 -type f \( -name '*_pb2.py' -o -name '*_pb2.pyi' -o -name '*_pb2_grpc.py' \) \
+  -print0 |
+  while IFS= read -r -d '' existing; do
+    if [[ ! -f "${STAGING}/$(basename "${existing}")" && ! -f "$(find "${STAGING}" -name "$(basename "${existing}")" -print -quit)" ]]; then
+      rm -f "${existing}"
+      echo "removed stale binding ${existing##*/}"
+    fi
+  done
 
 # protoc emits imports that follow the proto package path
 # (`from mas.api.v1 import mas_pb2 ...`). Because we flatten the tree into a
@@ -77,8 +102,12 @@ done
 # generated service stubs are unimportable. This rewrite is mechanical and is
 # re-applied on every regeneration, so the generated files stay untouched
 # by hand.
-find "${OUT_DIR}" -name '*_pb2_grpc.py' -print0 | while IFS= read -r -d '' stub; do
-  python3 - "${stub}" <<'REWRITE'
+# Both generated modules are rewritten, not just the gRPC stubs: rewriting only
+# the stubs once left `*_pb2.py` importing `from mas.api.v1 import ...`, which
+# failed at `import mas_orchestrator.grpc.generated`.
+find "${OUT_DIR}" \( -name '*_pb2_grpc.py' -o -name '*_pb2.py' \) -print0 |
+  while IFS= read -r -d '' stub; do
+  "${PYTHON_BIN}" - "${stub}" <<'REWRITE'
 import pathlib
 import re
 import sys
@@ -104,12 +133,16 @@ done
 # the documented contract name is `mas_api_pb2`. Rather than hand-editing the
 # generated file (which would be lost on regeneration), the package re-exports
 # it under the documented alias. BASE is read back from what protoc produced.
-BASE="$(find "${STAGING}" -name '*_pb2.py' -exec basename {} .py \; | head -1)"
-if [[ -z "${BASE}" ]]; then
-  echo "error: protoc produced no *_pb2.py module" >&2
-  exit 1
-fi
-SERVICE_BASE="$(find "${STAGING}" -name '*_pb2_grpc.py' -exec basename {} .py \; | head -1)"
+BASE="mas_pb2"
+SERVICE_BASE="mas_pb2_grpc"
+# protoc preserves the proto package path under the staging root, so each
+# expected module is located by name rather than by a hard-coded layout.
+for expected in "${BASE}" "${SERVICE_BASE}"; do
+  if ! find "${STAGING}" -name "${expected}.py" -print -quit | grep -q .; then
+    echo "error: protoc produced no ${expected}.py module" >&2
+    exit 1
+  fi
+done
 
 cat >"${OUT_DIR}/__init__.py" <<PY
 """Generated protobuf bindings — DO NOT EDIT.
@@ -130,7 +163,10 @@ from __future__ import annotations
 from . import ${BASE} as mas_api_pb2
 from . import ${SERVICE_BASE} as mas_api_pb2_grpc
 
-__all__ = ["mas_api_pb2", "mas_api_pb2_grpc"]
+__all__ = [
+    "mas_api_pb2",
+    "mas_api_pb2_grpc",
+]
 PY
 
 echo "==> generated:"

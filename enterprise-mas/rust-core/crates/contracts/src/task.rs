@@ -114,6 +114,15 @@ pub struct TaskQuery {
     pub status: Option<TaskStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<AgentId>,
+    /// Pinned published agent version the run must execute.
+    ///
+    /// A queued task that names an agent without naming the version would let
+    /// a republish between enqueue and execution silently change what runs, so
+    /// the producer copies the version it authorized and the worker resolves
+    /// exactly that one. Absent for non-agent operations and for tasks that
+    /// intentionally track the current published version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_version_id: Option<AgentVersionId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow_id: Option<WorkflowId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -153,6 +162,15 @@ pub struct TaskResponse {
     pub operation: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<AgentId>,
+    /// Pinned published agent version the run must execute.
+    ///
+    /// A queued task that names an agent without naming the version would let
+    /// a republish between enqueue and execution silently change what runs, so
+    /// the producer copies the version it authorized and the worker resolves
+    /// exactly that one. Absent for non-agent operations and for tasks that
+    /// intentionally track the current published version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_version_id: Option<AgentVersionId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow_id: Option<WorkflowId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -193,12 +211,13 @@ pub struct TaskQueueMessage {
     pub execution_id: Option<ExecutionId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<AgentId>,
-    /// The pinned agent version this delivery must execute.
+    /// Pinned published agent version the run must execute.
     ///
-    /// It rides with the task so the worker resolves *that* immutable version
-    /// rather than "whatever is published now", and so a retry of an older
-    /// delivery cannot silently pick up a republished agent. Absent means
-    /// "current published version", matching the AgentBridge convention.
+    /// A queued task that names an agent without naming the version would let
+    /// a republish between enqueue and execution silently change what runs, so
+    /// the producer copies the version it authorized and the worker resolves
+    /// exactly that one. Absent for non-agent operations and for tasks that
+    /// intentionally track the current published version.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_version_id: Option<AgentVersionId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -236,6 +255,7 @@ impl TaskQueueMessage {
         input: serde_json::Value,
         execution_id: Option<ExecutionId>,
         agent_id: Option<AgentId>,
+        agent_version_id: Option<AgentVersionId>,
         workflow_id: Option<WorkflowId>,
         idempotency_key: String,
         priority: TaskPriority,
@@ -255,9 +275,7 @@ impl TaskQueueMessage {
             input,
             execution_id,
             agent_id,
-            // Pinned at dispatch by `with_agent_version_id`; a staged message
-            // that is never pinned executes the current published version.
-            agent_version_id: None,
+            agent_version_id,
             workflow_id,
             idempotency_key,
             priority,
@@ -273,7 +291,7 @@ impl TaskQueueMessage {
         Ok(staged)
     }
 
-    /// Pins the exact immutable agent version this delivery executes.
+    /// Pins the exact published agent version this task must execute.
     #[must_use]
     pub fn with_agent_version_id(mut self, agent_version_id: AgentVersionId) -> Self {
         self.agent_version_id = Some(agent_version_id);
@@ -328,6 +346,7 @@ mod queue_attempt_tests {
             serde_json::json!({"prompt": "hello"}),
             Some(ExecutionId::new()),
             Some(AgentId::new()),
+            Some(AgentVersionId::new()),
             None,
             "idem-1".to_owned(),
             TaskPriority::Normal,

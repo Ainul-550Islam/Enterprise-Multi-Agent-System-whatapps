@@ -60,9 +60,9 @@ import logging
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Any, Final
 
-from mas_orchestrator.agents.base import Termination
+from mas_orchestrator.agents.base import AgentSpec, Termination
 from mas_orchestrator.agents.runtime import ExecutionResult
 from mas_orchestrator.context.execution_context import build_execution_context
 from mas_orchestrator.contracts.errors import (
@@ -73,7 +73,7 @@ from mas_orchestrator.contracts.errors import (
     TenantContextError,
 )
 from mas_orchestrator.contracts.protocol_version import CURRENT_PROTOCOL_VERSION
-from mas_orchestrator.grpc.agent_snapshot import ValidatedAgentSnapshot, parse_agent_snapshot
+from mas_orchestrator.grpc.agent_snapshot import parse_agent_snapshot
 from mas_orchestrator.grpc.errors import abort_with_error
 from mas_orchestrator.grpc.generated import mas_api_pb2, mas_api_pb2_grpc
 from mas_orchestrator.grpc.metadata import (
@@ -96,7 +96,6 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
 
     import grpc
-    from google.protobuf.message import Message
 
     from mas_orchestrator.context import ExecutionContext
     from mas_orchestrator.security.identity import (
@@ -259,7 +258,7 @@ def usage_from_result(result: ExecutionResult) -> mas_api_pb2.AgentUsageMsg | No
 DEFAULT_ALLOWED_INTERNAL_CALLERS: Final[frozenset[str]] = DEFAULT_ALLOWED_CALLERS
 
 
-def _canonical_request_bytes(request: Message | None) -> bytes:
+def _canonical_request_bytes(request: mas_api_pb2.AgentRunRequest | None) -> bytes:
     """Serializes the request exactly as it will be verified.
 
     The signature is bound to the bytes that were sent, so the bytes verified
@@ -268,10 +267,7 @@ def _canonical_request_bytes(request: Message | None) -> bytes:
     Rust (prost) and Python (protobuf) implementations.
 
     Args:
-        request: The wire request, or ``None`` for a call with no body. Any
-            protobuf message is accepted: the Data Hub bridge signs its own
-            message types through this same function, and serialising *that*
-            message is what makes the check cover it too.
+        request: The wire request, or ``None`` for a call with no body.
 
     Returns:
         The canonical encoding. An absent request yields ``b""``, which can
@@ -400,12 +396,12 @@ class AgentBridgeServicer(mas_api_pb2_grpc.AgentBridgeApiServicer):
         # --- 6. validate the request body -------------------------------------
         prompt = await self._prompt_from(request, context)
 
-        # --- 6b. validate the Rust-resolved agent snapshot ---------------------
-        # Rust owns which immutable agent version executes. The snapshot is
-        # covered by the body HMAC and is re-checked against the request scope
-        # here, so a caller cannot run a different (or a mutated) version by
-        # editing the request or by omitting the snapshot entirely.
-        snapshot = await self._agent_snapshot(request, context)
+        # --- 6b. resolve the immutable agent snapshot -------------------------
+        # Done before dispatch so a missing, foreign or malformed snapshot is
+        # an INVALID_ARGUMENT on this call rather than a failure inside a run
+        # that has already been started and metered. Nothing is recorded and
+        # no runtime work happens if this raises.
+        agent_spec = await self._agent_spec_from(request, execution_context, context)
 
         # --- 7, 8, 9. dispatch, bounded by the context, cancellable -----------
         # The clock for the runtime excludes the work done above: the operator
@@ -416,7 +412,12 @@ class AgentBridgeServicer(mas_api_pb2_grpc.AgentBridgeApiServicer):
         disarm = self._arm_cancellation(context, cancel_event)
         try:
             result = await self._dispatch(
-                prompt, request, snapshot, execution_context, cancel_event, context
+                prompt,
+                request,
+                execution_context,
+                cancel_event,
+                context,
+                agent_spec,
             )
         except asyncio.CancelledError:
             self._telemetry.cancellation(execution_context)
@@ -481,7 +482,7 @@ class AgentBridgeServicer(mas_api_pb2_grpc.AgentBridgeApiServicer):
         self,
         metadata: RustCallMetadata,
         context: grpc.aio.ServicerContext,
-        request: Message | None,
+        request: mas_api_pb2.AgentRunRequest | None,
     ) -> None:
         """Verifies the caller's body-bound signature, or refuses the call.
 
@@ -579,11 +580,81 @@ class AgentBridgeServicer(mas_api_pb2_grpc.AgentBridgeApiServicer):
         await abort_with_error(context, refusal)
         raise AssertionError("abort_with_error never returns") from None
 
+    async def validate_call_context(
+        self,
+        request: Any,
+        context: grpc.aio.ServicerContext,
+        *,
+        required_scope: ServiceScope | None = None,
+    ) -> tuple[RustCallMetadata, ServiceIdentity]:
+        """Authenticates one inbound bridge call and returns its metadata.
+
+        This is the single authentication entry point for *every* Rust → Python
+        surface. :meth:`RunAgent` and the Data Hub servicer both come through
+        here, so there is exactly one credential check, one signature check,
+        one scope check and one clock-skew policy in the process. A second
+        implementation on a second servicer is how the two drift apart — and
+        the one that drifts is the one serving the newer surface.
+
+        Args:
+            request: The wire request. Its serialized form is what the body
+                signature is verified over, so this must be the exact message
+                received, not a reconstruction.
+            context: The gRPC servicer context, aborted on rejection.
+            required_scope: The scope this operation needs. Defaults to the
+                servicer's configured ``require_scope``.
+
+        Returns:
+            The parsed call metadata and the authenticated identity.
+
+        Raises:
+            OrchestratorError: Propagated after aborting the RPC, so a caller
+                that ignores the abort still cannot proceed.
+        """
+        metadata = extract_call_metadata(tuple(context.invocation_metadata() or ()))
+        scope = required_scope if required_scope is not None else self._config.require_scope
+        identity = await self._authenticate_with_scope(metadata, context, request, scope)
+        return metadata, identity
+
+    async def _authenticate_with_scope(
+        self,
+        metadata: RustCallMetadata,
+        context: grpc.aio.ServicerContext,
+        request: Any,
+        required_scope: ServiceScope | None,
+    ) -> ServiceIdentity:
+        """Verifies the signature, resolves the credential, enforces the scope.
+
+        Split from :meth:`_authenticate` only so the required scope can be a
+        parameter: the agent bridge asks for ``EXECUTE_AGENT``, the Data Hub
+        for its own operation scope, and both must run the identical check
+        sequence in the identical order.
+        """
+        await self._verify_internal_signature(metadata, context, request)
+
+        try:
+            identity = await self._resolver.resolve(metadata.credential)
+        except OrchestratorError as error:
+            self._telemetry.authorization_failure(None, error=error)
+            await abort_with_error(context, error)
+            raise
+
+        if required_scope is not None and not identity.has_scope(required_scope):
+            refusal = AuthorizationError(
+                f"caller is not permitted to {required_scope.value}",
+                details={"subject": identity.subject, "required_scope": required_scope.value},
+            )
+            self._telemetry.authorization_failure(None, error=refusal)
+            await abort_with_error(context, refusal)
+            raise AssertionError("abort_with_error never returns") from None
+
+        return identity
+
     async def _authenticate(
         self,
         metadata: RustCallMetadata,
         context: grpc.aio.ServicerContext,
-        request: Message | None = None,
+        request: mas_api_pb2.AgentRunRequest | None = None,
     ) -> ServiceIdentity:
         """Resolves the caller's credential and authorises it.
 
@@ -634,62 +705,6 @@ class AgentBridgeServicer(mas_api_pb2_grpc.AgentBridgeApiServicer):
             raise AssertionError("abort_with_error never returns") from None
 
         return identity
-
-    async def validate_call_context(
-        self,
-        request: Message,
-        context: grpc.aio.ServicerContext,
-        *,
-        required_scope: ServiceScope,
-    ) -> tuple[RustCallMetadata, ServiceIdentity]:
-        """Authenticates a non-``RunAgent`` bridge call and returns its context.
-
-        The Data Hub bridge is a *separate* gRPC service and must not grow its
-        own trust boundary: a second metadata parser, token resolver or HMAC
-        implementation is a second place for them to disagree. So it delegates
-        here, and this method runs exactly the two proofs ``RunAgent`` runs, in
-        the same order:
-
-        1. the body-bound internal HMAC over ``request.SerializeToString()``,
-           so a signature cannot be lifted from one call and replayed on
-           another; and
-        2. the bearer credential resolved by the configured
-           :class:`ServiceIdentityResolver`, followed by the scope check.
-
-        One boundary also means a fix to authentication can never land on one
-        entry point and silently miss the other.
-
-        Protocol version is deliberately *not* compared here: the caller does
-        that, because the field lives on its own message type and a mismatch is
-        an error about that message, not about identity.
-
-        Args:
-            request: The wire message whose bytes were signed.
-            context: The servicer context, aborted on failure.
-            required_scope: The scope the resolved identity must hold for this
-                operation.
-
-        Returns:
-            The parsed call metadata and the authenticated identity.
-
-        Raises:
-            OrchestratorError: When authentication or authorisation fails. The
-                context has already been aborted with the same error, so the
-                gRPC edge reports a typed status rather than a traceback.
-        """
-        metadata = extract_call_metadata(tuple(context.invocation_metadata() or ()))
-        identity = await self._authenticate(metadata, context, request)
-
-        if not identity.has_scope(required_scope):
-            refusal = AuthorizationError(
-                "caller is not permitted to perform this data hub operation",
-                details={"subject": identity.subject, "scope": str(required_scope)},
-            )
-            self._telemetry.authorization_failure(None, error=refusal)
-            await abort_with_error(context, refusal)
-            raise AssertionError("abort_with_error never returns") from None
-
-        return metadata, identity
 
     async def _reconcile_scope(
         self,
@@ -807,44 +822,6 @@ class AgentBridgeServicer(mas_api_pb2_grpc.AgentBridgeApiServicer):
             await abort_with_error(context, error)
             raise
 
-    async def _agent_snapshot(
-        self,
-        request: mas_api_pb2.AgentRunRequest,
-        context: grpc.aio.ServicerContext,
-    ) -> ValidatedAgentSnapshot:
-        """Validates the Rust-resolved immutable agent snapshot.
-
-        The snapshot is the only agent definition the runtime is allowed to
-        execute. It is parsed with a closed schema and re-checked field by
-        field against the authoritative request scope, so a caller cannot run
-        an agent version Rust did not resolve for this tenant, organization and
-        project.
-
-        Args:
-            request: The wire request carrying ``agent_snapshot_json``.
-            context: The gRPC servicer context, aborted on a bad snapshot.
-
-        Returns:
-            The validated snapshot projected to an immutable runtime spec.
-        """
-        # `agent_version` is proto3 `optional`, so an unpinned run arrives as
-        # the empty string rather than as absent. Passing that through would
-        # validate "" as a UUID and refuse every run that does not pin a
-        # version; `None` is the honest representation of "no pin".
-        pinned_version = request.agent_version.strip() or None
-        try:
-            return parse_agent_snapshot(
-                request.agent_snapshot_json,
-                expected_agent_id=request.agent_id,
-                expected_tenant_id=request.tenant_id,
-                expected_organization_id=request.organization_id,
-                expected_project_id=request.project_id,
-                expected_agent_version_id=pinned_version,
-            )
-        except OrchestratorError as error:
-            await abort_with_error(context, error)
-            raise
-
     async def _prompt_from(
         self,
         request: mas_api_pb2.AgentRunRequest,
@@ -883,21 +860,85 @@ class AgentBridgeServicer(mas_api_pb2_grpc.AgentBridgeApiServicer):
 
         return raw
 
+    async def _agent_spec_from(
+        self,
+        request: mas_api_pb2.AgentRunRequest,
+        execution_context: ExecutionContext,
+        context: grpc.aio.ServicerContext,
+    ) -> AgentSpec:
+        """Validates the wire snapshot into the spec this run will execute.
+
+        Args:
+            request: The wire request, whose ``agent_snapshot_json`` is covered
+                by the body signature already verified above.
+            execution_context: The authoritative context, which supplies the
+                identity the snapshot must agree with.
+            context: The gRPC servicer context, aborted on rejection.
+
+        Returns:
+            The immutable spec for exactly the pinned agent version.
+
+        Raises:
+            InvalidRequestError: If the snapshot is absent, malformed, or does
+                not match the request scope.
+
+        There is no fallback to the Python catalog. A snapshot is signed by
+        Rust and is the authority on which published version runs; resolving
+        from a process-local catalog instead would silently execute whatever
+        that process happened to hold — exactly the substitution pinning an
+        agent version is meant to prevent.
+        """
+        # An omitted project or version is not an empty string to compare
+        # against: it means the request did not pin one, and a snapshot that
+        # names one cannot be reconciled with "unspecified". Refusing here
+        # keeps the later comparison from reporting a UUID-format error for
+        # what is really a missing field.
+        if not request.project_id:
+            await abort_with_error(
+                context,
+                InvalidRequestError(
+                    "agent run requires the project the snapshot was resolved for",
+                    details={"field": "project_id"},
+                ),
+            )
+            raise AssertionError("abort_with_error never returns") from None
+        if not request.agent_version:
+            await abort_with_error(
+                context,
+                InvalidRequestError(
+                    "agent run requires the exact pinned agent version",
+                    details={"field": "agent_version"},
+                ),
+            )
+            raise AssertionError("abort_with_error never returns") from None
+
+        try:
+            return parse_agent_snapshot(
+                request.agent_snapshot_json,
+                expected_agent_id=request.agent_id,
+                expected_tenant_id=request.tenant_id,
+                expected_organization_id=request.organization_id,
+                expected_project_id=request.project_id,
+                expected_agent_version_id=request.agent_version,
+            ).spec
+        except InvalidRequestError as error:
+            await abort_with_error(context, error)
+            raise AssertionError("abort_with_error never returns") from None
+
     async def _dispatch(
         self,
         prompt: str,
         request: mas_api_pb2.AgentRunRequest,
-        snapshot: ValidatedAgentSnapshot,
         execution_context: ExecutionContext,
         cancel_event: asyncio.Event,
         context: grpc.aio.ServicerContext,
+        agent_spec: AgentSpec,
     ) -> ExecutionResult:
         """Runs the execution and maps failures onto the right channel.
 
         Args:
             prompt: The validated input.
             request: The wire request.
-            snapshot: The validated immutable agent snapshot from Rust.
             execution_context: The authoritative context.
             cancel_event: Cancellation signal mirrored from the wire.
             context: The gRPC servicer context, aborted on an unmodelled fault.
@@ -912,7 +953,7 @@ class AgentBridgeServicer(mas_api_pb2_grpc.AgentBridgeApiServicer):
                     context=execution_context,
                     agent_id=request.agent_id or None,
                     protocol_version=(request.protocol_version or self._config.protocol_version),
-                    agent_snapshot=snapshot,
+                    agent_spec=agent_spec,
                 ),
                 cancel_event=cancel_event,
             )

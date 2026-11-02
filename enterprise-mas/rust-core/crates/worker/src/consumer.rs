@@ -677,9 +677,6 @@ impl Mediator {
 
         let settled = match outcome {
             Ok(value) => {
-                // The handler's JSON result is the task's durable output, so it
-                // is threaded into settlement rather than only being mined for
-                // usage. Usage is read from the same value.
                 self.attempts
                     .succeed(
                         claim,
@@ -1050,6 +1047,7 @@ mod tests {
             task.input.clone(),
             task.execution_id,
             task.agent_id,
+            None,
             task.workflow_id,
             task.idempotency_key.clone(),
             task.priority,
@@ -1671,7 +1669,7 @@ mod tests {
         let error = first
             .succeed(
                 &claim,
-                serde_json::Value::Null,
+                serde_json::json!({ "ok": true }),
                 Default::default(),
                 true,
                 &later,
@@ -1684,7 +1682,7 @@ mod tests {
             first
                 .succeed(
                     &claim,
-                    serde_json::Value::Null,
+                    serde_json::json!({ "ok": true }),
                     Default::default(),
                     true,
                     &later

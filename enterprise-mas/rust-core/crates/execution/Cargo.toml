@@ -30,16 +30,13 @@ dev-bridges = []
 workspace = true
 
 [dependencies]
+hex.workspace = true
 mas-common.workspace = true
 mas-domain.workspace = true
 mas-orchestration.workspace = true
-# `data_hub_bridge` hashes the exact payload bytes it forwards to the Python
-# ingestion plane, so the digest algorithm and its hex encoding are direct
-# dependencies of this crate rather than transitively borrowed.
-sha2.workspace = true
-hex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 thiserror.workspace = true

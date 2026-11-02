@@ -66,6 +66,20 @@ orchestrator:
 migrate:
   image: migrate
   command: ["up"]
+  # Fails the pre-install/pre-upgrade hook rather than hanging the release. A
+  # hook that never returns blocks the install and holds the schema advisory
+  # lock while it waits.
+  activeDeadlineSeconds: 600
+  # Retried once, not indefinitely: a real schema conflict is not fixed by
+  # retrying, and a flapping migration is worse than a failed one.
+  backoffLimit: 1
+  resources:
+    limits:
+      cpu: 500m
+      memory: 256Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
 
 # External infrastructure references (operator-provided).
 postgres:
@@ -89,20 +103,37 @@ providers:
 ingress:
   enabled: false
   class: nginx
+  # Public hostname for the api. Required when ingress.enabled=true; the chart
+  # refuses to render without it rather than falling back to a placeholder that
+  # would silently route nothing.
+  host: api.mas.example.com
   tls:
     enabled: false
+  # cert-manager ClusterIssuer used when tls.enabled=true.
+  clusterIssuer: letsencrypt-prod
 
 # Security context (hardened, applied to all workloads).
-securityContext:
+# Pod-level context. Only fields the PodSecurityContext API defines may appear
+# here; crucially *not* readOnlyRootFilesystem / allowPrivilegeEscalation /
+# capabilities, which are container-level. Shipping those here made every
+# rendered manifest invalid — the API server rejects the pod spec outright.
+podSecurityContext:
   runAsNonRoot: true
   runAsUser: 65532
+  runAsGroup: 65532
   fsGroup: 65532
-  readOnlyRootFilesystem: true
-  allowPrivilegeEscalation: false
-  capabilities:
-    drop: ["ALL"]
   seccompProfile:
     type: RuntimeDefault
+
+# Container-level context, applied to every container in every workload.
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  privileged: false
+  runAsNonRoot: true
+  runAsUser: 65532
+  capabilities:
+    drop: ["ALL"]
 
 # HPA disabled by default (opt-in flag).
 hpa:
@@ -112,3 +143,12 @@ hpa:
   workerMinReplicas: 2
   workerMaxReplicas: 20
   targetCPUUtilizationPercentage: 70
+
+# NetworkPolicy set. Enabled by default: the release ships a default-deny and
+# then allows only the flows each workload needs (DNS, data plane, bridge).
+networkPolicy:
+  enabled: true
+  # Namespace holding the ingress controller that fronts the api Service.
+  ingressNamespace: ingress-nginx
+  # Namespace holding PostgreSQL and NATS. Both are external to this chart.
+  dataNamespace: mas-data

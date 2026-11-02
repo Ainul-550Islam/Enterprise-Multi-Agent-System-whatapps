@@ -344,10 +344,12 @@ impl AttemptCoordinator {
 
     /// Settles a successful attempt.
     ///
-    /// `result` is the exact JSON the handler returned. It is *not* optional
-    /// here: the durable layer copies it onto the task row, and a settlement
-    /// that dropped it would mark a task completed while losing the only
-    /// record of what it produced.
+    /// `result` is the exact JSON value the handler produced. It is persisted
+    /// with the settled attempt (and, when this task is its execution's
+    /// terminal unit of work, copied onto the execution) so the outcome of a
+    /// completed run is recoverable after the worker process is gone. Passing
+    /// it in rather than reconstructing it later is deliberate: a result the
+    /// worker no longer holds cannot be recovered from anywhere else.
     pub async fn succeed(
         &self,
         claim: &TaskClaim,
@@ -695,7 +697,7 @@ mod tests {
         coordinator
             .succeed(
                 &first[0],
-                serde_json::Value::Null,
+                serde_json::json!({ "ok": true }),
                 ExecutionUsage::default(),
                 true,
                 &now(),
@@ -732,7 +734,7 @@ mod tests {
         let error = worker_a
             .succeed(
                 &claim,
-                serde_json::Value::Null,
+                serde_json::json!({ "ok": true }),
                 ExecutionUsage::default(),
                 true,
                 &after_lapse,
@@ -758,7 +760,7 @@ mod tests {
         let error = stranger
             .succeed(
                 &claim,
-                serde_json::Value::Null,
+                serde_json::json!({ "ok": true }),
                 ExecutionUsage::default(),
                 false,
                 &now(),
@@ -778,7 +780,7 @@ mod tests {
         let receipt = coordinator
             .succeed(
                 &claim,
-                serde_json::json!({"answer": 42}),
+                serde_json::json!({ "settled": true }),
                 ExecutionUsage {
                     provider: Some("openai".to_owned()),
                     model: Some("gpt-4o-mini".to_owned()),

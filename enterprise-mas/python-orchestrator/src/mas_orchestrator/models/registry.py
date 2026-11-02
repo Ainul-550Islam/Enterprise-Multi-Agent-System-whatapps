@@ -183,26 +183,12 @@ class ModelRegistry:
         return len(self._providers)
 
     def __contains__(self, model: object) -> bool:
-        """Whether *model* is servable. Unknown objects yield ``False``.
-
-        A bare ``provider/model`` string is accepted as well as a
-        :class:`~mas_orchestrator.models.types.ModelRef`. The allowlist is
-        spelled as strings in configuration, so the membership test every
-        deployment runs against it must understand strings; a string has no
-        ``key`` attribute, and rejecting it would fail startup for exactly the
-        deployments that hardened their model surface with an allowlist.
-        """
-        key: str | None = None
-        if isinstance(model, str):
-            key = model
-        else:
-            candidate = getattr(model, "key", None)
-            if isinstance(candidate, str):
-                key = candidate
-        if key is None or "/" not in key:
+        """Whether *model* is servable. Unknown objects yield ``False``."""
+        if not hasattr(model, "key"):
             return False
-        if key in self._models:
-            return True
+        key = model.key
+        if not isinstance(key, str):
+            return False
         return self.find(_ref_from_key(key)) is not None
 
     def register_all(self, providers: Iterable[object]) -> None:

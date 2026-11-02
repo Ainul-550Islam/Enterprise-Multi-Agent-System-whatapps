@@ -59,24 +59,16 @@ from mas_orchestrator.security.internal_service import (
     signed_internal_signature,
 )
 
-# The agent-snapshot parser validates every scope identifier as a canonical
-# UUID (Rust sends `Uuid` values on the wire), so the bridge fixtures use UUID
-# scope ids. `TENANT_NAME` keeps the readable label for log/assertion clarity.
+# Bridge identity fixtures are canonical UUIDs. Rust owns these ids and sends
+# them as UUID strings, and the snapshot validator rejects anything else. Using
+# readable slugs here would let a fixture pass while the wire contract it stands
+# in for could never be satisfied.
 TENANT = "11111111-1111-4111-8111-111111111111"
-TENANT_NAME = "tenant-alpha"
 OTHER_TENANT = "22222222-2222-4222-8222-222222222222"
-OTHER_TENANT_NAME = "tenant-beta"
-ORGANIZATION = "66666666-6666-4666-8666-666666666666"
-
-# Canonical UUIDs for the immutable agent snapshot. Rust sends real UUIDs on
-# the wire and the snapshot parser validates every one of them, so fixtures use
-# the same shape rather than convenient non-UUID placeholders.
-AGENT = "33333333-3333-4333-8333-333333333333"
-AGENT_VERSION = "44444444-4444-4444-8444-444444444444"
-PROJECT = "55555555-5555-4555-8555-555555555555"
-
-#: A valid lowercase-hex SHA-256, as Rust computes over the versioned config.
-CONFIGURATION_CHECKSUM = "a" * 64
+ORGANIZATION = "33333333-3333-4333-8333-333333333333"
+PROJECT = "66666666-6666-4666-8666-666666666666"
+AGENT = "55555555-5555-4555-8555-555555555555"
+AGENT_VERSION = "77777777-7777-4777-8777-777777777777"
 CREDENTIAL = "bridge-service-token"
 SUBJECT = "rust-core"
 
@@ -105,9 +97,9 @@ class RecordedRun:
         context: The execution context the servicer built.
         cancel_event: The cancellation event handed to the run, so a test can
             observe whether the bridge mirrored a wire cancellation onto it.
-        agent_spec: The validated agent snapshot the servicer resolved, so a
-            test can prove the signed Rust snapshot reached the runtime rather
-            than the local catalog.
+        agent_spec: The immutable agent definition the bridge resolved from
+            the signed snapshot and asked the runtime to execute. ``None``
+            when the request carried no snapshot.
     """
 
     request_text: str
@@ -155,10 +147,7 @@ class RecordingExecutionService:
                 request.request,
                 request.context,
                 event,
-                # Record the projected spec, which is what the runtime is
-                # actually handed, so a test asserts on the executable
-                # definition rather than on the transport wrapper.
-                agent_spec=getattr(getattr(request, "agent_snapshot", None), "spec", None),
+                getattr(request, "agent_spec", None),
             )
         )
 
@@ -237,6 +226,12 @@ def failed_result(
     )
 
 
+#: A stable, lowercase SHA-256 hex string. The snapshot contract requires
+#: exactly 64 lowercase hex characters; the value itself is opaque to Python,
+#: which only checks its shape and forwards it to the runtime for logging.
+SNAPSHOT_CHECKSUM = "b" * 64
+
+
 def snapshot_json(
     *,
     agent_id: str = AGENT,
@@ -244,33 +239,56 @@ def snapshot_json(
     organization_id: str = ORGANIZATION,
     project_id: str = PROJECT,
     agent_version_id: str = AGENT_VERSION,
-    version_number: int = 3,
-    configuration_checksum: str = CONFIGURATION_CHECKSUM,
-    name: str = "Snapshot Agent",
-    slug: str = "snapshot-agent",
-    kind: str = "standard",
+    version_number: int = 1,
+    model_hint: str = "provider/model-test",
+    system_prompt: str = "Rust-published test instructions",
     status: str = "active",
     origin: str = "user",
-    read_only: bool = False,
-    description: str | None = "bridge fixture",
-    model_hint: str | None = "provider/model-test",
-    system_prompt: str = "Rust-published test instructions",
+    read_only: bool | None = None,
+    name: str = "Published Test Agent",
+    slug: str = "published-test-agent",
+    kind: str = "standard",
+    description: str | None = None,
+    tags: tuple[str, ...] = (),
+    allowed_tools: tuple[str, ...] = (),
     max_steps: int = 25,
-    max_tool_calls: int = 5,
-    max_delegation_depth: int = 0,
+    max_tool_calls: int = 50,
+    max_delegation_depth: int = 2,
     timeout_seconds: float | None = None,
-    tags: list[str] | None = None,
-    allowed_tools: list[str] | None = None,
+    configuration_checksum: str | None = None,
 ) -> str:
-    """Builds the closed ``agent_snapshot_json`` body Rust sends.
+    """Serializes a Rust-owned agent snapshot the way Rust sends it.
 
-    The key set and value shapes match
-    ``mas_orchestrator.grpc.agent_snapshot``'s closed schema exactly, because
-    its parser rejects both unknown *and* missing keys. Keeping the builder in
-    one place means a schema change breaks one fixture rather than every test.
+    Args:
+        agent_id: Agent id, matching the request body.
+        tenant_id: Authoritative tenant; must match the request and metadata.
+        organization_id: Authoritative organization.
+        project_id: Authoritative project.
+        agent_version_id: The exact pinned published version id.
+        version_number: Monotonic version number.
+        model_hint: Routing preference from the published configuration.
+        system_prompt: The immutable published instructions.
+        status: Lifecycle status; only ``active`` is executable.
+        origin: ``user`` or ``system``. ``system`` agents are read-only.
+        read_only: Override for the derived read-only flag, so a test can
+            reproduce the inconsistent state the validator must reject.
+        name: Display name.
+        slug: URL-safe identifier.
+        kind: ``standard``, ``supervisor`` or ``tool_user``.
+        description: Optional description.
+        tags: Free-form labels.
+        allowed_tools: Tool ids the agent may call.
+        max_steps: Step ceiling.
+        max_tool_calls: Tool-call ceiling.
+        max_delegation_depth: Delegation ceiling.
+        timeout_seconds: Optional wall-clock ceiling.
+        configuration_checksum: Override for the default checksum.
 
     Returns:
-        The JSON document as it appears on the wire.
+        The JSON the wire field ``agent_snapshot_json`` carries.
+
+    Every key is emitted, including ``null`` ones: the schema is closed in both
+    directions, so a missing key is as much a rejection as an unknown one.
     """
     return json.dumps(
         {
@@ -280,13 +298,13 @@ def snapshot_json(
             "project_id": project_id,
             "agent_version_id": agent_version_id,
             "version_number": version_number,
-            "configuration_checksum": configuration_checksum,
+            "configuration_checksum": configuration_checksum or SNAPSHOT_CHECKSUM,
             "name": name,
             "slug": slug,
             "kind": kind,
             "status": status,
             "origin": origin,
-            "read_only": read_only,
+            "read_only": (origin == "system") if read_only is None else read_only,
             "configuration": {
                 "description": description,
                 "model_hint": model_hint,
@@ -297,10 +315,11 @@ def snapshot_json(
                     "max_delegation_depth": max_delegation_depth,
                     "timeout_seconds": timeout_seconds,
                 },
-                "tags": list(tags) if tags is not None else ["fixture"],
-                "allowed_tools": list(allowed_tools) if allowed_tools is not None else [],
+                "tags": list(tags),
+                "allowed_tools": list(allowed_tools),
             },
-        }
+        },
+        sort_keys=True,
     )
 
 
@@ -308,17 +327,19 @@ def request(
     *,
     tenant_id: str = TENANT,
     organization_id: str = ORGANIZATION,
+    project_id: str = PROJECT,
     input_json: str = "hello",
-    agent_id: str = "platform.default",
+    # The default agent is a UUID because the signed snapshot must name the
+    # exact agent Rust resolved; the human-readable catalog id belongs to a
+    # path production never takes.
+    agent_id: str = AGENT,
     correlation_id: str = "corr-1",
     request_id: str = "req-1",
     execution_id: str = "exec-1",
     deadline_rfc3339: str = "",
     identity_subject: str = SUBJECT,
     idempotency_key: str = "",
-    agent_id_pinned: str = AGENT,
-    agent_version: str = AGENT_VERSION,
-    project_id: str = PROJECT,
+    agent_version: str | None = AGENT_VERSION,
     agent_snapshot_json: str | None = None,
 ) -> mas_api_pb2.AgentRunRequest:
     """Builds a well-formed ``AgentRunRequest``.
@@ -326,25 +347,26 @@ def request(
     Args:
         tenant_id: Authoritative tenant.
         organization_id: Authoritative organization.
+        project_id: Authoritative project the snapshot was resolved for.
         input_json: The run input.
-        agent_id: The agent to run (the routing id shown to the caller).
-        agent_id_pinned: The agent id the snapshot pins; must match the request.
-        agent_version: The exact pinned version; must match the snapshot.
-        project_id: Authoritative project, also pinned in the snapshot.
-        agent_snapshot_json: An explicit snapshot body, or ``None`` to build the
-            default one that agrees with the defaults above.
+        agent_id: The agent to run.
         correlation_id: Correlation id.
         request_id: Request id.
         execution_id: Execution id.
         deadline_rfc3339: Deadline, or empty for none.
         identity_subject: The declared caller subject.
         idempotency_key: Idempotency key, or empty.
+        agent_version: The pinned version id. ``None`` omits it, which the
+            bridge must treat as "no version pinned".
+        agent_snapshot_json: The signed snapshot body. Defaults to a valid
+            snapshot matching the default ids; pass ``""`` to reproduce a
+            missing one.
 
     Returns:
         The request.
     """
     message = mas_api_pb2.AgentRunRequest(
-        agent_id=agent_id_pinned,
+        agent_id=agent_id,
         input_json=input_json,
         correlation_id=correlation_id,
         request_id=request_id,
@@ -352,24 +374,27 @@ def request(
         tenant_id=tenant_id,
         organization_id=organization_id,
         project_id=project_id,
-        agent_version=agent_version,
         protocol_version=str(CURRENT_PROTOCOL_VERSION),
         deadline_rfc3339=deadline_rfc3339,
         identity=mas_api_pb2.ServiceIdentityMsg(subject=identity_subject),
-        agent_snapshot_json=(
-            agent_snapshot_json
-            if agent_snapshot_json is not None
-            else snapshot_json(
-                tenant_id=tenant_id,
-                organization_id=organization_id,
-                project_id=project_id,
-                agent_id=agent_id_pinned,
-                agent_version_id=agent_version,
-            )
-        ),
     )
     if idempotency_key:
         message.idempotency_key = idempotency_key
+    if agent_version is not None:
+        message.agent_version = agent_version
+    if agent_snapshot_json is None:
+        # Default to a snapshot whose identity matches this very request, so
+        # every existing test keeps exercising the real signed path instead of
+        # a catalog fallback that production never takes.
+        message.agent_snapshot_json = snapshot_json(
+            agent_id=agent_id,
+            tenant_id=tenant_id,
+            organization_id=organization_id,
+            project_id=project_id,
+            agent_version_id=agent_version or AGENT_VERSION,
+        )
+    else:
+        message.agent_snapshot_json = agent_snapshot_json
     return message
 
 

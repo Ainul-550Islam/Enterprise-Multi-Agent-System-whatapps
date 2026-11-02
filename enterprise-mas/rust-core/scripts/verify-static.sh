@@ -519,6 +519,15 @@ for (mod, fn), methods in sorted(handlers.items()):
 # -------------------------------------------------------------------------
 # S10: shared-file non-additive edits must sit inside the verify-fix
 #      allowlist (file + recorded reason); anything else fails.
+#
+#      SCOPE NOTE: this check is pinned to the Batch 01/02 cleanup it was
+#      written for — it diffs against `origin/main` and compares the result to
+#      the hardcoded list below. After any later, legitimate change to a shared
+#      file it reports the deletions in that change as S10 failures even when
+#      the file is a net addition (e.g. a missing field being added). It is not
+#      wired into CI for that reason. Treat S10 output as "these files changed
+#      since the batch", not as a defect list; the other checks in this script
+#      are the ones that generalise.
 # -------------------------------------------------------------------------
 print("-- S10 shared-file non-additive edits (allowlist) --")
 ALLOWED_DELETIONS = {
@@ -534,19 +543,6 @@ ALLOWED_DELETIONS = {
     "crates/persistence/src/repositories/audit.rs": "verify fix: tenant predicates on audit-pool reads + PURPOSE header",
     "crates/persistence/tests/live_pg.rs": "verify: correlation read gains tenant argument",
     "migrations/0051_webhook_replay_attempts/up.sql": "verify: PURPOSE header",
-    # ---- backend-completion batch (PROMPT 01) ----------------------------
-    # Each entry is a real defect fix or a widening needed to consume the
-    # newly added proto field; none removes behaviour.
-    "crates/ai-bridge/src/data_hub.rs": "fix: next_cursor is optional<string>; nonempty(String) rejected Option<String> (type error at HEAD)",
-    "crates/ai-bridge/src/lib.rs": "feature: AI_PROTOCOL_VERSION 1.0.0->1.1.0, agent_snapshot_json encoded, channel retained for Data Hub, snapshot test imports",
-    "crates/ai-bridge/tests/e2e_python.rs": "fix: cross-language fixtures pin the signed snapshot the runtime now requires",
-    "crates/api/src/middleware.rs": "fix: platform-admin lane must not skip RLS scope arming for admins that have a home tenant",
-    "crates/contracts/src/task.rs": "fix: TaskQueueMessage carries agent_version_id so the worker can pin the resolved version",
-    "crates/execution/src/agent_bridge.rs": "feature: AgentRuntimeSnapshot projection + succeed() carries handler result/usage",
-    "crates/execution/src/lib.rs": "feature: re-export AgentRuntimeSnapshot types and the data_hub module",
-    "crates/worker/src/attempts.rs": "fix: ClaimManager::succeed() signature now carries handler result and usage",
-    "crates/worker/src/consumer.rs": "fix: consumer passes the handler result/usage through succeed()",
-    "crates/worker/src/failure_matrix.rs": "fix: failure-matrix call sites follow the succeed() signature",
 }
 numstat = subprocess.run(["git", "diff", "--numstat", "origin/main", "--", "."],
                          capture_output=True, text=True).stdout

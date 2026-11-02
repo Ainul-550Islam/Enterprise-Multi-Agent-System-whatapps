@@ -9,7 +9,7 @@
 name = "mas-worker-service"
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
+license = "LicenseRef-Proprietary"
 description = "Host binary for the mas-worker durable consumer (mirrors mas-scheduler-service)."
 
 [[bin]]

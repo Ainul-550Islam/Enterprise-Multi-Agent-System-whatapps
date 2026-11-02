@@ -138,11 +138,11 @@ class AgentSpec:
         system_prompt: The agent's instructions.
         limits: Execution ceilings.
         tags: Free-form labels.
-        read_only: Whether the platform owns this agent. A read-only agent is
-            shipped with the product (for example the built-in platform
-            assistant): it cannot be edited, republished or mutated through a
-            request, and the factory refuses to build one that does not meet
-            the stricter contract for product-owned agents.
+        read_only: Whether this agent is forbidden from mutating anything —
+            no tool invocation and no state write. Product-owned builtins set
+            it; a caller-supplied spec cannot. It is a property of the
+            definition rather than of the request, so a tenant cannot grant
+            itself a mutable variant of a read-only agent.
     """
 
     agent_id: str

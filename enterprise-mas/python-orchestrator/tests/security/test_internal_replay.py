@@ -16,7 +16,6 @@ def _identity(nonce: str = "0123456789abcdefghijklmnopqrstuv") -> InternalServic
         service="mas-worker",
         signed_at_ms=1_700_000_000_000,
         nonce=nonce,
-        expires_at_ms=4_102_444_800_000,
     )
 
 

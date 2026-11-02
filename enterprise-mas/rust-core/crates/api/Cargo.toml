@@ -23,7 +23,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 description = "HTTP + gRPC api processes: thin transports over mas-application use-cases"
-license = "Proprietary"
+license = "LicenseRef-Proprietary"
 
 [lib]
 name = "mas_api"
@@ -39,7 +39,7 @@ mas-domain = { workspace = true }
 mas-contracts = { workspace = true }
 mas-application = { workspace = true }
 mas-ai-bridge = { workspace = true }
-mas-execution = { workspace = true }
+mas-execution = { workspace = true, features = ["dev-bridges"] }
 mas-observability = { workspace = true }
 mas-persistence = { workspace = true }
 mas-security = { workspace = true }
@@ -81,7 +81,7 @@ http-body-util = "0.1"
 
 [features]
 default = ["testutils"]
-testutils = ["mas-cli/testutils"]
+testutils = ["mas-cli/testutils", "mas-execution/dev-bridges"]
 
 [lints]
 workspace = true

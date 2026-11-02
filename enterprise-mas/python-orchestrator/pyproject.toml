@@ -53,6 +53,11 @@ dependencies = [
     "protobuf>=7.35.1,<8",
     # Outbound HTTP for provider/tool adapters (SSRF-guarded by our own layer).
     "httpx>=0.27",
+    # Hardened XML parsing for the Data Hub sitemap/RSS source adapter.
+    # defusedxml is imported unconditionally by data_hub.sources, so it is a
+    # hard runtime dependency, not an extra; stdlib ElementTree is vulnerable
+    # to entity-expansion and external-entity attacks from untrusted feeds.
+    "defusedxml>=0.7.1,<1",
 ]
 
 [project.optional-dependencies]
@@ -65,27 +70,6 @@ otel = [
 ]
 # Prometheus exposition for the metrics registry when scraping is configured.
 metrics = ["prometheus-client>=0.20"]
-
-# The PostgreSQL/pgvector retrieval plane. `rag/pgvector_index.py` imports
-# `psycopg`, `psycopg_pool` and `pgvector` at module scope, so the plane cannot
-# even be imported without these — they are an extra rather than core
-# dependencies only because a deployment that never enables RAG needs neither.
-pgvector = [
-    "psycopg[binary,pool]>=3.2,<4",
-    "pgvector>=0.3,<1",
-]
-
-# Document ingestion: PDF and DOCX parsing plus hardened XML for source
-# adapters. `rag/parsing.py` imports `pypdf` and `docx`, and
-# `data_hub/sources.py` imports `defusedxml` on the bridge import path, so this
-# extra is required by any process that serves the Data Hub bridge — which the
-# orchestrator does. `beautifulsoup4` is deliberately absent: HTML is parsed
-# with the standard library's `html.parser`.
-ingest = [
-    "defusedxml>=0.7.1,<1",
-    "pypdf>=5,<7",
-    "python-docx>=1.1,<2",
-]
 
 [project.scripts]
 mas-orchestrator = "mas_orchestrator.main:main"
@@ -159,11 +143,11 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S", "S101"]
 "src/mas_orchestrator/grpc/generated/**" = ["ALL"]
-# The servicer implements methods whose names are fixed by the protobuf
-# contract (`RunAgent`, `Health`). Renaming them would break the wire, so the
-# naming rule is relaxed for the one file that must match the schema.
+# The servicers implement methods whose names are fixed by the protobuf
+# contract (`RunAgent`, `Health`, `SyncSource`, `IngestDocument`,
+# `PurgeDocument`). Renaming them would break the wire, so the naming rule is
+# relaxed for the files that must match the schema.
 "src/mas_orchestrator/grpc/agent_bridge_servicer.py" = ["N802"]
-# gRPC method names are wire identifiers fixed by the proto contract.
 "src/mas_orchestrator/grpc/data_hub_servicer.py" = ["N802"]
 
 [tool.ruff.format]
@@ -190,14 +174,18 @@ show_error_codes = true
 pretty = true
 
 [[tool.mypy.overrides]]
-module = [
-    "grpc.*",
-    "grpc_health.*",
-    "google.protobuf.*",
-    "opentelemetry.*",
-    "prometheus_client.*",
-    "structlog.*",
-]
+module = ["grpc.*", "grpc_health.*", "opentelemetry.*", "prometheus_client.*", "structlog.*"]
+ignore_missing_imports = true
+
+# Optional extras that are imported lazily and only when their backend is
+# selected (`pgvector` and `psycopg*` for the RAG plane, `grpc_tools` for the
+# proto generator). Every one of those call sites is already wrapped in a
+# try/except ImportError that raises ConfigurationError with the extra to
+# install, so a missing stub here is not a typing gap in our own code. Listing
+# them keeps `mypy src` clean without `--ignore-missing-imports`, which would
+# also silence real problems in a required dependency.
+[[tool.mypy.overrides]]
+module = ["pgvector.*", "psycopg.*", "psycopg_pool.*", "grpc_tools.*", "pypdf.*", "docx.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]

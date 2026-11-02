@@ -1,56 +1,65 @@
-#!/usr/bin/env sh
-# PURPOSE:
-# Restores the complete Python toolchain after the sandbox loses it.
+#!/usr/bin/env bash
 #
-# Installs the pinned development dependencies AND the package itself, so a
-# fresh session can run `scripts/check.sh` green with one command. Installing
-# the package matters, not just its dependencies: `pyproject.toml` sets
-# `pythonpath = ["src"]`, which lets pytest import `mas_orchestrator` but does
-# nothing for a test that spawns a bare `python3 -c "import ..."` subprocess.
-# Without the install, that one test goes red for reasons that look like a
-# product bug and are not.
+# Installs the Python orchestrator's development toolchain.
 #
-# Usage:  ./scripts/bootstrap.sh
+# This is the one script CI runs before `scripts/check.sh`, and it is also what
+# a developer runs after cloning. Keeping both paths identical means a check
+# that passes locally passes in CI for the same reason rather than by accident.
 #
-# The sandbox can lose installed packages between sessions while /home/user
-# survives. Running this script restores the toolchain without touching any
-# source file.
+# Usage:
+#   bash scripts/bootstrap.sh [--force]
 #
-# Usage:  ./scripts/bootstrap.sh
-set -eu
+# Idempotent: re-running against an existing environment is a no-op reinstall.
 
-python3 -m pip install -q --disable-pip-version-check \
-    "pydantic>=2.9,<3" \
-    "pydantic-settings>=2.5,<3" \
-    "structlog>=24.1" \
-    "httpx>=0.27" \
-    "grpcio>=1.84" \
-    "grpcio-tools>=1.84" \
-    "protobuf>=7.35.1,<8" \
-    "beautifulsoup4>=4.12,<5" \
-    "defusedxml>=0.7.1,<1" \
-    "pgvector>=0.3,<1" \
-    "pypdf>=5,<7" \
-    "psycopg[binary,pool]>=3.2,<4" \
-    "python-docx>=1.1,<2" \
-    "pytest>=8.2" \
-    "pytest-asyncio>=0.24" \
-    "ruff>=0.6" \
-    "mypy>=1.11" \
-    "types-defusedxml>=0.7.0"
+set -euo pipefail
 
-# Install the package itself, not only its dev dependencies.
-#
-# `pyproject.toml` sets `pythonpath = ["src"]`, which is enough for pytest to
-# import `mas_orchestrator` but NOT enough for a test that spawns a bare
-# `python3 -c "import mas_orchestrator"` subprocess: that child inherits no
-# pytest path setup. The fingerprint-stability test does exactly that, because
-# a hash that differs between processes is not a fingerprint at all. Restoring
-# only the tools therefore leaves one test red after a reset, which looks like
-# a product bug and is not.
-python3 -m pip install -q --disable-pip-version-check --no-deps -e .
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-echo "toolchain restored"
-python3 -m ruff --version
-python3 -m mypy --version
-python3 -m pytest --version
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+
+if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
+  echo "error: ${PYTHON_BIN} is not on PATH" >&2
+  echo "hint: set PYTHON_BIN=/path/to/python3.13 and re-run" >&2
+  exit 1
+fi
+
+# The checked-in protobuf bindings require >= 3.11 (StrEnum, `Self` in
+# protocols). Failing here with a clear message beats failing 200 tests in with
+# ImportError.
+PY_VERSION="$("${PYTHON_BIN}" -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
+PY_MAJOR="${PY_VERSION%%.*}"
+PY_MINOR="${PY_VERSION##*.}"
+if [[ "${PY_MAJOR}" -lt 3 ]] || { [[ "${PY_MAJOR}" -eq 3 ]] && [[ "${PY_MINOR}" -lt 11 ]]; }; then
+  echo "error: Python >= 3.11 is required, found ${PY_VERSION}" >&2
+  exit 1
+fi
+
+echo "==> bootstrapping with Python ${PY_VERSION} (${PYTHON_BIN})"
+
+# A venv keeps this script from mutating whatever interpreter the runner or the
+# developer happens to have, and gives `check.sh` a predictable path.
+VENV_DIR="${VENV_DIR:-${ROOT_DIR}/.venv}"
+if [[ ! -d "${VENV_DIR}" ]]; then
+  echo "==> creating virtualenv at ${VENV_DIR}"
+  "${PYTHON_BIN}" -m venv "${VENV_DIR}"
+fi
+# shellcheck disable=SC1091
+source "${VENV_DIR}/bin/activate"
+
+python -m pip install --upgrade pip >/dev/null
+
+echo "==> installing the package with its dev dependency group"
+# `-e` so the installed console script and the working tree are the same code;
+# installing a copy would let `check.sh` pass against a stale build.
+python -m pip install --editable ".[otel,metrics]" >/dev/null
+python -m pip install "pytest>=8.2" "pytest-asyncio>=0.24" "ruff>=0.6" "mypy>=1.11" \
+  "grpcio-tools>=1.84" "defusedxml>=0.7.1,<1" "types-defusedxml" >/dev/null
+
+echo "==> toolchain ready"
+python - <<'PY'
+import grpc, pydantic, structlog, defusedxml  # noqa: F401
+import mas_orchestrator  # noqa: F401
+
+print(f"    grpcio={grpc.__version__} pydantic={pydantic.VERSION}")
+PY

@@ -34,7 +34,6 @@ from mas_orchestrator.contracts.errors import (
     AgentNotFoundError,
     ConfigurationError,
     ExecutionTimeoutError,
-    InvalidRequestError,
 )
 from mas_orchestrator.models.cost import CostLedger
 
@@ -160,11 +159,12 @@ class AgentRuntime:
             cancel_event: Optional cancellation signal.
             agent_id: Run a specific agent instead of selecting one. The
                 agent must still satisfy the routing policy.
-            agent_spec: An exact, already-validated agent definition resolved
-                by Rust and delivered in the signed run snapshot. When present
-                it is authoritative: the local catalog is **not** consulted, so
-                Rust remains the sole authority on which immutable version
-                runs. It is still scope-checked here before use.
+            agent_spec: An immutable definition resolved by the caller (from a
+                Rust-owned snapshot). When given, it is executed verbatim: the
+                registry is never consulted, because the published version is
+                Rust's authority and a catalog lookup would substitute whatever
+                this process happens to hold. The routing policy is still
+                applied, so a snapshot cannot bypass a routing denial.
 
         Returns:
             An :class:`ExecutionResult`.
@@ -172,14 +172,39 @@ class AgentRuntime:
         Raises:
             AgentNotFoundError: If no agent is eligible. Raised rather than
                 returned, because there is no agent outcome to report.
-            InvalidRequestError: If ``agent_spec`` disagrees with the
-                authoritative execution context.
         """
         started = time.monotonic()
         ledger = CostLedger(self._pricing) if self._pricing is not None else None
 
         if agent_spec is not None:
-            spec = self._validated_snapshot_spec(agent_spec, context)
+            # Snapshot path: the caller (the bridge, from a signed Rust body)
+            # has already resolved exactly which published version to run.
+            # Two invariants are enforced here rather than trusted:
+            #   * the spec belongs to the request's tenant — a snapshot for
+            #     another tenant must never execute under this context;
+            #   * the routing policy still applies — routing governs whether an
+            #     agent may run at all, and a caller-supplied definition does
+            #     not exempt it.
+            if agent_spec.tenant_id != context.tenant_id:
+                raise AgentNotFoundError(
+                    "agent snapshot belongs to a different tenant",
+                    details={"agent_id": agent_spec.agent_id},
+                )
+            if agent_id is not None and agent_spec.agent_id != agent_id:
+                raise AgentNotFoundError(
+                    "agent snapshot does not match the requested agent",
+                    details={"agent_id": agent_id},
+                )
+            rejection = self._router.evaluate(agent_spec, routing or AgentRoutingRequest())
+            if rejection is not None:
+                # A snapshot is Rust's decision about *which* definition to run,
+                # not permission for it to run. The python-side policy still
+                # applies, exactly as it does for an explicitly named agent.
+                raise AgentNotFoundError(
+                    "the snapshotted agent does not satisfy the routing policy",
+                    details={"agent_id": agent_spec.agent_id, "reason": rejection.reason},
+                )
+            spec = agent_spec
         else:
             spec = self._select_agent(context.tenant_id, routing, agent_id)
         agent = self._factory.build(spec, ledger=ledger)
@@ -218,47 +243,6 @@ class AgentRuntime:
             duration_ms=duration_ms,
             error=outcome.error,
         )
-
-    def _validated_snapshot_spec(self, spec: AgentSpec, context: ExecutionContext) -> AgentSpec:
-        """Re-checks a Rust-resolved snapshot against the authoritative context.
-
-        The snapshot crossed a trust boundary, so the runtime does not simply
-        trust it because it arrived signed: it must still describe the agent
-        this execution is for, belong to the same tenant, be runnable, and — if
-        the context pins a version — be that exact version.
-
-        Args:
-            spec: The snapshot projected to a spec by the bridge boundary.
-            context: The authoritative execution context.
-
-        Returns:
-            The same spec, once it is proven consistent.
-
-        Raises:
-            InvalidRequestError: If any scope or lifecycle field disagrees.
-        """
-        if spec.agent_id != context.agent_id:
-            raise InvalidRequestError(
-                "agent snapshot does not match the execution's agent",
-                details={"agent_id": spec.agent_id, "expected": context.agent_id},
-            )
-        if spec.tenant_id != context.tenant_id:
-            raise InvalidRequestError(
-                "agent snapshot belongs to a different tenant",
-                details={"tenant_id": spec.tenant_id},
-            )
-        pinned_version = getattr(context, "agent_version_id", None)
-        if pinned_version is not None and spec.agent_version_id != pinned_version:
-            raise InvalidRequestError(
-                "agent snapshot does not match the pinned execution version",
-                details={"agent_version_id": spec.agent_version_id},
-            )
-        if not spec.status.is_runnable:
-            raise InvalidRequestError(
-                "agent snapshot is not runnable",
-                details={"status": spec.status.value},
-            )
-        return spec
 
     def _select_agent(
         self,

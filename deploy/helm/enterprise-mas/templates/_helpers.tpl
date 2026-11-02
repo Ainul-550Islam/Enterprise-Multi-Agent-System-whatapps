@@ -47,3 +47,22 @@ Container port helper
 {{- define "enterprise-mas.containerPort" -}}
 {{- . -}}
 {{- end }}
+
+{{/*
+Data-plane egress (PostgreSQL + NATS).
+
+Both are external to this chart, so they are addressed by namespace rather than
+by a pod selector in the release namespace. Emitted as raw egress list items so
+callers can `include ... | nindent` it directly under `egress:`.
+*/}}
+{{- define "enterprise-mas.dataEgress" -}}
+- to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: {{ .Values.networkPolicy.dataNamespace }}
+  ports:
+    - port: {{ .Values.postgres.port | default 5432 }}
+      protocol: TCP
+    - port: {{ .Values.nats.port | default 4222 }}
+      protocol: TCP
+{{- end }}

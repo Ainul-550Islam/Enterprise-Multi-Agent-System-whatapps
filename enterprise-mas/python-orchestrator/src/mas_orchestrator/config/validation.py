@@ -438,10 +438,7 @@ def _check_security(settings: Settings) -> list[ConfigViolation]:
             ConfigViolation(
                 field="service.service_token_secret_ref",
                 message="the inbound service surface has no service token configured",
-                remediation=(
-                    "set security.service_token_ref (or service.service_token_secret_ref) "
-                    "to a resolvable secret name"
-                ),
+                remediation="set service.service_token_secret_ref to a resolvable secret name",
             )
         )
 
