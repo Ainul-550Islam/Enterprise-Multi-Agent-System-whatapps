@@ -176,10 +176,16 @@ pub(crate) fn validate_claims(
     if !expiry_with_skew.is_future() {
         return Err(fail("token has expired"));
     }
+    // A present but malformed not-before is not an absent constraint. Silently
+    // dropping it would authorize a token whose validity window is unknown.
     let not_before = object
         .get("nbf")
-        .and_then(Value::as_i64)
-        .map(secs_to_timestamp)
+        .map(|value| {
+            value
+                .as_i64()
+                .ok_or_else(|| fail("token 'nbf' must be an integer timestamp"))
+                .and_then(secs_to_timestamp)
+        })
         .transpose()?;
     if let Some(nbf) = not_before {
         let nbf_minus_skew = nbf
@@ -378,6 +384,34 @@ mod tests {
         assert!(JwtValidator::new(key(), None, Some("mas-admin".into()))
             .validate(&good)
             .is_err());
+    }
+
+    #[test]
+    fn malformed_not_before_is_not_treated_as_absent() {
+        let validator = JwtValidator::new(key(), Some("mas-idp".into()), Some("mas-api".into()));
+        for value in [
+            Value::Null,
+            Value::String("4102444800".to_owned()),
+            serde_json::json!(1.5),
+            Value::Bool(true),
+            serde_json::json!({}),
+        ] {
+            let mut payload = claims();
+            payload["nbf"] = value;
+            assert!(validator
+                .validate(&encode_hs256_for_test(&key(), &payload))
+                .is_err());
+        }
+        let mut future = claims();
+        future["nbf"] = Value::from(Timestamp::now().to_unix_seconds() + 300);
+        assert!(validator
+            .validate(&encode_hs256_for_test(&key(), &future))
+            .is_err());
+        let mut past = claims();
+        past["nbf"] = Value::from(Timestamp::now().to_unix_seconds() - 1);
+        assert!(validator
+            .validate(&encode_hs256_for_test(&key(), &past))
+            .is_ok());
     }
 
     #[test]

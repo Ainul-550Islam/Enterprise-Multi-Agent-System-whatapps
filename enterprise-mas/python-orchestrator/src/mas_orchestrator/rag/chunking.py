@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from typing import Final
 
 from mas_orchestrator.contracts.errors import InvalidRequestError
-from mas_orchestrator.rag.models import Chunk, SourceDocument, new_chunk_id
+from mas_orchestrator.rag.models import MAX_CHUNK_CHARS, Chunk, SourceDocument, new_chunk_id
 
 _SENTENCE: Final[re.Pattern[str]] = re.compile(r"(?<=[.!?])\s+")
 _PARAGRAPH: Final[re.Pattern[str]] = re.compile(r"\n\s*\n")
@@ -49,6 +49,11 @@ class ChunkingConfig:
             raise InvalidRequestError(
                 "max_chars must not be below target_chars",
                 details={"field": "max_chars"},
+            )
+        if self.max_chars > MAX_CHUNK_CHARS:
+            raise InvalidRequestError(
+                "max_chars exceeds the maximum indexable chunk size",
+                details={"field": "max_chars", "limit": MAX_CHUNK_CHARS},
             )
         if not 0 <= self.overlap_chars < self.target_chars:
             raise InvalidRequestError(
@@ -174,10 +179,18 @@ class Chunker:
         if end - start <= self._config.max_chars:
             return [(start, end)]
 
-        # Cap the span, then continue from just before the cap so the next
-        # chunk overlaps and nothing is lost between them.
-        capped = start + self._config.max_chars
-        return [(start, capped)]
+        # Separators between blocks can be much longer than the blocks
+        # themselves. Split the entire original span rather than silently
+        # dropping everything after the first cap. The configured overlap is
+        # strictly smaller than max_chars, so each iteration advances.
+        spans: list[tuple[int, int]] = []
+        cursor = start
+        while end - cursor > self._config.max_chars:
+            capped = cursor + self._config.max_chars
+            spans.append((cursor, capped))
+            cursor = capped - self._config.overlap_chars
+        spans.append((cursor, end))
+        return spans
 
 
 def chunk_document(

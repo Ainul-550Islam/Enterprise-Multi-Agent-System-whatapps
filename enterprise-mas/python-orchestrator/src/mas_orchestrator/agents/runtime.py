@@ -34,6 +34,7 @@ from mas_orchestrator.contracts.errors import (
     AgentNotFoundError,
     ConfigurationError,
     ExecutionTimeoutError,
+    InvalidRequestError,
 )
 from mas_orchestrator.models.cost import CostLedger
 
@@ -159,12 +160,9 @@ class AgentRuntime:
             cancel_event: Optional cancellation signal.
             agent_id: Run a specific agent instead of selecting one. The
                 agent must still satisfy the routing policy.
-            agent_spec: An immutable definition resolved by the caller (from a
-                Rust-owned snapshot). When given, it is executed verbatim: the
-                registry is never consulted, because the published version is
-                Rust's authority and a catalog lookup would substitute whatever
-                this process happens to hold. The routing policy is still
-                applied, so a snapshot cannot bypass a routing denial.
+            agent_spec: An already validated Rust-owned immutable snapshot.
+                Its identity must agree with the authoritative context and
+                it must still satisfy routing policy.
 
         Returns:
             An :class:`ExecutionResult`.
@@ -176,37 +174,25 @@ class AgentRuntime:
         started = time.monotonic()
         ledger = CostLedger(self._pricing) if self._pricing is not None else None
 
-        if agent_spec is not None:
-            # Snapshot path: the caller (the bridge, from a signed Rust body)
-            # has already resolved exactly which published version to run.
-            # Two invariants are enforced here rather than trusted:
-            #   * the spec belongs to the request's tenant — a snapshot for
-            #     another tenant must never execute under this context;
-            #   * the routing policy still applies — routing governs whether an
-            #     agent may run at all, and a caller-supplied definition does
-            #     not exempt it.
-            if agent_spec.tenant_id != context.tenant_id:
-                raise AgentNotFoundError(
-                    "agent snapshot belongs to a different tenant",
-                    details={"agent_id": agent_spec.agent_id},
-                )
-            if agent_id is not None and agent_spec.agent_id != agent_id:
-                raise AgentNotFoundError(
-                    "agent snapshot does not match the requested agent",
-                    details={"agent_id": agent_id},
-                )
-            rejection = self._router.evaluate(agent_spec, routing or AgentRoutingRequest())
-            if rejection is not None:
-                # A snapshot is Rust's decision about *which* definition to run,
-                # not permission for it to run. The python-side policy still
-                # applies, exactly as it does for an explicitly named agent.
-                raise AgentNotFoundError(
-                    "the snapshotted agent does not satisfy the routing policy",
-                    details={"agent_id": agent_spec.agent_id, "reason": rejection.reason},
-                )
-            spec = agent_spec
-        else:
+        if agent_spec is None:
             spec = self._select_agent(context.tenant_id, routing, agent_id)
+        else:
+            if (
+                agent_spec.tenant_id != context.tenant_id
+                or agent_spec.agent_id != context.agent_id
+                or agent_id != context.agent_id
+                or not context.agent_version_id
+                or agent_spec.agent_version_id != context.agent_version_id
+            ):
+                raise InvalidRequestError(
+                    "agent snapshot identity does not match execution context"
+                )
+            if (
+                self._router.evaluate_pinned(agent_spec, routing or AgentRoutingRequest())
+                is not None
+            ):
+                raise AgentNotFoundError("the requested agent does not satisfy the routing policy")
+            spec = agent_spec
         agent = self._factory.build(spec, ledger=ledger)
 
         initial = state or _seed(spec, request)
@@ -214,13 +200,9 @@ class AgentRuntime:
 
         try:
             outcome = await self._run_bounded(agent, initial, context, cancel_event)
-        except asyncio.CancelledError as error:
-            outcome = AgentOutcome(
-                agent_id=spec.agent_id,
-                termination=Termination.CANCELLED,
-                error=error,
-                duration_ms=int((time.monotonic() - started) * 1000),
-            )
+        except asyncio.CancelledError:
+            cancel_event.set()
+            raise
 
         duration_ms = int((time.monotonic() - started) * 1000)
         _LOGGER.info(

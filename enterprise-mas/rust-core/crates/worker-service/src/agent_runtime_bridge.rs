@@ -131,6 +131,11 @@ impl AgentBridge for ResolvedAgentBridge {
 
     async fn run(&self, mut request: AgentRunRequest) -> Result<AgentRunVerdict> {
         request.require_authoritative_scope()?;
+        if request.task_id.is_some() && request.agent_version.is_none() {
+            return Err(AppError::validation(
+                "durable agent runs require a pinned published agent version",
+            ));
+        }
         let snapshot = self.resolver.resolve(&request).await?;
         ensure_snapshot_matches_request(&request, &snapshot)?;
 
@@ -256,7 +261,7 @@ mod tests {
             slug: "snapshot-agent".to_owned(),
             kind: "standard".to_owned(),
             status: "active".to_owned(),
-            origin: "tenant".to_owned(),
+            origin: "user".to_owned(),
             read_only: false,
             configuration: AgentRuntimeConfiguration {
                 description: Some("test runtime".to_owned()),
@@ -346,6 +351,29 @@ mod tests {
             .run(request(agent_id, tenant_id, organization_id, project_id))
             .await
             .is_err());
+        assert!(inner.seen.lock().expect("recording mutex").is_none());
+    }
+
+    #[tokio::test]
+    async fn durable_task_without_version_is_refused_before_forwarding() {
+        let agent_id = AgentId::new();
+        let tenant_id = TenantId::new();
+        let organization_id = OrganizationId::new();
+        let project_id = ProjectId::new();
+        let resolver = Arc::new(FixedResolver {
+            snapshot: snapshot(
+                agent_id,
+                tenant_id,
+                organization_id,
+                project_id,
+                AgentVersionId::new(),
+            ),
+        });
+        let inner = Arc::new(RecordingBridge::default());
+        let bridge = ResolvedAgentBridge::new(resolver, inner.clone());
+        let mut request = request(agent_id, tenant_id, organization_id, project_id);
+        request.task_id = Some(mas_common::ids::TaskId::new());
+        assert!(bridge.run(request).await.is_err());
         assert!(inner.seen.lock().expect("recording mutex").is_none());
     }
 

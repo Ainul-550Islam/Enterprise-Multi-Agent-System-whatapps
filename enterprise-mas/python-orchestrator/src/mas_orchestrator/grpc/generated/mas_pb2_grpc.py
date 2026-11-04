@@ -1263,31 +1263,8 @@ class AgentBridgeApi:
 
 
 class DataHubBridgeApiStub:
-    """=========================================================================
-    Data Hub bridge
-    =========================================================================
-
-    The second Python-facing surface: source synchronization and document
-    ingestion for the RAG plane. Every request below uses the same
-    authentication envelope as `AgentBridgeApi` — a bearer service token in
-    metadata, the body-bound `x-mas-internal-signature` v2 HMAC over the exact
-    request bytes, and the authoritative tenant/organization identity carried
-    *in the body* so Python can reconcile it against the signed metadata.
-
-    It must NOT:
-    • carry secret material — only opaque secret *references*;
-    • let a caller name a tenant that Rust did not sign into the body.
-
-    The identity field reuses `ServiceIdentityMsg` rather than declaring a
-    Data-Hub-specific twin: the shape is identical, and two structurally equal
-    messages would be two things to keep in sync for no benefit.
-
-    Source synchronization and document ingestion for the RAG plane.
-
-    Every request below uses the same authentication envelope as
-    `AgentBridgeApi`: a bearer service token in metadata, the body-bound
-    `x-mas-internal-signature` v2 HMAC over the exact request bytes, and the
-    authoritative tenant/organization identity carried *in the body*.
+    """Rust-owned catalogue -> Python-owned ingestion. Stateful calls carry the
+    complete authoritative scope and identity in the signed protobuf body.
     """
 
     def __init__(self, channel):
@@ -1319,64 +1296,30 @@ class DataHubBridgeApiStub:
 
 
 class DataHubBridgeApiServicer:
-    """=========================================================================
-    Data Hub bridge
-    =========================================================================
-
-    The second Python-facing surface: source synchronization and document
-    ingestion for the RAG plane. Every request below uses the same
-    authentication envelope as `AgentBridgeApi` — a bearer service token in
-    metadata, the body-bound `x-mas-internal-signature` v2 HMAC over the exact
-    request bytes, and the authoritative tenant/organization identity carried
-    *in the body* so Python can reconcile it against the signed metadata.
-
-    It must NOT:
-    • carry secret material — only opaque secret *references*;
-    • let a caller name a tenant that Rust did not sign into the body.
-
-    The identity field reuses `ServiceIdentityMsg` rather than declaring a
-    Data-Hub-specific twin: the shape is identical, and two structurally equal
-    messages would be two things to keep in sync for no benefit.
-
-    Source synchronization and document ingestion for the RAG plane.
-
-    Every request below uses the same authentication envelope as
-    `AgentBridgeApi`: a bearer service token in metadata, the body-bound
-    `x-mas-internal-signature` v2 HMAC over the exact request bytes, and the
-    authoritative tenant/organization identity carried *in the body*.
+    """Rust-owned catalogue -> Python-owned ingestion. Stateful calls carry the
+    complete authoritative scope and identity in the signed protobuf body.
     """
 
     def SyncSource(self, request, context):
-        """Enumerates a Rust-authorized source and indexes everything that changed
-        since `cursor`. Bounded by the caller's deadline; partial progress is
-        reported rather than rolled back, because the next sync resumes from the
-        returned cursor.
-        """
+        """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def IngestDocument(self, request, context):
-        """Indexes one already-authorized document (upload, discovered item or
-        fetched page) under the tenant's RAG partition.
-        """
+        """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def PurgeDocument(self, request, context):
-        """Removes exactly one tenant/document pair from the RAG plane. Deleting
-        catalogue state is Rust's job; this only drops derived vectors.
-        """
+        """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def Health(self, request, context):
-        """Secret-free readiness of the ingestion plane. Unauthenticated for the same
-        reason `AgentBridgeApi.Health` is: a supervisor probe has no tenant data
-        to protect and the reply carries a boolean and a static string.
-        """
+        """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
@@ -1413,31 +1356,8 @@ def add_DataHubBridgeApiServicer_to_server(servicer, server):
 
  # This class is part of an EXPERIMENTAL API.
 class DataHubBridgeApi:
-    """=========================================================================
-    Data Hub bridge
-    =========================================================================
-
-    The second Python-facing surface: source synchronization and document
-    ingestion for the RAG plane. Every request below uses the same
-    authentication envelope as `AgentBridgeApi` — a bearer service token in
-    metadata, the body-bound `x-mas-internal-signature` v2 HMAC over the exact
-    request bytes, and the authoritative tenant/organization identity carried
-    *in the body* so Python can reconcile it against the signed metadata.
-
-    It must NOT:
-    • carry secret material — only opaque secret *references*;
-    • let a caller name a tenant that Rust did not sign into the body.
-
-    The identity field reuses `ServiceIdentityMsg` rather than declaring a
-    Data-Hub-specific twin: the shape is identical, and two structurally equal
-    messages would be two things to keep in sync for no benefit.
-
-    Source synchronization and document ingestion for the RAG plane.
-
-    Every request below uses the same authentication envelope as
-    `AgentBridgeApi`: a bearer service token in metadata, the body-bound
-    `x-mas-internal-signature` v2 HMAC over the exact request bytes, and the
-    authoritative tenant/organization identity carried *in the body*.
+    """Rust-owned catalogue -> Python-owned ingestion. Stateful calls carry the
+    complete authoritative scope and identity in the signed protobuf body.
     """
 
     @staticmethod

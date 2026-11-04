@@ -82,3 +82,27 @@ async def test_data_hub_does_not_accept_a_missing_body_identity() -> None:
 
     assert len(boundary.calls) == 1
     assert boundary.calls[0][2] is ServiceScope.DATA_HUB_SYNC
+
+
+@pytest.mark.asyncio
+async def test_expired_wire_deadline_does_not_construct_the_operation() -> None:
+    from mas_orchestrator.contracts.errors import ExecutionTimeoutError
+
+    servicer = DataHubBridgeServicer(service=object(), agent_bridge=_AgentBridgeBoundary())  # type: ignore[arg-type]
+    request = mas_api_pb2.SyncSourceRequest(
+        deadline_rfc3339=(datetime.now(UTC) + timedelta(minutes=1)).isoformat()
+    )
+    called = False
+
+    def operation():
+        nonlocal called
+        called = True
+        raise AssertionError("expired operation must not be constructed")
+
+    with pytest.raises(ExecutionTimeoutError):
+        await servicer._run_with_deadline(
+            request,
+            SimpleNamespace(time_remaining=lambda: 0),  # type: ignore[arg-type]
+            operation,
+        )
+    assert not called

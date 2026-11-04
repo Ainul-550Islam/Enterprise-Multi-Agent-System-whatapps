@@ -43,11 +43,12 @@ import logging
 import signal
 import sys
 from collections.abc import Awaitable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Final
 
 from mas_orchestrator.config.settings import load_settings
 from mas_orchestrator.config.validation import validate_settings_or_raise
+from mas_orchestrator.contracts.errors import ConfigurationError
 from mas_orchestrator.grpc.agent_bridge_servicer import (
     AgentBridgeServicer,
     AgentBridgeServicerConfig,
@@ -56,6 +57,7 @@ from mas_orchestrator.grpc.data_hub_servicer import DataHubBridgeServicer
 from mas_orchestrator.grpc.server import GrpcServer, GrpcServerConfig
 from mas_orchestrator.observability.logging import LoggingConfig, configure_logging
 from mas_orchestrator.security.identity import ServiceScope
+from mas_orchestrator.security.internal_replay import InMemoryReplayGuard, PostgresReplayGuard
 from mas_orchestrator.security.internal_service import DEFAULT_ALLOWED_CALLERS
 from mas_orchestrator.services.composition import build_runtime_bundle
 from mas_orchestrator.services.lifecycle import (
@@ -69,6 +71,7 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Sequence
 
     from mas_orchestrator.config.settings import Settings
+    from mas_orchestrator.security.internal_replay import InternalReplayGuard
 
 _LOGGER: Final[logging.Logger] = logging.getLogger("mas_orchestrator.main")
 
@@ -134,9 +137,6 @@ def bootstrap(
         A :class:`Bootstrap`.
 
     Raises:
-        ConfigurationError: When the loaded configuration violates a rule that
-            pydantic cannot express per field (a disabled provider alongside
-            enabled agents, plaintext transport in production, and so on).
         Exception: Propagated from settings loading. Callers must let it
             propagate: a misconfigured process must not start.
     """
@@ -144,12 +144,6 @@ def bootstrap(
 
     resolved = Environment(environment) if environment else None
     settings = load_settings(environment=resolved)
-
-    # Cross-field rules run here, before any object is constructed from the
-    # settings. A process that starts with configuration that is invalid *in
-    # combination* has already begun serving under it by the time the first
-    # request discovers the problem, and the failure then looks like a bug in
-    # whatever path happened to hit it first.
     validate_settings_or_raise(settings)
 
     configure_logging(
@@ -208,6 +202,18 @@ def _internal_signing_secret(settings: Settings) -> str | None:
     return resolve_secret(reference).reveal()
 
 
+def _internal_replay_guard(settings: Settings) -> InternalReplayGuard:
+    """Build a shared receipt guard, allowing process-local guards only in tests/dev."""
+    reference = settings.security.internal_replay_database_url_ref
+    if reference:
+        from mas_orchestrator.security.credentials import resolve_secret
+
+        return PostgresReplayGuard(resolve_secret(reference).reveal())
+    if settings.environment.allows_fakes:
+        return InMemoryReplayGuard()
+    raise ConfigurationError("a durable internal replay receipt store is required")
+
+
 def build_bridge_server(
     settings: Settings,
     coordinator: ShutdownCoordinator,
@@ -236,6 +242,7 @@ def build_bridge_server(
     servicer = AgentBridgeServicer(
         execution_service=bundle.execution_service,
         identity_resolver=bundle.identity_resolver,
+        replay_guard=_internal_replay_guard(settings),
         config=AgentBridgeServicerConfig(
             require_scope=ServiceScope.EXECUTE_AGENT,
             max_input_bytes=settings.service.max_request_bytes,
@@ -250,28 +257,25 @@ def build_bridge_server(
             require_internal_signature=settings.is_production,
         ),
     )
-    # The Data Hub servicer deliberately takes the *same* AgentBridgeServicer
-    # instance as its authentication boundary rather than its own token
-    # resolver, metadata parser or HMAC implementation. Two copies of that
-    # logic would be two places for the signature check to drift, and the
-    # second copy is the one nobody reviews.
-    data_hub_servicer = DataHubBridgeServicer(
-        service=bundle.data_hub_service,
-        agent_bridge=servicer,
+    transport = GrpcServerConfig.from_service_settings(
+        settings.service,
+        environment=settings.environment,
+        graceful_stop_seconds=settings.service.shutdown_grace_seconds,
     )
+    if settings.rag.enabled:
+        transport = replace(
+            transport,
+            max_receive_bytes=max(
+                transport.max_receive_bytes, settings.data_hub.max_document_bytes + 128 * 1024
+            ),
+        )
     server = GrpcServer(
         servicer=servicer,
-        data_hub_servicer=data_hub_servicer,
-        # The bundle owns the provider transports and the Data Hub pools. Handing
-        # it to the server means a start that fails after opening them closes
-        # them again, instead of leaving a non-listening process holding
-        # connections for the lifetime of its crash loop.
-        closeables=(bundle,),
-        config=GrpcServerConfig.from_service_settings(
-            settings.service,
-            environment=settings.environment,
-            graceful_stop_seconds=settings.service.shutdown_grace_seconds,
+        data_hub_servicer=DataHubBridgeServicer(
+            service=bundle.data_hub_service, agent_bridge=servicer
         ),
+        closeables=(bundle,),
+        config=transport,
     )
     server.register_with(coordinator)
     return server

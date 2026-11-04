@@ -870,11 +870,7 @@ fn route_user_principal(
 
 async fn protected_route_fixture() -> ProtectedRouteFixture {
     let (mut state, store) = inmemory_state_with_store();
-    let system = ServiceContext::for_service(
-        "authorization-matrix-seed",
-        "authorization-matrix-route-fixture",
-        &Timestamp::now(),
-    )
+    let system = ServiceContext::system("authorization-matrix-route-fixture", &Timestamp::now())
     .expect("system context");
     let organization = state
         .tenancy

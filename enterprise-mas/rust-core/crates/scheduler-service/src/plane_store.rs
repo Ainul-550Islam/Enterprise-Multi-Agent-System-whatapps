@@ -157,7 +157,7 @@ impl ScheduleStorePort for SchedulerPlaneStore {
         let tenancy = self.tenancy_of(id).await?;
         self.in_schedule_scope(tenancy, || async move {
             let mut connection = mas_persistence::scoped_request::connection().await?;
-            ScheduleStore::get_in(connection.connection().as_mut(), id).await
+            ScheduleStore::get_in(connection.connection(), id).await
         })
         .await
     }
@@ -176,7 +176,7 @@ impl ScheduleStorePort for SchedulerPlaneStore {
         let stored = schedule.clone();
         self.in_schedule_scope(tenancy, move || async move {
             let mut connection = mas_persistence::scoped_request::connection().await?;
-            ScheduleStore::save_in(connection.connection().as_mut(), &stored).await
+            ScheduleStore::save_in(connection.connection(), &stored).await
         })
         .await
     }
@@ -190,8 +190,7 @@ impl ScheduleStorePort for SchedulerPlaneStore {
         let tenancy = self.tenancy_of(schedule_id).await?;
         self.in_schedule_scope(tenancy, move || async move {
             let mut connection = mas_persistence::scoped_request::connection().await?;
-            ScheduleStore::record_run_in(connection.connection().as_mut(), schedule_id, planned_at)
-                .await
+            ScheduleStore::record_run_in(connection.connection(), schedule_id, planned_at).await
         })
         .await
     }

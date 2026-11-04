@@ -29,6 +29,8 @@
 
 pub mod auth;
 pub mod context;
+/// Explicit, fail-closed browser origin policy.
+pub mod cors;
 pub mod grpc;
 pub mod handlers;
 pub mod inmemory_directory;

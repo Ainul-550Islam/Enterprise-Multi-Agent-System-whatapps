@@ -288,6 +288,14 @@ impl NodeExecutor for AgentNodeExecutor {
         request.task_id = input.task_id;
         request.task_attempt_id = input.task_attempt_id;
         request.idempotency_key = input.idempotency_key.map(ToOwned::to_owned);
+        if input.node.config.contains_key("agent_version_id") {
+            let version = required_config_str(input.node, "agent_version_id")?;
+            let version = resolve_uuid_ref("config.agent_version_id", &version)?;
+            if version.is_nil() {
+                return Err(AppError::validation("agent version must not be nil"));
+            }
+            request.agent_version = Some(version.to_string());
+        }
 
         let verdict = match self.bridge.run(request).await {
             Ok(verdict) => verdict,

@@ -53,14 +53,19 @@ dependencies = [
     "protobuf>=7.35.1,<8",
     # Outbound HTTP for provider/tool adapters (SSRF-guarded by our own layer).
     "httpx>=0.27",
-    # Hardened XML parsing for the Data Hub sitemap/RSS source adapter.
-    # defusedxml is imported unconditionally by data_hub.sources, so it is a
-    # hard runtime dependency, not an extra; stdlib ElementTree is vulnerable
-    # to entity-expansion and external-entity attacks from untrusted feeds.
-    "defusedxml>=0.7.1,<1",
+    # Safely parses XML in Data Hub source adapters, imported at startup.
+    "defusedxml>=0.7,<1",
+    # Shared PostgreSQL replay receipts are required by the production bridge.
+    "psycopg[binary]>=3.2,<4",
 ]
 
 [project.optional-dependencies]
+# Durable RAG requires both the vector adapter and Psycopg's separately
+# distributed asynchronous pool. Production images install this extra.
+pgvector = ["pgvector>=0.3,<1", "psycopg-pool>=3.2,<4"]
+# PDF and DOCX parsers are intentionally optional for deployments that do not
+# accept those document types. Production images install both parsers.
+ingest = ["pypdf>=5,<7", "python-docx>=1.1,<2"]
 # Observability extras: OpenTelemetry is optional so the service boots without
 # an exporter configured. Nothing in the AI runtime depends on it being present.
 otel = [
@@ -143,12 +148,10 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S", "S101"]
 "src/mas_orchestrator/grpc/generated/**" = ["ALL"]
-# The servicers implement methods whose names are fixed by the protobuf
-# contract (`RunAgent`, `Health`, `SyncSource`, `IngestDocument`,
-# `PurgeDocument`). Renaming them would break the wire, so the naming rule is
-# relaxed for the files that must match the schema.
+# The servicer implements methods whose names are fixed by the protobuf
+# contract (`RunAgent`, `Health`). Renaming them would break the wire, so the
+# naming rule is relaxed for the one file that must match the schema.
 "src/mas_orchestrator/grpc/agent_bridge_servicer.py" = ["N802"]
-"src/mas_orchestrator/grpc/data_hub_servicer.py" = ["N802"]
 
 [tool.ruff.format]
 quote-style = "double"
@@ -175,17 +178,6 @@ pretty = true
 
 [[tool.mypy.overrides]]
 module = ["grpc.*", "grpc_health.*", "opentelemetry.*", "prometheus_client.*", "structlog.*"]
-ignore_missing_imports = true
-
-# Optional extras that are imported lazily and only when their backend is
-# selected (`pgvector` and `psycopg*` for the RAG plane, `grpc_tools` for the
-# proto generator). Every one of those call sites is already wrapped in a
-# try/except ImportError that raises ConfigurationError with the extra to
-# install, so a missing stub here is not a typing gap in our own code. Listing
-# them keeps `mypy src` clean without `--ignore-missing-imports`, which would
-# also silence real problems in a required dependency.
-[[tool.mypy.overrides]]
-module = ["pgvector.*", "psycopg.*", "psycopg_pool.*", "grpc_tools.*", "pypdf.*", "docx.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]

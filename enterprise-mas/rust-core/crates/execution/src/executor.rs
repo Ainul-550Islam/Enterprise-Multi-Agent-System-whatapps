@@ -34,7 +34,9 @@ use crate::node_adapters::{AdapterWiring, AgentNodeExecutor, RunScope, SharedSco
 use crate::resource_guard::{GuardSnapshot, ResourceGuard};
 use crate::step_runner::StepRunner;
 use mas_common::error::AppError;
-use mas_common::ids::{AgentId, ExecutionId, ExecutionStepId, TaskAttemptId, TaskId};
+use mas_common::ids::{
+    AgentId, AgentVersionId, ExecutionId, ExecutionStepId, TaskAttemptId, TaskId,
+};
 use mas_common::result::Result;
 use mas_domain::{
     ExecutionStep, ResourceLimits, TokenBudget, WorkflowGraph, WorkflowNode, WorkflowNodeType,
@@ -128,6 +130,8 @@ pub struct DurableRunIdentity {
     pub task_id: TaskId,
     /// The durable attempt that owns this particular delivery, when known.
     pub task_attempt_id: Option<TaskAttemptId>,
+    /// Exact version pinned in the durable task, when one was selected.
+    pub agent_version_id: Option<AgentVersionId>,
     /// The task's idempotency key: the deduplication handle for the run.
     ///
     /// Owned so the identity remains valid across the awaited bridge call; a
@@ -448,6 +452,15 @@ impl Executor {
             "agent_ref".to_owned(),
             serde_json::Value::String(agent_id.to_string()),
         );
+        if let Some(version) = durable
+            .as_ref()
+            .and_then(|identity| identity.agent_version_id)
+        {
+            config.insert(
+                "agent_version_id".to_owned(),
+                serde_json::Value::String(version.to_string()),
+            );
+        }
         let node =
             WorkflowNode::new("agent", WorkflowNodeType::Agent, "agent run")?.with_config(config);
         node.validate()?;
@@ -1139,14 +1152,16 @@ mod tests {
         let org = OrganizationId::new();
         let project = ProjectId::new();
         let task_id = TaskId::new();
+        let version_id = AgentVersionId::new();
 
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorder = Arc::clone(&seen);
         let bridge = Arc::new(InMemoryAgentBridge::new().with_handler(move |request| {
-            recorder
-                .lock()
-                .expect("recorder")
-                .push((request.task_id, request.idempotency_key.clone()));
+            recorder.lock().expect("recorder").push((
+                request.task_id,
+                request.idempotency_key.clone(),
+                request.agent_version.clone(),
+            ));
             Ok(AgentRunVerdict::Succeeded {
                 output: serde_json::json!({"ok": true}),
                 usage: AgentUsage::default(),
@@ -1165,6 +1180,7 @@ mod tests {
                 Some(DurableRunIdentity {
                     task_id,
                     task_attempt_id: None,
+                    agent_version_id: Some(version_id),
                     idempotency_key: "idem-durable-1".to_owned(),
                 }),
             )
@@ -1175,7 +1191,11 @@ mod tests {
         assert_eq!(seen.len(), 1, "the bridge was called exactly once");
         assert_eq!(
             seen[0],
-            (Some(task_id), Some("idem-durable-1".to_owned())),
+            (
+                Some(task_id),
+                Some("idem-durable-1".to_owned()),
+                Some(version_id.to_string())
+            ),
             "the orchestrator receives the task's durable identity, so a \
              redelivered task cannot re-run paid work"
         );

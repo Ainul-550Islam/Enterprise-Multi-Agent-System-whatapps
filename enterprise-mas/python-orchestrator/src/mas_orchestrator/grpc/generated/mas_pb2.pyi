@@ -504,15 +504,10 @@ class BridgeHealthReply(_message.Message):
     def __init__(self, healthy: _Optional[bool] = ..., detail: _Optional[str] = ...) -> None: ...
 
 class SyncSourceRequest(_message.Message):
-    __slots__ = ("tenant_id", "organization_id", "project_id", "correlation_id", "request_id", "protocol_version", "deadline_rfc3339", "identity", "source_id", "source_name", "source_kind", "configuration_json", "credential_secret_ref", "cursor", "required_roles", "denied_principals")
+    __slots__ = ("tenant_id", "organization_id", "project_id", "source_id", "source_name", "source_kind", "configuration_json", "credential_secret_ref", "cursor", "required_roles", "denied_principals", "correlation_id", "request_id", "protocol_version", "deadline_rfc3339", "identity")
     TENANT_ID_FIELD_NUMBER: _ClassVar[int]
     ORGANIZATION_ID_FIELD_NUMBER: _ClassVar[int]
     PROJECT_ID_FIELD_NUMBER: _ClassVar[int]
-    CORRELATION_ID_FIELD_NUMBER: _ClassVar[int]
-    REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
-    PROTOCOL_VERSION_FIELD_NUMBER: _ClassVar[int]
-    DEADLINE_RFC3339_FIELD_NUMBER: _ClassVar[int]
-    IDENTITY_FIELD_NUMBER: _ClassVar[int]
     SOURCE_ID_FIELD_NUMBER: _ClassVar[int]
     SOURCE_NAME_FIELD_NUMBER: _ClassVar[int]
     SOURCE_KIND_FIELD_NUMBER: _ClassVar[int]
@@ -521,14 +516,14 @@ class SyncSourceRequest(_message.Message):
     CURSOR_FIELD_NUMBER: _ClassVar[int]
     REQUIRED_ROLES_FIELD_NUMBER: _ClassVar[int]
     DENIED_PRINCIPALS_FIELD_NUMBER: _ClassVar[int]
+    CORRELATION_ID_FIELD_NUMBER: _ClassVar[int]
+    REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
+    PROTOCOL_VERSION_FIELD_NUMBER: _ClassVar[int]
+    DEADLINE_RFC3339_FIELD_NUMBER: _ClassVar[int]
+    IDENTITY_FIELD_NUMBER: _ClassVar[int]
     tenant_id: str
     organization_id: str
     project_id: str
-    correlation_id: str
-    request_id: str
-    protocol_version: str
-    deadline_rfc3339: str
-    identity: ServiceIdentityMsg
     source_id: str
     source_name: str
     source_kind: str
@@ -537,7 +532,12 @@ class SyncSourceRequest(_message.Message):
     cursor: str
     required_roles: _containers.RepeatedScalarFieldContainer[str]
     denied_principals: _containers.RepeatedScalarFieldContainer[str]
-    def __init__(self, tenant_id: _Optional[str] = ..., organization_id: _Optional[str] = ..., project_id: _Optional[str] = ..., correlation_id: _Optional[str] = ..., request_id: _Optional[str] = ..., protocol_version: _Optional[str] = ..., deadline_rfc3339: _Optional[str] = ..., identity: _Optional[_Union[ServiceIdentityMsg, _Mapping]] = ..., source_id: _Optional[str] = ..., source_name: _Optional[str] = ..., source_kind: _Optional[str] = ..., configuration_json: _Optional[str] = ..., credential_secret_ref: _Optional[str] = ..., cursor: _Optional[str] = ..., required_roles: _Optional[_Iterable[str]] = ..., denied_principals: _Optional[_Iterable[str]] = ...) -> None: ...
+    correlation_id: str
+    request_id: str
+    protocol_version: str
+    deadline_rfc3339: str
+    identity: ServiceIdentityMsg
+    def __init__(self, tenant_id: _Optional[str] = ..., organization_id: _Optional[str] = ..., project_id: _Optional[str] = ..., source_id: _Optional[str] = ..., source_name: _Optional[str] = ..., source_kind: _Optional[str] = ..., configuration_json: _Optional[str] = ..., credential_secret_ref: _Optional[str] = ..., cursor: _Optional[str] = ..., required_roles: _Optional[_Iterable[str]] = ..., denied_principals: _Optional[_Iterable[str]] = ..., correlation_id: _Optional[str] = ..., request_id: _Optional[str] = ..., protocol_version: _Optional[str] = ..., deadline_rfc3339: _Optional[str] = ..., identity: _Optional[_Union[ServiceIdentityMsg, _Mapping]] = ...) -> None: ...
 
 class SyncSourceReply(_message.Message):
     __slots__ = ("source_id", "discovered_count", "changed_count", "indexed_count", "failed_count", "next_cursor", "errors")
@@ -558,15 +558,10 @@ class SyncSourceReply(_message.Message):
     def __init__(self, source_id: _Optional[str] = ..., discovered_count: _Optional[int] = ..., changed_count: _Optional[int] = ..., indexed_count: _Optional[int] = ..., failed_count: _Optional[int] = ..., next_cursor: _Optional[str] = ..., errors: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class IngestDocumentRequest(_message.Message):
-    __slots__ = ("tenant_id", "organization_id", "project_id", "correlation_id", "request_id", "protocol_version", "deadline_rfc3339", "identity", "source_id", "document_id", "source_kind", "title", "mime_type", "content", "source_uri", "content_sha256", "required_roles", "denied_principals", "metadata_json")
+    __slots__ = ("tenant_id", "organization_id", "project_id", "source_id", "document_id", "source_kind", "title", "mime_type", "content", "source_uri", "content_sha256", "required_roles", "denied_principals", "metadata_json", "correlation_id", "request_id", "protocol_version", "deadline_rfc3339", "identity")
     TENANT_ID_FIELD_NUMBER: _ClassVar[int]
     ORGANIZATION_ID_FIELD_NUMBER: _ClassVar[int]
     PROJECT_ID_FIELD_NUMBER: _ClassVar[int]
-    CORRELATION_ID_FIELD_NUMBER: _ClassVar[int]
-    REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
-    PROTOCOL_VERSION_FIELD_NUMBER: _ClassVar[int]
-    DEADLINE_RFC3339_FIELD_NUMBER: _ClassVar[int]
-    IDENTITY_FIELD_NUMBER: _ClassVar[int]
     SOURCE_ID_FIELD_NUMBER: _ClassVar[int]
     DOCUMENT_ID_FIELD_NUMBER: _ClassVar[int]
     SOURCE_KIND_FIELD_NUMBER: _ClassVar[int]
@@ -578,14 +573,14 @@ class IngestDocumentRequest(_message.Message):
     REQUIRED_ROLES_FIELD_NUMBER: _ClassVar[int]
     DENIED_PRINCIPALS_FIELD_NUMBER: _ClassVar[int]
     METADATA_JSON_FIELD_NUMBER: _ClassVar[int]
+    CORRELATION_ID_FIELD_NUMBER: _ClassVar[int]
+    REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
+    PROTOCOL_VERSION_FIELD_NUMBER: _ClassVar[int]
+    DEADLINE_RFC3339_FIELD_NUMBER: _ClassVar[int]
+    IDENTITY_FIELD_NUMBER: _ClassVar[int]
     tenant_id: str
     organization_id: str
     project_id: str
-    correlation_id: str
-    request_id: str
-    protocol_version: str
-    deadline_rfc3339: str
-    identity: ServiceIdentityMsg
     source_id: str
     document_id: str
     source_kind: str
@@ -597,7 +592,12 @@ class IngestDocumentRequest(_message.Message):
     required_roles: _containers.RepeatedScalarFieldContainer[str]
     denied_principals: _containers.RepeatedScalarFieldContainer[str]
     metadata_json: str
-    def __init__(self, tenant_id: _Optional[str] = ..., organization_id: _Optional[str] = ..., project_id: _Optional[str] = ..., correlation_id: _Optional[str] = ..., request_id: _Optional[str] = ..., protocol_version: _Optional[str] = ..., deadline_rfc3339: _Optional[str] = ..., identity: _Optional[_Union[ServiceIdentityMsg, _Mapping]] = ..., source_id: _Optional[str] = ..., document_id: _Optional[str] = ..., source_kind: _Optional[str] = ..., title: _Optional[str] = ..., mime_type: _Optional[str] = ..., content: _Optional[bytes] = ..., source_uri: _Optional[str] = ..., content_sha256: _Optional[str] = ..., required_roles: _Optional[_Iterable[str]] = ..., denied_principals: _Optional[_Iterable[str]] = ..., metadata_json: _Optional[str] = ...) -> None: ...
+    correlation_id: str
+    request_id: str
+    protocol_version: str
+    deadline_rfc3339: str
+    identity: ServiceIdentityMsg
+    def __init__(self, tenant_id: _Optional[str] = ..., organization_id: _Optional[str] = ..., project_id: _Optional[str] = ..., source_id: _Optional[str] = ..., document_id: _Optional[str] = ..., source_kind: _Optional[str] = ..., title: _Optional[str] = ..., mime_type: _Optional[str] = ..., content: _Optional[bytes] = ..., source_uri: _Optional[str] = ..., content_sha256: _Optional[str] = ..., required_roles: _Optional[_Iterable[str]] = ..., denied_principals: _Optional[_Iterable[str]] = ..., metadata_json: _Optional[str] = ..., correlation_id: _Optional[str] = ..., request_id: _Optional[str] = ..., protocol_version: _Optional[str] = ..., deadline_rfc3339: _Optional[str] = ..., identity: _Optional[_Union[ServiceIdentityMsg, _Mapping]] = ...) -> None: ...
 
 class DocumentIngestionReply(_message.Message):
     __slots__ = ("document_id", "sha256", "byte_count", "chunk_count", "embedded_count", "skipped_reason")
@@ -616,28 +616,28 @@ class DocumentIngestionReply(_message.Message):
     def __init__(self, document_id: _Optional[str] = ..., sha256: _Optional[str] = ..., byte_count: _Optional[int] = ..., chunk_count: _Optional[int] = ..., embedded_count: _Optional[int] = ..., skipped_reason: _Optional[str] = ...) -> None: ...
 
 class PurgeDocumentRequest(_message.Message):
-    __slots__ = ("tenant_id", "organization_id", "project_id", "correlation_id", "request_id", "protocol_version", "deadline_rfc3339", "identity", "source_id", "document_id")
+    __slots__ = ("tenant_id", "organization_id", "project_id", "source_id", "document_id", "correlation_id", "request_id", "protocol_version", "deadline_rfc3339", "identity")
     TENANT_ID_FIELD_NUMBER: _ClassVar[int]
     ORGANIZATION_ID_FIELD_NUMBER: _ClassVar[int]
     PROJECT_ID_FIELD_NUMBER: _ClassVar[int]
+    SOURCE_ID_FIELD_NUMBER: _ClassVar[int]
+    DOCUMENT_ID_FIELD_NUMBER: _ClassVar[int]
     CORRELATION_ID_FIELD_NUMBER: _ClassVar[int]
     REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
     PROTOCOL_VERSION_FIELD_NUMBER: _ClassVar[int]
     DEADLINE_RFC3339_FIELD_NUMBER: _ClassVar[int]
     IDENTITY_FIELD_NUMBER: _ClassVar[int]
-    SOURCE_ID_FIELD_NUMBER: _ClassVar[int]
-    DOCUMENT_ID_FIELD_NUMBER: _ClassVar[int]
     tenant_id: str
     organization_id: str
     project_id: str
+    source_id: str
+    document_id: str
     correlation_id: str
     request_id: str
     protocol_version: str
     deadline_rfc3339: str
     identity: ServiceIdentityMsg
-    source_id: str
-    document_id: str
-    def __init__(self, tenant_id: _Optional[str] = ..., organization_id: _Optional[str] = ..., project_id: _Optional[str] = ..., correlation_id: _Optional[str] = ..., request_id: _Optional[str] = ..., protocol_version: _Optional[str] = ..., deadline_rfc3339: _Optional[str] = ..., identity: _Optional[_Union[ServiceIdentityMsg, _Mapping]] = ..., source_id: _Optional[str] = ..., document_id: _Optional[str] = ...) -> None: ...
+    def __init__(self, tenant_id: _Optional[str] = ..., organization_id: _Optional[str] = ..., project_id: _Optional[str] = ..., source_id: _Optional[str] = ..., document_id: _Optional[str] = ..., correlation_id: _Optional[str] = ..., request_id: _Optional[str] = ..., protocol_version: _Optional[str] = ..., deadline_rfc3339: _Optional[str] = ..., identity: _Optional[_Union[ServiceIdentityMsg, _Mapping]] = ...) -> None: ...
 
 class PurgeDocumentReply(_message.Message):
     __slots__ = ("document_id", "removed_chunks")

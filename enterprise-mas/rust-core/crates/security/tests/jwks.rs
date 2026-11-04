@@ -109,6 +109,8 @@ async fn malformed_expired_future_and_wrong_issuer_or_audience_tokens_are_reject
         json!({"sub":"future","iss":"https://issuer.example.test","aud":["mas-api"],"exp":Timestamp::now().checked_add(Duration::from_secs(600)).expect("future").to_unix_seconds(),"nbf":Timestamp::now().checked_add(Duration::from_secs(600)).expect("future").to_unix_seconds()}),
         json!({"sub":"wrong-issuer","iss":"https://evil.example.test","aud":["mas-api"],"exp":Timestamp::now().checked_add(Duration::from_secs(600)).expect("future").to_unix_seconds()}),
         json!({"sub":"wrong-audience","iss":"https://issuer.example.test","aud":["other-service"],"exp":Timestamp::now().checked_add(Duration::from_secs(600)).expect("future").to_unix_seconds()}),
+        json!({"sub":"malformed-nbf","iss":"https://issuer.example.test","aud":["mas-api"],"exp":Timestamp::now().checked_add(Duration::from_secs(600)).expect("future").to_unix_seconds(),"nbf":"4102444800"}),
+        json!({"sub":"null-nbf","iss":"https://issuer.example.test","aud":["mas-api"],"exp":Timestamp::now().checked_add(Duration::from_secs(600)).expect("future").to_unix_seconds(),"nbf":null}),
     ];
     for claims in cases {
         let token = signed_token(&pair, "claims-key", claims, "ES256");

@@ -117,15 +117,7 @@ class VectorBackend(StrEnum):
 
 
 class DataSourceKind(StrEnum):
-    """Data Hub source adapter, mirroring the Rust ``DataSourceKind``.
-
-    These strings cross the bridge verbatim: Rust serialises
-    ``mas_common::string_enum!` members with ``as_str()`` and Python parses the
-    value it receives. Values must therefore stay byte-identical to the Rust
-    declarations in ``crates/domain/src/data_source.rs`` — ``"upload"``,
-    ``"object_storage"`` and ``"web"`` — because a rename on either side is a
-    silent data-plane break rather than a type error.
-    """
+    """Rust-owned Data Hub source kinds accepted by the ingestion plane."""
 
     UPLOAD = "upload"
     OBJECT_STORAGE = "object_storage"

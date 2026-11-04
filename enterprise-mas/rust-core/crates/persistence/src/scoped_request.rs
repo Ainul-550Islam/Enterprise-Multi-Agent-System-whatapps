@@ -37,8 +37,7 @@ use std::sync::Arc;
 use mas_common::error::AppError;
 use mas_common::result::Result;
 use mas_security::AuthoritativeScope;
-use sqlx::pool::PoolConnection;
-use sqlx::{PgPool, Postgres};
+use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use crate::error::map_sqlx;
@@ -50,7 +49,7 @@ use crate::rls::RlsContext;
 /// one statement and release it immediately: a guard held across another
 /// repository call would deadlock.
 struct ScopedConnection {
-    connection: PoolConnection<Postgres>,
+    transaction: Transaction<'static, Postgres>,
     scope: AuthoritativeScope,
 }
 
@@ -97,8 +96,8 @@ pub struct ScopedExecutor {
 
 impl ScopedExecutor {
     /// The connection, ready to be used as a `sqlx` executor.
-    pub fn connection(&mut self) -> &mut PoolConnection<Postgres> {
-        &mut self.guard.connection
+    pub fn connection(&mut self) -> &mut PgConnection {
+        &mut self.guard.transaction
     }
 
     /// The scope this transaction runs under.
@@ -133,8 +132,10 @@ fn already_scoped() -> bool {
 ///
 /// The transaction is opened, the RLS GUCs are applied inside it, and `work`
 /// runs with both bound to the current task. On success the transaction
-/// commits; on error, on panic, or if the task is cancelled, it rolls back and
-/// the connection returns to the pool carrying no GUC state.
+/// commits; on error, panic, or cancellation before commit, SQLx rolls it back
+/// before reusing the pooled connection. If cancellation or a network error
+/// occurs while COMMIT is in flight, the commit outcome can be ambiguous and
+/// callers must use durable idempotency rather than assume it rolled back.
 ///
 /// Nesting is refused. One request gets one transaction and one tenant; a
 /// second scope inside the first would mean two tenants in one request, which
@@ -160,18 +161,15 @@ where
         ));
     }
 
-    let mut connection = pool.acquire().await.map_err(map_sqlx)?;
-
-    // BEGIN, then arm RLS inside the transaction. There is deliberately no
-    // window between the two: the first statement after BEGIN is the GUC.
-    sqlx::query("BEGIN")
-        .execute(connection.as_mut())
-        .await
-        .map_err(map_sqlx)?;
-    apply(&mut connection, &scope).await?;
+    // A SQLx transaction owns its pooled connection and schedules rollback on
+    // drop, including cancellation and panic. A raw BEGIN on PoolConnection
+    // does not register with SQLx's transaction manager and can return a live
+    // transaction (and its SET LOCAL scope) to the pool on cancellation.
+    let mut transaction = pool.begin().await.map_err(map_sqlx)?;
+    apply(&mut transaction, &scope).await?;
 
     let handle = Arc::new(Mutex::new(ScopedConnection {
-        connection,
+        transaction,
         scope: scope.clone(),
     }));
 
@@ -179,31 +177,27 @@ where
         .scope(handle.clone(), SCOPE.scope(scope, work()))
         .await;
 
-    let mut guard = handle.lock().await;
-    match &outcome {
-        Ok(_) => {
-            sqlx::query("COMMIT")
-                .execute(guard.connection.as_mut())
-                .await
-                .map_err(map_sqlx)?;
+    // Repository handles must not escape the request. Waiting on the mutex
+    // would deadlock if a handle were returned in `outcome`; refuse instead.
+    let scoped = Arc::try_unwrap(handle)
+        .map_err(|_| AppError::internal("a scoped connection escaped its request"))?
+        .into_inner();
+    match outcome {
+        Ok(value) => {
+            scoped.transaction.commit().await.map_err(map_sqlx)?;
+            Ok(value)
         },
-        Err(_) => {
-            // Best-effort: the original error is what the caller needs, and
-            // dropping the connection rolls back regardless.
-            let _ = sqlx::query("ROLLBACK")
-                .execute(guard.connection.as_mut())
-                .await;
+        Err(error) => {
+            // SQLx also rolls back on drop if this explicit rollback fails or
+            // is interrupted. Preserve the work error for the caller.
+            let _ = scoped.transaction.rollback().await;
+            Err(error)
         },
     }
-    drop(guard);
-    outcome
 }
 
 /// Applies the RLS GUCs, transaction-locally.
-async fn apply(
-    connection: &mut PoolConnection<Postgres>,
-    scope: &AuthoritativeScope,
-) -> Result<()> {
+async fn apply(connection: &mut PgConnection, scope: &AuthoritativeScope) -> Result<()> {
     let context =
         RlsContext::for_organization_with_tenant(scope.organization_id(), scope.tenant_id());
     if context.is_unscoped() {

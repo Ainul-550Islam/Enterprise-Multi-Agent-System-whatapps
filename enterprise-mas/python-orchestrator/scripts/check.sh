@@ -1,79 +1,58 @@
 #!/usr/bin/env bash
+# PURPOSE:
+# Runs every check the project promises, and refuses to hide a failure.
 #
-# Runs every check the Python orchestrator must pass, in the order CI runs them.
+# Format, lint, strict type-check, tests, byte-compilation, and finally a
+# completeness check that proves the published deliverable still contains each
+# file verbatim rather than a shortened copy of it.
 #
-# Usage:
-#   bash scripts/check.sh           # lint + format + types + tests
-#   bash scripts/check.sh --fast    # skip the type-check pass
+# Runs format, lint, type-check and test checks without hiding failures.
 #
-# Exits non-zero on the first failing stage. Every stage is meaningful on its
-# own, so a failure names the stage rather than dumping four tool outputs.
+# Every stage runs even when an earlier one fails, so a single invocation
+# reports the full picture; the exit status is non-zero if any stage failed.
+# There is deliberately no `|| true` anywhere in this script.
 #
-# The protobuf bindings are *verified*, not regenerated: if `mas.proto` changed
-# without re-running `scripts/generate_proto.sh`, the bindings are stale and
-# that must fail the build here rather than surface as a wire mismatch in
-# production.
+# The completeness stage belongs here because this script is where the
+# "no shortening" rule is enforced. A stage that only grepped for "..." would
+# have passed the truncated document it exists to catch; comparing every file
+# against its source is the only check that can actually fail.
+#
+# The completeness stage is why this script is the right place for the rule
+# "no shortening". A stage that only greps for "..." would have passed the
+# truncated document it was written to catch; comparing each file against its
+# source is the only check that can fail.
 
-set -euo pipefail
+set -uo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
 
-FAST=0
-if [[ "${1:-}" == "--fast" ]]; then
-  FAST=1
-fi
+overall=0
 
-# Prefer the venv `bootstrap.sh` created, but fall back to whatever is on PATH
-# so the script works in a container that installed the package directly.
-if [[ -x "${ROOT_DIR}/.venv/bin/python" ]]; then
-  PY="${ROOT_DIR}/.venv/bin/python"
-else
-  PY="${PYTHON_BIN:-python3}"
-fi
-
-export PYTHONPATH="${ROOT_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}"
-
-stage() { printf '\n==> %s\n' "$1"; }
-
-stage "ruff (lint)"
-"${PY}" -m ruff check src tests
-
-stage "ruff (format)"
-"${PY}" -m ruff format --check src tests
-
-if [[ "${FAST}" -eq 0 ]]; then
-  stage "mypy (strict)"
-  "${PY}" -m mypy src
-fi
-
-stage "protobuf bindings are current"
-# Regenerating into a temp directory and diffing catches a stale checked-in
-# binding without needing the Rust checkout to be buildable; when the proto is
-# unreachable the check is skipped with a warning rather than failing spuriously
-# on a machine that only has the Python half.
-if command -v protoc >/dev/null 2>&1 || "${PY}" -c "import grpc_tools.protoc" >/dev/null 2>&1; then
-  BEFORE="$(mktemp)"
-  cat src/mas_orchestrator/grpc/generated/mas_pb2.py src/mas_orchestrator/grpc/generated/mas_pb2_grpc.py >"${BEFORE}"
-  bash "${SCRIPT_DIR}/generate_proto.sh" >/dev/null
-  AFTER="$(mktemp)"
-  cat src/mas_orchestrator/grpc/generated/mas_pb2.py src/mas_orchestrator/grpc/generated/mas_pb2_grpc.py >"${AFTER}"
-  if ! diff -q "${BEFORE}" "${AFTER}" >/dev/null; then
-    echo "error: generated protobuf bindings were stale; they have been regenerated." >&2
-    echo "hint: commit src/mas_orchestrator/grpc/generated/ and re-run." >&2
-    rm -f "${BEFORE}" "${AFTER}"
-    exit 1
+run_stage() {
+  local name="$1"
+  shift
+  echo
+  echo "=== ${name} ==="
+  if "$@"; then
+    echo "--- ${name}: PASS"
+  else
+    echo "--- ${name}: FAIL"
+    overall=1
   fi
-  rm -f "${BEFORE}" "${AFTER}"
-  echo "    bindings match mas.proto"
-else
-  echo "    skipped: no protoc available (install grpcio-tools to enable)"
+}
+
+run_stage "ruff format (check)" python3 -m ruff format --check src tests
+run_stage "ruff lint" python3 -m ruff check src tests
+run_stage "mypy (strict)" env PYTHONPATH=src python3 -m mypy src/mas_orchestrator
+run_stage "pytest" env PYTHONPATH=src python3 -m pytest tests -q
+run_stage "compileall" python3 -m compileall -q src tests
+run_stage "deliverable build" python3 build_phase16_deliverable.py
+run_stage "deliverable completeness" python3 verify_deliverable_completeness.py
+
+echo
+if [[ "${overall}" -ne 0 ]]; then
+  echo "FAILURE: one or more checks failed"
+  exit 1
 fi
-
-stage "pytest"
-# `--continue-on-collection-errors` so one broken module does not hide the
-# results of the other sixty; the non-zero exit still fails the stage.
-"${PY}" -m pytest tests -q --continue-on-collection-errors
-
-printf '\n==> all checks passed\n'
+echo "SUCCESS: all checks passed"

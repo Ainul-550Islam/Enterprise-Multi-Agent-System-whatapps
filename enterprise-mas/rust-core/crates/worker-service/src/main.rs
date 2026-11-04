@@ -46,6 +46,7 @@ use mas_worker::handler::OperationDispatcher;
 use mas_worker::AttemptCoordinator;
 use mas_worker::ConsumerOutcome;
 use mas_worker_service::run_slots::ControlPlaneRunSlots;
+use mas_worker_service::{PostgresAgentRuntimeSnapshotResolver, ResolvedAgentBridge};
 
 #[tokio::main]
 async fn main() {
@@ -264,9 +265,14 @@ async fn run() -> Result<(), String> {
         // The cancellation token the graceful-drain path owns: cancelling it
         // stops in-flight AI work instead of abandoning it mid-run.
         let cancellation = mas_orchestration::cancellation::CancellationToken::new();
+        let resolver = Arc::new(PostgresAgentRuntimeSnapshotResolver::new(pool.clone()));
+        let resolved_bridge = ResolvedAgentBridge::new(resolver, Arc::new(bridge));
         dispatcher = dispatcher.with_handler(
             "execution.run",
-            Arc::new(AgentRunHandler::new(Arc::new(bridge), cancellation)),
+            Arc::new(AgentRunHandler::new(
+                Arc::new(resolved_bridge),
+                cancellation,
+            )),
         );
     }
     let ops: Vec<&str> = dispatcher.operations();

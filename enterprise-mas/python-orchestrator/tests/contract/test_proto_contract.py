@@ -28,10 +28,8 @@ import pytest
 from mas_orchestrator.grpc.generated import mas_api_pb2 as pb
 from mas_orchestrator.grpc.generated import mas_api_pb2_grpc as pbg
 
-# The wire protocol version both sides must agree on. 1.1 adds the Data Hub
-# bridge surface without changing AgentBridge semantics; the Rust constant in
-# `crates/ai-bridge/src/lib.rs` is the other half of this assertion.
-EXPECTED_PROTOCOL_VERSION = "1.1.0"
+# The wire protocol version both sides must agree on.
+EXPECTED_PROTOCOL_VERSION = "1.0.0"
 
 
 class TestAgentBridgeServiceShape:
@@ -83,11 +81,6 @@ class TestAgentRunRequestShape:
             "idempotency_key",
             "identity",
             "task_attempt_id",
-            # Field 18. Rust publishes the immutable agent snapshot it resolved
-            # for exactly this (agent, version) pair; Python executes that and
-            # never falls back to its own catalog. Listed here so a future proto
-            # edit cannot add, remove or reorder a field without this contract
-            # test having to be updated deliberately.
             "agent_snapshot_json",
         ]
 
@@ -112,6 +105,15 @@ class TestAgentRunRequestShape:
         decoded = pb.AgentRunRequest.FromString(request.SerializeToString())
         assert decoded.HasField("task_attempt_id")
         assert decoded.task_attempt_id == "attempt-1"
+
+    def test_snapshot_has_additive_wire_number_and_presence(self) -> None:
+        field = pb.AgentRunRequest.DESCRIPTOR.fields_by_name["agent_snapshot_json"]
+        assert field.number == 18
+        assert field.has_presence is True
+        request = pb.AgentRunRequest(agent_snapshot_json='{"version_number":1}')
+        decoded = pb.AgentRunRequest.FromString(request.SerializeToString())
+        assert decoded.HasField("agent_snapshot_json")
+        assert decoded.agent_snapshot_json == '{"version_number":1}'
 
     def test_required_identity_fields_are_not_optional(self) -> None:
         """Mandatory identity is a plain field, not `optional`, in proto3."""

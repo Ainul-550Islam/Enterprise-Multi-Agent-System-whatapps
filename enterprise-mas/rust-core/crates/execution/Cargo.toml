@@ -30,12 +30,12 @@ dev-bridges = []
 workspace = true
 
 [dependencies]
-hex.workspace = true
 mas-common.workspace = true
 mas-domain.workspace = true
 mas-orchestration.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+hex.workspace = true
 sha2.workspace = true
 uuid.workspace = true
 chrono.workspace = true

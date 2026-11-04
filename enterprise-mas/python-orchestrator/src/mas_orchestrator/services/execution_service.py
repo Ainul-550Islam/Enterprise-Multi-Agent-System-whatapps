@@ -128,13 +128,9 @@ class ExecutionRequest:
         context: Authoritative execution context.
         routing: Optional agent selection constraints.
         agent_id: Run a specific agent rather than selecting one.
+        agent_spec: Validated immutable agent version supplied by Rust.
         state: Optional starting state.
         protocol_version: The protocol version claimed by the caller.
-        agent_spec: An immutable agent definition resolved by the caller
-            (from a Rust-owned snapshot) that the runtime must execute instead
-            of resolving one from its own catalog. Supplied by the bridge for
-            every signed run; ``None`` means "resolve it yourself", which is
-            only correct for in-process callers such as tests and the CLI.
     """
 
     request: str
@@ -254,13 +250,7 @@ class ExecutionService:
                 agent_spec=request.agent_spec,
             )
         except asyncio.CancelledError:
-            # Record the cancellation for observers, then let it propagate.
-            # Converting it into a normal result would leave the task alive:
-            # `asyncio.CancelledError` is how a task is told to stop, and a
-            # coroutine that catches it and returns has effectively refused.
-            # The caller would then continue executing past its own
-            # cancellation scope, and provider/tool work would keep running
-            # under a request nobody is waiting for any more.
+            cancel_event.set()
             await self._emit(
                 cancellation(
                     tenant_id=context.tenant_id,

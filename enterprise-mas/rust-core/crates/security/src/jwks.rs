@@ -176,6 +176,7 @@ pub struct RemoteJwksValidator {
     config: JwksConfig,
     fetcher: Arc<dyn JwksFetchPort>,
     cache: Mutex<Option<KeyCache>>,
+    next_refresh: Mutex<Option<Instant>>,
     refresh_gate: AsyncMutex<()>,
 }
 
@@ -206,6 +207,7 @@ impl RemoteJwksValidator {
             config,
             fetcher,
             cache: Mutex::new(None),
+            next_refresh: Mutex::new(None),
             refresh_gate: AsyncMutex::new(()),
         })
     }
@@ -240,44 +242,44 @@ impl RemoteJwksValidator {
         if let Some(key) = self.cached_key(kid, now) {
             return Ok(key);
         }
-        if self.unknown_kid_refresh_is_throttled(now) {
-            return Err(authentication_failure("unknown token signing key"));
+        if lock_recover(&self.next_refresh).is_some_and(|deadline| deadline > now) {
+            return Err(authentication_failure(
+                "token signing key refresh is throttled",
+            ));
         }
         let forced_unknown_refresh = self.has_fresh_cache(now);
-
-        let response = self
-            .fetcher
-            .fetch(&self.endpoint)
-            .await
-            .map_err(|_| authentication_failure("token signing keys are unavailable"))?;
+        // Set the deadline before awaiting network I/O. Missing keys, bad JWKS,
+        // network errors and cancellation must not bypass the cooldown.
+        *lock_recover(&self.next_refresh) = Some(
+            now.checked_add(UNKNOWN_KID_REFRESH_COOLDOWN)
+                .ok_or_else(|| authentication_failure("token signing key cache overflow"))?,
+        );
+        let response = self.fetcher.fetch(&self.endpoint).await;
+        *lock_recover(&self.next_refresh) = Some(
+            Instant::now()
+                .checked_add(UNKNOWN_KID_REFRESH_COOLDOWN)
+                .ok_or_else(|| authentication_failure("token signing key cache overflow"))?,
+        );
+        let response =
+            response.map_err(|_| authentication_failure("token signing keys are unavailable"))?;
         if response.len() > MAX_JWKS_BODY_BYTES {
             return Err(authentication_failure("token signing keys are invalid"));
         }
         let keys = parse_jwks(&response, &self.config.algorithms)
             .map_err(|_| authentication_failure("token signing keys are invalid"))?;
-        let key = keys
-            .get(kid)
-            .cloned()
-            .ok_or_else(|| authentication_failure("unknown token signing key"))?;
+        let key = keys.get(kid).cloned();
         let expires_at = Instant::now()
             .checked_add(self.config.cache_ttl)
             .ok_or_else(|| authentication_failure("token signing key cache overflow"))?;
-        let next_unknown_kid_refresh = if forced_unknown_refresh {
-            Some(
-                Instant::now()
-                    .checked_add(UNKNOWN_KID_REFRESH_COOLDOWN)
-                    .ok_or_else(|| authentication_failure("token signing key cache overflow"))?,
-            )
-        } else {
-            None
-        };
-        let mut cache = lock_recover(&self.cache);
-        *cache = Some(KeyCache {
-            keys,
-            expires_at,
-            next_unknown_kid_refresh,
-        });
-        Ok(key)
+        // Publish even when the requested kid was unknown, so a forged cold
+        // miss does not prevent known keys from using the fetched document.
+        *lock_recover(&self.cache) = Some(KeyCache { keys, expires_at });
+        if key.is_some() && !forced_unknown_refresh {
+            // A successful ordinary/cold refresh is not a forced rotation
+            // refresh: allow the first new kid to trigger rotation promptly.
+            *lock_recover(&self.next_refresh) = None;
+        }
+        key.ok_or_else(|| authentication_failure("unknown token signing key"))
     }
 
     fn cached_key(&self, kid: &str, now: Instant) -> Option<VerificationKey> {
@@ -286,16 +288,6 @@ impl RemoteJwksValidator {
             (entry.expires_at > now)
                 .then(|| entry.keys.get(kid).cloned())
                 .flatten()
-        })
-    }
-
-    fn unknown_kid_refresh_is_throttled(&self, now: Instant) -> bool {
-        let cache = lock_recover(&self.cache);
-        cache.as_ref().is_some_and(|entry| {
-            entry.expires_at > now
-                && entry
-                    .next_unknown_kid_refresh
-                    .is_some_and(|next_refresh| next_refresh > now)
         })
     }
 
@@ -310,7 +302,6 @@ impl RemoteJwksValidator {
 struct KeyCache {
     keys: HashMap<String, VerificationKey>,
     expires_at: Instant,
-    next_unknown_kid_refresh: Option<Instant>,
 }
 
 #[derive(Debug, Clone)]
@@ -783,6 +774,155 @@ mod tests {
             .await
             .expect("rotation refresh");
         assert_eq!(fetcher.calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn unknown_kids_are_throttled_after_a_miss_and_known_keys_still_work() {
+        let pair = signing_key();
+        let fetcher = Arc::new(FixtureFetcher::new(vec![
+            jwks_for(&pair, "known"),
+            jwks_for(&pair, "known"),
+            jwks_for(&pair, "known"),
+        ]));
+        let validator =
+            RemoteJwksValidator::new("https://idp.example.test/jwks", config(), fetcher.clone())
+                .expect("validator");
+        validator
+            .validate(&token_for(&pair, "known", "user"))
+            .await
+            .expect("known key");
+        for kid in ["fake-1", "fake-2", "fake-3"] {
+            assert!(validator
+                .validate(&token_for(&pair, kid, "user"))
+                .await
+                .is_err());
+        }
+        assert_eq!(fetcher.calls.load(Ordering::Relaxed), 2);
+        validator
+            .validate(&token_for(&pair, "known", "user"))
+            .await
+            .expect("cached known key");
+        *lock_recover(&validator.next_refresh) = Some(Instant::now() - Duration::from_secs(1));
+        assert!(validator
+            .validate(&token_for(&pair, "fake-4", "user"))
+            .await
+            .is_err());
+        assert_eq!(fetcher.calls.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn concurrent_unknown_keys_share_one_forced_refresh() {
+        let pair = signing_key();
+        let fetcher = Arc::new(FixtureFetcher::new(vec![
+            jwks_for(&pair, "known"),
+            jwks_for(&pair, "known"),
+        ]));
+        let validator = Arc::new(
+            RemoteJwksValidator::new("https://idp.example.test/jwks", config(), fetcher.clone())
+                .expect("validator"),
+        );
+        validator
+            .validate(&token_for(&pair, "known", "user"))
+            .await
+            .expect("known key");
+        let mut tasks = tokio::task::JoinSet::new();
+        for n in 0..32 {
+            let validator = validator.clone();
+            let token = token_for(&pair, &format!("fake-{n}"), "user");
+            tasks.spawn(async move { validator.validate(&token).await });
+        }
+        while let Some(result) = tasks.join_next().await {
+            assert!(result.expect("task succeeded").is_err());
+        }
+        assert_eq!(fetcher.calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn cold_unknown_key_populates_cache_but_cannot_trigger_repeated_fetches() {
+        let pair = signing_key();
+        let fetcher = Arc::new(FixtureFetcher::new(vec![jwks_for(&pair, "known")]));
+        let validator =
+            RemoteJwksValidator::new("https://idp.example.test/jwks", config(), fetcher.clone())
+                .expect("validator");
+        assert!(validator
+            .validate(&token_for(&pair, "fake-1", "user"))
+            .await
+            .is_err());
+        assert!(validator
+            .validate(&token_for(&pair, "fake-2", "user"))
+            .await
+            .is_err());
+        validator
+            .validate(&token_for(&pair, "known", "user"))
+            .await
+            .expect("known key from cold miss");
+        assert_eq!(fetcher.calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_fetch_is_throttled_even_without_a_cache() {
+        let pair = signing_key();
+        let fetcher = Arc::new(FixtureFetcher::new(vec![]));
+        let validator =
+            RemoteJwksValidator::new("https://idp.example.test/jwks", config(), fetcher.clone())
+                .expect("validator");
+        for kid in ["fake-1", "fake-2", "fake-3"] {
+            assert!(validator
+                .validate(&token_for(&pair, kid, "user"))
+                .await
+                .is_err());
+        }
+        assert_eq!(fetcher.calls.load(Ordering::Relaxed), 1);
+        *lock_recover(&validator.next_refresh) = Some(Instant::now() - Duration::from_secs(1));
+        assert!(validator
+            .validate(&token_for(&pair, "fake-4", "user"))
+            .await
+            .is_err());
+        assert_eq!(fetcher.calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[derive(Debug)]
+    struct PendingFetcher {
+        calls: AtomicUsize,
+        started: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl JwksFetchPort for PendingFetcher {
+        async fn fetch(&self, _endpoint: &str) -> Result<Vec<u8>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.started.notify_one();
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_fetch_keeps_the_cooldown() {
+        let pair = signing_key();
+        let fetcher = Arc::new(PendingFetcher {
+            calls: AtomicUsize::new(0),
+            started: tokio::sync::Notify::new(),
+        });
+        let validator = Arc::new(
+            RemoteJwksValidator::new("https://idp.example.test/jwks", config(), fetcher.clone())
+                .expect("validator"),
+        );
+        let token = token_for(&pair, "unknown", "user");
+        let task = tokio::spawn({
+            let validator = validator.clone();
+            let token = token.clone();
+            async move { validator.validate(&token).await }
+        });
+        fetcher.started.notified().await;
+        task.abort();
+        assert!(task.await.expect_err("aborted").is_cancelled());
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), validator.validate(&token))
+                .await
+                .expect("throttled without a fetch")
+                .is_err()
+        );
+        assert_eq!(fetcher.calls.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]

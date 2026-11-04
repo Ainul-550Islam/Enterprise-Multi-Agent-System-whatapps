@@ -52,15 +52,6 @@ use mas_execution::agent_bridge::{
 use mas_security::secret_string::SecretString;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
 
-pub mod data_hub;
-
-/// Production Data Hub adapter and its configuration.
-///
-/// Re-exported at the crate root because the API composition root wires the
-/// bridge by name, exactly as it wires [`GrpcAgentBridge`]. The module stays
-/// public so the tests that construct it directly keep working.
-pub use data_hub::{GrpcDataHubBridge, GrpcDataHubBridgeConfig};
-
 pub mod gen {
     //! Generated `mas.api.v1` client stubs (build.rs).
     //!
@@ -75,6 +66,9 @@ pub mod gen {
 
 use gen::agent_bridge_api_client::AgentBridgeApiClient;
 use gen::{agent_run_reply, AgentRunReply, BridgeHealthReply, ResourceLimitsMsg};
+
+mod data_hub;
+pub use data_hub::{GrpcDataHubBridge, GrpcDataHubBridgeConfig};
 
 /// Metadata key carrying the bearer credential, matching the platform-wide
 /// header name used by the HTTP surface.
@@ -94,15 +88,6 @@ const PROTOCOL_VERSION_HEADER: &str = "x-ai-protocol-version";
 const IDEMPOTENCY_HEADER: &str = "idempotency-key";
 
 /// The AI wire protocol version this adapter speaks.
-///
-/// 1.1 adds `DataHubBridgeApi` (source sync, document ingestion, purge) next to
-/// `AgentBridgeApi` without changing any AgentBridge wire semantics, so a 1.0
-/// orchestrator still satisfies every agent run this client sends. The Python
-/// side declares the same value in
-/// `mas_orchestrator/contracts/protocol_version.py::CURRENT_PROTOCOL_VERSION`,
-/// and `tests/bridge/test_cross_language_contract.py` fails if they diverge:
-/// a mismatched major is refused before any AI work happens, and a silent
-/// drift here would only surface as a rejected request in production.
 const AI_PROTOCOL_VERSION: &str = "1.1.0";
 
 /// A deadline shorter than this is not worth a round trip: fail fast instead of
@@ -202,54 +187,11 @@ impl Default for GrpcAgentBridgeConfig {
 #[derive(Debug, Clone)]
 pub struct GrpcAgentBridge {
     client: AgentBridgeApiClient<tonic::transport::Channel>,
-    /// The connected channel, shared with the Data Hub adapter so the process
-    /// has exactly one authenticated connection, one TLS configuration and one
-    /// pool of HTTP/2 streams rather than one per bridge.
     channel: tonic::transport::Channel,
     config: GrpcAgentBridgeConfig,
 }
 
 impl GrpcAgentBridge {
-    /// Builds a bridge over an already-connected channel.
-    ///
-    /// Used by tests and by composition roots that own the connection (for
-    /// example one that applies a custom connector or a shared resolver). It
-    /// performs no TLS validation of its own, so production code should prefer
-    /// [`GrpcAgentBridge::connect`] unless it has already validated the
-    /// channel.
-    #[must_use]
-    pub fn from_channel(channel: tonic::transport::Channel, config: GrpcAgentBridgeConfig) -> Self {
-        let client = AgentBridgeApiClient::new(channel.clone())
-            .max_decoding_message_size(config.max_response_bytes);
-        Self {
-            client,
-            channel,
-            config,
-        }
-    }
-
-    /// The underlying channel, for adapters that speak a different service on
-    /// the same authenticated endpoint (today: `DataHubBridgeApi`).
-    ///
-    /// Sharing the channel is deliberate: a second connection would duplicate
-    /// TLS state and could silently pick up different trust material, which is
-    /// exactly the kind of divergence an authentication review is meant to
-    /// remove.
-    #[must_use]
-    pub fn channel(&self) -> tonic::transport::Channel {
-        self.channel.clone()
-    }
-
-    /// The configuration this bridge was built with.
-    ///
-    /// Exposed read-only so a sibling adapter can reuse the deadline,
-    /// response-size bound, signing secret and service identity without
-    /// copying them into a second configuration object that could drift.
-    #[must_use]
-    pub fn config(&self) -> &GrpcAgentBridgeConfig {
-        &self.config
-    }
-
     /// Connects to the orchestrator endpoint.
     ///
     /// This performs the transport handshake but not an RPC: use [`health`] to
@@ -346,6 +288,12 @@ impl GrpcAgentBridge {
         Ok(gen::AgentRunRequest {
             agent_id: request.agent_id.to_string(),
             agent_version: request.agent_version.clone(),
+            agent_snapshot_json: request
+                .agent_snapshot
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|err| AppError::serialization(format!("agent snapshot: {err}")))?,
             input_json: serde_json::to_string(&request.input)
                 .map_err(|err| AppError::serialization(format!("agent input: {err}")))?,
             correlation_id: request.correlation_id.clone(),
@@ -377,19 +325,6 @@ impl GrpcAgentBridge {
             }),
             token_budget_max: request.token_budget_max,
             idempotency_key: request.idempotency_key.clone(),
-            // The immutable definition Python must execute. Serialized here
-            // rather than inside the transport call so the JSON that the body
-            // signature covers is exactly the JSON the request carries: a
-            // snapshot serialized twice could differ by key order and the HMAC
-            // would cover bytes that never reached the wire.
-            agent_snapshot_json: match request.agent_snapshot.as_ref() {
-                Some(snapshot) => snapshot.to_json()?,
-                // Left empty on purpose. The Python boundary refuses it with a
-                // typed INVALID_ARGUMENT, which is the correct outcome for a
-                // caller that resolved no snapshot; inventing a catalog
-                // fallback here would defeat the whole pinning contract.
-                None => String::new(),
-            },
             // Filled by the caller below, which owns the configured identity.
             identity: None,
         })
@@ -708,11 +643,8 @@ fn annotate(error: AppError, suffix: &str) -> AppError {
         },
         Timeout(message) => Timeout(push(message)),
         Cancelled(message) => Cancelled(push(message)),
-        // A missing composition is a deployment fact, not an input problem:
-        // the suffix must not turn it into a generic internal error, because
-        // the API boundary answers `Unavailable` with a stable 503 code.
-        Unavailable(message) => Unavailable(push(message)),
         Database(message) => Database(push(message)),
+        Unavailable(message) => Unavailable(push(message)),
         Messaging(message) => Messaging(push(message)),
         Serialization(message) => Serialization(push(message)),
         ExternalService { service, message } => ExternalService {
@@ -872,6 +804,43 @@ mod tests {
     }
 
     #[test]
+    fn immutable_agent_snapshot_is_carried_in_signed_wire_body() {
+        use mas_execution::agent_bridge::{AgentRuntimeConfiguration, AgentRuntimeSnapshot};
+        use prost::Message;
+        let mut request = request();
+        let snapshot = AgentRuntimeSnapshot {
+            agent_id: request.agent_id,
+            tenant_id: request.tenant_id.expect("tenant"),
+            organization_id: request.organization_id.expect("organization"),
+            project_id: request.project_id.expect("project"),
+            agent_version_id: mas_common::ids::AgentVersionId::new(),
+            version_number: 7,
+            configuration_checksum: "a".repeat(64),
+            name: "Snapshot Agent".to_owned(),
+            slug: "snapshot-agent".to_owned(),
+            kind: "standard".to_owned(),
+            status: "active".to_owned(),
+            origin: "user".to_owned(),
+            read_only: false,
+            configuration: AgentRuntimeConfiguration {
+                system_prompt: "published instructions".to_owned(),
+                ..Default::default()
+            },
+        };
+        let without_snapshot = GrpcAgentBridge::encode_request(&request).expect("legacy wire");
+        request.agent_snapshot = Some(snapshot.clone());
+        let wire = GrpcAgentBridge::encode_request(&request).expect("snapshot wire");
+        let decoded: AgentRuntimeSnapshot = serde_json::from_str(
+            wire.agent_snapshot_json
+                .as_deref()
+                .expect("snapshot included"),
+        )
+        .expect("valid snapshot");
+        assert_eq!(decoded, snapshot);
+        assert_ne!(wire.encode_to_vec(), without_snapshot.encode_to_vec());
+    }
+
+    #[test]
     fn from_context_populates_the_authoritative_scope() {
         let request = request();
         assert!(request.tenant_id.is_some(), "tenant scope is mandatory");
@@ -919,6 +888,7 @@ mod tests {
         gen::AgentRunRequest {
             agent_id: "00000000-0000-0000-0000-000000000001".to_owned(),
             agent_version: Some("v1".to_owned()),
+            agent_snapshot_json: None,
             input_json: "{\"prompt\":\"hi\"}".to_owned(),
             correlation_id: "corr-1".to_owned(),
             request_id: "req-1".to_owned(),
@@ -945,13 +915,6 @@ mod tests {
                 issuer: "platform-internal".to_owned(),
                 scopes: vec!["execute_agent".to_owned()],
             }),
-            // Deliberately empty. This vector pins the *AgentBridge* envelope
-            // byte for byte, and an empty string is proto3's default, so it
-            // emits no field-18 tag and the pinned hex below stays valid. A
-            // populated snapshot is covered by its own round-trip test: folding
-            // it into this fixture would make every envelope change look like a
-            // serialization regression.
-            agent_snapshot_json: String::new(),
         }
     }
 
@@ -1296,6 +1259,20 @@ mod tests {
             rendered.contains("request_id=req-9"),
             "request id must be joinable: {rendered}"
         );
+    }
+
+    #[test]
+    fn unavailable_annotation_preserves_error_kind_and_details() {
+        let error = annotate(
+            AppError::Unavailable("upstream offline".to_owned()),
+            "[code=x]",
+        );
+        match error {
+            AppError::Unavailable(message) => {
+                assert_eq!(message, "upstream offline [code=x]");
+            },
+            other => panic!("expected unavailable error, got {other:?}"),
+        }
     }
 
     #[test]

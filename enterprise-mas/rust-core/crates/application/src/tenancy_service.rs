@@ -278,6 +278,23 @@ impl TenancyService {
     ) -> Result<Membership> {
         let tenant_id = ctx.require_tenant()?;
         let organization_id = ctx.require_organization()?;
+        // The canonical security decision is applied here, not just in the
+        // HTTP/gRPC adapters: every use-case caller must respect the same
+        // delegation boundary. A trusted system bootstrap is the only
+        // role-less exception (e.g. initial owner provisioning).
+        if ctx.actor.kind != mas_domain::AuditActorKind::System {
+            let actor_role = ctx.require_resolved_role()?;
+            if !mas_security::AuthorizationService::can_invite_role(actor_role, role) {
+                return Err(AppError::forbidden(
+                    "membership invitation role is not permitted",
+                ));
+            }
+        }
+        self.tenants
+            .get(tenant_id)
+            .await?
+            .filter(|tenant| tenant.organization_id() == organization_id)
+            .ok_or_else(|| AppError::not_found("tenant", tenant_id.to_string()))?;
         if self.users.get(user).await?.is_none() {
             return Err(AppError::not_found("user", user.to_string()));
         }
@@ -428,6 +445,102 @@ mod tests {
         );
 
         assert_eq!(fixture.audit.len(), 4, "org×2 + tenant + project audited");
+    }
+
+    #[tokio::test]
+    async fn invitation_delegation_rejects_escalation_before_any_mutation() {
+        let fixture = fixture();
+        let system = ServiceContext::system("bootstrap", &now()).unwrap();
+        let org = fixture
+            .service
+            .register_organization(&system, "Acme", "Acme", "delegation-org")
+            .await
+            .unwrap();
+        let tenant = fixture
+            .service
+            .register_tenant(
+                &system.clone().with_scope(TenantId::new(), org.id),
+                "Prod",
+                "delegation-tenant",
+                Environment::Production,
+                IsolationMode::SharedRls,
+            )
+            .await
+            .unwrap();
+        let target = fixture
+            .service
+            .register_user(&system, "delegation@example.test", "Invitee")
+            .await
+            .unwrap();
+        let actor =
+            mas_domain::AuditActor::new(mas_domain::AuditActorKind::User, "manager").unwrap();
+        let base = ServiceContext::new(actor, Some(tenant.id), Some(org.id), "delegation", &now())
+            .unwrap();
+        let initial_audits = fixture.audit.len();
+        for (actor_role, target_role) in [
+            (Some(MembershipRole::Admin), MembershipRole::Owner),
+            (Some(MembershipRole::Admin), MembershipRole::Admin),
+            (Some(MembershipRole::Owner), MembershipRole::Owner),
+            (Some(MembershipRole::Developer), MembershipRole::Viewer),
+            (None, MembershipRole::Viewer),
+        ] {
+            let denied = fixture
+                .service
+                .invite_membership(
+                    &base.clone().with_resolved_role(actor_role),
+                    target.id,
+                    target_role,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(denied.error_code(), "FORBIDDEN");
+        }
+        let service = ServiceContext::for_service("unprivileged-service", "delegation", &now())
+            .unwrap()
+            .with_scope(tenant.id, org.id);
+        assert_eq!(
+            fixture
+                .service
+                .invite_membership(&service, target.id, MembershipRole::Viewer)
+                .await
+                .unwrap_err()
+                .error_code(),
+            "FORBIDDEN"
+        );
+        assert_eq!(fixture.audit.len(), initial_audits);
+        assert!(fixture
+            .service
+            .tenant_memberships(&base)
+            .await
+            .unwrap()
+            .is_empty());
+        let wrong_org = base
+            .clone()
+            .with_scope(tenant.id, mas_common::ids::OrganizationId::new())
+            .with_resolved_role(Some(MembershipRole::Owner));
+        assert_eq!(
+            fixture
+                .service
+                .invite_membership(&wrong_org, target.id, MembershipRole::Admin)
+                .await
+                .unwrap_err()
+                .error_code(),
+            "RESOURCE_NOT_FOUND"
+        );
+        let invited = fixture
+            .service
+            .invite_membership(
+                &base.with_resolved_role(Some(MembershipRole::Admin)),
+                target.id,
+                MembershipRole::Developer,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            invited.roles,
+            std::collections::BTreeSet::from([MembershipRole::Developer])
+        );
+        assert_eq!(fixture.audit.len(), initial_audits + 1);
     }
 
     #[tokio::test]

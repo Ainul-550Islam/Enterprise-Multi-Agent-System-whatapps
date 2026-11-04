@@ -776,12 +776,12 @@ class TestCitations:
         assert "not in the retrieved set" in str(checks[0].reason)
 
     def test_assert_supported_raises(self) -> None:
-        checks = validate_citations([self._citation("nonsense")], {"c1": "hello"})
+        checks = validate_citations([self._citation("nonsense")], {("d1", "c1"): "hello"})
         with pytest.raises(CitationValidationError):
             assert_supported(checks)
 
     def test_assert_supported_passes_when_valid(self) -> None:
-        checks = validate_citations([self._citation("hello")], {"c1": "hello world"})
+        checks = validate_citations([self._citation("hello")], {("d1", "c1"): "hello world"})
         assert_supported(checks)
 
     def test_tolerates_some_bad_citations(self) -> None:

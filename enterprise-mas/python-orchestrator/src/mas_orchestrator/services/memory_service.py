@@ -101,14 +101,14 @@ class MemoryService:
         # The record is built here so its execution binding and retention
         # policy are validated first; the write goes through the manager, which
         # stamps the tenant from the authoritative context.
-        await self._manager.remember(
-            content,
+        return await self._manager.remember(
+            record.content,
             context,
             scope=MemoryScope.TASK,
             sensitivity=sensitivity,
             retention=record.retention,
+            record_id=record.record_id,
         )
-        return record
 
     async def remember_fact(
         self,
@@ -132,13 +132,14 @@ class MemoryService:
             agent_id=context.agent_id,
             sensitivity=sensitivity,
         )
-        await self._manager.remember(
-            content,
+        return await self._manager.remember(
+            record.content,
             context,
             scope=MemoryScope.DURABLE,
             sensitivity=sensitivity,
+            retention=record.retention,
+            record_id=record.record_id,
         )
-        return record
 
     async def recall(
         self,
@@ -202,7 +203,7 @@ class MemoryService:
         )
 
     async def forget(self, context: ExecutionContext, record_id: str) -> bool:
-        """Deletes one record in this execution's tenant."""
+        """Deletes a record visible to this execution."""
         return await self._manager.forget(context, record_id)
 
     async def close_execution(self, context: ExecutionContext) -> int:

@@ -519,15 +519,6 @@ for (mod, fn), methods in sorted(handlers.items()):
 # -------------------------------------------------------------------------
 # S10: shared-file non-additive edits must sit inside the verify-fix
 #      allowlist (file + recorded reason); anything else fails.
-#
-#      SCOPE NOTE: this check is pinned to the Batch 01/02 cleanup it was
-#      written for — it diffs against `origin/main` and compares the result to
-#      the hardcoded list below. After any later, legitimate change to a shared
-#      file it reports the deletions in that change as S10 failures even when
-#      the file is a net addition (e.g. a missing field being added). It is not
-#      wired into CI for that reason. Treat S10 output as "these files changed
-#      since the batch", not as a defect list; the other checks in this script
-#      are the ones that generalise.
 # -------------------------------------------------------------------------
 print("-- S10 shared-file non-additive edits (allowlist) --")
 ALLOWED_DELETIONS = {

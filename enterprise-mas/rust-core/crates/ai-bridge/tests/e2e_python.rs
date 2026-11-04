@@ -39,8 +39,7 @@ use mas_common::ids::{
 };
 use mas_domain::{ResourceLimits, TokenBudget};
 use mas_execution::agent_bridge::{
-    AgentBridge, AgentRunRequest, AgentRunVerdict, AgentRuntimeConfiguration, AgentRuntimeLimits,
-    AgentRuntimeSnapshot,
+    AgentBridge, AgentRunRequest, AgentRunVerdict, AgentRuntimeConfiguration, AgentRuntimeSnapshot,
 };
 use mas_orchestration::runtime_context::RuntimeContext;
 use mas_security::secret_string::SecretString;
@@ -307,14 +306,7 @@ fn miskeyed_bridge(port: u16) -> GrpcAgentBridgeConfig {
     }
 }
 
-/// Builds a properly scoped run request, including the immutable agent snapshot
-/// the Python boundary now requires.
-///
-/// In production `ResolvedAgentBridge` fills these two fields from the
-/// tenant-scoped published version. This test intentionally drives the raw
-/// `GrpcAgentBridge`, so it must construct the same pair by hand — otherwise it
-/// would exercise a request shape the wire contract no longer allows, and its
-/// "successful" verdicts would prove nothing about the real path.
+/// Builds a properly scoped run request.
 fn request() -> AgentRunRequest {
     let context = RuntimeContext::new(
         TenantId::new(),
@@ -325,7 +317,7 @@ fn request() -> AgentRunRequest {
     )
     .expect("context");
 
-    let mut request = AgentRunRequest::from_context(
+    let request = AgentRunRequest::from_context(
         &context,
         AgentId::new(),
         serde_json::json!({"prompt": "hello from rust"}),
@@ -333,49 +325,32 @@ fn request() -> AgentRunRequest {
         &TokenBudget::unlimited(),
     )
     .expect("request");
-
-    let snapshot = snapshot_for(&request);
-    request.agent_version = Some(snapshot.agent_version_id.to_string());
-    request.agent_snapshot = Some(snapshot);
-    request
+    with_snapshot(request)
 }
 
-/// Builds a valid, executable snapshot for the identities in *request*.
-fn snapshot_for(request: &AgentRunRequest) -> AgentRuntimeSnapshot {
-    let snapshot = AgentRuntimeSnapshot {
+fn with_snapshot(mut request: AgentRunRequest) -> AgentRunRequest {
+    let version = AgentVersionId::new();
+    request.agent_version = Some(version.to_string());
+    request.agent_snapshot = Some(AgentRuntimeSnapshot {
         agent_id: request.agent_id,
         tenant_id: request.tenant_id.expect("tenant"),
         organization_id: request.organization_id.expect("organization"),
         project_id: request.project_id.expect("project"),
-        agent_version_id: AgentVersionId::new(),
+        agent_version_id: version,
         version_number: 1,
-        // A real lowercase-hex SHA-256; the Python validator rejects anything
-        // that is not exactly 64 lowercase hex characters.
         configuration_checksum: "a".repeat(64),
-        name: "E2E Agent".to_owned(),
-        slug: "e2e-agent".to_owned(),
-        // Standard, active, tenant-owned: the only combination Python executes
-        // without further authorization decisions of its own.
+        name: "Bridge Test Agent".to_owned(),
+        slug: "bridge-test-agent".to_owned(),
         kind: "standard".to_owned(),
         status: "active".to_owned(),
         origin: "user".to_owned(),
         read_only: false,
         configuration: AgentRuntimeConfiguration {
-            description: Some("cross-language end-to-end agent".to_owned()),
-            model_hint: Some("provider/model-test".to_owned()),
-            system_prompt: "Answer briefly.".to_owned(),
-            limits: AgentRuntimeLimits {
-                max_steps: 4,
-                max_tool_calls: 0,
-                max_delegation_depth: 0,
-                timeout_seconds: None,
-            },
-            tags: vec!["e2e".to_owned()],
-            allowed_tools: Vec::new(),
+            description: Some("Bridge test agent".to_owned()),
+            ..Default::default()
         },
-    };
-    snapshot.validate().expect("valid snapshot");
-    snapshot
+    });
+    request
 }
 
 /// Converts an unavailable bridge prerequisite into a visible test failure.
@@ -483,14 +458,7 @@ fn scoped_request(
     .expect("request");
     request.task_id = Some(TaskId::from_uuid(task_id));
     request.task_attempt_id = Some(TaskAttemptId::from_uuid(task_attempt_id));
-
-    // Same snapshot wiring as `request()`: the raw bridge does not resolve one,
-    // and the Python boundary refuses a run without it and without the pinned
-    // version id that must agree with it.
-    let snapshot = snapshot_for(&request);
-    request.agent_version = Some(snapshot.agent_version_id.to_string());
-    request.agent_snapshot = Some(snapshot);
-    request
+    with_snapshot(request)
 }
 
 /// Reads the scope the Python side reported back.

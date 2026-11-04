@@ -38,7 +38,8 @@ use mas_domain::quota::{EnforcementMode, Quota, QuotaDimension, QuotaPeriod};
 use mas_domain::reservation::ReservationState;
 use mas_domain::subscription::{Subscription, SubscriptionState};
 use mas_persistence::repositories::control_plane::{
-    ControlPlaneStores, PostgresCounterStore, PostgresPolicyStore, ReceiptState, UsageWrite,
+    BillingClaim, ControlPlaneStores, PostgresCounterStore, PostgresPolicyStore, ReceiptState,
+    UsageWrite,
 };
 use mas_policy::store::PolicyStorePort;
 use mas_quota::counter::{CounterKey, CounterStorePort};
@@ -1209,22 +1210,26 @@ async fn a_replayed_webhook_event_is_recorded_once() {
     let hash = sha256_hex(b"{\"id\":\"evt\"}");
     let now = at(1_700_000_000);
 
-    let first = stores
+    let BillingClaim::New(first) = stores
         .billing
         .claim("stripe", &event_id, "invoice.paid", &hash, true, None)
         .await
         .expect("first claim")
-        .expect("claimed");
+    else {
+        panic!("first claim must be new")
+    };
     assert_eq!(first.state, "received");
     assert!(first.signature_valid);
 
     // The same event delivered again is recognised, not applied twice.
-    let replay = stores
+    let BillingClaim::Existing(replay) = stores
         .billing
         .claim("stripe", &event_id, "invoice.paid", &hash, true, None)
         .await
         .expect("replay")
-        .expect("the existing receipt comes back");
+    else {
+        panic!("replay must be existing")
+    };
     assert_eq!(
         replay.id, first.id,
         "a duplicate delivery returns the original receipt, not a second one"
@@ -1277,33 +1282,178 @@ async fn a_replayed_webhook_event_is_recorded_once() {
 }
 
 #[tokio::test]
-async fn an_unsigned_callback_is_recorded_as_rejected_not_applied() {
+async fn unsigned_event_cannot_poison_a_verified_event_id() {
     let Some(pool) = support::live_pool("cp-webhook-unsigned").await else {
         return;
     };
-    let stores = ControlPlaneStores::new(pool.clone());
+    let stores = ControlPlaneStores::new(pool);
     let event_id = format!("evt_{}", uuid::Uuid::new_v4().simple());
     let hash = sha256_hex(b"forged");
-
-    let receipt = stores
+    assert!(stores
         .billing
         .claim("stripe", &event_id, "customer.updated", &hash, false, None)
         .await
-        .expect("claim")
-        .expect("receipt");
+        .is_err());
+    assert!(stores.billing.get("stripe", &event_id).await.is_err());
+    assert!(matches!(
+        stores
+            .billing
+            .claim("stripe", &event_id, "customer.updated", &hash, true, None)
+            .await
+            .expect("valid event accepted"),
+        BillingClaim::New(_)
+    ));
+}
+
+#[tokio::test]
+async fn billing_claims_are_concurrent_distinct_and_detect_mutated_replays() {
+    let Some(pool) = support::live_pool("cp-billing-claims").await else {
+        return;
+    };
+    let store = ControlPlaneStores::new(pool).billing;
+    let event_id = format!("evt_{}", uuid::Uuid::new_v4().simple());
+    let hash = sha256_hex(b"original");
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let store = store.clone();
+        let event_id = event_id.clone();
+        let hash = hash.clone();
+        tasks.push(tokio::spawn(async move {
+            store
+                .claim("stripe", &event_id, "invoice.paid", &hash, true, None)
+                .await
+                .expect("claim")
+        }));
+    }
+    let mut new_count = 0;
+    let mut ids = Vec::new();
+    for task in tasks {
+        let result = task.await.expect("task");
+        match result {
+            BillingClaim::New(row) => {
+                new_count += 1;
+                ids.push(row.id);
+            },
+            BillingClaim::Existing(row) => ids.push(row.id),
+        }
+    }
+    assert_eq!(new_count, 1);
+    assert!(ids.iter().all(|id| *id == ids[0]));
+    assert!(store
+        .claim(
+            "stripe",
+            &event_id,
+            "invoice.paid",
+            &sha256_hex(b"altered"),
+            true,
+            None
+        )
+        .await
+        .is_err());
+    assert!(store
+        .claim("stripe", &event_id, "invoice.failed", &hash, true, None)
+        .await
+        .is_err());
+    assert!(store
+        .claim(
+            "stripe",
+            &event_id,
+            "invoice.paid",
+            &"z".repeat(64),
+            true,
+            None
+        )
+        .await
+        .is_err());
+
+    let nil_tenant = TenantId::from_uuid(uuid::Uuid::nil());
+    assert!(store
+        .claim(
+            "stripe",
+            &event_id,
+            "invoice.paid",
+            &hash,
+            true,
+            Some(nil_tenant)
+        )
+        .await
+        .is_err());
+    let id = mas_common::ids::BillingReceiptId::from_uuid(ids[0]);
+    let now = at(1_700_000_000);
+    assert!(store
+        .finish(id, ReceiptState::Ignored, None, Some(nil_tenant), &now)
+        .await
+        .is_err());
+    assert!(store
+        .finish(id, ReceiptState::Received, None, None, &now)
+        .await
+        .is_err());
+    let ignored = store
+        .finish(id, ReceiptState::Ignored, Some("unsupported"), None, &now)
+        .await
+        .expect("ignored");
+    assert_eq!(ignored.state, "ignored");
+    assert!(store
+        .finish(id, ReceiptState::Applied, None, None, &now)
+        .await
+        .is_err());
+    assert!(store
+        .finish(id, ReceiptState::Ignored, Some("different"), None, &now)
+        .await
+        .is_err());
     assert_eq!(
-        receipt.state, "rejected",
-        "an unverified callback is rejected at receipt time"
+        store
+            .finish(id, ReceiptState::Ignored, Some("unsupported"), None, &now)
+            .await
+            .expect("same verdict")
+            .id,
+        ignored.id
     );
-    assert!(!receipt.signature_valid);
-    assert_eq!(
-        receipt.rejection_reason.as_deref(),
-        Some("signature verification failed"),
-        "and the receipt says why"
+}
+
+#[tokio::test]
+async fn duplicate_billing_claim_does_not_abort_the_request_transaction() {
+    let Some(_admin) = support::live_pool("cp-billing-scope").await else {
+        return;
+    };
+    let Some(app) = support::live_app_pool("cp-billing-scope-app").await else {
+        return;
+    };
+    let store = ControlPlaneStores::new(app.clone()).billing;
+    let event_id = format!("evt_{}", uuid::Uuid::new_v4().simple());
+    let hash = sha256_hex(b"event");
+    let scope = AuthoritativeScope::resolved(
+        TenantId::new(),
+        mas_common::ids::OrganizationId::new(),
+        "test",
     );
+    mas_persistence::scoped_request::with_authoritative_scope(&app, scope, || async {
+        assert!(matches!(
+            store
+                .claim("stripe", &event_id, "invoice.paid", &hash, true, None)
+                .await?,
+            BillingClaim::New(_)
+        ));
+        assert!(matches!(
+            store
+                .claim("stripe", &event_id, "invoice.paid", &hash, true, None)
+                .await?,
+            BillingClaim::Existing(_)
+        ));
+        // Any previous unique-violation would leave PostgreSQL in an aborted
+        // transaction and make this third statement fail.
+        assert!(store.get("stripe", &event_id).await.is_ok());
+        Ok(())
+    })
+    .await
+    .expect("scope commits");
     assert_eq!(
-        receipt.tenant_id, None,
-        "no tenant is resolved from an untrusted callback"
+        store
+            .get("stripe", &event_id)
+            .await
+            .expect("persisted")
+            .state,
+        "received"
     );
 }
 

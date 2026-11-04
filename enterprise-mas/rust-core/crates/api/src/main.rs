@@ -32,11 +32,6 @@
 //! * `MAS_API_HTTP_ADDR` (default `0.0.0.0:8080`)
 //! * `MAS_API_GRPC_ADDR` (default `0.0.0.0:50051`)
 //! * `MAS_DEV_TOKENS` (`token:subject:kind,...`; only with `--dev-inmemory`)
-//!
-//! Flags:
-//! * `--dev-inmemory` — the stateless local lane described above.
-//! * `--health` — probe mode for the container `HEALTHCHECK`: prints `ok` and
-//!   exits 0 without loading configuration or connecting to anything.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -65,25 +60,8 @@ mod inbound_webhook_composition;
 mod integration_composition;
 mod oauth_composition;
 
-/// Container/local health probe: `mas-api --health`.
-///
-/// This exists for the image `HEALTHCHECK` and for liveness probing of a
-/// process whose listeners may not be ready yet. It performs no configuration
-/// loading and touches no database, so it answers one question only — "is this
-/// process able to execute at all" — and always exits 0. Readiness (database
-/// reachability, migration state) stays on `GET /v1/health/ready`, which is
-/// the surface that is allowed to fail.
-fn health_probe_requested() -> bool {
-    std::env::args().skip(1).any(|arg| arg == "--health")
-}
-
 #[tokio::main]
 async fn main() {
-    if health_probe_requested() {
-        println!("mas-api: ok");
-        return;
-    }
-
     std::process::exit(match run().await {
         Ok(0) => 0,
         Ok(_) => 0,
@@ -116,6 +94,15 @@ async fn run() -> Result<i32, String> {
         "MAS_API_GRPC_ADDR",
     )?;
     let _ = (&http_addr, &grpc_addr); // listener bind-up ships with compose path below
+    let cors_origins = merger
+        .string_list(
+            "MAS_CORS_ALLOWED_ORIGINS",
+            "server.cors_allowed_origins",
+            &[],
+        )
+        .map_err(|error| format!("CORS configuration: {error}"))?;
+    let cors = mas_api::cors::CorsPolicy::new(&cors_origins, dev_inmemory)
+        .map_err(|error| format!("CORS configuration: {error}"))?;
 
     // Production guardrails (dev flags are exactly the ones documented in
     // config/production.toml's header).
@@ -194,6 +181,7 @@ async fn run() -> Result<i32, String> {
         // refuses, rather than trusting the network.
         internal_secret,
     )
+    .with_cors(cors)
     .with_rollbacks(rollbacks)
     .with_notifications(notifications)
     .with_analytics(analytics)
@@ -1381,13 +1369,6 @@ async fn compose_production(merger: &mas_common::config::Merger<'_>) -> Result<S
         hub
     };
 
-    let oidc = compose_oidc_verifier(merger)?;
-    let verifier: Arc<dyn mas_api::auth::TokenVerifierPort> =
-        Arc::new(mas_api::oidc_auth::ProductionTokenVerifier::new(
-            mas_api::prod_auth::PostgresApiKeyVerifier::new(ApiKeyStore::new(pool.clone())),
-            oidc,
-        ));
-
     // ── Tenancy directory (the one unscoped read path) ────────────────
     //
     // Resolving which tenant a principal may reach has to happen before a
@@ -1416,6 +1397,12 @@ async fn compose_production(merger: &mas_common::config::Merger<'_>) -> Result<S
         .await
         .map_err(|err| format!("directory database: {err}"))?;
     let directory_pool = directory_database.pool().clone();
+    let oidc = compose_oidc_verifier(merger, directory_pool.clone())?;
+    let verifier: Arc<dyn mas_api::auth::TokenVerifierPort> =
+        Arc::new(mas_api::oidc_auth::ProductionTokenVerifier::new(
+            mas_api::prod_auth::PostgresApiKeyVerifier::new(ApiKeyStore::new(pool.clone())),
+            oidc,
+        ));
     let scope_resolver = Some(mas_api::scope_resolution::RequestScopeResolver::new(
         mas_tenancy::TenantResolver::new(
             Arc::new(mas_persistence::directory::PgTenantDirectory::new(
@@ -1501,6 +1488,15 @@ async fn compose_production(merger: &mas_common::config::Merger<'_>) -> Result<S
         load_internal_secret(merger)?,
         health,
     ))
+}
+
+/// The protobuf envelope and metadata share the Python server's 128 KiB
+/// transport allowance in addition to the configured raw document ceiling.
+fn data_hub_grpc_request_limit(limits: DataHubLimits) -> Result<usize, String> {
+    usize::try_from(limits.max_upload_bytes)
+        .ok()
+        .and_then(|bytes| bytes.checked_add(128 * 1024))
+        .ok_or_else(|| "Data Hub gRPC request limit does not fit usize".to_owned())
 }
 
 /// Resolves bounded Data Hub request limits from the layered configuration.
@@ -1624,7 +1620,9 @@ async fn compose_production_data_hub(
         max_response_bytes: usize::try_from(max_response_bytes.max(1024))
             .map_err(|_| "Data Hub bridge response limit does not fit usize".to_owned())?,
         bearer_token: Some(mas_security::SecretString::new(token)),
-        service_subject: "mas-api-data-hub".to_owned(),
+        // The orchestrator's static bearer-token resolver authenticates this
+        // credential as rust-core and verifies the signed subject matches it.
+        service_subject: mas_ai_bridge::GrpcAgentBridgeConfig::default().service_subject,
         service_issuer: "platform-internal".to_owned(),
         service_scopes: vec![
             "data_hub_sync".to_owned(),
@@ -1641,8 +1639,7 @@ async fn compose_production_data_hub(
     let bridge = Arc::new(
         mas_ai_bridge::GrpcDataHubBridge::connect(mas_ai_bridge::GrpcDataHubBridgeConfig {
             agent_bridge,
-            max_request_bytes: usize::try_from(limits.max_upload_bytes)
-                .map_err(|_| "Data Hub upload limit does not fit usize".to_owned())?,
+            max_request_bytes: data_hub_grpc_request_limit(limits)?,
         })
         .await
         .map_err(|error| format!("Data Hub bridge: {error}"))?,
@@ -1685,6 +1682,7 @@ fn optional_pem(path: String, label: &str) -> Result<Option<Vec<u8>>, String> {
 /// cannot silently downgrade to static tokens or symmetric IdP secrets.
 fn compose_oidc_verifier(
     merger: &mas_common::config::Merger<'_>,
+    directory_pool: sqlx::PgPool,
 ) -> Result<mas_api::oidc_auth::OidcJwksTokenVerifier, String> {
     use std::str::FromStr;
     use std::time::Duration;
@@ -1695,7 +1693,7 @@ fn compose_oidc_verifier(
     validate_production_oidc_url("OIDC JWKS URL", &jwks_url)?;
 
     let audience = merger.string("MAS_OIDC_AUDIENCE", "oidc.audience", "");
-    let audience = (!audience.trim().is_empty()).then_some(audience);
+    let audience = Some(require_oidc_audience(audience)?);
     let algorithms = merger
         .string_list("MAS_OIDC_ALGS", "oidc.algs", &["RS256", "ES256"])
         .map_err(|error| format!("OIDC algorithms: {error}"))?
@@ -1743,7 +1741,26 @@ fn compose_oidc_verifier(
         .map_err(|error| format!("JWKS HTTP configuration: {error}"))?;
     let validator = mas_security::RemoteJwksValidator::new(jwks_url, config, Arc::new(fetcher))
         .map_err(|error| format!("JWKS verifier configuration: {error}"))?;
-    Ok(mas_api::oidc_auth::OidcJwksTokenVerifier::new(validator))
+    Ok(mas_api::oidc_auth::OidcJwksTokenVerifier::new(
+        validator,
+        Arc::new(mas_api::oidc_auth::PgOidcIdentityDirectory::new(
+            directory_pool,
+        )),
+    ))
+}
+
+/// Require a non-empty, exact API audience in the durable composition.
+fn require_oidc_audience(audience: String) -> Result<String, String> {
+    if audience.trim().is_empty()
+        || audience.trim() != audience
+        || audience.len() > 512
+        || audience.chars().any(char::is_control)
+    {
+        return Err(
+            "production OIDC requires a valid MAS_OIDC_AUDIENCE / oidc.audience".to_owned(),
+        );
+    }
+    Ok(audience)
 }
 
 /// Refuses insecure or ambiguous OIDC endpoints in the durable production
@@ -1894,6 +1911,59 @@ fn dev_verifier() -> Result<StaticTokenVerifier, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shipped_data_hub_limits_fit_both_service_schemas() {
+        for (name, config) in [
+            ("default", include_str!("../../../config/default.toml")),
+            (
+                "production",
+                include_str!("../../../config/production.toml"),
+            ),
+        ] {
+            let parsed: toml::Value = toml::from_str(config).expect("shipped configuration parses");
+            let data = &parsed["data_hub"];
+            let upload = u64::try_from(data["max_upload_bytes"].as_integer().unwrap()).unwrap();
+            let document = u64::try_from(data["max_document_bytes"].as_integer().unwrap()).unwrap();
+            DataHubLimits {
+                max_upload_bytes: upload,
+                ..DataHubLimits::default()
+            }
+            .validate()
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+            // Python settings require each limit within 1 KiB..8 MiB and
+            // upload no larger than document; maintain this cross-plane contract.
+            assert!(
+                (1024..=mas_application::data_hub_service::MAX_UPLOAD_BYTES).contains(&document),
+                "{name}"
+            );
+            assert!(upload >= 1024 && upload <= document, "{name}");
+        }
+    }
+
+    #[test]
+    fn data_hub_request_ceiling_includes_protobuf_headroom() {
+        let limits = DataHubLimits::default();
+        assert_eq!(
+            data_hub_grpc_request_limit(limits).unwrap(),
+            2 * 1024 * 1024 + 128 * 1024
+        );
+        assert_eq!(
+            mas_ai_bridge::GrpcAgentBridgeConfig::default().service_subject,
+            "rust-core"
+        );
+    }
+
+    #[test]
+    fn production_requires_an_exact_bounded_oidc_audience() {
+        for value in ["", " ", " api", "api\n", &"x".repeat(513)] {
+            assert!(require_oidc_audience(value.to_owned()).is_err());
+        }
+        assert_eq!(
+            require_oidc_audience("mas-api".to_owned()).unwrap(),
+            "mas-api"
+        );
+    }
 
     #[test]
     fn production_guardrail_accepts_empty_dev_tokens() {

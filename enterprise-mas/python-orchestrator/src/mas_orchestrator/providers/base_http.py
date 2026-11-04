@@ -17,6 +17,7 @@ import ipaddress
 import logging
 import socket
 from dataclasses import dataclass, field
+from http.cookiejar import CookieJar, DefaultCookiePolicy
 from typing import TYPE_CHECKING, Final, Self, cast
 from urllib.parse import urljoin, urlparse
 
@@ -73,8 +74,16 @@ BLOCKED_NETWORKS: Final[tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...
     # policy path.
     ipaddress.ip_network("::/96"),
     ipaddress.ip_network("::ffff:0:0/96"),
+    ipaddress.ip_network("::ffff:0:0:0/96"),  # IPv4-translatable addresses
+    # Translation/tunnel prefixes can route apparently global IPv6 destinations
+    # to embedded IPv4 addresses without the guard seeing the final target.
+    ipaddress.ip_network("64:ff9b::/96"),
+    ipaddress.ip_network("64:ff9b:1::/48"),
+    ipaddress.ip_network("2001::/32"),  # Teredo
+    ipaddress.ip_network("2002::/16"),  # 6to4
     ipaddress.ip_network("fc00::/7"),
     ipaddress.ip_network("fe80::/10"),
+    ipaddress.ip_network("fec0::/10"),  # deprecated site-local space
     ipaddress.ip_network("ff00::/8"),
 )
 
@@ -87,20 +96,6 @@ DEFAULT_ALLOWED_HOSTS: Final[frozenset[str]] = frozenset(
     {
         "api.openai.com",
         "api.anthropic.com",
-    }
-)
-
-#: Request headers that must never be forwarded to a different origin.  A
-#: redirect can be controlled by an upstream service; stripping rather than
-#: forwarding is not sufficient for a configured bearer credential because the
-#: redirect itself is unexpected and is useful evidence of misconfiguration.
-_SENSITIVE_REQUEST_HEADERS: Final[frozenset[str]] = frozenset(
-    {
-        "authorization",
-        "cookie",
-        "proxy-authorization",
-        "x-api-key",
-        "x-amz-security-token",
     }
 )
 
@@ -134,7 +129,14 @@ def is_blocked_address(address: str) -> bool:
     except ValueError:
         return True
 
-    if any(parsed in network for network in BLOCKED_NETWORKS):
+    # Use the standard library's special-purpose registries in addition to
+    # explicit ranges: a denylist alone misses newly reserved/non-global space.
+    # `is_global` alone is insufficient for multicast and translation prefixes.
+    if (
+        not parsed.is_global
+        or parsed.is_reserved
+        or any(parsed in network for network in BLOCKED_NETWORKS)
+    ):
         return True
 
     mapped = getattr(parsed, "ipv4_mapped", None)
@@ -444,6 +446,9 @@ class HttpTransport:
             transport=_PinnedAsyncTransport(policy),
             timeout=self._timeout,
             follow_redirects=False,
+            # A shared provider client must not retain one tenant's server-set
+            # cookies and replay them on a later tenant's request.
+            cookies=CookieJar(policy=DefaultCookiePolicy(allowed_domains=[])),
             trust_env=False,
         )
 
@@ -506,11 +511,6 @@ class HttpTransport:
         host = (parsed.hostname or "").rstrip(".").lower()
         return scheme, host, parsed.port or (443 if scheme == "https" else 80)
 
-    def _has_sensitive_headers(self, headers: Mapping[str, str] | None) -> bool:
-        if self._credential is not None:
-            return True
-        return bool(headers and any(key.lower() in _SENSITIVE_REQUEST_HEADERS for key in headers))
-
     async def request(
         self,
         method: str,
@@ -556,10 +556,13 @@ class HttpTransport:
             origin = self._origin(current_url)
             if initial_origin is None:
                 initial_origin = origin
-            elif origin != initial_origin and self._has_sensitive_headers(headers):
+            elif origin != initial_origin:
+                # Unknown custom authentication headers and URL parameters may
+                # be sensitive too. A finite header denylist cannot prove that
+                # forwarding them to another allowlisted host is safe.
                 raise ToolPermissionDeniedError(
-                    "cross-origin redirects are not permitted for credentialed requests",
-                    details={"reason": "credential_redirect"},
+                    "cross-origin redirects are not permitted",
+                    details={"reason": "cross_origin_redirect"},
                 )
 
             request = self._client.build_request(
@@ -569,6 +572,14 @@ class HttpTransport:
                 content=content if request_body is None else None,
                 headers=self._headers(headers),
             )
+            # httpx serializes json_body while constructing the request. Enforce
+            # the same outbound byte ceiling as raw content before network I/O;
+            # character counts would undercount non-ASCII JSON.
+            if len(request.content) > self._policy.max_response_bytes:
+                raise InvalidRequestError(
+                    "outbound request body exceeds the guarded transport limit",
+                    details={"limit_bytes": self._policy.max_response_bytes},
+                )
             try:
                 response = await self._client.send(request, stream=True)
             except httpx.TimeoutException as error:

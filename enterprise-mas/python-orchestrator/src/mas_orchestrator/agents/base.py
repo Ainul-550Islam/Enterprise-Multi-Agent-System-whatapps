@@ -138,11 +138,7 @@ class AgentSpec:
         system_prompt: The agent's instructions.
         limits: Execution ceilings.
         tags: Free-form labels.
-        read_only: Whether this agent is forbidden from mutating anything —
-            no tool invocation and no state write. Product-owned builtins set
-            it; a caller-supplied spec cannot. It is a property of the
-            definition rather than of the request, so a tenant cannot grant
-            itself a mutable variant of a read-only agent.
+        read_only: Whether the agent is product-owned and immutable.
     """
 
     agent_id: str

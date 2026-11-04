@@ -168,6 +168,8 @@ pub struct AppState {
     /// opens one transaction per request with row-level security armed, and
     /// every repository call in that request runs inside it.
     pub runtime_pool: Option<PgPool>,
+    /// Static browser origin allowlist; empty by default.
+    pub cors: crate::cors::CorsPolicy,
     /// Shared secret used to authenticate internal service calls.
     ///
     /// `None` means every internal route refuses, rather than trusting the
@@ -185,6 +187,13 @@ impl std::fmt::Debug for AppState {
 }
 
 impl AppState {
+    /// Installs a startup-validated browser origin policy.
+    #[must_use]
+    pub fn with_cors(mut self, cors: crate::cors::CorsPolicy) -> Self {
+        self.cors = cors;
+        self
+    }
+
     /// Installs the rollback use case after the shared agent/workflow services
     /// have been composed over their common history store.
     #[must_use]
@@ -712,6 +721,7 @@ impl AppState {
             control_plane_stores,
             health,
             runtime_pool,
+            cors: crate::cors::CorsPolicy::default(),
             internal_secret,
         }
     }

@@ -112,9 +112,10 @@ def test_a_one_byte_body_change_is_detected() -> None:
 
 
 def test_a_signature_outside_the_skew_window_is_refused() -> None:
-    old = _now_ms() - (MAX_SKEW_SECONDS * 1000) - 1
+    now = _now_ms()
+    old = now - (MAX_SKEW_SECONDS * 1000) - 1
     with pytest.raises(AuthenticationError):
-        verify_internal_signature(SECRET, _sign(at_ms=old), "mas-api", _now_ms(), BODY)
+        verify_internal_signature(SECRET, _sign(at_ms=old), "mas-api", now, BODY)
 
 
 def test_a_signature_at_the_edge_of_the_window_is_accepted() -> None:
@@ -125,14 +126,7 @@ def test_a_signature_at_the_edge_of_the_window_is_accepted() -> None:
 
 
 def test_a_signature_from_the_future_is_refused() -> None:
-    """Clock skew is symmetric: a caller whose clock is ahead is rejected too.
-
-    One timestamp is read and reused for both the signature and the verifier.
-    Calling `_now_ms()` twice made the test race the scheduler: any delay
-    between the two calls shrank the overshoot below `MAX_SKEW_SECONDS * 1000`,
-    so a loaded machine (or a full-suite run) could see the signature arrive
-    *inside* the window and the test failed intermittently.
-    """
+    """Clock skew is symmetric: a caller whose clock is ahead is rejected too."""
     now = _now_ms()
     future = now + (MAX_SKEW_SECONDS * 1000) + 1
     with pytest.raises(AuthenticationError):

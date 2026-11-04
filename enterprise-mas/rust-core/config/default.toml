@@ -233,7 +233,7 @@ metrics_addr = ""
 # Issuer and JWKS endpoint for interactive-user JWTs. Development may use a
 # local IdP; production overrides both with the deployment's trusted HTTPS IdP.
 issuer = "http://127.0.0.1:8081/realms/mas"
-# Optional API audience pin. Env: MAS_OIDC_AUDIENCE
+# Required in the durable production lane. Env: MAS_OIDC_AUDIENCE
 audience = ""
 jwks_url = "http://127.0.0.1:8081/realms/mas/protocol/openid-connect/certs"
 # Asymmetric IdP algorithms only; HS256 remains reserved for internal tokens.
@@ -260,7 +260,7 @@ rollup_lookback_days = 90
 
 # ── Data Hub ingestion bounds ────────────────────────────────────────────────
 [data_hub]
-max_upload_bytes = 33554432
-max_document_bytes = 33554432
+max_upload_bytes = 2097152
+max_document_bytes = 2097152
 max_pages_per_sync = 500
 max_crawl_depth = 3

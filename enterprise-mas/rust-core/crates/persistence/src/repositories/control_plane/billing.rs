@@ -25,7 +25,8 @@
 //!     body;
 //!   • apply the same provider event twice (the unique index is the
 //!     anti-replay control);
-//!   • mutate or delete a receipt — they are append-only evidence.
+//!   • treat a receipt as an exclusive processing lease or as proof that
+//!     separately committed business effects were applied atomically.
 
 use mas_common::error::AppError;
 use mas_common::ids::{BillingReceiptId, TenantId};
@@ -35,7 +36,7 @@ use sqlx::PgPool;
 use sqlx::Row;
 
 use super::executor::executor;
-use crate::error::{is_unique_violation, map_sqlx};
+use crate::error::map_sqlx;
 
 /// Lifecycle of a received callback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,6 +127,17 @@ impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for BillingReceiptRow {
     }
 }
 
+/// Whether this delivery created the unique receipt or matched an existing one.
+/// A duplicate is not a grant to apply the event again; processing needs its
+/// own transactional claim/recovery protocol.
+#[derive(Debug, Clone)]
+pub enum BillingClaim {
+    /// This delivery inserted the receipt.
+    New(BillingReceiptRow),
+    /// A previous verified delivery already inserted the identical receipt.
+    Existing(BillingReceiptRow),
+}
+
 /// The receipt log.
 #[derive(Debug, Clone)]
 pub struct PostgresBillingWebhookStore {
@@ -139,17 +151,31 @@ impl PostgresBillingWebhookStore {
         Self { pool }
     }
 
-    /// Claims a provider event.
+    /// Claims a Stripe event authenticated by the Stripe-specific verifier.
     ///
-    /// Returns `None` when this `(provider, event_id)` has already been seen:
-    /// that is the anti-replay control, and it is the *unique index* doing the
-    /// work rather than a `SELECT` followed by an `INSERT`, because two
-    /// concurrent deliveries would both read "unseen" and both proceed.
+    /// A receipt is not a processing lease or an atomic billing effect; a
+    /// future production ingress must provide those separately.
+    pub async fn claim_verified_stripe(
+        &self,
+        event: &mas_integrations::stripe_webhooks::VerifiedStripeEvent,
+    ) -> Result<BillingClaim> {
+        self.claim(
+            "stripe",
+            event.id(),
+            event.event_type(),
+            event.payload_hash(),
+            true,
+            None,
+        )
+        .await
+    }
+
+    /// Claims an authenticated provider event without poisoning its id on
+    /// invalid signatures. A duplicate is distinguished from a new insert and
+    /// must match the original event type and raw-body hash.
     ///
-    /// The caller must have verified the signature before calling. A receipt
-    /// is still written for a failed signature — the rejection is the evidence
-    /// that someone is sending unsigned callbacks — but `signature_valid` is
-    /// recorded honestly and the state is [`ReceiptState::Rejected`].
+    /// A receipt alone is not an exclusive processing lease. Callers must
+    /// atomically record business effects and use a crash-recovery protocol.
     pub async fn claim(
         &self,
         provider: &str,
@@ -158,22 +184,47 @@ impl PostgresBillingWebhookStore {
         payload_hash: &str,
         signature_valid: bool,
         tenant: Option<TenantId>,
-    ) -> Result<Option<BillingReceiptRow>> {
-        if payload_hash.len() != 64 {
-            return Err(AppError::validation(
-                "payload hash must be 64 hex characters (sha-256)",
+    ) -> Result<BillingClaim> {
+        if !signature_valid {
+            return Err(AppError::unauthorized(
+                "billing callback signature was not verified",
             ));
         }
-        let state = if signature_valid {
-            ReceiptState::Received
-        } else {
-            ReceiptState::Rejected
-        };
-        let result = sqlx::query_as::<_, BillingReceiptRow>(
+        if tenant.is_some_and(|id| id.is_nil()) {
+            return Err(AppError::validation(
+                "billing receipt tenant must be concrete",
+            ));
+        }
+        for (field, value, max) in [
+            ("provider", provider, 64),
+            ("event_id", event_id, 256),
+            ("event_type", event_type, 256),
+        ] {
+            if value.is_empty() || value.len() > max || value.chars().any(char::is_control) {
+                return Err(AppError::invalid_field(
+                    field,
+                    "invalid_format",
+                    "invalid billing event identifier",
+                ));
+            }
+        }
+        if payload_hash.len() != 64
+            || !payload_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(AppError::validation(
+                "payload hash must be lowercase SHA-256 hex",
+            ));
+        }
+        // ON CONFLICT avoids aborting the surrounding request transaction,
+        // unlike catching a PostgreSQL unique-violation after the fact.
+        let row = sqlx::query_as::<_, BillingReceiptRow>(
             "INSERT INTO billing_webhook_receipts
                 (id, provider, event_id, event_type, payload_hash, signature_valid,
                  state, tenant_id, rejection_reason)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+             VALUES ($1,$2,$3,$4,$5,true,'received',$6,NULL)
+             ON CONFLICT (provider, event_id) DO NOTHING
              RETURNING id, provider, event_id, event_type, payload_hash,
                        signature_valid, state, tenant_id, rejection_reason,
                        received_at, processed_at",
@@ -183,27 +234,24 @@ impl PostgresBillingWebhookStore {
         .bind(event_id)
         .bind(event_type)
         .bind(payload_hash)
-        .bind(signature_valid)
-        .bind(state.as_str())
         .bind(tenant.map(TenantId::into_uuid))
-        .bind(if signature_valid {
-            None
-        } else {
-            Some("signature verification failed".to_owned())
-        })
-        .fetch_one(executor(&self.pool).await?.connection())
-        .await;
-
-        match result {
-            Ok(row) => Ok(Some(row)),
-            Err(error) if is_unique_violation(&error) => {
-                // Already seen. Return the existing receipt so the caller can
-                // tell "applied" from "rejected" from "still in flight"
-                // without re-processing.
-                self.get(provider, event_id).await.map(Some)
-            },
-            Err(error) => Err(map_sqlx(error)),
+        .fetch_optional(executor(&self.pool).await?.connection())
+        .await
+        .map_err(map_sqlx)?;
+        if let Some(row) = row {
+            return Ok(BillingClaim::New(row));
         }
+        let existing = self.get(provider, event_id).await?;
+        if !existing.signature_valid
+            || existing.event_type != event_type
+            || existing.payload_hash != payload_hash
+            || tenant.is_some_and(|id| existing.tenant_id != Some(id.into_uuid()))
+        {
+            return Err(AppError::conflict(
+                "billing event id conflicts with an existing receipt",
+            ));
+        }
+        Ok(BillingClaim::Existing(existing))
     }
 
     /// Reads one receipt.
@@ -224,11 +272,9 @@ impl PostgresBillingWebhookStore {
 
     /// Records the outcome of processing, and why, when it was not applied.
     ///
-    /// Idempotent in effect: calling it twice with the same state is accepted
-    /// and overwrites the reason, because a retried handler legitimately
-    /// re-reports the same verdict. What it will *not* do is move a terminal
-    /// receipt back to `received` — that would let a second delivery of the
-    /// same event re-run the state change.
+    /// A terminal verdict can be retried unchanged, but never changed to a
+    /// different verdict or tenant. Receipt finalization alone does not make
+    /// separately performed business effects atomic.
     pub async fn finish(
         &self,
         receipt_id: BillingReceiptId,
@@ -237,13 +283,24 @@ impl PostgresBillingWebhookStore {
         tenant: Option<TenantId>,
         at: &Timestamp,
     ) -> Result<BillingReceiptRow> {
+        if state == ReceiptState::Received {
+            return Err(AppError::validation(
+                "received is not a terminal billing receipt state",
+            ));
+        }
+        if tenant.is_some_and(|id| id.is_nil()) {
+            return Err(AppError::validation(
+                "billing receipt tenant must be concrete",
+            ));
+        }
         let row = sqlx::query_as::<_, BillingReceiptRow>(
             "UPDATE billing_webhook_receipts
                 SET state = $2,
                     rejection_reason = COALESCE($3, rejection_reason),
                     tenant_id = COALESCE($4, tenant_id),
                     processed_at = $5
-              WHERE id = $1 AND state <> $2
+              WHERE id = $1 AND state = 'received' AND signature_valid
+                AND (tenant_id IS NULL OR $4::uuid IS NULL OR tenant_id = $4::uuid)
           RETURNING id, provider, event_id, event_type, payload_hash, signature_valid,
                     state, tenant_id, rejection_reason, received_at, processed_at",
         )
@@ -256,20 +313,29 @@ impl PostgresBillingWebhookStore {
         .await
         .map_err(map_sqlx)?;
 
-        match row {
-            Some(row) => Ok(row),
-            // No row changed means it was already in this state: a duplicate
-            // delivery. Returning the current receipt rather than an error is
-            // what makes the handler safe to retry.
-            None => sqlx::query_as::<_, BillingReceiptRow>(
-                "SELECT id, provider, event_id, event_type, payload_hash, signature_valid,
-                            state, tenant_id, rejection_reason, received_at, processed_at
-                       FROM billing_webhook_receipts WHERE id = $1",
-            )
-            .bind(receipt_id.into_uuid())
-            .fetch_one(executor(&self.pool).await?.connection())
-            .await
-            .map_err(map_sqlx),
+        if let Some(row) = row {
+            return Ok(row);
+        }
+        let existing = sqlx::query_as::<_, BillingReceiptRow>(
+            "SELECT id, provider, event_id, event_type, payload_hash, signature_valid,
+                    state, tenant_id, rejection_reason, received_at, processed_at
+               FROM billing_webhook_receipts WHERE id = $1",
+        )
+        .bind(receipt_id.into_uuid())
+        .fetch_optional(executor(&self.pool).await?.connection())
+        .await
+        .map_err(map_sqlx)?
+        .ok_or_else(|| AppError::not_found("billing_receipt", receipt_id.to_string()))?;
+        if existing.signature_valid
+            && existing.state == state.as_str()
+            && tenant.is_none_or(|id| existing.tenant_id == Some(id.into_uuid()))
+            && reason.is_none_or(|value| existing.rejection_reason.as_deref() == Some(value))
+        {
+            Ok(existing)
+        } else {
+            Err(AppError::conflict(
+                "billing receipt is already finalized or has a different owner",
+            ))
         }
     }
 

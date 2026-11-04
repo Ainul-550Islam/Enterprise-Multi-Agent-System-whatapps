@@ -30,7 +30,7 @@
 
 use mas_common::enums::{ExecutionStatus, TaskStatus};
 use mas_common::error::AppError;
-use mas_common::ids::{EventId, ExecutionId, TaskAttemptId, TaskId, TenantId};
+use mas_common::ids::{EventId, ExecutionId, OrganizationId, TaskAttemptId, TaskId, TenantId};
 use mas_common::result::Result;
 use mas_common::timestamps::Timestamp;
 use mas_domain::{
@@ -1224,6 +1224,25 @@ impl DurableExecutionPort for InMemoryDurableExecution {
             .collect())
     }
 
+    async fn list_executions_scoped(
+        &self,
+        tenant: TenantId,
+        organization: Option<OrganizationId>,
+        limit: usize,
+    ) -> Result<Vec<Execution>> {
+        let state = self.lock();
+        Ok(state
+            .executions
+            .values()
+            .filter(|execution| {
+                execution.tenant_id == tenant
+                    && organization.is_none_or(|org| execution.organization_id == org)
+            })
+            .take(limit)
+            .cloned()
+            .collect())
+    }
+
     async fn counters(&self, worker: &str, at: &Timestamp) -> Result<PipelineCounters> {
         let state = self.lock();
         let now = *at;
@@ -2003,6 +2022,31 @@ mod tests {
             store.execution(receipt.execution.id).expect("exec").status,
             ExecutionStatus::Completed
         );
+    }
+
+    #[tokio::test]
+    async fn organization_filter_is_applied_before_the_listing_limit() {
+        let store = InMemoryDurableExecution::new();
+        let mut first = intent("scope-first", A);
+        let mut second = intent("scope-second", A);
+        first.organization_id = OrganizationId::new();
+        second.organization_id = OrganizationId::new();
+        store.submit(first).await.expect("first");
+        store.submit(second).await.expect("second");
+        let unfiltered = store.list_executions(test_tenant(), 2).await.expect("all");
+        assert_eq!(unfiltered.len(), 2);
+        let target = &unfiltered[1];
+        let scoped = store
+            .list_executions_scoped(test_tenant(), Some(target.organization_id), 1)
+            .await
+            .expect("organization listing");
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].id, target.id);
+        assert!(store
+            .list_executions_scoped(TenantId::new(), Some(target.organization_id), 1)
+            .await
+            .expect("foreign tenant")
+            .is_empty());
     }
 
     #[tokio::test]

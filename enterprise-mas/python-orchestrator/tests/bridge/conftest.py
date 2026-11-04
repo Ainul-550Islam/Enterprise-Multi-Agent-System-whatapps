@@ -54,21 +54,18 @@ from mas_orchestrator.security.identity import (
     ServiceScope,
     StaticTokenServiceIdentityResolver,
 )
+from mas_orchestrator.security.internal_replay import InMemoryReplayGuard
 from mas_orchestrator.security.internal_service import (
     now_millis,
     signed_internal_signature,
 )
 
-# Bridge identity fixtures are canonical UUIDs. Rust owns these ids and sends
-# them as UUID strings, and the snapshot validator rejects anything else. Using
-# readable slugs here would let a fixture pass while the wire contract it stands
-# in for could never be satisfied.
 TENANT = "11111111-1111-4111-8111-111111111111"
 OTHER_TENANT = "22222222-2222-4222-8222-222222222222"
 ORGANIZATION = "33333333-3333-4333-8333-333333333333"
-PROJECT = "66666666-6666-4666-8666-666666666666"
+PROJECT = "44444444-4444-4444-8444-444444444444"
 AGENT = "55555555-5555-4555-8555-555555555555"
-AGENT_VERSION = "77777777-7777-4777-8777-777777777777"
+AGENT_VERSION = "66666666-6666-4666-8666-666666666666"
 CREDENTIAL = "bridge-service-token"
 SUBJECT = "rust-core"
 
@@ -97,15 +94,12 @@ class RecordedRun:
         context: The execution context the servicer built.
         cancel_event: The cancellation event handed to the run, so a test can
             observe whether the bridge mirrored a wire cancellation onto it.
-        agent_spec: The immutable agent definition the bridge resolved from
-            the signed snapshot and asked the runtime to execute. ``None``
-            when the request carried no snapshot.
     """
 
     request_text: str
     context: Any
     cancel_event: asyncio.Event
-    agent_spec: Any = None
+    agent_spec: Any
 
 
 @dataclass(slots=True)
@@ -142,14 +136,7 @@ class RecordingExecutionService:
             Exception: The configured error, if one was set.
         """
         event = cancel_event if cancel_event is not None else asyncio.Event()
-        self.runs.append(
-            RecordedRun(
-                request.request,
-                request.context,
-                event,
-                getattr(request, "agent_spec", None),
-            )
-        )
+        self.runs.append(RecordedRun(request.request, request.context, event, request.agent_spec))
 
         if self.delay_seconds:
             if self.honour_cancel:
@@ -226,12 +213,6 @@ def failed_result(
     )
 
 
-#: A stable, lowercase SHA-256 hex string. The snapshot contract requires
-#: exactly 64 lowercase hex characters; the value itself is opaque to Python,
-#: which only checks its shape and forwards it to the runtime for logging.
-SNAPSHOT_CHECKSUM = "b" * 64
-
-
 def snapshot_json(
     *,
     agent_id: str = AGENT,
@@ -243,53 +224,8 @@ def snapshot_json(
     model_hint: str = "provider/model-test",
     system_prompt: str = "Rust-published test instructions",
     status: str = "active",
-    origin: str = "user",
-    read_only: bool | None = None,
-    name: str = "Published Test Agent",
-    slug: str = "published-test-agent",
-    kind: str = "standard",
-    description: str | None = None,
-    tags: tuple[str, ...] = (),
-    allowed_tools: tuple[str, ...] = (),
-    max_steps: int = 25,
-    max_tool_calls: int = 50,
-    max_delegation_depth: int = 2,
-    timeout_seconds: float | None = None,
-    configuration_checksum: str | None = None,
 ) -> str:
-    """Serializes a Rust-owned agent snapshot the way Rust sends it.
-
-    Args:
-        agent_id: Agent id, matching the request body.
-        tenant_id: Authoritative tenant; must match the request and metadata.
-        organization_id: Authoritative organization.
-        project_id: Authoritative project.
-        agent_version_id: The exact pinned published version id.
-        version_number: Monotonic version number.
-        model_hint: Routing preference from the published configuration.
-        system_prompt: The immutable published instructions.
-        status: Lifecycle status; only ``active`` is executable.
-        origin: ``user`` or ``system``. ``system`` agents are read-only.
-        read_only: Override for the derived read-only flag, so a test can
-            reproduce the inconsistent state the validator must reject.
-        name: Display name.
-        slug: URL-safe identifier.
-        kind: ``standard``, ``supervisor`` or ``tool_user``.
-        description: Optional description.
-        tags: Free-form labels.
-        allowed_tools: Tool ids the agent may call.
-        max_steps: Step ceiling.
-        max_tool_calls: Tool-call ceiling.
-        max_delegation_depth: Delegation ceiling.
-        timeout_seconds: Optional wall-clock ceiling.
-        configuration_checksum: Override for the default checksum.
-
-    Returns:
-        The JSON the wire field ``agent_snapshot_json`` carries.
-
-    Every key is emitted, including ``null`` ones: the schema is closed in both
-    directions, so a missing key is as much a rejection as an unknown one.
-    """
+    """An immutable published Rust snapshot for bridge tests."""
     return json.dumps(
         {
             "agent_id": agent_id,
@@ -298,28 +234,27 @@ def snapshot_json(
             "project_id": project_id,
             "agent_version_id": agent_version_id,
             "version_number": version_number,
-            "configuration_checksum": configuration_checksum or SNAPSHOT_CHECKSUM,
-            "name": name,
-            "slug": slug,
-            "kind": kind,
+            "configuration_checksum": "a" * 64,
+            "name": "Test Agent",
+            "slug": "test-agent",
+            "kind": "standard",
             "status": status,
-            "origin": origin,
-            "read_only": (origin == "system") if read_only is None else read_only,
+            "origin": "user",
+            "read_only": False,
             "configuration": {
-                "description": description,
+                "description": None,
                 "model_hint": model_hint,
                 "system_prompt": system_prompt,
                 "limits": {
-                    "max_steps": max_steps,
-                    "max_tool_calls": max_tool_calls,
-                    "max_delegation_depth": max_delegation_depth,
-                    "timeout_seconds": timeout_seconds,
+                    "max_steps": 25,
+                    "max_tool_calls": 50,
+                    "max_delegation_depth": 5,
+                    "timeout_seconds": None,
                 },
-                "tags": list(tags),
-                "allowed_tools": list(allowed_tools),
+                "tags": [],
+                "allowed_tools": [],
             },
-        },
-        sort_keys=True,
+        }
     )
 
 
@@ -327,27 +262,23 @@ def request(
     *,
     tenant_id: str = TENANT,
     organization_id: str = ORGANIZATION,
-    project_id: str = PROJECT,
     input_json: str = "hello",
-    # The default agent is a UUID because the signed snapshot must name the
-    # exact agent Rust resolved; the human-readable catalog id belongs to a
-    # path production never takes.
     agent_id: str = AGENT,
+    project_id: str = PROJECT,
+    agent_version: str = AGENT_VERSION,
+    agent_snapshot_json: str | None = None,
     correlation_id: str = "corr-1",
     request_id: str = "req-1",
     execution_id: str = "exec-1",
     deadline_rfc3339: str = "",
     identity_subject: str = SUBJECT,
     idempotency_key: str = "",
-    agent_version: str | None = AGENT_VERSION,
-    agent_snapshot_json: str | None = None,
 ) -> mas_api_pb2.AgentRunRequest:
     """Builds a well-formed ``AgentRunRequest``.
 
     Args:
         tenant_id: Authoritative tenant.
         organization_id: Authoritative organization.
-        project_id: Authoritative project the snapshot was resolved for.
         input_json: The run input.
         agent_id: The agent to run.
         correlation_id: Correlation id.
@@ -356,45 +287,37 @@ def request(
         deadline_rfc3339: Deadline, or empty for none.
         identity_subject: The declared caller subject.
         idempotency_key: Idempotency key, or empty.
-        agent_version: The pinned version id. ``None`` omits it, which the
-            bridge must treat as "no version pinned".
-        agent_snapshot_json: The signed snapshot body. Defaults to a valid
-            snapshot matching the default ids; pass ``""`` to reproduce a
-            missing one.
 
     Returns:
         The request.
     """
     message = mas_api_pb2.AgentRunRequest(
         agent_id=agent_id,
+        project_id=project_id,
+        agent_version=agent_version,
+        agent_snapshot_json=(
+            snapshot_json(
+                agent_id=agent_id,
+                tenant_id=tenant_id,
+                organization_id=organization_id,
+                project_id=project_id,
+                agent_version_id=agent_version,
+            )
+            if agent_snapshot_json is None
+            else agent_snapshot_json
+        ),
         input_json=input_json,
         correlation_id=correlation_id,
         request_id=request_id,
         execution_id=execution_id,
         tenant_id=tenant_id,
         organization_id=organization_id,
-        project_id=project_id,
         protocol_version=str(CURRENT_PROTOCOL_VERSION),
         deadline_rfc3339=deadline_rfc3339,
         identity=mas_api_pb2.ServiceIdentityMsg(subject=identity_subject),
     )
     if idempotency_key:
         message.idempotency_key = idempotency_key
-    if agent_version is not None:
-        message.agent_version = agent_version
-    if agent_snapshot_json is None:
-        # Default to a snapshot whose identity matches this very request, so
-        # every existing test keeps exercising the real signed path instead of
-        # a catalog fallback that production never takes.
-        message.agent_snapshot_json = snapshot_json(
-            agent_id=agent_id,
-            tenant_id=tenant_id,
-            organization_id=organization_id,
-            project_id=project_id,
-            agent_version_id=agent_version or AGENT_VERSION,
-        )
-    else:
-        message.agent_snapshot_json = agent_snapshot_json
     return message
 
 
@@ -688,6 +611,7 @@ async def signed_bridge(execution_service: RecordingExecutionService):
             require_scope=ServiceScope.EXECUTE_AGENT,
             internal_service_secret=SIGNING_SECRET,
         ),
+        replay_guard=InMemoryReplayGuard(),
     )
     server = GrpcServer(servicer=servicer, config=GrpcServerConfig(host="127.0.0.1", port=0))
     port = await server.start()

@@ -42,7 +42,7 @@ pub mod subscriptions;
 pub mod usage;
 
 pub use adapters::build_postgres_control_plane;
-pub use billing::{BillingReceiptRow, PostgresBillingWebhookStore, ReceiptState};
+pub use billing::{BillingClaim, BillingReceiptRow, PostgresBillingWebhookStore, ReceiptState};
 pub use counters::{PostgresCounterStore, PostgresQuotaRegistry, QuotaRow};
 pub use entitlements::{EntitlementRow, PostgresEntitlementStore, PostgresOverrideStore};
 pub use mas_domain::reservation::Settlement;

@@ -13,7 +13,7 @@ import asyncio
 import json
 import logging
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from mas_orchestrator.config.enums import DataSourceKind
 from mas_orchestrator.contracts.errors import (
@@ -24,7 +24,7 @@ from mas_orchestrator.contracts.errors import (
     ProtocolError,
 )
 from mas_orchestrator.contracts.protocol_version import negotiate_protocol_version
-from mas_orchestrator.data_hub.models import DataHubDocument, DataHubSource
+from mas_orchestrator.data_hub.models import DataHubDocument, DataHubSource, require_scope_uuid
 from mas_orchestrator.data_hub.service import DataHubService, parse_source_config_json
 from mas_orchestrator.grpc.agent_bridge_servicer import AgentBridgeServicer, parse_deadline
 from mas_orchestrator.grpc.errors import abort_with_error
@@ -32,8 +32,11 @@ from mas_orchestrator.grpc.generated import mas_api_pb2, mas_api_pb2_grpc
 from mas_orchestrator.security.identity import ServiceScope
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
     import grpc
 
+_T = TypeVar("_T")
 _LOGGER = logging.getLogger(__name__)
 _HEALTHY_DETAIL = "data hub ready"
 _DISABLED_DETAIL = "data hub is disabled"
@@ -59,7 +62,7 @@ class DataHubBridgeServicer(mas_api_pb2_grpc.DataHubBridgeApiServicer):
         """Closes source transports and the RAG-plane pool at process shutdown."""
         await self._service.aclose()
 
-    async def SyncSource(
+    async def SyncSource(  # noqa: N802 - required protobuf RPC method name
         self,
         request: Any,
         context: grpc.aio.ServicerContext,
@@ -91,7 +94,7 @@ class DataHubBridgeServicer(mas_api_pb2_grpc.DataHubBridgeApiServicer):
             report = await self._run_with_deadline(
                 request,
                 context,
-                self._service.sync_source(source),
+                lambda: self._service.sync_source(source),
             )
             _LOGGER.info(
                 "Data Hub source synchronization finished",
@@ -128,7 +131,7 @@ class DataHubBridgeServicer(mas_api_pb2_grpc.DataHubBridgeApiServicer):
             await abort_with_error(context, InternalError("Data Hub source synchronization failed"))
             raise AssertionError("abort_with_error never returns") from error
 
-    async def IngestDocument(
+    async def IngestDocument(  # noqa: N802 - required protobuf RPC method name
         self,
         request: Any,
         context: grpc.aio.ServicerContext,
@@ -169,7 +172,7 @@ class DataHubBridgeServicer(mas_api_pb2_grpc.DataHubBridgeApiServicer):
                 metadata=document_metadata,
             )
             report = await self._run_with_deadline(
-                request, context, self._service.ingest_document(document)
+                request, context, lambda: self._service.ingest_document(document)
             )
             return mas_api_pb2.DocumentIngestionReply(
                 document_id=report.document_id,
@@ -192,7 +195,7 @@ class DataHubBridgeServicer(mas_api_pb2_grpc.DataHubBridgeApiServicer):
             await abort_with_error(context, InternalError("Data Hub document ingestion failed"))
             raise AssertionError("abort_with_error never returns") from error
 
-    async def PurgeDocument(
+    async def PurgeDocument(  # noqa: N802 - required protobuf RPC method name
         self,
         request: Any,
         context: grpc.aio.ServicerContext,
@@ -202,11 +205,16 @@ class DataHubBridgeServicer(mas_api_pb2_grpc.DataHubBridgeApiServicer):
         del metadata
         self._log_call("purge_document", request, identity.subject)
         try:
+            for field in ("tenant_id", "organization_id", "project_id", "source_id", "document_id"):
+                require_scope_uuid(getattr(request, field), field)
             removed = await self._run_with_deadline(
                 request,
                 context,
-                self._service.purge_document(
+                lambda: self._service.purge_document(
                     tenant_id=request.tenant_id,
+                    organization_id=request.organization_id,
+                    project_id=request.project_id,
+                    source_id=request.source_id,
                     document_id=request.document_id,
                 ),
             )
@@ -227,7 +235,7 @@ class DataHubBridgeServicer(mas_api_pb2_grpc.DataHubBridgeApiServicer):
             await abort_with_error(context, InternalError("Data Hub document purge failed"))
             raise AssertionError("abort_with_error never returns") from error
 
-    async def Health(
+    async def Health(  # noqa: N802 - required protobuf RPC method name
         self,
         request: mas_api_pb2.Empty,
         context: grpc.aio.ServicerContext,
@@ -289,8 +297,17 @@ class DataHubBridgeServicer(mas_api_pb2_grpc.DataHubBridgeApiServicer):
         except ProtocolError as error:
             await abort_with_error(context, error)
             raise
-        deadline_ms = parse_deadline(request.deadline_rfc3339)
-        if deadline_ms is not None and deadline_ms <= int(time.time() * 1000):
+        try:
+            deadline_ms = parse_deadline(request.deadline_rfc3339)
+            if deadline_ms is None:
+                raise InvalidRequestError(
+                    "Data Hub request is missing its signed deadline",
+                    details={"field": "deadline_rfc3339"},
+                )
+        except InvalidRequestError as error:
+            await abort_with_error(context, error)
+            raise AssertionError("abort_with_error never returns") from None
+        if deadline_ms <= int(time.time() * 1000):
             await abort_with_error(
                 context,
                 ExecutionTimeoutError("Data Hub request deadline has expired"),
@@ -302,23 +319,24 @@ class DataHubBridgeServicer(mas_api_pb2_grpc.DataHubBridgeApiServicer):
         self,
         request: Any,
         context: grpc.aio.ServicerContext,
-        operation: Any,
-    ) -> Any:
+        operation: Callable[[], Awaitable[_T]],
+    ) -> _T:
         """Bounds one awaited operation by the signed absolute deadline."""
         deadline_ms = parse_deadline(request.deadline_rfc3339)
-        remaining = None
-        if deadline_ms is not None:
-            remaining = max(0.0, (deadline_ms - int(time.time() * 1000)) / 1000.0)
+        if deadline_ms is None:
+            raise InvalidRequestError(
+                "Data Hub request is missing its signed deadline",
+                details={"field": "deadline_rfc3339"},
+            )
+        remaining = max(0.0, (deadline_ms - int(time.time() * 1000)) / 1000.0)
         wire_remaining = context.time_remaining()
         if wire_remaining is not None:
-            remaining = wire_remaining if remaining is None else min(remaining, wire_remaining)
+            remaining = min(remaining, wire_remaining)
         try:
-            if remaining is None:
-                return await operation
             if remaining <= 0:
                 raise ExecutionTimeoutError("Data Hub request deadline has expired")
             async with asyncio.timeout(remaining):
-                return await operation
+                return await operation()
         except TimeoutError as error:
             raise ExecutionTimeoutError("Data Hub operation exceeded its deadline") from error
 

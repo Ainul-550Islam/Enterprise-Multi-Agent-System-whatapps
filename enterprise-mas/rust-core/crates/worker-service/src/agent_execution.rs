@@ -411,6 +411,7 @@ impl AgentRunHandler {
             durable: mas_execution::executor::DurableRunIdentity {
                 task_id: message.task_id,
                 task_attempt_id: message.task_attempt_id,
+                agent_version_id: message.agent_version_id,
                 // The identity owns the key for the duration of the awaited
                 // run and drops it with the dispatch; no process-lifetime leak.
                 idempotency_key: message.idempotency_key.clone(),
@@ -597,13 +598,52 @@ mod tests {
     use super::*;
     use mas_common::error::AppError;
     use mas_common::ids::{
-        AgentId, AgentVersionId, ExecutionId, OrganizationId, ProjectId, TaskAttemptId, TaskId,
-        TenantId,
+        AgentId, ExecutionId, OrganizationId, ProjectId, TaskAttemptId, TaskId, TenantId,
     };
     use mas_execution::agent_bridge::{AgentRunVerdict, AgentUsage};
     // `execute` comes from the trait, not from an inherent impl: the handler is
     // only meaningful as a `TaskHandlerPort`.
     use mas_worker::TaskHandlerPort;
+
+    // These tests must exercise the actual environment-over-file precedence,
+    // without mutating the process environment shared by parallel tests. A
+    // child test process supplies an isolated production configuration.
+    fn production_test_in_child(name: &str) -> bool {
+        const CHILD: &str = "MAS_AGENT_BRIDGE_PRODUCTION_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            return false;
+        }
+        let mut command =
+            std::process::Command::new(std::env::current_exe().expect("test executable"));
+        command
+            .arg("--exact")
+            .arg(name)
+            .env(CHILD, "1")
+            .env("MAS_ENV", "production");
+        for key in [
+            ENV_ENDPOINT,
+            ENV_TOKEN,
+            ENV_TIMEOUT_MS,
+            ENV_MAX_RESPONSE_BYTES,
+            ENV_INTERNAL_SIGNING_SECRET,
+            ENV_TLS_CA_CERTIFICATE_PATH,
+            ENV_TLS_CLIENT_CERTIFICATE_PATH,
+            ENV_TLS_CLIENT_PRIVATE_KEY_PATH,
+        ] {
+            command.env_remove(key);
+        }
+        let output = command
+            .output()
+            .expect("run isolated production configuration test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed; 0 failed"),
+            "production configuration child did not pass exactly one test: {}{}",
+            stdout,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        true
+    }
 
     fn message() -> TaskQueueMessage {
         TaskQueueMessage::staged(
@@ -615,7 +655,6 @@ mod tests {
             serde_json::json!({"prompt": "hello"}),
             Some(ExecutionId::new()),
             Some(AgentId::new()),
-            Some(AgentVersionId::new()),
             None,
             "idem-1".to_owned(),
             mas_common::enums::TaskPriority::Normal,
@@ -742,12 +781,16 @@ mod tests {
     fn build_dispatch_propagates_task_identity_and_idempotency() {
         let handler = handler();
         let task_attempt_id = TaskAttemptId::new();
-        let message = message().with_task_attempt_id(task_attempt_id);
+        let version_id = mas_common::ids::AgentVersionId::new();
+        let message = message()
+            .with_task_attempt_id(task_attempt_id)
+            .with_agent_version_id(version_id);
 
         let dispatch = handler.build_dispatch(&message).expect("dispatch");
 
         assert_eq!(dispatch.durable.task_id, message.task_id);
         assert_eq!(dispatch.durable.task_attempt_id, Some(task_attempt_id));
+        assert_eq!(dispatch.durable.agent_version_id, Some(version_id));
         assert_eq!(dispatch.execution_id, message.execution_id.expect("seeded"));
         assert_eq!(dispatch.durable.idempotency_key, "idem-1");
         assert_eq!(dispatch.context.correlation_id(), "corr-1");
@@ -969,47 +1012,14 @@ mod tests {
         assert!(rendered.contains(PATH_TOKEN), "names the key: {rendered}");
     }
 
-    /// Serialises tests that mutate the process environment.
-    ///
-    /// `std::env` is process-global, so two tests that remove/restore `MAS_ENV`
-    /// concurrently observe each other's writes and one of them sees the wrong
-    /// environment. Every test using `EnvGuard` must take this lock for the
-    /// whole body.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Clears `MAS_ENV` for the duration of a test and restores it on drop.
-    ///
-    /// `Merger::string` resolves `env → file.path → default`, so an inherited
-    /// `MAS_ENV` (scripts/check.sh exports `MAS_ENV=test`) silently overrides
-    /// the `environment = "production"` table these tests build, and the
-    /// production assertions then test the wrong configuration.
-    struct EnvGuard {
-        key: &'static str,
-        previous: Option<String>,
-    }
-
-    impl EnvGuard {
-        fn remove(key: &'static str) -> Self {
-            let previous = std::env::var(key).ok();
-            std::env::remove_var(key);
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match &self.previous {
-                Some(value) => std::env::set_var(self.key, value),
-                None => std::env::remove_var(self.key),
-            }
-        }
-    }
-
     #[test]
     fn production_settings_require_https_transport() {
+        if production_test_in_child(
+            "agent_execution::tests::production_settings_require_https_transport",
+        ) {
+            return;
+        }
         use mas_common::config::Merger;
-        let _serialised = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _env = EnvGuard::remove("MAS_ENV");
         let mut table = toml::Table::new();
         table.insert(
             "environment".to_owned(),
@@ -1037,9 +1047,12 @@ mod tests {
 
     #[test]
     fn production_settings_require_the_python_shared_signing_secret() {
+        if production_test_in_child(
+            "agent_execution::tests::production_settings_require_the_python_shared_signing_secret",
+        ) {
+            return;
+        }
         use mas_common::config::Merger;
-        let _serialised = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _env = EnvGuard::remove("MAS_ENV");
         let mut table = toml::Table::new();
         table.insert(
             "environment".to_owned(),

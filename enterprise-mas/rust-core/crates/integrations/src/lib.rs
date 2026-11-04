@@ -65,6 +65,8 @@ pub mod registry;
 pub mod reqwest_egress;
 /// Production secret-manager adapters and version-aware webhook secret bridge.
 pub mod secrets;
+/// Raw-body Stripe webhook verification (not an ingress or processing worker).
+pub mod stripe_webhooks;
 pub mod webhooks;
 
 pub use reqwest_egress::ReqwestEgress;

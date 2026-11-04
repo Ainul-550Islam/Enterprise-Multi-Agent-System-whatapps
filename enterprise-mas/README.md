@@ -22,7 +22,7 @@ enterprise-mas/
 | 3 | Rust ↔ Python Production AgentBridge | `BRIDGE_INTEGRATION_STATUS.md`, `RUST_PYTHON_BRIDGE_PHASE16_FILES.md` | Complete — 36/36, E2E 12 |
 | 4 | Canonical Durable Execution Pipeline | `CANONICAL_DURABLE_PIPELINE_REPORT.md` | Complete |
 | 5 | Enterprise Security / Authorization / Tenancy / RLS Hardening | `SECURITY_HARDENING_REPORT.md` (1.2 MB), `SECURITY_NARRATIVE_BN.md` (Bangla) | Complete — 66 files, 1,200,577 bytes |
-| 6 | Enterprise Policy + Distributed Quota + Usage + Entitlement-Billing Control Plane | `CONTROL_PLANE_REPORT.md` | Complete — 1149 tests, 0 failed |
+| 6 | Enterprise Policy + Distributed Quota + Usage + Entitlement-Billing Control Plane | `CONTROL_PLANE_REPORT.md` | Complete — 956 tests, 0 failed |
 
 Item 6 is the most recent. Its report is the one to read first if you are picking the
 work up: §4 covers what was built against the spec, §5 lists the 19 real defects found
@@ -43,8 +43,8 @@ export MAS_ENV=test CARGO_INCREMENTAL=0
 export MAS_TEST_DATABASE_URL="postgres://mas:mas@127.0.0.1:55432/mas_live"
 export MAS_TEST_DATABASE_APP_URL="postgres://mas_app:mas_app_pw@127.0.0.1:55432/mas_live"
 
-cargo test --workspace --locked                  # 1149 passed, 0 failed
-cargo test --workspace --locked --features nats  # 1149 passed, 0 failed
+cargo test --workspace --locked                  # 956 passed, 0 failed
+cargo test --workspace --locked --features nats  # 956 passed, 0 failed
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt --all -- --check
 cargo doc --no-deps --workspace

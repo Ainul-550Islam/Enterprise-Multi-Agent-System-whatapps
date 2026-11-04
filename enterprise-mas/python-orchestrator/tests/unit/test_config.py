@@ -534,3 +534,99 @@ def test_environment_semantics() -> None:
     assert Environment.PRODUCTION.allows_fakes is False
     assert Environment.DEVELOPMENT.allows_fakes is True
     assert Environment.TEST.allows_fakes is True
+
+
+def test_referenced_prefixed_secret_env_is_not_parsed_or_exposed_as_setting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mas_orchestrator.security.credentials import resolve_secret
+
+    monkeypatch.setenv("MAS_ORCH_SECURITY__SERVICE_TOKEN_REF", "env:MAS_ORCH_BRIDGE_TOKEN")
+    monkeypatch.setenv("MAS_ORCH_BRIDGE_TOKEN", "private-test-token")
+    monkeypatch.setenv("MAS_ORCH_SECRET_API_KEY", "another-private-test-token")
+    settings = load_settings()
+    assert settings.security.service_token_ref == "env:MAS_ORCH_BRIDGE_TOKEN"
+    assert resolve_secret(settings.security.service_token_ref).reveal() == "private-test-token"
+    assert "private-test-token" not in repr(settings)
+    assert "another-private-test-token" not in repr(settings)
+
+
+def test_referenced_secret_from_toml_and_explicit_override_is_not_parsed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: object,
+) -> None:
+    import pathlib
+
+    config_dir = pathlib.Path(str(tmp_path))
+    (config_dir / "default.toml").write_text(
+        '[security]\nservice_token_ref = "env:MAS_ORCH_TOML_TOKEN"\n'
+    )
+    monkeypatch.setenv("MAS_ORCH_TOML_TOKEN", "toml-private")
+    monkeypatch.setenv("MAS_ORCH_OVERRIDE_SECRET", "override-private")
+    settings = load_settings(
+        config_dir=config_dir,
+        overrides={"security": {"internal_service_secret_ref": "env:MAS_ORCH_OVERRIDE_SECRET"}},
+    )
+    assert settings.security.service_token_ref == "env:MAS_ORCH_TOML_TOKEN"
+    assert settings.security.internal_service_secret_ref == "env:MAS_ORCH_OVERRIDE_SECRET"
+    assert "toml-private" not in repr(settings) and "override-private" not in repr(settings)
+
+
+def test_unknown_prefixed_settings_still_fail_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MAS_ORCH_SECURITY__TYPO_SETTING", "not-a-secret")
+    with pytest.raises(ValidationError):
+        load_settings()
+
+
+def test_superseded_env_secret_reference_is_not_exposed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MAS_ORCH_SECURITY__SERVICE_TOKEN_REF", "env:MAS_ORCH_OLD_TOKEN")
+    monkeypatch.setenv("MAS_ORCH_OLD_TOKEN", "old-secret")
+    monkeypatch.setenv("MAS_ORCH_NEW_TOKEN", "new-secret")
+    settings = load_settings(
+        overrides={"security": {"service_token_ref": "env:MAS_ORCH_NEW_TOKEN"}}
+    )
+    assert settings.security.service_token_ref == "env:MAS_ORCH_NEW_TOKEN"
+    assert "old-secret" not in repr(settings)
+    assert "new-secret" not in repr(settings)
+
+
+def test_prefixed_secret_references_inside_binding_json_are_not_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import json
+
+    binding = {
+        "tenant_id": "00000000-0000-4000-8000-000000000012",
+        "organization_id": "00000000-0000-4000-8000-000000000013",
+        "project_id": "00000000-0000-4000-8000-000000000014",
+        "source_id": "00000000-0000-4000-8000-000000000011",
+        "endpoint_url": "https://storage.example.test",
+        "bucket": "test-bucket",
+        "access_key_secret_ref": "env:MAS_ORCH_STORAGE_ACCESS",
+        "secret_key_secret_ref": "env:MAS_ORCH_STORAGE_SECRET",
+    }
+    monkeypatch.setenv("MAS_ORCH_DATA_HUB__OBJECT_STORAGE_BINDINGS", json.dumps([binding]))
+    monkeypatch.setenv("MAS_ORCH_STORAGE_ACCESS", "private-access-key")
+    monkeypatch.setenv("MAS_ORCH_STORAGE_SECRET", "private-secret-key")
+    settings = load_settings()
+    assert len(settings.data_hub.object_storage_bindings) == 1
+    assert "private-access-key" not in repr(settings)
+    assert "private-secret-key" not in repr(settings)
+
+
+def test_secret_reference_cannot_mask_nested_setting(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(
+        "MAS_ORCH_SECURITY__SERVICE_TOKEN_REF", "env:MAS_ORCH_AGENTS__MAX_PLANNING_STEPS"
+    )
+    monkeypatch.setenv("MAS_ORCH_AGENTS__MAX_PLANNING_STEPS", "42")
+    with pytest.raises(ValueError, match="overlaps the settings namespace"):
+        load_settings()
+
+
+def test_secret_reference_cannot_mask_root_setting(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MAS_ORCH_SECURITY__SERVICE_TOKEN_REF", "env:MAS_ORCH_ENVIRONMENT")
+    monkeypatch.setenv("MAS_ORCH_ENVIRONMENT", "production")
+    with pytest.raises(ValueError, match="overlaps the settings namespace"):
+        load_settings()

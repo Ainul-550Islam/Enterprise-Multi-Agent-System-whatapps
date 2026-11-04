@@ -39,6 +39,12 @@ use crate::state::AppState;
 
 /// Builds the full HTTP router for the api process.
 pub fn router(state: AppState) -> Router {
+    let data_hub_body_limit = state
+        .data_hub
+        .as_ref()
+        .map_or(data_hub::MAX_DATA_HUB_MULTIPART_BYTES, |service| {
+            data_hub::multipart_body_limit(service.max_upload_bytes())
+        });
     let public = Router::new()
         .route("/v1/health/live", get(health::live))
         .route("/v1/health/ready", get(health::ready))
@@ -183,13 +189,12 @@ pub fn router(state: AppState) -> Router {
             "/v1/data-sources/{id}/documents",
             get(data_hub::list_documents),
         )
-        // This endpoint has its own bounded 64 MiB extractor limit; the Data
-        // Hub application service applies the deployment-specific limit again
-        // before retaining content or calling the Python bridge.
+        // Bound the whole multipart envelope using the configured content
+        // limit plus framing/metadata allowance, then bound individual fields.
         .route(
             "/v1/documents/upload",
             post(data_hub::upload_document)
-                .layer(DefaultBodyLimit::max(data_hub::MAX_DATA_HUB_MULTIPART_BYTES)),
+                .layer(DefaultBodyLimit::max(data_hub_body_limit)),
         )
         .route(
             "/v1/documents/{id}",
@@ -266,6 +271,9 @@ pub fn router(state: AppState) -> Router {
             state.clone(),
             request_context_layer,
         ))
+        // Outermost: preflight must not enter authentication, request scope,
+        // handlers, or the database. Actual requests still traverse them all.
+        .layer(state.cors.layer())
         .with_state(state)
 }
 
@@ -303,8 +311,7 @@ mod tests {
 
     async fn seeded() -> Seeded {
         let (mut state, store) = inmemory_state_with_store();
-        let system =
-            ServiceContext::for_service("seed", "http-it-1", &Timestamp::now()).expect("ctx");
+        let system = ServiceContext::system("http-it-1", &Timestamp::now()).expect("ctx");
         let organization = state
             .tenancy
             .register_organization(&system, "Acme Ltd.", "Acme", "acme-http")

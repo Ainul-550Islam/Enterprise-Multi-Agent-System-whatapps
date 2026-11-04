@@ -41,13 +41,7 @@ services:
       - mas
 
   migrate:
-    # One-shot job: exits 0 when the schema is current. It intentionally has no
-    # healthcheck — a completed migration is not "healthy", it is done — and
-    # `restart: "no"` keeps it from running again under a restart policy.
     image: enterprise-mas/migrate:local
-    build:
-      context: ../..
-      dockerfile: deploy/docker/migrate.Dockerfile
     depends_on:
       postgres:
         condition: service_healthy
@@ -59,9 +53,6 @@ services:
 
   api:
     image: enterprise-mas/api:local
-    build:
-      context: ../..
-      dockerfile: deploy/docker/api.Dockerfile
     depends_on:
       postgres:
         condition: service_healthy
@@ -88,20 +79,12 @@ services:
 
   worker:
     image: enterprise-mas/worker:local
-    build:
-      context: ../..
-      dockerfile: deploy/docker/worker.Dockerfile
     depends_on:
       postgres:
         condition: service_healthy
       nats:
         condition: service_healthy
       api:
-        condition: service_healthy
-      # The worker aborts its boot when the AI bridge probe fails, so starting
-      # before the orchestrator listens turns a normal startup race into a
-      # crash loop.
-      orchestrator:
         condition: service_healthy
     environment:
       MAS_ENV: development
@@ -110,18 +93,9 @@ services:
       MAS_AI_BRIDGE_TOKEN: ${MAS_AI_BRIDGE_TOKEN:-dev-bridge-token}
     networks:
       - mas
-    healthcheck:
-      test: ["CMD-SHELL", "pgrep -x mas-worker >/dev/null || exit 1"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-      start_period: 30s
 
   scheduler:
     image: enterprise-mas/scheduler:local
-    build:
-      context: ../..
-      dockerfile: deploy/docker/scheduler.Dockerfile
     depends_on:
       postgres:
         condition: service_healthy
@@ -133,35 +107,13 @@ services:
       MAS_SCHEDULER_API_URL: http://api:8080
     networks:
       - mas
-    healthcheck:
-      test: ["CMD-SHELL", "pgrep -x mas-scheduler >/dev/null || exit 1"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-      start_period: 20s
 
   orchestrator:
     image: enterprise-mas/orchestrator:local
-    build:
-      context: ../..
-      dockerfile: deploy/docker/orchestrator.Dockerfile
     environment:
       MAS_ENV: development
-      MAS_ORCH_SERVICE__BIND_HOST: 0.0.0.0
-      MAS_ORCH_SERVICE__BIND_PORT: "9100"
-    expose:
-      - "9100"
     networks:
       - mas
-    healthcheck:
-      # The orchestrator serves gRPC only. Opening a TCP connection to the port
-      # is the honest readiness signal available without a client library; it
-      # goes unhealthy as soon as the listener dies.
-      test: ["CMD-SHELL", "python3 -c \"import socket,sys; s=socket.socket(); s.settimeout(2); sys.exit(0 if s.connect_ex(('127.0.0.1',9100))==0 else 1)\""]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-      start_period: 20s
 
 networks:
   mas:

@@ -140,6 +140,15 @@ class TestBlockedAddressRanges:
             "fc00::1",
             "fd00::1",
             "::ffff:127.0.0.1",
+            "::ffff:0:a9fe:a9fe",  # IPv4-translatable cloud metadata
+            "64:ff9b::a9fe:a9fe",  # NAT64 cloud metadata
+            "64:ff9b::808:808",  # even publicly addressed NAT64 is refused
+            "64:ff9b:1::a9fe:a9fe",  # local-use NAT64
+            "2002:7f00:1::1",  # 6to4 loopback
+            "2001::1",  # Teredo
+            "2001:db8::1",  # documentation-only
+            "fec0::1",  # deprecated site-local
+            "5f00::1",  # reserved IPv6 space
         ],
     )
     def test_private_and_special_ranges_are_blocked(self, address: str) -> None:
@@ -160,9 +169,9 @@ class TestBlockedAddressRanges:
     def test_cloud_metadata_is_covered(self) -> None:
         """The single most valuable SSRF target must be unreachable."""
         assert is_blocked_address("169.254.169.254") is True
-        assert (
-            any("169.254.169.254" in str(network) for network in BLOCKED_NETWORKS) or True
-        )  # covered by 169.254.0.0/16
+        from ipaddress import ip_address
+
+        assert any(ip_address("169.254.169.254") in network for network in BLOCKED_NETWORKS)
 
     def test_policy_refuses_blocked_resolution(self) -> None:
         with pytest.raises(ToolPermissionDeniedError):
@@ -256,6 +265,22 @@ class TestPinnedNetworkBackend:
         assert recorder.calls == []
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("resolved", ["64:ff9b::a9fe:a9fe", "::ffff:0:a9fe:a9fe"])
+    async def test_refuses_translated_metadata_addresses_before_dialling(
+        self, monkeypatch: pytest.MonkeyPatch, resolved: str
+    ) -> None:
+        async def resolve(_host: str) -> list[str]:
+            return ["93.184.216.34", resolved]
+
+        monkeypatch.setattr(base_http, "_resolve_host", resolve)
+        backend = base_http._ValidatedNetworkBackend(_policy())
+        recorder = _RecordingNetworkBackend()
+        backend._delegate = recorder  # type: ignore[assignment]
+        with pytest.raises(httpcore.ConnectError):
+            await backend.connect_tcp("api.openai.com", 443)
+        assert recorder.calls == []
+
+    @pytest.mark.asyncio
     async def test_dns_failure_is_mapped_to_an_httpcore_connection_failure(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -304,3 +329,114 @@ class TestPolicyValidation:
         policy = HttpPolicy.for_providers({"llm.internal"})
         with pytest.raises(ToolPermissionDeniedError):
             policy.validate_resolved_address("10.0.0.1")
+
+
+@pytest.mark.asyncio
+async def test_guarded_client_does_not_replay_server_cookies_across_requests() -> None:
+    import httpx
+
+    from mas_orchestrator.providers.base_http import HttpTransport
+
+    requests: list[httpx.Request] = []
+
+    def reply(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if len(requests) == 1:
+            return httpx.Response(
+                200, headers={"set-cookie": "session=tenant-a; Path=/; Secure"}, content=b"ok"
+            )
+        return httpx.Response(200, content=b"ok")
+
+    transport = HttpTransport(_policy())
+    transport._client._transport = httpx.MockTransport(reply)
+    try:
+        await transport.request("GET", "https://api.openai.com/first")
+        await transport.request("GET", "https://api.openai.com/second")
+        await transport.request(
+            "GET", "https://api.openai.com/third", headers={"Cookie": "explicit=caller"}
+        )
+        assert "cookie" not in requests[1].headers
+        assert requests[2].headers["cookie"] == "explicit=caller"
+        assert len(transport._client.cookies) == 0
+    finally:
+        await transport.aclose()
+
+
+@pytest.mark.asyncio
+async def test_cross_origin_redirect_is_denied_even_for_unknown_credential_headers() -> None:
+    import httpx
+
+    from mas_orchestrator.providers.base_http import HttpTransport
+
+    requests: list[httpx.Request] = []
+
+    def reply(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(302, headers={"location": "https://second.example/steal"})
+
+    transport = HttpTransport(
+        _policy(allowed_hosts=frozenset({"api.openai.com", "second.example"}))
+    )
+    transport._client._transport = httpx.MockTransport(reply)
+    try:
+        with pytest.raises(ToolPermissionDeniedError, match="cross-origin"):
+            await transport.request(
+                "GET", "https://api.openai.com/a", headers={"X-Custom-Secret": "tenant-secret"}
+            )
+        assert len(requests) == 1
+    finally:
+        await transport.aclose()
+
+
+@pytest.mark.asyncio
+async def test_same_origin_redirect_still_works() -> None:
+    import httpx
+
+    from mas_orchestrator.providers.base_http import HttpTransport
+
+    requests: list[httpx.Request] = []
+
+    def reply(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return (
+            httpx.Response(302, headers={"location": "/next"})
+            if len(requests) == 1
+            else httpx.Response(200, content=b"ok")
+        )
+
+    transport = HttpTransport(_policy())
+    transport._client._transport = httpx.MockTransport(reply)
+    try:
+        response = await transport.request(
+            "GET", "https://api.openai.com/start", headers={"X-Custom-Secret": "tenant-secret"}
+        )
+        assert response.body == b"ok"
+        assert requests[1].headers["x-custom-secret"] == "tenant-secret"
+    finally:
+        await transport.aclose()
+
+
+@pytest.mark.asyncio
+async def test_serialized_json_request_is_bounded_in_bytes_before_network() -> None:
+    import httpx
+
+    from mas_orchestrator.providers.base_http import HttpTransport
+
+    calls = 0
+
+    def reply(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, content=b"ok")
+
+    transport = HttpTransport(_policy(max_response_bytes=1024))
+    transport._client._transport = httpx.MockTransport(reply)
+    try:
+        await transport.request("POST", "https://api.openai.com", json_body={"v": "a" * 100})
+        assert calls == 1
+        # The 600 characters alone are below the limit but use 1200 UTF-8 bytes.
+        with pytest.raises(InvalidRequestError, match="outbound request body"):
+            await transport.request("POST", "https://api.openai.com", json_body={"v": "é" * 600})
+        assert calls == 1
+    finally:
+        await transport.aclose()

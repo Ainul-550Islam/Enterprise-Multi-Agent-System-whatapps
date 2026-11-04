@@ -59,7 +59,6 @@ if TYPE_CHECKING:
     from mas_orchestrator.models.cost import PricingTable
     from mas_orchestrator.models.registry import ModelRegistry
     from mas_orchestrator.providers.factory import ProviderBundle, ProviderSpec
-    from mas_orchestrator.rag.embeddings import HashingEmbedder, OpenAIEmbedder
     from mas_orchestrator.security.identity import ServiceIdentityResolver
     from mas_orchestrator.services.execution_service import ExecutionService
 
@@ -69,7 +68,6 @@ __all__ = [
     "DEFAULT_AGENT_CATALOG",
     "DEFAULT_AGENT_ID",
     "RuntimeBundle",
-    "build_data_hub_service",
     "build_identity_resolver",
     "build_provider_specs",
     "build_runtime_bundle",
@@ -96,10 +94,6 @@ class RuntimeBundle:
         providers: The constructed provider bundle, kept so the composition
             root can close every adapter on shutdown.
         agent_registry: The tenant-scoped registry, exposed for diagnostics.
-        data_hub_service: The Data Hub ingestion plane. It is always present;
-            when RAG is disabled its operations fail closed with a typed
-            configuration error rather than the servicer being absent, so the
-            bridge reports one consistent surface.
     """
 
     execution_service: ExecutionService
@@ -110,14 +104,11 @@ class RuntimeBundle:
     data_hub_service: DataHubService
 
     async def aclose(self) -> None:
-        """Closes every transport and pool this bundle owns.
-
-        The Data Hub plane goes first: its parsers and vector pool are the most
-        likely to be mid-work when shutdown begins, and closing provider
-        transports first would only strand them.
-        """
-        await self.data_hub_service.aclose()
-        await self.providers.aclose()
+        """Close both the Data Hub and model provider resources."""
+        try:
+            await self.data_hub_service.aclose()
+        finally:
+            await self.providers.aclose()
 
     def describe(self) -> dict[str, object]:
         """A log-safe summary of what was composed.
@@ -231,16 +222,15 @@ def build_identity_resolver(settings: Settings) -> ServiceIdentityResolver:
             details={"field": "security.service_token_ref"},
         ) from error
 
+    scopes = {ServiceScope.EXECUTE_AGENT, ServiceScope.INVOKE_API, ServiceScope.READ_HEALTH}
+    if settings.rag.enabled:
+        scopes.update(
+            {ServiceScope.DATA_HUB_SYNC, ServiceScope.DATA_HUB_INGEST, ServiceScope.DATA_HUB_PURGE}
+        )
     return StaticTokenServiceIdentityResolver(
         token=token,
         subject="rust-core",
-        scopes=frozenset(
-            {
-                ServiceScope.EXECUTE_AGENT,
-                ServiceScope.INVOKE_API,
-                ServiceScope.READ_HEALTH,
-            }
-        ),
+        scopes=frozenset(scopes),
     )
 
 
@@ -267,6 +257,7 @@ def build_runtime_bundle(settings: Settings) -> RuntimeBundle:
     from mas_orchestrator.agents.router import AgentRouter, build_policy
     from mas_orchestrator.agents.runtime import AgentRuntime, RuntimeConfig
     from mas_orchestrator.agents.tenant_registry import TenantScopedAgentRegistry
+    from mas_orchestrator.data_hub.composition import build_data_hub_service
     from mas_orchestrator.models.registry import ModelRegistry
     from mas_orchestrator.models.router import ModelRouter
     from mas_orchestrator.models.router import build_policy as build_model_policy
@@ -334,7 +325,6 @@ def build_runtime_bundle(settings: Settings) -> RuntimeBundle:
         ),
     )
     execution_service = build_execution_service(runtime)
-    data_hub_service = build_data_hub_service(settings)
 
     bundle = RuntimeBundle(
         execution_service=execution_service,
@@ -342,7 +332,7 @@ def build_runtime_bundle(settings: Settings) -> RuntimeBundle:
         identity_resolver=build_identity_resolver(settings),
         providers=providers,
         agent_registry=agent_registry,
-        data_hub_service=data_hub_service,
+        data_hub_service=build_data_hub_service(settings),
     )
 
     _LOGGER.info(
@@ -350,103 +340,6 @@ def build_runtime_bundle(settings: Settings) -> RuntimeBundle:
         extra={"event": "startup.runtime", **bundle.describe()},
     )
     return bundle
-
-
-def build_data_hub_service(settings: Settings) -> DataHubService:
-    """Composes the Data Hub ingestion plane.
-
-    Args:
-        settings: Loaded service settings.
-
-    Returns:
-        A :class:`~mas_orchestrator.data_hub.service.DataHubService`. The
-        ingestion pipeline, embedder and vector index are ``None`` when RAG is
-        disabled; the service then refuses ingestion with a typed configuration
-        error instead of the bridge surface disappearing.
-
-    The pipeline is only composed when RAG is enabled. Building a pgvector pool
-    for a deployment that never enabled retrieval would open a database
-    connection this process has no use for, and would fail startup for
-    deployments that deliberately run without RAG.
-    """
-    from mas_orchestrator.data_hub.service import DataHubService
-
-    if not settings.rag.enabled:
-        return DataHubService(
-            settings=settings,
-            pipeline=None,
-            index=None,
-            embedder=None,
-        )
-
-    from mas_orchestrator.rag.ingestion import IngestionPipeline
-    from mas_orchestrator.rag.pgvector_index import PgVectorIndex
-    from mas_orchestrator.security.credentials import resolve_secret
-
-    secret_ref = settings.rag.database_url_secret_ref
-    if not secret_ref:
-        raise ConfigurationError(
-            "RAG is enabled but no database URL secret reference is configured",
-            details={"field": "rag.database_url_secret_ref"},
-        )
-    index = PgVectorIndex.deferred(
-        resolve_secret(secret_ref).reveal(),
-        dimensions=settings.rag.embedding_dimensions,
-        database_role=settings.rag.database_role,
-    )
-    embedder = _build_embedder(settings)
-    pipeline = IngestionPipeline(embedder=embedder, index=index)
-    return DataHubService(
-        settings=settings,
-        pipeline=pipeline,
-        index=index,
-        embedder=embedder,
-    )
-
-
-def _build_embedder(settings: Settings) -> HashingEmbedder | OpenAIEmbedder:
-    """Builds the embedder the RAG plane will use.
-
-    Args:
-        settings: Loaded service settings.
-
-    Returns:
-        The configured embedder.
-
-    Raises:
-        ConfigurationError: If a provider-backed embedder is selected without a
-            credential reference. Falling back to the hashing embedder here
-            would silently index every document with a lexical bag-of-words
-            vector while the operator believes they configured a semantic one.
-    """
-    from mas_orchestrator.rag.embeddings import HashingEmbedder, OpenAIEmbedder
-    from mas_orchestrator.security.credentials import resolve_secret
-
-    if settings.rag.use_hashing_embedder:
-        # Refuses production in its own constructor; not re-checked here so
-        # there is exactly one place that decides.
-        return HashingEmbedder(
-            dimensions=settings.rag.embedding_dimensions or 256,
-            environment=settings.environment,
-        )
-
-    secret_ref = settings.rag.embedding_api_key_secret_ref
-    if not secret_ref:
-        raise ConfigurationError(
-            "RAG is enabled but no embedding provider credential reference is configured",
-            details={"field": "rag.embedding_api_key_secret_ref"},
-        )
-    if settings.rag.embedding_dimensions < 1:
-        raise ConfigurationError(
-            "RAG is enabled but rag.embedding_dimensions is unset; the vector "
-            "column width must match the embedding model",
-            details={"field": "rag.embedding_dimensions"},
-        )
-    return OpenAIEmbedder(
-        api_key=resolve_secret(secret_ref),
-        model=settings.rag.embedding_model,
-        dimensions=settings.rag.embedding_dimensions,
-    )
 
 
 def _pricing_table(settings: Settings) -> PricingTable:

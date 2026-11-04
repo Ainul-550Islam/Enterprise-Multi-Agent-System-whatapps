@@ -342,15 +342,8 @@ impl AttemptCoordinator {
 
     // -- settlement ---------------------------------------------------------
 
-    /// Settles a successful attempt.
-    ///
-    /// `result` is the exact JSON value the handler produced. It is persisted
-    /// with the settled attempt (and, when this task is its execution's
-    /// terminal unit of work, copied onto the execution) so the outcome of a
-    /// completed run is recoverable after the worker process is gone. Passing
-    /// it in rather than reconstructing it later is deliberate: a result the
-    /// worker no longer holds cannot be recovered from anywhere else.
-    pub async fn succeed(
+    /// Settles a successful attempt with the exact value produced by the handler.
+    pub async fn succeed_with_result(
         &self,
         claim: &TaskClaim,
         result: serde_json::Value,
@@ -361,6 +354,25 @@ impl AttemptCoordinator {
         self.settle(
             claim,
             TaskOutcome::Succeeded { result, usage },
+            finalize_execution,
+            at,
+        )
+        .await
+    }
+
+    /// Convenience for lifecycle tests that do not exercise handler output.
+    #[cfg(test)]
+    pub(crate) async fn succeed(
+        &self,
+        claim: &TaskClaim,
+        usage: mas_application::durable::ExecutionUsage,
+        finalize_execution: bool,
+        at: &Timestamp,
+    ) -> Result<SettlementReceipt> {
+        self.succeed_with_result(
+            claim,
+            serde_json::Value::Null,
+            usage,
             finalize_execution,
             at,
         )
@@ -695,13 +707,7 @@ mod tests {
 
         // Settling one attempt frees exactly one slot.
         coordinator
-            .succeed(
-                &first[0],
-                serde_json::json!({ "ok": true }),
-                ExecutionUsage::default(),
-                true,
-                &now(),
-            )
+            .succeed(&first[0], ExecutionUsage::default(), true, &now())
             .await
             .expect("settle");
         assert_eq!(
@@ -732,13 +738,7 @@ mod tests {
 
         // A finishes late and tries to record its success. It must be rejected.
         let error = worker_a
-            .succeed(
-                &claim,
-                serde_json::json!({ "ok": true }),
-                ExecutionUsage::default(),
-                true,
-                &after_lapse,
-            )
+            .succeed(&claim, ExecutionUsage::default(), true, &after_lapse)
             .await
             .expect_err("a stale worker must not overwrite newer state");
         assert!(matches!(error, AppError::Conflict(_)), "{error:?}");
@@ -758,13 +758,7 @@ mod tests {
 
         let claim = owner.claim(4, &now()).await.expect("claim").remove(0);
         let error = stranger
-            .succeed(
-                &claim,
-                serde_json::json!({ "ok": true }),
-                ExecutionUsage::default(),
-                false,
-                &now(),
-            )
+            .succeed(&claim, ExecutionUsage::default(), false, &now())
             .await
             .expect_err("a non-owner must be rejected");
         assert!(matches!(error, AppError::Conflict(_)));
@@ -780,7 +774,6 @@ mod tests {
         let receipt = coordinator
             .succeed(
                 &claim,
-                serde_json::json!({ "settled": true }),
                 ExecutionUsage {
                     provider: Some("openai".to_owned()),
                     model: Some("gpt-4o-mini".to_owned()),

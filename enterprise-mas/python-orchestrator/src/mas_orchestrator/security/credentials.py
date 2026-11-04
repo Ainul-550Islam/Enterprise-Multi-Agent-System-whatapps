@@ -89,9 +89,11 @@ class Secret:
             return NotImplemented
         return self._value == other._value
 
-    def __hash__(self) -> int:
-        """Hashable so secrets can live in sets/dicts without being printed."""
-        return hash(("Secret", self.reference))
+    # Values compare by secret bytes, independently of the reference. Hashing
+    # by reference violates Python's equality/hash contract, while hashing by
+    # secret leaks a value-derived hash and mutable values would invalidate a
+    # dictionary key. Secret objects are deliberately not hashable.
+    __hash__ = None  # type: ignore[assignment]
 
 
 @runtime_checkable

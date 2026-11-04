@@ -1,11 +1,8 @@
 // PURPOSE:
 // The canonical wire contract between Rust and Python.
 //
-// Declares the two surfaces Rust owns toward Python: `AgentBridgeApi`, which
-// asks Python to run an agent, and `DataHubBridgeApi`, which asks Python to
-// synchronize a source or index a document into its RAG plane.
-//
-// Every message that crosses `AgentBridgeApi`: the request carrying
+// Declares `AgentBridgeApi`, the only surface Rust uses to ask Python to run
+// an agent, together with every message that crosses it: the request carrying
 // request/execution/task/tenant/org/project identity, the authenticated
 // service identity, a correlation id, an absolute deadline, an idempotency
 // key, the agent reference and version, the input, runtime state and tool
@@ -278,20 +275,9 @@ message AgentRunRequest {
   ServiceIdentityMsg identity = 16;
   // Durable worker claim attempt; absent for non-queue-driven runs.
   optional string task_attempt_id = 17;
-  // Rust-resolved, immutable agent snapshot for exactly the pinned
-  // (`agent_id`, `agent_version`) in this request, serialized as the JSON
-  // projection of `mas_execution::agent_bridge::AgentRuntimeSnapshot`.
-  //
-  // Present, Python runs *this* definition and never consults its own catalog:
-  // the published version is Rust's authority, and a process-local lookup
-  // would silently substitute whatever the Python catalog happened to hold.
-  // Absent, the run is refused — there is no fallback, because falling back
-  // would mean Python executing an agent Rust did not authorize.
-  //
-  // The body HMAC covers this field along with the rest of the request, so a
-  // snapshot cannot be swapped in transit, and the full tenant/organization/
-  // project identity is repeated inside it so Python can reconcile the two.
-  string agent_snapshot_json = 18;
+  // Immutable Rust-resolved agent/version snapshot, included in the signed
+  // request body. An absent field is accepted only by explicitly legacy lanes.
+  optional string agent_snapshot_json = 18;
 }
 
 // Authenticated internal service identity (mirrors
@@ -358,201 +344,94 @@ message BridgeHealthReply {
   string detail = 2;
 }
 
-// =========================================================================
-// Data Hub bridge
-// =========================================================================
-//
-// The second Python-facing surface: source synchronization and document
-// ingestion for the RAG plane. Every request below uses the same
-// authentication envelope as `AgentBridgeApi` — a bearer service token in
-// metadata, the body-bound `x-mas-internal-signature` v2 HMAC over the exact
-// request bytes, and the authoritative tenant/organization identity carried
-// *in the body* so Python can reconcile it against the signed metadata.
-//
-// It must NOT:
-//   • carry secret material — only opaque secret *references*;
-//   • let a caller name a tenant that Rust did not sign into the body.
-//
-// The identity field reuses `ServiceIdentityMsg` rather than declaring a
-// Data-Hub-specific twin: the shape is identical, and two structurally equal
-// messages would be two things to keep in sync for no benefit.
-
-// Source synchronization and document ingestion for the RAG plane.
-//
-// Every request below uses the same authentication envelope as
-// `AgentBridgeApi`: a bearer service token in metadata, the body-bound
-// `x-mas-internal-signature` v2 HMAC over the exact request bytes, and the
-// authoritative tenant/organization identity carried *in the body*.
+// Rust-owned catalogue -> Python-owned ingestion. Stateful calls carry the
+// complete authoritative scope and identity in the signed protobuf body.
 service DataHubBridgeApi {
-  // Enumerates a Rust-authorized source and indexes everything that changed
-  // since `cursor`. Bounded by the caller's deadline; partial progress is
-  // reported rather than rolled back, because the next sync resumes from the
-  // returned cursor.
   rpc SyncSource(SyncSourceRequest) returns (SyncSourceReply);
-
-  // Indexes one already-authorized document (upload, discovered item or
-  // fetched page) under the tenant's RAG partition.
   rpc IngestDocument(IngestDocumentRequest) returns (DocumentIngestionReply);
-
-  // Removes exactly one tenant/document pair from the RAG plane. Deleting
-  // catalogue state is Rust's job; this only drops derived vectors.
   rpc PurgeDocument(PurgeDocumentRequest) returns (PurgeDocumentReply);
-
-  // Secret-free readiness of the ingestion plane. Unauthenticated for the same
-  // reason `AgentBridgeApi.Health` is: a supervisor probe has no tenant data
-  // to protect and the reply carries a boolean and a static string.
   rpc Health(Empty) returns (DataHubHealthReply);
 }
 
-// Identity Rust asserts on every Data Hub call.
-//
-// Deliberately identical to the AgentBridge message so one resolver, one token
-// and one scope check serve both services.
-// Synchronize one source and index its changed items.
 message SyncSourceRequest {
-  // ---- authoritative identity (repeated in every message) ----------------
   string tenant_id = 1;
   string organization_id = 2;
   string project_id = 3;
-  string correlation_id = 4;
-  string request_id = 5;
-  // Wire protocol version; a mismatched major is refused before any work.
-  string protocol_version = 6;
-  // Absolute wall-clock deadline, RFC-3339 with milliseconds.
-  string deadline_rfc3339 = 7;
-  // Service identity Rust asserts.
-  ServiceIdentityMsg identity = 8;
-
-  // ---- Rust-owned source snapshot ---------------------------------------
-  // Stable source identifier; echoed back so Rust can reject a mismatched
-  // reply rather than persist another source's progress.
-  string source_id = 9;
-  // Human-readable source name.
-  string source_name = 10;
-  // `upload`, `object_storage` or `web`. Validated by Python against its own
-  // supported adapter set.
-  string source_kind = 11;
-  // JSON object of adapter configuration. Never contains secret material;
-  // Rust rejects a configuration that looks like a credential before sending.
-  string configuration_json = 12;
-  // Opaque reference to a secret the *deployment* resolves; never the secret.
-  optional string credential_secret_ref = 13;
-  // Resume point from the previous sync, owned and persisted by Rust.
-  optional string cursor = 14;
-  // Roles a reader must hold to see the indexed content.
-  repeated string required_roles = 15;
-  // Principals explicitly denied access to the indexed content.
-  repeated string denied_principals = 16;
+  string source_id = 4;
+  string source_name = 5;
+  string source_kind = 6;
+  string configuration_json = 7;
+  optional string credential_secret_ref = 8;
+  optional string cursor = 9;
+  repeated string required_roles = 10;
+  repeated string denied_principals = 11;
+  string correlation_id = 12;
+  string request_id = 13;
+  string protocol_version = 14;
+  string deadline_rfc3339 = 15;
+  ServiceIdentityMsg identity = 16;
 }
 
-// Result of one source synchronization.
 message SyncSourceReply {
-  // Echo of the request's source id.
   string source_id = 1;
-  // Source entries observed.
   uint32 discovered_count = 2;
-  // Entries whose content changed.
   uint32 changed_count = 3;
-  // Documents successfully indexed.
   uint32 indexed_count = 4;
-  // Documents that failed (summarized in `errors`).
   uint32 failed_count = 5;
-  // Cursor Rust must persist for the next sync. Empty means "no progress
-  // information", which makes the next sync start over rather than skip.
-  string next_cursor = 6;
-  // Sanitized `<document_id>: <error_code>` summaries only. Never derived from
-  // document content, so a failure cannot leak tenant text into Rust's logs.
+  optional string next_cursor = 6;
   repeated string errors = 7;
 }
 
-// Index one bounded document.
 message IngestDocumentRequest {
-  // ---- authoritative identity -------------------------------------------
   string tenant_id = 1;
   string organization_id = 2;
   string project_id = 3;
-  string correlation_id = 4;
-  string request_id = 5;
-  string protocol_version = 6;
-  string deadline_rfc3339 = 7;
-  ServiceIdentityMsg identity = 8;
-
-  // ---- Rust-owned document snapshot -------------------------------------
-  string source_id = 9;
-  // Stable document identifier; echoed back for the same reason as `source_id`.
-  string document_id = 10;
-  // `upload`, `object_storage` or `web`.
-  string source_kind = 11;
-  // Display title.
-  string title = 12;
-  // MIME type; Python refuses a type it has no parser for unless it is
-  // explicitly configured to index it as plain text.
-  string mime_type = 13;
-  // Exact document bytes. Bounded by the platform's upload ceiling and
-  // re-checked against `content_sha256` when one is supplied.
-  bytes content = 14;
-  // Where the bytes came from, for citation. Not an SSRF input: Python never
-  // fetches this URI.
-  optional string source_uri = 15;
-  // Expected lowercase-hex SHA-256 of `content`, when Rust computed one.
-  optional string content_sha256 = 16;
-  // Roles a reader must hold to see the indexed content.
-  repeated string required_roles = 17;
-  // Principals explicitly denied access.
-  repeated string denied_principals = 18;
-  // JSON object of non-secret document metadata (labels, language, …).
-  string metadata_json = 19;
+  string source_id = 4;
+  string document_id = 5;
+  string source_kind = 6;
+  string title = 7;
+  string mime_type = 8;
+  bytes content = 9;
+  optional string source_uri = 10;
+  optional string content_sha256 = 11;
+  repeated string required_roles = 12;
+  repeated string denied_principals = 13;
+  string metadata_json = 14;
+  string correlation_id = 15;
+  string request_id = 16;
+  string protocol_version = 17;
+  string deadline_rfc3339 = 18;
+  ServiceIdentityMsg identity = 19;
 }
 
-// Result of indexing one document.
 message DocumentIngestionReply {
-  // Echo of the request's document id.
   string document_id = 1;
-  // Lowercase-hex SHA-256 of the bytes actually indexed. Rust compares it
-  // against its own digest, so a truncated upload cannot be silently accepted.
   string sha256 = 2;
-  // Exact byte count observed by Python.
   uint64 byte_count = 3;
-  // Chunks produced.
   uint32 chunk_count = 4;
-  // Vectors written. Never greater than `chunk_count`.
   uint32 embedded_count = 5;
-  // Safe reason the item was deliberately not indexed (empty document,
-  // unsupported type, …). Absent when the document was indexed.
   optional string skipped_reason = 6;
 }
 
-// Remove one tenant/document pair from the RAG plane.
 message PurgeDocumentRequest {
-  // ---- authoritative identity -------------------------------------------
   string tenant_id = 1;
   string organization_id = 2;
   string project_id = 3;
-  string correlation_id = 4;
-  string request_id = 5;
-  string protocol_version = 6;
-  string deadline_rfc3339 = 7;
-  ServiceIdentityMsg identity = 8;
-
-  // ---- target ------------------------------------------------------------
-  string source_id = 9;
-  // Document to purge; echoed back so Rust can confirm the right row went.
-  string document_id = 10;
+  string source_id = 4;
+  string document_id = 5;
+  string correlation_id = 6;
+  string request_id = 7;
+  string protocol_version = 8;
+  string deadline_rfc3339 = 9;
+  ServiceIdentityMsg identity = 10;
 }
 
-// Result of one purge.
 message PurgeDocumentReply {
-  // Echo of the request's document id.
   string document_id = 1;
-  // Derived chunk rows removed. Zero is a valid answer: the document may
-  // never have produced any vectors.
   uint64 removed_chunks = 2;
 }
 
-// Readiness of the ingestion plane.
 message DataHubHealthReply {
-  // Whether the plane can serve work right now.
   bool healthy = 1;
-  // Static, secret-free detail (e.g. `data hub ready`).
   string detail = 2;
 }

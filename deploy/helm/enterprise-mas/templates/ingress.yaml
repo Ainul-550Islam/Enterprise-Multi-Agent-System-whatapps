@@ -8,14 +8,14 @@ metadata:
   {{- if .Values.ingress.tls.enabled }}
   annotations:
     nginx.ingress.kubernetes.io/ssl-redirect: "true"
-    cert-manager.io/cluster-issuer: {{ .Values.ingress.clusterIssuer }}
+    cert-manager.io/cluster-issuer: letsencrypt-prod
   {{- end }}
 spec:
   {{- if .Values.ingress.class }}
   ingressClassName: {{ .Values.ingress.class }}
   {{- end }}
   rules:
-    - host: {{ .Values.ingress.host | required "ingress.host is required when ingress.enabled=true" }}
+    - host: api.mas.example.com
       http:
         paths:
           - path: /
@@ -28,7 +28,7 @@ spec:
   {{- if .Values.ingress.tls.enabled }}
   tls:
     - hosts:
-        - {{ .Values.ingress.host }}
+        - api.mas.example.com
       secretName: {{ include "enterprise-mas.fullname" . }}-tls
   {{- end }}
 {{- end }}

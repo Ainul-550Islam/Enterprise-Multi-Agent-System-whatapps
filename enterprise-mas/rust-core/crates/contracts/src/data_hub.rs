@@ -9,6 +9,7 @@ use serde_json::{Map, Value};
 
 /// Register a tenant-scoped source with non-secret adapter configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateDataSourceRequest {
     /// Owning project.
     pub project_id: ProjectId,
@@ -52,9 +53,130 @@ impl CreateDataSourceRequest {
                 "source config must be an object",
             ));
         }
+        validate_source_config(&self.kind, &self.config)?;
         reject_secrets(&self.config)?;
         Ok(())
     }
+}
+
+/// Rejects unsupported source configuration, including misspelled policy
+/// keys, rather than silently ingesting content with an unintended open ACL.
+pub fn validate_source_config(kind: &str, config: &Value) -> Result<()> {
+    if !matches!(kind, "upload" | "web" | "object_storage") {
+        return Err(mas_common::error::AppError::invalid_field(
+            "kind",
+            "invalid_enum_value",
+            "unsupported data source kind",
+        ));
+    }
+    let fields = config.as_object().ok_or_else(|| {
+        mas_common::error::AppError::invalid_field(
+            "config",
+            "not_object",
+            "source config must be an object",
+        )
+    })?;
+    for key in fields.keys() {
+        let common = matches!(
+            key.as_str(),
+            "required_roles" | "denied_principals" | "credential_secret_ref"
+        );
+        let supported = match kind {
+            "upload" => false,
+            "web" => matches!(
+                key.as_str(),
+                "url" | "start_urls" | "max_depth" | "max_pages"
+            ),
+            "object_storage" => matches!(
+                key.as_str(),
+                "endpoint_url"
+                    | "bucket"
+                    | "prefix"
+                    | "region"
+                    | "access_key_secret_ref"
+                    | "secret_key_secret_ref"
+            ),
+            _ => {
+                return Err(mas_common::error::AppError::invalid_field(
+                    "kind",
+                    "invalid_enum_value",
+                    "unsupported data source kind",
+                ))
+            },
+        };
+        if !common && !supported {
+            return Err(mas_common::error::AppError::invalid_field(
+                "config",
+                "unknown_field",
+                "source config contains an unsupported field",
+            ));
+        }
+    }
+    // URL components can conceal inline tokens even though the surrounding
+    // config key is innocuous. Source URLs must not carry credentials, query
+    // parameters, or fragments; secret values belong in approved references.
+    let url_fields: &[&str] = match kind {
+        "web" => &["url", "start_urls"],
+        "object_storage" => &["endpoint_url"],
+        _ => &[],
+    };
+    for field in url_fields {
+        if let Some(value) = fields.get(*field) {
+            match value {
+                Value::String(url) => validate_source_url(url)?,
+                Value::Array(urls) if *field == "start_urls" => {
+                    if urls.is_empty() || urls.len() > 25 {
+                        return Err(mas_common::error::AppError::validation(
+                            "invalid source URL list",
+                        ));
+                    }
+                    for url in urls {
+                        let url = url.as_str().ok_or_else(|| {
+                            mas_common::error::AppError::validation("source URLs must be strings")
+                        })?;
+                        validate_source_url(url)?;
+                    }
+                },
+                _ => {
+                    return Err(mas_common::error::AppError::validation(
+                        "source URL must be a string or URL list",
+                    ))
+                },
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_source_url(raw: &str) -> Result<()> {
+    let invalid = || {
+        mas_common::error::AppError::validation(
+            "source URL must be HTTPS and must not contain credentials, query, or fragment",
+        )
+    };
+    if raw.len() > 2048 || raw.trim() != raw || raw.chars().any(char::is_control) {
+        return Err(invalid());
+    }
+    let (_, authority) = raw.split_once("://").ok_or_else(invalid)?;
+    if authority
+        .split(['/', '?', '#'])
+        .next()
+        .is_none_or(|part| part.contains('@'))
+    {
+        return Err(invalid());
+    }
+    let url = url::Url::parse(raw).map_err(|_| invalid())?;
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.port().is_some_and(|port| port != 443)
+    {
+        return Err(invalid());
+    }
+    Ok(())
 }
 
 fn reject_secrets(value: &Value) -> Result<()> {
@@ -101,6 +223,7 @@ fn reject_secrets(value: &Value) -> Result<()> {
 
 /// Begin ingestion of one document; upload content is transported separately.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateDocumentRequest {
     /// Source whose adapter owns this content.
     pub source_id: DataSourceId,
@@ -132,6 +255,13 @@ impl CreateDocumentRequest {
                 "title and object-shaped access policy are required",
             ));
         }
+        if self.size_bytes == 0 {
+            return Err(mas_common::error::AppError::invalid_field(
+                "size_bytes",
+                "empty",
+                "document content must not be empty",
+            ));
+        }
         if self.content_sha256.len() != 64
             || !self
                 .content_sha256
@@ -142,6 +272,25 @@ impl CreateDocumentRequest {
                 "content_sha256",
                 "invalid_format",
                 "content hash must be lowercase SHA-256 hex",
+            ));
+        }
+        // An unknown policy field must never be silently ignored: a caller
+        // could otherwise believe an unenforced restriction protects content.
+        let policy = self.access_policy.as_object().ok_or_else(|| {
+            mas_common::error::AppError::invalid_field(
+                "access_policy",
+                "not_object",
+                "access policy must be an object",
+            )
+        })?;
+        if policy
+            .keys()
+            .any(|key| key != "required_roles" && key != "denied_principals")
+        {
+            return Err(mas_common::error::AppError::invalid_field(
+                "access_policy",
+                "unknown_field",
+                "access policy contains an unsupported field",
             ));
         }
         reject_secrets(&self.access_policy)?;
@@ -209,4 +358,56 @@ pub struct DataSourceSyncDto {
     pub job_id: Option<String>,
     /// Accepted status.
     pub status: String,
+}
+
+#[cfg(test)]
+mod strict_request_tests {
+    use super::*;
+
+    #[test]
+    fn source_urls_reject_embedded_credentials_and_queries() {
+        for url in [
+            "https://user:pass@docs.example.test/root",
+            "https://@docs.example.test/root",
+            "https:docs.example.test/root",
+            "https://docs.example.test/root?",
+            "https://docs.example.test/root#",
+            "https://docs.example.test/\nsecret",
+            "https://docs.example.test/root?token=secret",
+            "https://docs.example.test/root#secret",
+            "http://docs.example.test/root",
+            "https://docs.example.test:8443/root",
+        ] {
+            assert!(validate_source_config("web", &serde_json::json!({"url": url})).is_err());
+            assert!(
+                validate_source_config("web", &serde_json::json!({"start_urls": [url]})).is_err()
+            );
+            assert!(validate_source_config(
+                "object_storage",
+                &serde_json::json!({"endpoint_url": url})
+            )
+            .is_err());
+        }
+        assert!(validate_source_config(
+            "web",
+            &serde_json::json!({"start_urls": ["https://docs.example.test/root"]})
+        )
+        .is_ok());
+        assert!(validate_source_config("web", &serde_json::json!({"start_urls": [42]})).is_err());
+    }
+
+    #[test]
+    fn top_level_policy_typos_are_rejected_by_deserialization() {
+        let source = serde_json::json!({
+            "project_id": ProjectId::new(), "name": "s", "kind": "upload",
+            "config": {}, "access_policy": {"required_roles": ["admin"]}
+        });
+        assert!(serde_json::from_value::<CreateDataSourceRequest>(source).is_err());
+        let document = serde_json::json!({
+            "source_id": DataSourceId::new(), "title": "t", "mime_type": "text/plain",
+            "size_bytes": 1, "content_sha256": "a".repeat(64),
+            "access_policy": {}, "required_roles": ["admin"]
+        });
+        assert!(serde_json::from_value::<CreateDocumentRequest>(document).is_err());
+    }
 }

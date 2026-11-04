@@ -17,7 +17,6 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Final
 
 from mas_orchestrator.agents.base import AgentKind, AgentSpec, BaseAgent
-from mas_orchestrator.agents.builtin.platform_assistant import PLATFORM_ASSISTANT_AGENT_ID
 from mas_orchestrator.agents.executor import AgentExecutor, AgentRunConfig
 from mas_orchestrator.agents.supervisor import SupervisorAgent
 from mas_orchestrator.contracts.errors import ConfigurationError
@@ -77,38 +76,24 @@ class AgentFactory:
             ConfigurationError: If the spec's kind needs a collaborator that
                 was not supplied.
         """
-        # Product-owned builtins dispatch before the generic kinds below. The
-        # id is the dispatch key, not a flag on the spec: a caller cannot
-        # rename its own agent to take this branch, and the constructor
-        # re-checks every property it depends on (read-only, tool-free,
-        # standard) so a spec that reaches it by another route is refused
-        # rather than run with weaker assumptions.
-        if spec.agent_id == PLATFORM_ASSISTANT_AGENT_ID:
-            if not spec.read_only:
-                # The assistant's whole safety story is that it cannot mutate
-                # anything. Building it from a mutable spec would produce an
-                # assistant whose answers may be based on a write it should not
-                # have made.
-                raise ConfigurationError(
-                    "the platform assistant must be configured as a read-only standard agent",
-                    details={"agent_id": spec.agent_id, "read_only": spec.read_only},
-                )
-            from mas_orchestrator.agents.builtin.platform_assistant import (
-                PlatformAssistantAgent,
-            )
+        from mas_orchestrator.agents.builtin.platform_assistant import (
+            PLATFORM_ASSISTANT_AGENT_ID,
+            PlatformAssistantAgent,
+        )
 
-            return PlatformAssistantAgent(
+        if spec.agent_id == PLATFORM_ASSISTANT_AGENT_ID:
+            if not spec.read_only or spec.kind is not AgentKind.STANDARD or spec.allowed_tools:
+                raise ConfigurationError("platform assistant requires a read-only standard agent")
+            executor = AgentExecutor(
                 spec,
-                AgentExecutor(
-                    spec,
-                    router=self._router,
-                    provider_for=self._provider_for,
-                    tool_executor=self._tool_executor,
-                    tool_registry=self._tool_registry,
-                    config=config,
-                    ledger=ledger,
-                ),
+                router=self._router,
+                provider_for=self._provider_for,
+                tool_executor=None,
+                tool_registry=None,
+                ledger=ledger,
+                config=config,
             )
+            return PlatformAssistantAgent(spec, executor)
 
         if spec.kind is AgentKind.SUPERVISOR:
             if self._agent_registry is None:

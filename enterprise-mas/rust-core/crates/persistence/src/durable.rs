@@ -1948,14 +1948,17 @@ impl PgDurableExecution {
     async fn list_executions_in(
         connection: &mut PgConnection,
         tenant: TenantId,
+        organization: Option<OrganizationId>,
         limit: usize,
     ) -> Result<Vec<Execution>> {
         let conn = connection;
         let rows = sqlx::query(&format!(
             "SELECT {EXECUTION_SELECT} FROM executions WHERE tenant_id = $1
-             ORDER BY created_at DESC LIMIT $2"
+             AND ($2::uuid IS NULL OR organization_id = $2)
+             ORDER BY created_at DESC, id DESC LIMIT $3"
         ))
         .bind(tenant.into_uuid())
+        .bind(organization.map(OrganizationId::into_uuid))
         .bind(i64::try_from(limit.min(500)).unwrap_or(500))
         .fetch_all(&mut *conn)
         .await
@@ -2093,12 +2096,22 @@ impl DurableExecutionPort for PgDurableExecution {
     }
 
     async fn list_executions(&self, tenant: TenantId, limit: usize) -> Result<Vec<Execution>> {
+        self.list_executions_scoped(tenant, None, limit).await
+    }
+
+    async fn list_executions_scoped(
+        &self,
+        tenant: TenantId,
+        organization: Option<OrganizationId>,
+        limit: usize,
+    ) -> Result<Vec<Execution>> {
         if Self::has_request_scope() {
             let mut scoped = Self::request_connection().await?;
-            Self::list_executions_in(scoped.connection(), tenant, limit).await
+            Self::list_executions_in(scoped.connection(), tenant, organization, limit).await
         } else {
             let mut uow = UnitOfWork::begin(&self.pool).await?;
-            let outcome = Self::list_executions_in(uow.executor(), tenant, limit).await;
+            let outcome =
+                Self::list_executions_in(uow.executor(), tenant, organization, limit).await;
             Self::finish(uow, outcome).await
         }
     }

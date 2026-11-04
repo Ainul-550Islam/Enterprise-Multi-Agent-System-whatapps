@@ -52,10 +52,10 @@ class DataHubSource:
             raise InvalidRequestError("Data Hub source name exceeds 200 characters")
         if self.cursor is not None and len(self.cursor.encode("utf-8")) > 64 * 1024:
             raise InvalidRequestError("Data Hub source cursor exceeds its size limit")
-        _validate_uuid(self.source_id, "source_id")
-        _validate_uuid(self.tenant_id, "tenant_id")
-        _validate_uuid(self.organization_id, "organization_id")
-        _validate_uuid(self.project_id, "project_id")
+        require_scope_uuid(self.source_id, "source_id")
+        require_scope_uuid(self.tenant_id, "tenant_id")
+        require_scope_uuid(self.organization_id, "organization_id")
+        require_scope_uuid(self.project_id, "project_id")
         _validate_config_secrets(self.config)
 
 
@@ -100,7 +100,7 @@ class DataHubDocument:
             ("organization_id", self.organization_id),
             ("project_id", self.project_id),
         ):
-            _validate_uuid(value, field_name)
+            require_scope_uuid(value, field_name)
         if not isinstance(self.source_kind, DataSourceKind):
             raise InvalidRequestError("Data Hub document source kind is invalid")
         if not self.content:
@@ -151,7 +151,7 @@ class DiscoveredDocument:
                 )
 
 
-def _validate_uuid(value: str, field_name: str) -> None:
+def require_scope_uuid(value: str, field_name: str) -> None:
     """Requires canonical UUID identifiers at the signed bridge boundary."""
     import uuid
 
@@ -162,6 +162,11 @@ def _validate_uuid(value: str, field_name: str) -> None:
             f"Data Hub {field_name} must be a UUID",
             details={"field": field_name},
         ) from error
+    if parsed.int == 0:
+        raise InvalidRequestError(
+            f"Data Hub {field_name} must not be a nil UUID",
+            details={"field": field_name},
+        )
     if str(parsed) != value.lower():
         raise InvalidRequestError(
             f"Data Hub {field_name} must use canonical UUID form",
@@ -183,5 +188,13 @@ def _validate_config_secrets(config: Mapping[str, Any]) -> None:
                 "raw credentials are forbidden in Data Hub source configuration",
                 details={"field": str(key)},
             )
-        if isinstance(value, Mapping):
-            _validate_config_secrets(value)
+        _validate_nested_config_secrets(value)
+
+
+def _validate_nested_config_secrets(value: Any) -> None:
+    """Visit objects inside arrays as well as directly nested objects."""
+    if isinstance(value, Mapping):
+        _validate_config_secrets(value)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _validate_nested_config_secrets(item)

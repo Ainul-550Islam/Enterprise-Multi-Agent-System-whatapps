@@ -62,7 +62,7 @@ impl HttpJwksFetcher {
 #[async_trait]
 impl JwksFetchPort for HttpJwksFetcher {
     async fn fetch(&self, endpoint: &str) -> Result<Vec<u8>> {
-        let response = self
+        let mut response = self
             .client
             .get(endpoint)
             .header(reqwest::header::ACCEPT, "application/json")
@@ -84,17 +84,61 @@ impl JwksFetchPort for HttpJwksFetcher {
                 "response exceeded the configured body limit",
             ));
         }
-        let body = response
-            .bytes()
+        let mut body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
             .await
-            .map_err(|_| AppError::external_service("oidc_jwks", "response read failed"))?;
-        if body.len() > MAX_HTTP_JWKS_BODY_BYTES {
-            return Err(AppError::external_service(
-                "oidc_jwks",
-                "response exceeded the configured body limit",
-            ));
+            .map_err(|_| AppError::external_service("oidc_jwks", "response read failed"))?
+        {
+            if chunk.len() > MAX_HTTP_JWKS_BODY_BYTES.saturating_sub(body.len()) {
+                return Err(AppError::external_service(
+                    "oidc_jwks",
+                    "response exceeded the configured body limit",
+                ));
+            }
+            body.extend_from_slice(&chunk);
         }
-        Ok(body.to_vec())
+        Ok(body)
+    }
+}
+
+/// Pre-scope lookup for an explicitly linked, active local identity.
+/// Implementations must compare the exact verified issuer and subject, never
+/// an email or a claimed local user ID, and fail closed on ambiguity.
+#[async_trait]
+pub trait OidcIdentityDirectory: std::fmt::Debug + Send + Sync {
+    /// Returns the local ID only for an active, exact issuer/subject binding.
+    async fn lookup(&self, issuer: &str, subject: &str) -> Result<Option<mas_common::ids::UserId>>;
+}
+
+/// Narrow PostgreSQL lookup using the separately configured directory pool.
+#[derive(Debug, Clone)]
+pub struct PgOidcIdentityDirectory {
+    pool: sqlx::PgPool,
+}
+
+impl PgOidcIdentityDirectory {
+    /// The pool must connect as `mas_directory`, not the runtime role.
+    #[must_use]
+    pub const fn new(directory_pool: sqlx::PgPool) -> Self {
+        Self {
+            pool: directory_pool,
+        }
+    }
+}
+
+#[async_trait]
+impl OidcIdentityDirectory for PgOidcIdentityDirectory {
+    async fn lookup(&self, issuer: &str, subject: &str) -> Result<Option<mas_common::ids::UserId>> {
+        let ids: Vec<uuid::Uuid> = sqlx::query_scalar(
+            "SELECT id FROM users WHERE identity_provider = $1 AND external_subject = $2 AND status = 'active' LIMIT 2"
+        ).bind(issuer).bind(subject).fetch_all(&self.pool).await
+            .map_err(|_| AppError::internal("OIDC identity lookup failed"))?;
+        match ids.as_slice() {
+            [] => Ok(None),
+            [id] if !id.is_nil() => Ok(Some(mas_common::ids::UserId::from_uuid(*id))),
+            _ => Err(AppError::internal("ambiguous OIDC identity binding")),
+        }
     }
 }
 
@@ -107,24 +151,35 @@ impl JwksFetchPort for HttpJwksFetcher {
 #[derive(Debug, Clone)]
 pub struct OidcJwksTokenVerifier {
     validator: Arc<RemoteJwksValidator>,
+    identities: Arc<dyn OidcIdentityDirectory>,
 }
 
 impl OidcJwksTokenVerifier {
     /// Wraps the shared cache-backed validator.
     #[must_use]
-    pub fn new(validator: RemoteJwksValidator) -> Self {
+    pub fn new(validator: RemoteJwksValidator, identities: Arc<dyn OidcIdentityDirectory>) -> Self {
         Self {
             validator: Arc::new(validator),
+            identities,
         }
     }
 
-    /// Wraps an already shared cache-backed validator.
+    /// Wraps an already shared cache-backed validator and identity directory.
     #[must_use]
-    pub fn from_shared(validator: Arc<RemoteJwksValidator>) -> Self {
-        Self { validator }
+    pub fn from_shared(
+        validator: Arc<RemoteJwksValidator>,
+        identities: Arc<dyn OidcIdentityDirectory>,
+    ) -> Self {
+        Self {
+            validator,
+            identities,
+        }
     }
 
-    fn principal_from_claims(claims: mas_security::TokenClaims) -> Result<SecurityPrincipal> {
+    fn principal_from_claims(
+        claims: mas_security::TokenClaims,
+        local_user: mas_common::ids::UserId,
+    ) -> Result<SecurityPrincipal> {
         if claims.subject.trim().is_empty()
             || claims.subject.len() > 512
             || claims.subject.chars().any(char::is_control)
@@ -133,8 +188,13 @@ impl OidcJwksTokenVerifier {
         }
         let scopes = ScopeSet::new(claims.scopes)
             .map_err(|_| AppError::unauthorized("token scopes are invalid"))?;
+        // IdP scopes are not a local platform-admin grant, including wildcard
+        // spellings that would satisfy the platform administration check.
+        if scopes.permits("platform:admin") {
+            return Err(AppError::unauthorized("token scopes are invalid"));
+        }
         Ok(
-            SecurityPrincipal::new(claims.subject, PrincipalKind::User, None, scopes)
+            SecurityPrincipal::new(local_user.to_string(), PrincipalKind::User, None, scopes)
                 .with_roles(claims.roles)
                 .with_expiry(claims.expires_at),
         )
@@ -145,7 +205,22 @@ impl OidcJwksTokenVerifier {
 impl TokenVerifierPort for OidcJwksTokenVerifier {
     async fn verify(&self, token: &str) -> Result<SecurityPrincipal> {
         let claims = self.validator.validate(token).await?;
-        Self::principal_from_claims(claims)
+        let subject = &claims.subject;
+        if subject.trim().is_empty() || subject.len() > 512 || subject.chars().any(char::is_control)
+        {
+            return Err(AppError::unauthorized("token subject is invalid"));
+        }
+        let issuer = claims
+            .issuer
+            .as_deref()
+            .ok_or_else(|| AppError::unauthorized("invalid identity"))?;
+        let local_user = self
+            .identities
+            .lookup(issuer, subject)
+            .await
+            .map_err(|_| AppError::unauthorized("invalid identity"))?
+            .ok_or_else(|| AppError::unauthorized("invalid identity"))?;
+        Self::principal_from_claims(claims, local_user)
     }
 }
 
@@ -183,6 +258,42 @@ impl TokenVerifierPort for ProductionTokenVerifier {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn jwks_chunked_oversize_fails_before_stalled_stream_finishes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 2048];
+            let read = stream.read(&mut request).await.unwrap();
+            assert!(read > 0);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                .await
+                .unwrap();
+            let data = vec![b'x'; MAX_HTTP_JWKS_BODY_BYTES + 1];
+            stream
+                .write_all(format!("{:x}\r\n", data.len()).as_bytes())
+                .await
+                .unwrap();
+            let _ = stream.write_all(&data).await;
+            // A broken collector waits for the final chunk forever instead of
+            // rejecting as soon as the size limit is crossed.
+            std::future::pending::<()>().await;
+        });
+        let fetcher = HttpJwksFetcher::new(Duration::from_secs(10)).unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            fetcher.fetch(&format!("http://{address}/jwks")),
+        )
+        .await;
+        task.abort();
+        assert!(result
+            .expect("oversize must fail without waiting for stream EOF")
+            .is_err());
+    }
+
     #[test]
     fn oidc_claim_tenant_and_organization_never_become_local_bindings() {
         let tenant = mas_common::ids::TenantId::new();
@@ -203,7 +314,9 @@ mod tests {
             scopes: vec!["executions:read".to_owned()],
             extras: serde_json::Map::new(),
         };
-        let principal = OidcJwksTokenVerifier::principal_from_claims(claims).expect("principal");
+        let principal =
+            OidcJwksTokenVerifier::principal_from_claims(claims, mas_common::ids::UserId::new())
+                .expect("principal");
         assert_eq!(principal.kind, PrincipalKind::User);
         assert_eq!(principal.tenant_id, None);
         assert_eq!(principal.organization_id, None);

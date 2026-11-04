@@ -74,12 +74,12 @@ class InMemoryLexicalIndex:
     """A BM25-flavoured keyword index for development and tests."""
 
     def __init__(self) -> None:
-        self._items: dict[str, EmbeddedChunk] = {}
+        self._items: dict[tuple[str, str, str], EmbeddedChunk] = {}
 
     async def upsert(self, items: Sequence[EmbeddedChunk]) -> None:
         """Adds chunks to the index."""
         for item in items:
-            self._items[item.chunk.chunk_id] = item
+            self._items[_chunk_key(item)] = item
 
     async def search(
         self,
@@ -163,6 +163,23 @@ class Retriever:
         self._index = index
         self._lexical = lexical
         self._config = config or RetrievalConfig()
+        # No generic lexical interface proves it enforces the same owner and
+        # tombstone fences as the vector backend. Checking only isinstance of
+        # PgVectorIndex is bypassed by wrappers. Permit the known development
+        # in-memory pair only; arbitrary adapters require a future shared,
+        # enforceable fenced search contract rather than a capability flag.
+        from mas_orchestrator.rag.index import InMemoryVectorIndex
+
+        if (
+            self._config.hybrid
+            and lexical is not None
+            and (
+                type(index) is not InMemoryVectorIndex or type(lexical) is not InMemoryLexicalIndex
+            )
+        ):
+            raise ConfigurationError(
+                "hybrid retrieval does not support a separate lexical index for this vector backend"
+            )
 
     async def retrieve(
         self,
@@ -214,6 +231,15 @@ class Retriever:
                 query, context=context, limit=self._config.candidate_k
             )
 
+        # Do not trust a custom index to enforce tenant/role/principal rules.
+        # Backends still need to filter before their own scoring; this second
+        # check prevents a faulty adapter from returning forbidden candidates.
+        vector_hits = [
+            (item, score) for item, score in vector_hits if item.chunk.access.permits(context)
+        ]
+        keyword_hits = [
+            (item, score) for item, score in keyword_hits if item.chunk.access.permits(context)
+        ]
         fused = fuse(vector_hits, keyword_hits, limit=limit)
 
         _LOGGER.info(
@@ -229,6 +255,12 @@ class Retriever:
         return fused
 
 
+def _chunk_key(item: EmbeddedChunk) -> tuple[str, str, str]:
+    """Match the persistent index's tenant/document/chunk identity."""
+    chunk = item.chunk
+    return chunk.access.tenant_id, chunk.document_id, chunk.chunk_id
+
+
 def fuse(
     vector_hits: Sequence[tuple[EmbeddedChunk, float]],
     keyword_hits: Sequence[tuple[EmbeddedChunk, float]],
@@ -241,19 +273,22 @@ def fuse(
     lists accumulates both contributions, which is how agreement between the
     two signals is expressed without needing their scores to be comparable.
     """
-    scores: dict[str, float] = {}
-    vector_scores: dict[str, float] = {}
-    keyword_scores: dict[str, float] = {}
-    items: dict[str, EmbeddedChunk] = {}
+    scores: dict[tuple[str, str, str], float] = {}
+    vector_scores: dict[tuple[str, str, str], float] = {}
+    keyword_scores: dict[tuple[str, str, str], float] = {}
+    items: dict[tuple[str, str, str], EmbeddedChunk] = {}
 
     for rank, (item, score) in enumerate(vector_hits, start=1):
-        key = item.chunk.chunk_id
+        key = _chunk_key(item)
         items[key] = item
         vector_scores[key] = score
         scores[key] = scores.get(key, 0.0) + 1.0 / (RRF_K + rank)
 
     for rank, (item, score) in enumerate(keyword_hits, start=1):
-        key = item.chunk.chunk_id
+        key = _chunk_key(item)
+        prior = items.get(key)
+        if prior is not None and prior.chunk != item.chunk:
+            raise RetrievalError("retrieval indexes disagree on chunk content or access policy")
         items[key] = item
         keyword_scores[key] = score
         scores[key] = scores.get(key, 0.0) + 1.0 / (RRF_K + rank)

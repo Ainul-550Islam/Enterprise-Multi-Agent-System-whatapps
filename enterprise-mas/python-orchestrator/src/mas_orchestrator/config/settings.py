@@ -31,8 +31,10 @@ Loading order (later wins), matching the Rust Core convention:
 
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import Mapping
+from contextlib import suppress
 from pathlib import Path
 from typing import Any, Final
 
@@ -371,28 +373,6 @@ class RagSettings(_Frozen):
     #: Whether security filtering is applied after retrieval as well as before.
     post_retrieval_security_filter: bool = True
 
-    #: Secret reference holding the RAG-plane database URL. Required when
-    #: ``vector_backend`` is ``PGVECTOR``; a plain committed URL is never used,
-    #: because the RAG role's password must not live in configuration.
-    database_url_secret_ref: str | None = Field(default=None, max_length=512)
-
-    #: Dedicated database role the RAG plane must authenticate as. Pinned to
-    #: ``mas_rag`` by :class:`~mas_orchestrator.rag.pgvector_index.PgVectorIndex`;
-    #: exposing it here lets validation name the field that must change rather
-    #: than failing later inside the pool constructor.
-    database_role: str = Field(default="mas_rag", min_length=1, max_length=63)
-
-    #: Embedding model identifier when a provider-backed embedder is used.
-    embedding_model: str = Field(default="text-embedding-3-small", min_length=1, max_length=128)
-
-    #: Secret reference for the embedding provider credential.
-    embedding_api_key_secret_ref: str | None = Field(default=None, max_length=512)
-
-    #: Whether to use the deterministic hashing embedder. Development and test
-    #: only: it captures lexical overlap, not meaning, and is refused in
-    #: production by ``config/validation.py``.
-    use_hashing_embedder: bool = False
-
     @model_validator(mode="after")
     def _chunk_window_sane(self) -> RagSettings:
         """Rejects an overlap that consumes the entire chunk window."""
@@ -405,56 +385,94 @@ class RagSettings(_Frozen):
         return self
 
 
+class DataHubObjectStorageBinding(_Frozen):
+    """Operator-owned binding of one source and destination to secret references."""
+
+    tenant_id: str = Field(min_length=36, max_length=36)
+    organization_id: str = Field(min_length=36, max_length=36)
+    project_id: str = Field(min_length=36, max_length=36)
+    source_id: str = Field(min_length=36, max_length=36)
+    endpoint_url: str = Field(min_length=1, max_length=2048)
+    bucket: str = Field(min_length=3, max_length=63)
+    prefix: str = Field(default="", max_length=2048)
+    region: str = Field(default="us-east-1", min_length=1, max_length=64)
+    access_key_secret_ref: str = Field(min_length=5, max_length=512)
+    secret_key_secret_ref: str = Field(min_length=5, max_length=512)
+
+    @field_validator("tenant_id", "organization_id", "project_id", "source_id")
+    @classmethod
+    def _canonical_id(cls, value: str) -> str:
+        from uuid import UUID
+
+        parsed = UUID(value)
+        if parsed.int == 0 or str(parsed) != value:
+            raise ValueError("binding identifiers must be non-nil canonical UUIDs")
+        return value
+
+    @field_validator("access_key_secret_ref", "secret_key_secret_ref")
+    @classmethod
+    def _reference_only(cls, value: str) -> str:
+        if not value.startswith(("env:", "file:")) or not value.split(":", 1)[1].strip():
+            raise ValueError("binding credentials must use a supported secret reference")
+        return value
+
+
 class DataHubSettings(_Frozen):
-    """Data Hub ingestion limits applied before content reaches the RAG plane.
+    """Bounded source ingestion and dedicated RAG credentials by reference."""
 
-    Every bound here mirrors a Rust-side limit rather than inventing a second
-    policy: Rust has already refused anything larger before signing a bridge
-    request, so a Python limit that was *higher* would be dead code, and one
-    that was lower would reject traffic Rust considers valid. These exist to
-    bound work the Python side does on already-authorized input — an
-    unreachable Rust regression must not turn into unbounded parsing here.
-    """
-
-    #: Source adapters this deployment is allowed to run. Rust's own
-    #: allow-list is authoritative; this is defence in depth, so a source kind
-    #: Rust does not yet authorize cannot be reached by calling Python directly.
-    allowed_source_kinds: frozenset[DataSourceKind] = Field(
-        default_factory=lambda: frozenset(
-            {DataSourceKind.UPLOAD, DataSourceKind.OBJECT_STORAGE, DataSourceKind.WEB}
-        )
+    database_url_secret_ref: str | None = Field(default=None, max_length=512)
+    embedding_api_key_secret_ref: str | None = Field(default=None, max_length=512)
+    embedding_model: str = Field(default="text-embedding-3-small", min_length=1, max_length=128)
+    allowed_source_kinds: tuple[DataSourceKind, ...] = (DataSourceKind.UPLOAD,)
+    allowed_mime_types: tuple[str, ...] = (
+        "text/plain",
+        "text/markdown",
+        "text/html",
+        "text/csv",
+        "application/json",
+        "application/pdf",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     )
-
-    #: MIME types admitted for ingestion. Anything else is refused before the
-    #: parser (the least trusted component) ever sees the bytes.
-    allowed_mime_types: frozenset[str] = Field(
-        default_factory=lambda: frozenset(
-            {
-                "application/pdf",
-                "application/json",
-                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                "text/csv",
-                "text/html",
-                "text/markdown",
-                "text/plain",
-            }
-        )
+    allowed_web_hosts: tuple[str, ...] = ()
+    allowed_object_hosts: tuple[str, ...] = ()
+    object_storage_bindings: tuple[DataHubObjectStorageBinding, ...] = Field(
+        default=(), max_length=10_000
     )
+    max_upload_bytes: int = Field(default=2 * 1024 * 1024, ge=1024, le=8 * 1024 * 1024)
+    max_document_bytes: int = Field(default=2 * 1024 * 1024, ge=1024, le=8 * 1024 * 1024)
+    max_sync_bytes: int = Field(default=16 * 1024 * 1024, ge=1024, le=256 * 1024 * 1024)
+    max_pages_per_sync: int = Field(default=100, ge=1, le=10_000)
+    max_crawl_depth: int = Field(default=2, ge=0, le=10)
 
-    #: Ceiling for a document arriving through Rust-authorized storage.
-    max_upload_bytes: int = Field(default=15 * 1024 * 1024, ge=1, le=64 * 1024 * 1024)
+    @field_validator("object_storage_bindings", mode="before")
+    @classmethod
+    def _parse_object_bindings(cls, value: Any) -> Any:
+        # Nested settings arrive as strings in environment overrides. Accept a
+        # bounded JSON array for immutable operator configuration in containers.
+        if isinstance(value, str):
+            if len(value.encode("utf-8")) > 1024 * 1024:
+                raise ValueError("object storage bindings exceed the configuration byte limit")
+            try:
+                value = json.loads(value)
+            except (ValueError, RecursionError) as error:
+                raise ValueError("object storage bindings must be a JSON array") from error
+        return value
 
-    #: Ceiling for a document fetched from a source adapter (crawl, object
-    #: storage). Deliberately the same bound as an upload: the transport
-    #: differs, the trust level does not.
-    max_document_bytes: int = Field(default=15 * 1024 * 1024, ge=1, le=64 * 1024 * 1024)
-
-    #: Maximum documents admitted by a single synchronization, which bounds
-    #: both the work and the size of the reply Rust has to hold.
-    max_pages_per_sync: int = Field(default=500, ge=1, le=10_000)
-
-    #: Maximum total bytes admitted by a single synchronization.
-    max_sync_bytes: int = Field(default=64 * 1024 * 1024, ge=1, le=1024 * 1024 * 1024)
+    @model_validator(mode="after")
+    def _consistent_bounds(self) -> DataHubSettings:
+        if (
+            self.max_upload_bytes > self.max_document_bytes
+            or self.max_sync_bytes < self.max_document_bytes
+        ):
+            raise ValueError("data hub byte bounds are inconsistent")
+        if DataSourceKind.WEB in self.allowed_source_kinds and not self.allowed_web_hosts:
+            raise ValueError("web source requires an egress host allowlist")
+        if (
+            DataSourceKind.OBJECT_STORAGE in self.allowed_source_kinds
+            and not self.allowed_object_hosts
+        ):
+            raise ValueError("object storage requires an egress host allowlist")
+        return self
 
 
 class GuardrailSettings(_Frozen):
@@ -588,6 +606,10 @@ class SecuritySettings(_Frozen):
     #: identity.
     internal_service_secret_ref: str | None = Field(default=None, max_length=256)
 
+    #: Secret reference to the PostgreSQL DSN used for shared replay receipts.
+    #: The runtime role must have insert-only access to the receipt table.
+    internal_replay_database_url_ref: str | None = Field(default=None, max_length=256)
+
     #: Service ids permitted to call this process, in addition to the
     #: built-in default. A syntactically perfect signature from a service
     #: that is not on the allowlist is still a refusal.
@@ -660,7 +682,9 @@ def _read_toml(path: Path) -> Mapping[str, Any]:
         return tomllib.load(handle)
 
 
-def _env_overrides(prefix: str = ENV_PREFIX) -> Mapping[str, Any]:
+def _env_overrides(
+    prefix: str = ENV_PREFIX, *, secret_names: frozenset[str] = frozenset()
+) -> Mapping[str, Any]:
     """Builds a nested override mapping from prefixed environment variables.
 
     ``MAS_ORCH_RUST_CORE__ENDPOINT=host:500`` becomes
@@ -676,7 +700,11 @@ def _env_overrides(prefix: str = ENV_PREFIX) -> Mapping[str, Any]:
     """
     overrides: dict[str, Any] = {}
     for raw_key, raw_value in os.environ.items():
-        if not raw_key.startswith(prefix):
+        if (
+            not raw_key.startswith(prefix)
+            or raw_key.startswith("MAS_ORCH_SECRET_")
+            or raw_key in secret_names
+        ):
             continue
         parts = raw_key[len(prefix) :].lower().split("__")
         cursor: dict[str, Any] = overrides
@@ -696,6 +724,31 @@ def _env_overrides(prefix: str = ENV_PREFIX) -> Mapping[str, Any]:
         if leaf:
             cursor[leaf] = raw_value
     return overrides
+
+
+def _configured_secret_env_names(value: Any) -> frozenset[str]:
+    """Extract env references from operator config without resolving or logging them."""
+    found: set[str] = set()
+
+    def visit(item: Any, field: str = "") -> None:
+        if isinstance(item, Mapping):
+            for key, child in item.items():
+                visit(child, str(key).lower())
+        elif isinstance(item, (list, tuple)):
+            for child in item:
+                visit(child, field)
+        elif isinstance(item, str):
+            if field.endswith("_ref") and item.startswith("env:"):
+                name = item[4:].strip()
+                if name:
+                    found.add(name)
+            elif field == "object_storage_bindings" and len(item) <= 1024 * 1024:
+                # Field validation reports malformed configuration.
+                with suppress(ValueError, RecursionError):
+                    visit(json.loads(item))
+
+    visit(value)
+    return frozenset(found)
 
 
 def _deep_merge(base: Mapping[str, Any], overlay: Mapping[str, Any]) -> dict[str, Any]:
@@ -771,7 +824,33 @@ def load_settings(
         if overlay_file is not None:
             merged = _deep_merge(merged, _read_toml(overlay_file))
 
-    merged = _deep_merge(merged, _env_overrides())
+    # Resolve which env vars are secret values from the layered *references*
+    # before parsing env overrides. Otherwise e.g. MAS_ORCH_BRIDGE_TOKEN is
+    # mistaken for an unknown setting, and Pydantic errors can echo its value.
+    raw_reference_fields = [
+        {key.rsplit("__", 1)[-1].lower(): value}
+        for key, value in os.environ.items()
+        if key.startswith(ENV_PREFIX)
+    ]
+    # Include references from every layer, including superseded settings:
+    # an old injected secret may still exist in the environment after a config
+    # override and must never be validated or rendered as a setting value.
+    secret_names = (
+        _configured_secret_env_names(merged)
+        | _configured_secret_env_names(raw_reference_fields)
+        | _configured_secret_env_names(overrides or {})
+    )
+    if any(
+        name.startswith(ENV_PREFIX)
+        and not name.startswith("MAS_ORCH_SECRET_")
+        and (
+            "__" in name[len(ENV_PREFIX) :]
+            or name[len(ENV_PREFIX) :].lower() in Settings.model_fields
+        )
+        for name in secret_names
+    ):
+        raise ValueError("secret environment name overlaps the settings namespace")
+    merged = _deep_merge(merged, _env_overrides(secret_names=secret_names))
     if overrides:
         merged = _deep_merge(merged, overrides)
 

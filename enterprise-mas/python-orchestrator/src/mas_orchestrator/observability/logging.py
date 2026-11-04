@@ -26,7 +26,7 @@ import json
 import logging as _logging
 import sys
 from dataclasses import dataclass
-from typing import Any, Final
+from typing import Any, Final, cast
 
 # --- correlation context ----------------------------------------------------
 
@@ -101,20 +101,58 @@ class RedactingFilter(_logging.Filter):
         if not self._enabled:
             return True
 
-        from mas_orchestrator.security.redaction import redact_text, redact_value
+        from mas_orchestrator.security.redaction import (
+            REDACTED,
+            is_sensitive_key,
+            redact_text,
+            redact_value,
+        )
 
-        record.msg = redact_text(str(record.msg))
-        if record.args:
-            if isinstance(record.args, dict):
-                record.args = dict(redact_value(dict(record.args)))
-            else:
-                record.args = tuple(redact_value(arg) for arg in record.args)
+        try:
+            record.msg = (
+                redact_text(record.msg)
+                if isinstance(record.msg, str)
+                else f"<redacted:{type(record.msg).__name__}>"
+            )
+            if record.args:
+                if isinstance(record.args, dict):
+                    record.args = dict(redact_value(dict(record.args)))
+                else:
+                    record.args = tuple(redact_value(arg) for arg in record.args)
 
-        for key, value in list(record.__dict__.items()):
-            if key.startswith("_") or key in _LOGGING_RESERVED:
-                continue
-            if isinstance(value, str):
-                record.__dict__[key] = redact_text(value)
+            fields = cast("dict[object, Any]", record.__dict__)
+            for key, value in list(fields.items()):
+                if not isinstance(key, str):
+                    del fields[key]
+                    continue
+                if key.startswith("_") or key in _LOGGING_RESERVED:
+                    continue
+                record.__dict__[key] = REDACTED if is_sensitive_key(key) else redact_value(value)
+
+            # Traceback/exception/stack text can embed arbitrary provider payloads,
+            # short passwords, validation inputs or custom object reprs that no
+            # pattern-based redactor can reliably recognize. Preserve the fact an
+            # exception happened, not its potentially secret-bearing text.
+            if record.exc_info or record.exc_text:
+                record.exc_info = None
+                record.exc_text = "<exception details redacted>"
+            if record.stack_info:
+                record.stack_info = "<stack details redacted>"
+        except Exception:
+            # Logging must not emit the original record if a custom object or
+            # mapping breaks redaction. Keep only non-sensitive log metadata.
+            record.msg = REDACTED
+            record.args = ()
+            record.exc_info = None
+            record.exc_text = "<exception details redacted>"
+            record.stack_info = None
+            fields = cast("dict[object, Any]", record.__dict__)
+            for key in list(fields):
+                if not isinstance(key, str):
+                    del fields[key]
+                    continue
+                if not key.startswith("_") and key not in _LOGGING_RESERVED:
+                    record.__dict__[key] = REDACTED
         return True
 
 
@@ -181,6 +219,10 @@ class JsonFormatter(_logging.Formatter):
 
         if record.exc_info:
             payload["exception"] = self.formatException(record.exc_info)
+        elif record.exc_text:
+            payload["exception"] = record.exc_text
+        if record.stack_info:
+            payload["stack"] = self.formatStack(record.stack_info)
         return json.dumps(payload, default=repr, ensure_ascii=False)
 
 

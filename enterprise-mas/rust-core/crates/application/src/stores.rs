@@ -262,6 +262,8 @@ pub trait DataSourceStorePort: std::fmt::Debug + Send + Sync {
 
 #[async_trait]
 pub trait DocumentStorePort: std::fmt::Debug + Send + Sync {
+    /// Saves metadata without allowing a stale writer to revive a tombstone.
+    /// Repeated saves of a deleted document are permitted for purge retries.
     async fn save(&self, document: &Document) -> Result<()>;
     async fn get(&self, id: DocumentId) -> Result<Option<Document>>;
     async fn list(&self, tenant: TenantId, source: DataSourceId) -> Result<Vec<Document>>;
@@ -1709,11 +1711,17 @@ impl DataSourceStorePort for InMemoryServices {
 #[async_trait]
 impl DocumentStorePort for InMemoryServices {
     async fn save(&self, document: &Document) -> Result<()> {
-        self.state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .documents
-            .insert(document.id, document.clone());
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.documents.get(&document.id).is_some_and(|existing| {
+            existing.status == mas_domain::DocumentStatus::Deleted
+                && document.status != mas_domain::DocumentStatus::Deleted
+        }) {
+            return Err(mas_common::error::AppError::not_found(
+                "document",
+                document.id.to_string(),
+            ));
+        }
+        state.documents.insert(document.id, document.clone());
         Ok(())
     }
 

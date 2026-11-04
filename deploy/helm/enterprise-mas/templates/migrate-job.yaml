@@ -9,10 +9,6 @@ metadata:
     "helm.sh/hook-weight": "1"
     "helm.sh/hook-delete-policy": hook-succeeded
 spec:
-  # Hard ceiling on one migration attempt. A hook that never returns blocks the
-  # release and holds a cluster-wide schema advisory lock meanwhile.
-  activeDeadlineSeconds: {{ .Values.migrate.activeDeadlineSeconds }}
-  backoffLimit: {{ .Values.migrate.backoffLimit }}
   template:
     metadata:
       labels:
@@ -21,21 +17,12 @@ spec:
     spec:
       restartPolicy: Never
       securityContext:
-        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+        {{- toYaml .Values.securityContext | nindent 8 }}
       containers:
         - name: migrate
           image: "{{ .Values.image.registry }}/{{ .Values.image.repository }}-{{ .Values.migrate.image }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          securityContext:
-            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
           command: ["/usr/local/bin/mas_migrate", "up"]
-          # A finite Job has no long-running liveness signal, but an unbounded
-          # migration can wedge the whole release: `activeDeadlineSeconds` makes
-          # the Job fail (and therefore the hook fail) instead of hanging an
-          # install forever. Resource requests keep it from starving the API
-          # pods it runs beside.
-          resources:
-            {{- toYaml .Values.migrate.resources | nindent 12 }}
           env:
             - name: DATABASE_URL
               valueFrom:

@@ -42,7 +42,7 @@ use mas_common::result::Result;
 use mas_domain::value_objects::SafeUrl;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use url::Url;
 
 /// Default maximum redirect hops a guarded request may follow.
@@ -318,6 +318,20 @@ fn host_matches(host: &str, configured: &str) -> bool {
     }
 }
 
+// Never route through a recognized IPv4-in-IPv6 translator or tunnel, even
+// for internal endpoints: its embedded destination can be cloud metadata.
+// Operator-specific translation prefixes still require network egress controls.
+fn ipv6_is_translation(ip: &Ipv6Addr) -> bool {
+    let s = ip.segments();
+    ip.to_ipv4_mapped().is_some()
+        || s[..6] == [0; 6] // IPv4-compatible /96
+        || (s[..4] == [0, 0, 0, 0] && s[4] == 0xffff && s[5] == 0)
+        || (s[..6] == [0x0064, 0xff9b, 0, 0, 0, 0]) // well-known NAT64 /96
+        || (s[..3] == [0x0064, 0xff9b, 1]) // local-use NAT64 /48
+        || (s[0] == 0x2001 && s[1] == 0) // Teredo /32
+        || s[0] == 0x2002 // 6to4 /16
+}
+
 /// Whether an address is a link-local or cloud-metadata address.
 ///
 /// Never reachable, not even from an operator-declared internal endpoint:
@@ -335,10 +349,7 @@ pub fn is_metadata_or_link_local(addr: &IpAddr) -> bool {
                 || ip.is_multicast()
         },
         IpAddr::V6(ip) => {
-            // IPv4-mapped IPv6 is never a supported egress address. Treating
-            // a mapped public address as a separate class from IPv4 lets
-            // callers sidestep literal and DNS range policy.
-            if ip.to_ipv4_mapped().is_some() {
+            if ipv6_is_translation(ip) {
                 return true;
             }
             ip.is_unspecified()
@@ -358,9 +369,7 @@ pub fn is_publicly_routable(addr: &IpAddr) -> bool {
     match addr {
         IpAddr::V4(ip) => ipv4_is_public(ip),
         IpAddr::V6(ip) => {
-            // Never permit IPv4-mapped IPv6 through the IPv6 code path. The
-            // direct-literal guard and the DNS gate must agree on this class.
-            if ip.to_ipv4_mapped().is_some() {
+            if ipv6_is_translation(ip) {
                 return false;
             }
             let segments = ip.segments();
@@ -372,6 +381,7 @@ pub fn is_publicly_routable(addr: &IpAddr) -> bool {
                 || segments[..6].iter().all(|segment| *segment == 0)
                 || (segments[0] & 0xfe00) == 0xfc00 // fc00::/7 unique-local
                 || (segments[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
+                || (segments[0] & 0xffc0) == 0xfec0 // fec0::/10 deprecated site-local
                 || (segments[0] == 0x2001 && segments[1] == 0x0db8)) // documentation
         },
     }
@@ -388,6 +398,8 @@ fn ipv4_is_public(ip: &Ipv4Addr) -> bool {
         || ip.octets()[0] == 0
         // CGNAT 100.64.0.0/10
         || (ip.octets()[0] == 100 && (ip.octets()[1] & 0xC0) == 64)
+        // IETF protocol assignments 192.0.0.0/24, conservatively blocked.
+        || (ip.octets()[0..3] == [192, 0, 0])
         // benchmarking 198.18.0.0/15
         || (ip.octets()[0] == 198 && (ip.octets()[1] == 18 || ip.octets()[1] == 19))
         // reserved + broadcast space 240.0.0.0/4

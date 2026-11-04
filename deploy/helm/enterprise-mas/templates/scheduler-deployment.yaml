@@ -18,13 +18,11 @@ spec:
         component: scheduler
     spec:
       securityContext:
-        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+        {{- toYaml .Values.securityContext | nindent 8 }}
       containers:
         - name: scheduler
           image: "{{ .Values.image.registry }}/{{ .Values.image.repository }}-{{ .Values.scheduler.image }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          securityContext:
-            {{- toYaml .Values.containerSecurityContext | nindent 14 }}
           env:
             - name: MAS_ENV
               value: "production"
@@ -37,20 +35,6 @@ spec:
           envFrom:
             - secretRef:
                 name: {{ .Values.postgres.existingSecret }}
-          livenessProbe:
-            exec:
-              command: ["pgrep", "-x", "mas-scheduler"]
-            initialDelaySeconds: 20
-            periodSeconds: 15
-            timeoutSeconds: 5
-            failureThreshold: 3
-          readinessProbe:
-            exec:
-              command: ["pgrep", "-x", "mas-scheduler"]
-            initialDelaySeconds: 10
-            periodSeconds: 10
-            timeoutSeconds: 5
-            failureThreshold: 3
           resources:
             {{- toYaml .Values.scheduler.resources | nindent 12 }}
       {{- with .Values.imagePullSecrets }}

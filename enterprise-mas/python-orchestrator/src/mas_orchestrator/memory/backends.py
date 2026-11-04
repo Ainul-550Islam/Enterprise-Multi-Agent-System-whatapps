@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Final, Protocol, runtime_checkable
 
 from mas_orchestrator.config.enums import Environment
 from mas_orchestrator.contracts.errors import ConfigurationError
-from mas_orchestrator.memory.models import MemoryHit, MemoryQuery, MemoryRecord
+from mas_orchestrator.memory.models import MemoryHit, MemoryQuery, MemoryRecord, MemoryScope
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -25,6 +25,7 @@ if TYPE_CHECKING:
 _LOGGER: Final[logging.Logger] = logging.getLogger(__name__)
 
 MAX_RECORDS_PER_TENANT: Final[int] = 10_000
+MAX_CLOSED_EXECUTIONS: Final[int] = 100_000
 
 
 @runtime_checkable
@@ -33,6 +34,10 @@ class MemoryStore(Protocol):
 
     async def put(self, record: MemoryRecord) -> None:
         """Stores a record, overwriting any record with the same id."""
+        ...
+
+    async def create(self, record: MemoryRecord) -> bool:
+        """Atomically insert only if the tenant/id does not exist."""
         ...
 
     async def get(
@@ -49,6 +54,16 @@ class MemoryStore(Protocol):
 
     async def delete(self, tenant_id: str, record_id: str) -> bool:
         """Deletes a record. Returns whether it existed."""
+        ...
+
+    async def delete_visible(
+        self, tenant_id: str, record_id: str, *, execution_id: str, agent_id: str
+    ) -> bool:
+        """Atomically delete only a record visible to this execution."""
+        ...
+
+    async def close_execution(self, tenant_id: str, execution_id: str) -> int:
+        """Atomically fence task writes and delete every task record for a run."""
         ...
 
     async def purge_tenant(self, tenant_id: str) -> int:
@@ -76,6 +91,7 @@ class InProcessMemoryStore:
             )
         self._environment = environment
         self._records: dict[tuple[str, str], MemoryRecord] = {}
+        self._closed_executions: set[tuple[str, str]] = set()
 
     async def put(self, record: MemoryRecord) -> None:
         """Stores a record."""
@@ -87,9 +103,27 @@ class InProcessMemoryStore:
             )
         self._records[key] = record
 
+    async def create(self, record: MemoryRecord) -> bool:
+        """Atomically create without replacing another execution's record."""
+        key = (record.tenant_id, record.record_id)
+        if record.scope is MemoryScope.TASK and (
+            not record.execution_id
+            or (record.tenant_id, record.execution_id) in self._closed_executions
+        ):
+            raise ConfigurationError("task memory execution is closed or missing")
+        if key in self._records:
+            return False
+        if len(self._records) >= MAX_RECORDS_PER_TENANT:
+            raise ConfigurationError(
+                "in-process memory store is full", details={"limit": MAX_RECORDS_PER_TENANT}
+            )
+        self._records[key] = record
+        return True
+
     async def get(self, tenant_id: str, record_id: str) -> MemoryRecord | None:
         """Returns a record scoped to the tenant."""
-        return self._records.get((tenant_id, record_id))
+        record = self._records.get((tenant_id, record_id))
+        return None if record is not None and record.is_expired() else record
 
     async def query(self, query: MemoryQuery) -> list[MemoryHit]:
         """Searches records for one tenant.
@@ -104,7 +138,7 @@ class InProcessMemoryStore:
         for (owner, _), record in self._records.items():
             if owner != query.tenant_id:
                 continue
-            if record.scope not in query.scopes:
+            if record.is_expired() or record.scope not in query.scopes:
                 continue
             if query.agent_id is not None and record.agent_id != query.agent_id:
                 continue
@@ -126,6 +160,43 @@ class InProcessMemoryStore:
     async def delete(self, tenant_id: str, record_id: str) -> bool:
         """Deletes a record."""
         return self._records.pop((tenant_id, record_id), None) is not None
+
+    async def delete_visible(
+        self, tenant_id: str, record_id: str, *, execution_id: str, agent_id: str
+    ) -> bool:
+        """Check and delete without a read/delete race."""
+        key = (tenant_id, record_id)
+        record = self._records.get(key)
+        if record is None:
+            return False
+        if record.scope is MemoryScope.TASK and record.execution_id != execution_id:
+            return False
+        if record.scope is MemoryScope.EPISODIC and record.agent_id != agent_id:
+            return False
+        del self._records[key]
+        return True
+
+    async def close_execution(self, tenant_id: str, execution_id: str) -> int:
+        """Fence new task writes and remove the complete working set atomically."""
+        if not tenant_id.strip() or not execution_id.strip():
+            raise ConfigurationError("execution cleanup requires a concrete scope")
+        scope = (tenant_id, execution_id)
+        if (
+            scope not in self._closed_executions
+            and len(self._closed_executions) >= MAX_CLOSED_EXECUTIONS
+        ):
+            raise ConfigurationError("in-process closed execution fence is full")
+        self._closed_executions.add(scope)
+        doomed = [
+            key
+            for key, record in self._records.items()
+            if record.tenant_id == tenant_id
+            and record.scope is MemoryScope.TASK
+            and record.execution_id == execution_id
+        ]
+        for key in doomed:
+            del self._records[key]
+        return len(doomed)
 
     async def purge_tenant(self, tenant_id: str) -> int:
         """Deletes all records for a tenant."""

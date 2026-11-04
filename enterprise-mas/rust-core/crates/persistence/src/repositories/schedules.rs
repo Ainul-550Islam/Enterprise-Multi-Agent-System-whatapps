@@ -332,7 +332,7 @@ impl ScheduleStore {
     /// See [`Self::save_in`].
     pub async fn save(&self, schedule: &Schedule) -> Result<()> {
         let mut scoped = crate::scoped_request::connection().await?;
-        Self::save_in(scoped.connection().as_mut(), schedule).await
+        Self::save_in(scoped.connection(), schedule).await
     }
 
     /// Loads one schedule by primary key.
@@ -341,7 +341,7 @@ impl ScheduleStore {
     /// See [`Self::get_in`].
     pub async fn get(&self, id: ScheduleId) -> Result<Option<Schedule>> {
         let mut scoped = crate::scoped_request::connection().await?;
-        Self::get_in(scoped.connection().as_mut(), id).await
+        Self::get_in(scoped.connection(), id).await
     }
 
     /// Lists schedules in a tenant (name order).
@@ -350,7 +350,7 @@ impl ScheduleStore {
     /// See [`Self::list_in`].
     pub async fn list(&self, tenant: TenantId) -> Result<Vec<Schedule>> {
         let mut scoped = crate::scoped_request::connection().await?;
-        Self::list_in(scoped.connection().as_mut(), tenant).await
+        Self::list_in(scoped.connection(), tenant).await
     }
 
     /// Due-scan inside the request's scope.
@@ -363,7 +363,7 @@ impl ScheduleStore {
     /// See [`Self::list_due_in`].
     pub async fn list_due(&self, now: &Timestamp, limit: usize) -> Result<Vec<Schedule>> {
         let mut scoped = crate::scoped_request::connection().await?;
-        Self::list_due_in(scoped.connection().as_mut(), now, limit).await
+        Self::list_due_in(scoped.connection(), now, limit).await
     }
 
     /// Journals a planned tick.
@@ -372,7 +372,7 @@ impl ScheduleStore {
     /// See [`Self::record_run_in`].
     pub async fn record_run(&self, schedule_id: ScheduleId, planned_at: Timestamp) -> Result<bool> {
         let mut scoped = crate::scoped_request::connection().await?;
-        Self::record_run_in(scoped.connection().as_mut(), schedule_id, planned_at).await
+        Self::record_run_in(scoped.connection(), schedule_id, planned_at).await
     }
 }
 

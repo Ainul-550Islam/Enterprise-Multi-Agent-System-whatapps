@@ -152,6 +152,8 @@ pub async fn authenticated_layer(
     if claims.tenant.is_none()
         && claims.organization.is_none()
         && claims.project.is_none()
+        && principal.tenant_id.is_none()
+        && principal.organization_id.is_none()
         && principal.is_usable()
         && principal.scopes.permits("platform:admin")
     {

@@ -170,13 +170,10 @@ impl TenantResolver {
         let Some(principal) = principal else {
             return Ok(MembershipView::empty());
         };
-        if matches!(
-            principal.kind,
-            mas_security::PrincipalKind::System | mas_security::PrincipalKind::Token
-        ) {
-            // System and token principals do not carry memberships here; the
-            // token's own claims scope the action, the system identity is
-            // break-glass by design.
+        if principal.kind == mas_security::PrincipalKind::System {
+            // The system identity is break-glass and has no membership role.
+            // Credential-bound tokens, like API keys, must retain their own
+            // proven role through the normal credential branch below.
             return Ok(MembershipView::empty());
         }
         // A credential-bound principal (API key, service identity) carries its
@@ -197,9 +194,15 @@ impl TenantResolver {
             }
         }
 
-        // A membership-bound human principal additionally contributes every
-        // active grant the directory holds.
-        let Ok(user_id) = UserId::from_str(&principal.actor_id) else {
+        // Only human principals may derive authority from user membership
+        // rows. Credential identifiers can also be UUIDs, but must never gain
+        // a user's roles merely because their opaque IDs happen to collide.
+        let user_id = if principal.kind == mas_security::PrincipalKind::User {
+            UserId::from_str(&principal.actor_id).ok()
+        } else {
+            None
+        };
+        let Some(user_id) = user_id else {
             let highest_role = effective_roles
                 .iter()
                 .copied()

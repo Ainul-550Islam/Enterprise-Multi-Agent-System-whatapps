@@ -18,6 +18,7 @@ from mas_orchestrator.contracts.errors import ConfigurationError, RetrievalError
 from mas_orchestrator.rag.chunking import Chunker, ChunkingConfig
 from mas_orchestrator.rag.models import (
     Chunk,
+    DataHubOwnership,
     DocumentFormat,
     EmbeddedChunk,
     IngestResult,
@@ -54,6 +55,8 @@ class IngestConfig:
     batch_size: int = DEFAULT_BATCH_SIZE
     chunking: ChunkingConfig | None = None
     index_lexically: bool = True
+    #: Commit complete documents atomically; requires a supporting vector index.
+    atomic_document_replace: bool = False
     #: Isolated parser child-process concurrency for untrusted rich documents.
     parser_workers: int = 2
     #: Wall-clock limit for one parser child.
@@ -90,6 +93,13 @@ class IngestionPipeline:
         self._lexical = lexical
         self._parser = parser or Parser()
         self._config = config or IngestConfig()
+        if self._config.atomic_document_replace:
+            if not callable(getattr(index, "replace_document", None)):
+                raise ConfigurationError("atomic ingestion requires document replacement support")
+            if self._config.index_lexically and lexical is not None:
+                raise ConfigurationError(
+                    "atomic ingestion does not support a separate lexical index"
+                )
         # A custom parser is generally a deterministic test double. Production
         # construction leaves `parser` unset and therefore uses the isolated
         # pool for all untrusted parser implementations.
@@ -104,6 +114,11 @@ class IngestionPipeline:
             )
         self._chunker = chunker or Chunker(self._config.chunking)
 
+    @property
+    def atomic_document_replace(self) -> bool:
+        """Whether failed embedding leaves the previous document untouched."""
+        return self._config.atomic_document_replace
+
     async def aclose(self) -> None:
         """Closes the isolated parser facade before the service shuts down."""
         if self._parser_pool is not None:
@@ -114,6 +129,7 @@ class IngestionPipeline:
         document: SourceDocument,
         *,
         format: DocumentFormat | None = None,  # noqa: A002
+        data_hub_owner: DataHubOwnership | None = None,
     ) -> IngestResult:
         """Ingests one document.
 
@@ -129,6 +145,11 @@ class IngestionPipeline:
                 are reported in the result rather than raised, so one bad
                 document does not abort a batch.
         """
+        if data_hub_owner is not None:
+            begin = getattr(self._index, "begin_data_hub_ingest", None)
+            if not self._config.atomic_document_replace or not callable(begin):
+                raise ConfigurationError("Data Hub ingestion requires a fenced atomic index")
+            await begin(document.access.tenant_id, document.document_id, data_hub_owner)
         detected = detect_format(document.content, declared=format or document.format)
 
         try:
@@ -156,7 +177,16 @@ class IngestionPipeline:
                 skipped_reason="document produced no chunks",
             )
 
+        if self._config.atomic_document_replace:
+            from mas_orchestrator.rag.pgvector_index import MAX_DOCUMENT_CHUNKS
+
+            if len(chunks) > MAX_DOCUMENT_CHUNKS:
+                raise RetrievalError(
+                    "document exceeds the atomic indexing chunk limit",
+                    details={"limit": MAX_DOCUMENT_CHUNKS, "received": len(chunks)},
+                )
         embedded_count = 0
+        pending: list[EmbeddedChunk] = []
         for batch in _batched(chunks, self._config.batch_size):
             try:
                 vectors = await self._embedder.embed([chunk.text for chunk in batch])
@@ -187,10 +217,22 @@ class IngestionPipeline:
                 EmbeddedChunk(chunk=chunk, vector=vector, model=self._embedder.model)
                 for chunk, vector in zip(batch, vectors, strict=True)
             ]
-            await self._index.upsert(items)
-            if self._config.index_lexically and self._lexical is not None:
-                await self._lexical.upsert(items)
+            if self._config.atomic_document_replace:
+                pending.extend(items)
+            else:
+                await self._index.upsert(items)
+                if self._config.index_lexically and self._lexical is not None:
+                    await self._lexical.upsert(items)
             embedded_count += len(items)
+
+        if self._config.atomic_document_replace and embedded_count == len(chunks):
+            replace_document = getattr(self._index, "replace_document", None)
+            if not callable(replace_document):
+                raise ConfigurationError("atomic ingestion requires document replacement support")
+            if data_hub_owner is None:
+                await replace_document(pending)
+            else:
+                await replace_document(pending, owner=data_hub_owner)
 
         _LOGGER.info(
             "document ingested",

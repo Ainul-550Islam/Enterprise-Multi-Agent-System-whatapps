@@ -94,10 +94,8 @@ graph TD
 
 ```bash
 # 1. Compose (Postgres/pgvector + NATS + migrate + api + worker + scheduler + orchestrator)
-# `docker compose` reads .env from the compose file's own directory, not the
-# repo root — copy it next to the compose file or your values are ignored.
-cp deploy/compose/.env.example deploy/compose/.env   # fill secrets; never commit
-docker compose -f deploy/compose/docker-compose.yml up -d --build
+cp deploy/compose/.env.example .env   # fill operator secrets; never commit .env
+docker compose -f deploy/compose/docker-compose.yml up -d
 
 # 2. Verify
 curl -s http://127.0.0.1:8080/v1/health/live
@@ -106,12 +104,12 @@ curl -s -H "Authorization: Bearer dev-token" http://127.0.0.1:8080/v1/auth/me
 # 3. Rust checks (from enterprise-mas/rust-core)
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --locked        # 1149 passed, 0 failed
+cargo test --workspace --locked        # 1148 passed, 0 failed
 cargo deny check
 
 # 4. Python checks (from enterprise-mas/python-orchestrator)
 bash scripts/bootstrap.sh
-bash scripts/check.sh                  # 2002 passed, 2 skipped, 0 failed
+bash scripts/check.sh                  # 2003 passed, 2 skipped, 0 failed
 ```
 
 ## Repo map
@@ -151,43 +149,15 @@ bash scripts/check.sh                  # 2002 passed, 2 skipped, 0 failed
 
 ## Verified test counts (from ci-evidence logs)
 
-`AUDIT_EVIDENCE.md` indexes every command below together with the toolchain it
-was run on, the security findings that were fixed rather than suppressed, and
-the reproducible command list.
-
 | Command | Result |
 |---------|--------|
 | `cargo fmt --all -- --check` | PASS |
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | PASS |
-| `cargo test --workspace --locked` | 1149 passed, 0 failed |
-| `cargo test --workspace --locked --features nats` | 1149 passed, 0 failed |
+| `cargo test --workspace --locked` | 1148 passed, 0 failed |
+| `cargo test --workspace --locked --features nats` | 1148 passed, 0 failed |
 | `cargo test -p mas-ai-bridge --test e2e_python -- --ignored` | 12 passed, 0 failed |
-| `cargo deny check` | PASS (advisories, bans, licenses, sources) |
-| `python-orchestrator/scripts/check.sh` | 2002 passed, 2 skipped, 0 failed |
-| `helm lint deploy/helm/enterprise-mas` | PASS (0 failed) |
-| `helm template` (default values) | 16 resources render, 0 problems |
-| `helm template --set hpa.enabled=true --set ingress.enabled=true` | 19 resources render, 0 problems |
-| `docker compose config` | all 7 services parse |
-
-### Deployment artifacts, verified rather than asserted
-
-`helm lint` and `helm template` are executed against the real chart in
-`deploy/helm/enterprise-mas`: the rendered manifests are parsed as YAML, and
-every Deployment/Job is checked for a valid split of pod-level and
-container-level `securityContext`, resource limits on each container, and a
-liveness/readiness probe per Deployment. Run it yourself with:
-
-```bash
-helm lint deploy/helm/enterprise-mas
-helm template enterprise-mas deploy/helm/enterprise-mas \
-  --set hpa.enabled=true --set ingress.enabled=true
-```
-
-The chart as published originally could not be installed at all: `_helpers.tpl`
-had four actions closed with a single `}` instead of `}}`, and the
-`securityContext` values placed `readOnlyRootFilesystem`,
-`allowPrivilegeEscalation` and `capabilities` at *pod* level, where the
-Kubernetes API rejects them. Both are fixed and the chart now lints clean.
+| `cargo deny check` | PASS |
+| `python-orchestrator/scripts/check.sh` | 2003 passed, 2 skipped, 0 failed |
 
 Live-PostgreSQL / NATS-dependent suites and the compose smoke test could not
 run in this environment (no postgres/pgvector, nats-server, or docker daemon;

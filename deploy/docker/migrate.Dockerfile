@@ -1,17 +1,14 @@
 # Dockerfile — mas-migrate (one-shot migration runner)
-#
-# Builds the `mas_migrate` example from `mas-persistence` (which is why the
-# builder copies the whole workspace below: `mas-persistence` is a member of the
-# workspace, so Cargo must be able to load every member manifest even when only
-# one package is compiled).
 FROM rust:1.98.1-bookworm AS builder
 WORKDIR /build
 RUN apt-get update && apt-get install -y --no-install-recommends \
       libpq-dev pkg-config ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY enterprise-mas/rust-core/Cargo.toml enterprise-mas/rust-core/Cargo.lock ./
-COPY enterprise-mas/rust-core/crates ./crates
-COPY enterprise-mas/rust-core/benches ./benches
+COPY enterprise-mas/rust-core/crates/persistence ./crates/persistence
+COPY enterprise-mas/rust-core/crates/common ./crates/common
+COPY enterprise-mas/rust-core/crates/domain ./crates/domain
+COPY enterprise-mas/rust-core/crates/contracts ./crates/contracts
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
     cargo build -p mas-persistence --locked --release --example mas_migrate
