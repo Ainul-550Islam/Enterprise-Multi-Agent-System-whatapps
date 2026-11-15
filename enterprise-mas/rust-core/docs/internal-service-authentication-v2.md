@@ -17,7 +17,7 @@ The HMAC input, encoded as ASCII, is:
 v2:<service>:<unix-millis>:<nonce>:<sha256-hex-of-exact-body-bytes>
 ```
 
-`nonce` is a fresh 24-byte URL-safe random value without padding. Receivers reject v1; there is no downgrade compatibility path. A receiver verifies the body MAC, caller allowlist, and sixty-second symmetric clock window, then atomically inserts `(service_name, nonce)` into `internal_request_receipts` before parsing or performing work. Duplicate insertions, missing secrets, and malformed signatures are unauthenticated failures. Unavailable receipt storage fails closed without dispatching work; the Python bridge reports a configuration/internal error.
+`nonce` is a fresh 24-byte URL-safe random value without padding. Receivers reject v1; there is no downgrade compatibility path. A receiver verifies the body MAC, caller allowlist, and sixty-second symmetric clock window, then atomically inserts `(service_name, nonce)` into `internal_request_receipts` before parsing or performing work. Duplicate insertions, unavailable receipt storage, missing secrets, and malformed signatures are all unauthenticated failures.
 
 The Rust and Python implementations share this deterministic vector for cross-language verification:
 
@@ -41,8 +41,8 @@ Configure both secret references in the `security` block:
 
 ```toml
 [security]
-internal_service_secret_ref = "env:MAS_INTERNAL_SERVICE_SECRET"
-internal_replay_database_url_ref = "env:MAS_INTERNAL_REPLAY_DATABASE_URL"
+internal_service_secret_ref = "env://MAS_INTERNAL_SERVICE_SECRET"
+internal_replay_database_url_secret_ref = "env://MAS_INTERNAL_REPLAY_DATABASE_URL"
 ```
 
 `MAS_INTERNAL_REPLAY_DATABASE_URL` must resolve to a PostgreSQL DSN for a role with `INSERT` on `internal_request_receipts`. Production validation rejects a missing reference. The Python gRPC bridge uses `PostgresReplayGuard`; its in-memory guard exists only for tests and explicitly non-production composition.

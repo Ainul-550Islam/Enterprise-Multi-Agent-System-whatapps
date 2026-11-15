@@ -1,0 +1,22 @@
+{
+  "name": "mas-sdk-ts",
+  "version": "0.1.0",
+  "description": "mas SDK for TypeScript",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "axios": "^1.7.2",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.2",
+    "tsup": "^8.2.0",
+    "vitest": "^1.6.0",
+    "@types/node": "^20.14.2"
+  }
+}

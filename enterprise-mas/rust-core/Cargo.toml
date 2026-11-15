@@ -59,10 +59,13 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "1.0.0"
+
+[workspace.members]
+channel-whatsapp = "crates/channel-whatsapp"
 edition = "2021"
 rust-version = "1.85.0"
-license = "LicenseRef-Proprietary"
+license = "Proprietary"
 publish = false
 homepage = "https://enterprise-mas.internal"
 repository = "https://enterprise-mas.internal/enterprise-mas"

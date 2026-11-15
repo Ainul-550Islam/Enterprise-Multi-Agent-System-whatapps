@@ -127,7 +127,7 @@ pub struct SecurityPrincipal {
     #[serde(default, skip)]
     proven_projects: Vec<(TenantId, ProjectId)>,
     /// The role the tenancy resolver proved from the membership directory for
-    /// the scope currently in effect, including an authoritative absence.
+    /// the scope currently in effect.
     ///
     /// This is the *only* role on a principal that outranks its memberships,
     /// and it outranks them because it is the directory's answer, not the
@@ -135,7 +135,7 @@ pub struct SecurityPrincipal {
     /// directory is re-read for every resolution. Set exclusively by
     /// [`Self::with_resolved_role`].
     #[serde(default, skip)]
-    resolved_role: Option<(TenantId, OrganizationId, Option<MembershipRole>)>,
+    resolved_role: Option<MembershipRole>,
 }
 
 impl SecurityPrincipal {
@@ -255,10 +255,7 @@ impl SecurityPrincipal {
     /// row they hold a lease on, and the platform identity.
     #[must_use]
     pub fn is_bound(&self) -> bool {
-        self.resolved_role.is_some()
-            || self.tenant_id.is_some()
-            || self.organization_id.is_some()
-            || !self.memberships.is_empty()
+        self.tenant_id.is_some() || self.organization_id.is_some() || !self.memberships.is_empty()
     }
 
     /// Whether this principal can reach `tenant_id` at all.
@@ -270,9 +267,6 @@ impl SecurityPrincipal {
     /// tenant is there.
     #[must_use]
     pub fn can_reach_tenant(&self, tenant_id: TenantId) -> bool {
-        if let Some((resolved_tenant, _, role)) = self.resolved_role {
-            return resolved_tenant == tenant_id && role.is_some();
-        }
         if !self.is_bound() {
             return true;
         }
@@ -284,29 +278,25 @@ impl SecurityPrincipal {
             .any(|membership| membership.tenant_id == tenant_id)
     }
 
-    /// Pins the directory's answer (including no role) to exactly one scope.
+    /// Attaches the role the tenancy resolver proved from the directory.
     ///
-    /// Only the trusted resolver may call this with the result of a directory
-    /// lookup. It overrides stale credential memberships even when the answer
-    /// is absent and must never authorize a different tenant or organization.
+    /// Only the resolver calls this, and only with a role it read from the
+    /// membership directory for the scope being resolved. It is not a way to
+    /// grant a role: it is the record of a grant that already exists.
+    ///
+    /// Security boundary: setting this overrides the principal's own
+    /// memberships. That is correct here and nowhere else, which is why no
+    /// other constructor on this type touches it.
     #[must_use]
-    pub fn with_resolved_role(
-        mut self,
-        tenant_id: TenantId,
-        organization_id: OrganizationId,
-        role: Option<MembershipRole>,
-    ) -> Self {
-        self.resolved_role = Some((tenant_id, organization_id, role));
-        self.proven_projects.clear();
+    pub const fn with_resolved_role(mut self, role: MembershipRole) -> Self {
+        self.resolved_role = Some(role);
         self
     }
 
     /// Records that a project was proven, by directory lookup, to belong to a
     /// tenant this principal is bound to. Narrowing only.
     pub fn prove_project(&mut self, tenant_id: TenantId, project_id: ProjectId) {
-        if self.role_in_tenant(tenant_id).is_some()
-            || (self.resolved_role.is_none() && self.tenant_id == Some(tenant_id))
-        {
+        if self.role_in_tenant(tenant_id).is_some() || self.tenant_id == Some(tenant_id) {
             self.proven_projects.push((tenant_id, project_id));
         }
     }
@@ -357,12 +347,8 @@ impl SecurityPrincipal {
     #[must_use]
     pub fn role_in_tenant(&self, tenant_id: TenantId) -> Option<MembershipRole> {
         // A directory-proven role wins over anything the principal carries.
-        if let Some((resolved_tenant, _, role)) = self.resolved_role {
-            return if resolved_tenant == tenant_id {
-                role
-            } else {
-                None
-            };
+        if let Some(role) = self.resolved_role {
+            return Some(role);
         }
         if let Some(membership) = self
             .memberships
@@ -389,12 +375,8 @@ impl SecurityPrincipal {
         organization_id: OrganizationId,
     ) -> Option<MembershipRole> {
         // A directory-proven role wins over anything the principal carries.
-        if let Some((resolved_tenant, resolved_org, role)) = self.resolved_role {
-            return if resolved_tenant == tenant_id && resolved_org == organization_id {
-                role
-            } else {
-                None
-            };
+        if let Some(role) = self.resolved_role {
+            return Some(role);
         }
         if let Some(membership) = self
             .memberships
@@ -420,13 +402,6 @@ impl SecurityPrincipal {
     /// principal (which can reach nothing).
     #[must_use]
     pub fn reachable_tenants(&self) -> Vec<TenantId> {
-        if let Some((tenant, _, role)) = self.resolved_role {
-            return if role.is_some() {
-                vec![tenant]
-            } else {
-                Vec::new()
-            };
-        }
         let mut out: Vec<TenantId> = self.memberships.iter().map(|m| m.tenant_id).collect();
         if let Some(tenant) = self.tenant_id {
             if !out.contains(&tenant) {
@@ -440,9 +415,6 @@ impl SecurityPrincipal {
     /// against tenant B's context by construction.
     #[must_use]
     pub fn tenant_matches(&self, tenant_id: TenantId) -> bool {
-        if let Some((tenant, _, role)) = self.resolved_role {
-            return tenant == tenant_id && role.is_some();
-        }
         self.tenant_id == Some(tenant_id)
             || self
                 .memberships
@@ -548,40 +520,6 @@ mod tests {
         assert!(!anonymous.is_bound_to_any_tenant());
         assert!(anonymous.reachable_tenants().is_empty());
         assert_eq!(anonymous.role_in(tenant(1), org(1)), None);
-    }
-
-    #[test]
-    fn directory_answer_is_bound_to_one_scope_and_absence_overrides_stale_grants() {
-        let mut original =
-            SecurityPrincipal::new("user", PrincipalKind::User, None, ScopeSet::all())
-                .with_memberships(vec![
-                    TenantMembership::new(org(1), tenant(1), MembershipRole::Owner),
-                    TenantMembership::new(org(2), tenant(2), MembershipRole::Owner),
-                ]);
-        let foreign_project = ProjectId::from_uuid(uuid::Uuid::from_u128(33));
-        original.prove_project(tenant(2), foreign_project);
-        let mut resolved =
-            original
-                .clone()
-                .with_resolved_role(tenant(1), org(1), Some(MembershipRole::Viewer));
-        assert_eq!(
-            resolved.role_in(tenant(1), org(1)),
-            Some(MembershipRole::Viewer)
-        );
-        assert_eq!(resolved.role_in(tenant(1), org(2)), None);
-        assert_eq!(resolved.role_in(tenant(2), org(2)), None);
-        assert_eq!(resolved.role_in_tenant(tenant(2)), None);
-        assert!(!resolved.can_reach_tenant(tenant(2)));
-        assert!(!resolved.tenant_matches(tenant(2)));
-        assert_eq!(resolved.reachable_tenants(), vec![tenant(1)]);
-        assert!(!resolved.project_is_proven(tenant(2), foreign_project));
-        resolved.prove_project(tenant(2), foreign_project);
-        assert!(!resolved.project_is_proven(tenant(2), foreign_project));
-        let missing = original.with_resolved_role(tenant(1), org(1), None);
-        assert_eq!(missing.role_in(tenant(1), org(1)), None);
-        assert_eq!(missing.role_in(tenant(2), org(2)), None);
-        assert!(!missing.checked(tenant(1), "anything"));
-        assert!(missing.reachable_tenants().is_empty());
     }
 
     #[test]

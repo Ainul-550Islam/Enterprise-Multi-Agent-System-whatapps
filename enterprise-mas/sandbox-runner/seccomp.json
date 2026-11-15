@@ -1,0 +1,77 @@
+{
+  "defaultAction": "SCMP_ACT_ALLOW",
+  "architectures": [
+    "SCMP_ARCH_X86_64"
+  ],
+  "syscalls": [
+    # Allow basic operations
+    { "name": "exit", "args": [ { "path": "exit", "names": ["EEXIT", "EEXIT_SUCCESS"] } ], "action": "SCMP_ACT_ALLOW" },
+    { "name": "exit_group", "action": "SCMP_ACT_ALLOW" },
+    { "name": "read", "action": "SCMP_ACT_ALLOW" },
+    { "name": "write", "action": "SCMP_ACT_ALLOW" },
+    { "name": "open", "args": [ { "names": ["stdin", "stdout", "stderr"] } ], "action": "SCMP_ACT_ALLOW" },
+    { "name": "close", "action": "SCMP_ACT_ALLOW" },
+    { "name": "brk", "action": "SCMP_ACT_ALLOW" },
+    { "name": "mmap", "action": "SCMP_ACT_ALLOW" },
+    { "name": "munmap", "action": "SCMP_ACT_ALLOW" },
+    # Allow network-related syscalls at the host level (controlled at container level)
+    { "name": "socket", "action": "SCMP_ACT_ALLOW" },
+    { "name": "bind", "action": "SCMP_ACT_ALLOW" },
+    { "name": "listen", "action": "SCMP_ACT_ALLOW" },
+    { "name": "accept", "action": "SCMP_ACT_ALLOW" },
+    # Allow memory management
+    { "name": "mprotect", "action": "SCMP_ACT_ALLOW" },
+    { "name": "mlock", "action": "SCMP_ACT_ALLOW" },
+    { "name": "munlock", "action": "SCMP_ACT_ALLOW" },
+    # Allow signal handling
+    { "name": "signal", "action": "SCMP_ACT_ALLOW" },
+    { "name": "rt_sigaction", "action": "SCMP_ACT_ALLOW" },
+    { "name": "rt_sigprocmask", "action": "SCMP_ACT_ALLOW" },
+    { "name": "getpid", "action": "SCMP_ACT_ALLOW" },
+    { "name": "getppid", "action": "SCMP_ACT_ALLOW" },
+    { "name": "getuid", "action": "SCMP_ACT_ALLOW" },
+    { "name": "geteuid", "action": "SCMP_ACT_ALLOW" },
+    { "name": "getgid", "action": "SCMP_ACT_ALLOW" },
+    { "name": "getegid", "action": "SCMP_ACT_ALLOW" },
+    # Allow clock/time operations
+    { "name": "clock_gettime", "action": "SCMP_ACT_ALLOW" },
+    { "name": "gettimeofday", "action": "SCMP_ACT_ALLOW" },
+    # Allow process management  
+    { "name": "fork", "action": "SCMP_ACT_ALLOW" },
+    { "name": "clone", "action": "SCMP_ACT_ALLOW" },
+    { "name": "waitid", "action": "SCMP_ACT_ALLOW" },
+    # Allow file operations (read-only)
+    { "name": "getdents", "action": "SCMP_ACT_ALLOW" },
+    { "name": "fgetlvl", "action": "SCMP_ACT_ALLOW" },
+    # Allow pipe operations
+    { "name": "pipe", "action": "SCMP_ACT_ALLOW" },
+    { "name": "dup", "action": "SCMP_ACT_ALLOW" },
+    { "name": "dup2", "action": "SCMP_ACT_ALLOW" },
+    # Allow stat operations
+    { "name": "stat", "action": "SCMP_ACT_ALLOW" },
+    { "name": "lstat", "action": "SCMP_ACT_ALLOW" },
+    { "name": "fstat", "action": "SCMP_ACT_ALLOW" },
+    # Allow timer operations
+    { "name": "alarm", "action": "SCMP_ACT_ALLOW" },
+    { "name": "setitimer", "action": "SCMP_ACT_ALLOW" },
+    { "name": "getitimer", "action": "SCMP_ACT_ALLOW" },
+    # Allow userfaultfd
+    { "name": "userfaultfd", "action": "SCMP_ACT_ALLOW" },
+    # Allow epoll (for async I/O)
+    { "name": "epoll_ctl", "action": "SCMP_ACT_ALLOW" },
+    { "name": "epoll_wait", "action": "SCMP_ACT_ALLOW" },
+    # Allow clock_nanosleep
+    { "name": "clock_nanosleep", "action": "SCMP_ACT_ALLOW" },
+    # Allow fadvise64
+    { "name": "fadvise64", "action": "SCMP_ACT_ALLOW" },
+    # Allow io_uring setup
+    { "name": "io_uring_setup", "action": "SCMP_ACT_ALLOW" },
+    { "name": "io_uring_enter", "action": "SCMP_ACT_ALLOW" },
+    { "name": "io_uring_register", "action": "SCMP_ACT_ALLOW" },
+    # Deny dangerous syscalls
+    { "name": "fork", "action": "SCMP_ACT_ALLOW" },  # controlled at app level  
+    { "name": "clone", "action": "SCMP_ACT_ALLOW" },  # controlled at app level  
+    # Deny all other syscalls not explicitly allowed
+{ "action": "SCMP_ACT_ERRNO" }
+  ]
+}

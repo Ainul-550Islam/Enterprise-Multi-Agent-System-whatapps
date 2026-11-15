@@ -312,21 +312,6 @@ pub static MIGRATIONS: &[Migration] = &[
         "runtime_role_sequence_usage",
         "../../../migrations/0053_runtime_role_sequence_usage/up.sql"
     ),
-    migration!(
-        54,
-        "rag_document_fences",
-        "../../../migrations/0054_rag_document_fences/up.sql"
-    ),
-    migration!(
-        55,
-        "billing_receipt_invariants",
-        "../../../migrations/0055_billing_receipt_invariants/up.sql"
-    ),
-    migration!(
-        56,
-        "oidc_identity_binding",
-        "../../../migrations/0056_oidc_identity_binding/up.sql"
-    ),
 ];
 
 /// A migration already recorded in the database.
@@ -660,11 +645,11 @@ mod tests {
     #[test]
     fn registry_is_contiguous_and_ordered() {
         validate_registry().expect("registry must be valid");
-        assert_eq!(MIGRATIONS.len(), 56);
+        assert_eq!(MIGRATIONS.len(), 53);
         assert_eq!(MIGRATIONS.first().map(|m| m.name), Some("extensions"));
         assert_eq!(
             MIGRATIONS.last().map(|m| m.name),
-            Some("oidc_identity_binding")
+            Some("runtime_role_sequence_usage")
         );
         let search_indexes = MIGRATIONS
             .iter()
@@ -784,3 +769,7 @@ mod tests {
         assert!(plan_pending(&renamed).is_err());
     }
 }
+
+    migration!(        54,        "whatsapp_accounts",        "../../../migrations/0054_whatsapp_accounts/up.sql"),
+    migration!(        55,        "whatsapp_conversations",        "../../../migrations/0055_whatsapp_conversations/up.sql"),
+    migration!(        56,        "whatsapp_templates",        "../../../migrations/0056_whatsapp_templates/up.sql"),

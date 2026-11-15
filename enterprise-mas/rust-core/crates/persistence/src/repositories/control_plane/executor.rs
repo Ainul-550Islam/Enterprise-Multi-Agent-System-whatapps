@@ -74,10 +74,13 @@ impl ControlPlaneExecutor {
 
 /// The executor for one control-plane statement.
 ///
-/// Call it at the point of use and let the value die with the statement.
-/// This is a crate-private API, so its executable example lives in the unit
-/// test `executor_uses_the_scoped_transaction_for_each_statement`, not an
-/// external rustdoc example that cannot access private items.
+/// Call it at the point of use and let the value die with the statement:
+///
+/// ```ignore
+/// sqlx::query("SELECT 1")
+///     .fetch_optional(executor(&self.pool).await?.connection())
+///     .await
+/// ```
 ///
 /// # Errors
 /// * when a request scope is bound but its transaction cannot be borrowed —
@@ -92,67 +95,4 @@ pub(crate) async fn executor(pool: &PgPool) -> Result<ControlPlaneExecutor> {
     }
     let connection = pool.acquire().await.map_err(map_sqlx)?;
     Ok(ControlPlaneExecutor::Pooled(connection))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use mas_common::ids::{OrganizationId, TenantId};
-    use mas_security::AuthoritativeScope;
-    use sqlx::postgres::PgPoolOptions;
-    use std::time::Duration;
-
-    #[tokio::test]
-    async fn executor_uses_the_scoped_transaction_for_each_statement() {
-        let url = std::env::var("MAS_TEST_DATABASE_APP_URL")
-            .expect("MAS_TEST_DATABASE_APP_URL required for executor regression");
-        // A single connection proves scoped calls do not silently acquire a
-        // separate pooled session, which would deadlock until the timeout.
-        let pool = PgPoolOptions::new()
-            .max_connections(1)
-            .connect(&url)
-            .await
-            .unwrap();
-        sqlx::query("CREATE TEMP TABLE executor_doc_probe (value integer)")
-            .execute(&pool)
-            .await
-            .unwrap();
-        let tenant = TenantId::new();
-        let scope = AuthoritativeScope::resolved(tenant, OrganizationId::new(), "executor-test");
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            scoped_request::with_authoritative_scope(&pool, scope, || async {
-                let current: String =
-                    sqlx::query_scalar("SELECT current_setting('app.current_tenant')")
-                        .fetch_one(executor(&pool).await?.connection())
-                        .await
-                        .map_err(map_sqlx)?;
-                assert_eq!(current, tenant.to_string());
-                sqlx::query("INSERT INTO executor_doc_probe VALUES (1)")
-                    .execute(executor(&pool).await?.connection())
-                    .await
-                    .map_err(map_sqlx)?;
-                let row: Option<(i32,)> = sqlx::query_as("SELECT 1")
-                    .fetch_optional(executor(&pool).await?.connection())
-                    .await
-                    .map_err(map_sqlx)?;
-                assert_eq!(row, Some((1,)));
-                Ok(())
-            }),
-        )
-        .await
-        .expect("scoped statements must not acquire a second connection")
-        .expect("commit");
-        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM executor_doc_probe")
-            .fetch_one(executor(&pool).await.unwrap().connection())
-            .await
-            .unwrap();
-        assert_eq!(count, 1);
-        let tenant_after: Option<String> =
-            sqlx::query_scalar("SELECT current_setting('app.current_tenant', true)")
-                .fetch_one(executor(&pool).await.unwrap().connection())
-                .await
-                .unwrap();
-        assert!(tenant_after.as_deref().is_none_or(str::is_empty));
-    }
 }

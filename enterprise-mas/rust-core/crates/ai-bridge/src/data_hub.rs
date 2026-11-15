@@ -323,7 +323,7 @@ impl DataHubBridgePort for GrpcDataHubBridge {
             changed_count: reply.changed_count,
             indexed_count: reply.indexed_count,
             failed_count: reply.failed_count,
-            next_cursor: reply.next_cursor.and_then(nonempty),
+            next_cursor: nonempty(reply.next_cursor),
             errors: reply.errors,
         })
     }

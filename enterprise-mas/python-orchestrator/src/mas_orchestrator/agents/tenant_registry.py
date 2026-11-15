@@ -123,7 +123,6 @@ def materialise_catalog(
             allowed_tools=frozenset(str(item) for item in _sequence(template, "allowed_tools")),
             system_prompt=str(template.get("system_prompt", "")),
             tags=tuple(str(item) for item in _sequence(template, "tags")),
-            read_only=_read_only(template),
         )
         limits = template.get("limits")
         if limits is not None:
@@ -131,13 +130,6 @@ def materialise_catalog(
         specs.append(spec)
 
     return tuple(specs)
-
-
-def _read_only(template: Mapping[str, object]) -> bool:
-    value = template.get("read_only", False)
-    if not isinstance(value, bool):
-        raise ConfigurationError("agent catalog read_only must be boolean")
-    return value
 
 
 def _sequence(template: Mapping[str, object], key: str) -> tuple[object, ...]:
@@ -278,28 +270,6 @@ class TenantScopedAgentRegistry:
             "the tenant-scoped registry is built from a fixed catalog and "
             "does not accept runtime registration",
             details={"catalog": sorted(self.catalog_ids)},
-        )
-
-    def register_builtin(self, template: Mapping[str, object]) -> None:
-        """Add a product template at startup, never after requests can materialise it."""
-        from copy import deepcopy
-
-        candidate = deepcopy(dict(template))
-        materialise_catalog((candidate,), "startup-validation")
-        agent_id = str(candidate["agent_id"])
-        with self._lock:
-            if self._factory is not None or self._by_tenant:
-                raise ConfigurationError(
-                    "built-in agents must be registered before registry startup"
-                )
-            if agent_id in self.catalog_ids:
-                raise ConfigurationError("agent catalog contains duplicate agent ids")
-            self._catalog = (*self._catalog, candidate)
-
-    def is_read_only(self, tenant_id: str, agent_id: str) -> bool:
-        """Return whether this tenant's named agent is an immutable product template."""
-        return any(
-            spec.agent_id == agent_id and spec.read_only for spec in self.specs_for(tenant_id)
         )
 
     def specs_for(self, tenant_id: str) -> tuple[AgentSpec, ...]:

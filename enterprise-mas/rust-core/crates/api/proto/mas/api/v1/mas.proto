@@ -275,9 +275,6 @@ message AgentRunRequest {
   ServiceIdentityMsg identity = 16;
   // Durable worker claim attempt; absent for non-queue-driven runs.
   optional string task_attempt_id = 17;
-  // Immutable Rust-resolved agent/version snapshot, included in the signed
-  // request body. An absent field is accepted only by explicitly legacy lanes.
-  optional string agent_snapshot_json = 18;
 }
 
 // Authenticated internal service identity (mirrors
@@ -341,97 +338,5 @@ message AgentRunReply {
 message BridgeHealthReply {
   bool healthy = 1;
   // Human-readable detail; must never contain secret material.
-  string detail = 2;
-}
-
-// Rust-owned catalogue -> Python-owned ingestion. Stateful calls carry the
-// complete authoritative scope and identity in the signed protobuf body.
-service DataHubBridgeApi {
-  rpc SyncSource(SyncSourceRequest) returns (SyncSourceReply);
-  rpc IngestDocument(IngestDocumentRequest) returns (DocumentIngestionReply);
-  rpc PurgeDocument(PurgeDocumentRequest) returns (PurgeDocumentReply);
-  rpc Health(Empty) returns (DataHubHealthReply);
-}
-
-message SyncSourceRequest {
-  string tenant_id = 1;
-  string organization_id = 2;
-  string project_id = 3;
-  string source_id = 4;
-  string source_name = 5;
-  string source_kind = 6;
-  string configuration_json = 7;
-  optional string credential_secret_ref = 8;
-  optional string cursor = 9;
-  repeated string required_roles = 10;
-  repeated string denied_principals = 11;
-  string correlation_id = 12;
-  string request_id = 13;
-  string protocol_version = 14;
-  string deadline_rfc3339 = 15;
-  ServiceIdentityMsg identity = 16;
-}
-
-message SyncSourceReply {
-  string source_id = 1;
-  uint32 discovered_count = 2;
-  uint32 changed_count = 3;
-  uint32 indexed_count = 4;
-  uint32 failed_count = 5;
-  optional string next_cursor = 6;
-  repeated string errors = 7;
-}
-
-message IngestDocumentRequest {
-  string tenant_id = 1;
-  string organization_id = 2;
-  string project_id = 3;
-  string source_id = 4;
-  string document_id = 5;
-  string source_kind = 6;
-  string title = 7;
-  string mime_type = 8;
-  bytes content = 9;
-  optional string source_uri = 10;
-  optional string content_sha256 = 11;
-  repeated string required_roles = 12;
-  repeated string denied_principals = 13;
-  string metadata_json = 14;
-  string correlation_id = 15;
-  string request_id = 16;
-  string protocol_version = 17;
-  string deadline_rfc3339 = 18;
-  ServiceIdentityMsg identity = 19;
-}
-
-message DocumentIngestionReply {
-  string document_id = 1;
-  string sha256 = 2;
-  uint64 byte_count = 3;
-  uint32 chunk_count = 4;
-  uint32 embedded_count = 5;
-  optional string skipped_reason = 6;
-}
-
-message PurgeDocumentRequest {
-  string tenant_id = 1;
-  string organization_id = 2;
-  string project_id = 3;
-  string source_id = 4;
-  string document_id = 5;
-  string correlation_id = 6;
-  string request_id = 7;
-  string protocol_version = 8;
-  string deadline_rfc3339 = 9;
-  ServiceIdentityMsg identity = 10;
-}
-
-message PurgeDocumentReply {
-  string document_id = 1;
-  uint64 removed_chunks = 2;
-}
-
-message DataHubHealthReply {
-  bool healthy = 1;
   string detail = 2;
 }

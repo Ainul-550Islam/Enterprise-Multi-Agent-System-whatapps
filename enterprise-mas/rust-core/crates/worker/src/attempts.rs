@@ -342,37 +342,17 @@ impl AttemptCoordinator {
 
     // -- settlement ---------------------------------------------------------
 
-    /// Settles a successful attempt with the exact value produced by the handler.
-    pub async fn succeed_with_result(
+    /// Settles a successful attempt.
+    pub async fn succeed(
         &self,
         claim: &TaskClaim,
-        result: serde_json::Value,
         usage: mas_application::durable::ExecutionUsage,
         finalize_execution: bool,
         at: &Timestamp,
     ) -> Result<SettlementReceipt> {
         self.settle(
             claim,
-            TaskOutcome::Succeeded { result, usage },
-            finalize_execution,
-            at,
-        )
-        .await
-    }
-
-    /// Convenience for lifecycle tests that do not exercise handler output.
-    #[cfg(test)]
-    pub(crate) async fn succeed(
-        &self,
-        claim: &TaskClaim,
-        usage: mas_application::durable::ExecutionUsage,
-        finalize_execution: bool,
-        at: &Timestamp,
-    ) -> Result<SettlementReceipt> {
-        self.succeed_with_result(
-            claim,
-            serde_json::Value::Null,
-            usage,
+            TaskOutcome::Succeeded { usage },
             finalize_execution,
             at,
         )
@@ -619,7 +599,6 @@ mod tests {
                 project_id: ProjectId::from_uuid(uuid::Uuid::from_u128(2)),
                 workflow_id: Some(WorkflowId::from_uuid(uuid::Uuid::from_u128(3))),
                 agent_id: None,
-                agent_version_id: None,
                 input,
                 idempotency_key: Some(key.to_owned()),
                 fingerprint,

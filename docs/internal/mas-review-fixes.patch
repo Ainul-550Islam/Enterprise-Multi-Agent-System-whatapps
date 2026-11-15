@@ -1,0 +1,345 @@
+diff --git a/enterprise-mas/rust-core/crates/persistence/src/repositories/broker.rs b/enterprise-mas/rust-core/crates/persistence/src/repositories/broker.rs
+index d0397f2..63b6ac1 100644
+--- a/enterprise-mas/rust-core/crates/persistence/src/repositories/broker.rs
++++ b/enterprise-mas/rust-core/crates/persistence/src/repositories/broker.rs
+@@ -33,6 +33,7 @@ use mas_messaging::broker::{
+ };
+ use mas_messaging::headers::HeaderSet;
+ use mas_messaging::subjects::Subject;
++use serde_json::json;
+ use sqlx::{PgPool, Row};
+ use uuid::Uuid;
+ 
+@@ -55,7 +56,9 @@ const CLAIM_SQL: &str = "WITH claimable AS (
+     UPDATE tasks t
+     SET status = 'running', not_before = now() + make_interval(secs => $2), updated_at = now()
+     FROM claimable WHERE t.id = claimable.id
+-    RETURNING t.id, t.payload, t.created_at, t.correlation_id";
++    RETURNING t.id, t.tenant_id, t.organization_id, t.project_id, t.execution_id,
++              t.idempotency_key, t.kind, t.priority, t.deadline_at,
++              t.payload, t.created_at, t.correlation_id";
+ 
+ /// Return overdue claims to the queue (lease-expired 'running' rows).
+ const REAP_SQL: &str = "UPDATE tasks SET status = 'queued', not_before = now(), updated_at = now()
+@@ -113,9 +116,16 @@ impl PgTaskBroker {
+     /// Binds a broker to a pool.
+     #[must_use]
+     pub fn new(pool: PgPool) -> Self {
++        // `InMemoryBroker` starts UNAVAILABLE by design (see its chaos knob).
++        // The event lane here is a real delegation target for non-durable
++        // subjects, `fetch` remainders, `ack`, `dead_letters`, `ping` and
++        // `consumer_stats` — so it must be switched on or every one of those
++        // calls fails with "broker is currently unavailable".
++        let events = InMemoryBroker::new();
++        events.set_available(true);
+         Self {
+             pool,
+-            events: InMemoryBroker::new(),
++            events,
+             flight: FlightLedger::default(),
+             ack_window_seconds: DEFAULT_ACK_WINDOW.as_secs() as i64,
+         }
+@@ -153,6 +163,77 @@ impl PgTaskBroker {
+             let created_at: chrono::DateTime<chrono::Utc> =
+                 row.try_get("created_at").map_err(map_sqlx)?;
+             let correlation_id: String = row.try_get("correlation_id").map_err(map_sqlx)?;
++            // `publish` decomposed the staged `TaskQueueMessage` into dedicated
++            // columns (identity, routing, correlation) plus a payload jsonb
++            // holding `input` and the `_mas_spec` envelope. Consumers decode
++            // with the standard codec, so the frame MUST be re-assembled into
++            // the full message here — returning the raw payload made every
++            // durable frame undecodable (and therefore dead-lettered).
++            let tenant_id: Uuid = row.try_get("tenant_id").map_err(map_sqlx)?;
++            let organization_id: Uuid = row.try_get("organization_id").map_err(map_sqlx)?;
++            let project_id: Uuid = row.try_get("project_id").map_err(map_sqlx)?;
++            let execution_id: Option<Uuid> = row.try_get("execution_id").map_err(map_sqlx)?;
++            let idempotency_key: String = row.try_get("idempotency_key").map_err(map_sqlx)?;
++            let priority: String = row.try_get("priority").map_err(map_sqlx)?;
++            let deadline_at: Option<chrono::DateTime<chrono::Utc>> =
++                row.try_get("deadline_at").map_err(map_sqlx)?;
++
++            let spec = payload.get(crate::rows::SPEC_KEY).cloned();
++            let get = |key: &str| {
++                spec.as_ref()
++                    .and_then(|s| s.get(key))
++                    .cloned()
++                    .unwrap_or(serde_json::Value::Null)
++            };
++            let operation = get("operation")
++                .as_str()
++                .map(str::to_owned)
++                .or_else(|| row.try_get::<String, _>("kind").ok())
++                .unwrap_or_else(|| "execution.run".to_owned());
++            let enqueued_at = get("queued_at")
++                .as_str()
++                .map(str::to_owned)
++                .unwrap_or_else(|| Timestamp::from_datetime(created_at).to_rfc3339_millis());
++
++            let mut frame = serde_json::Map::new();
++            frame.insert("task_id".to_owned(), json!(id));
++            frame.insert("tenant_id".to_owned(), json!(tenant_id));
++            frame.insert("organization_id".to_owned(), json!(organization_id));
++            frame.insert("project_id".to_owned(), json!(project_id));
++            frame.insert("operation".to_owned(), json!(operation));
++            frame.insert(
++                "input".to_owned(),
++                payload.get("input").cloned().unwrap_or(json!({})),
++            );
++            if let Some(execution) = execution_id {
++                frame.insert("execution_id".to_owned(), json!(execution));
++            }
++            if let Some(agent) = get("agent_id").as_str() {
++                frame.insert("agent_id".to_owned(), json!(agent));
++            }
++            if let Some(workflow) = get("workflow_id").as_str() {
++                frame.insert("workflow_id".to_owned(), json!(workflow));
++            }
++            frame.insert("idempotency_key".to_owned(), json!(idempotency_key));
++            frame.insert("priority".to_owned(), json!(priority));
++            frame.insert(
++                "attempt_count".to_owned(),
++                json!(get("attempt_count").as_u64().unwrap_or(0)),
++            );
++            frame.insert(
++                "max_attempts".to_owned(),
++                json!(get("max_attempts").as_u64().unwrap_or(1)),
++            );
++            if let Some(deadline) = deadline_at {
++                frame.insert(
++                    "deadline".to_owned(),
++                    json!(Timestamp::from_datetime(deadline).to_rfc3339_millis()),
++                );
++            }
++            frame.insert("correlation_id".to_owned(), json!(&correlation_id));
++            frame.insert("enqueued_at".to_owned(), json!(enqueued_at));
++            let payload = serde_json::Value::Object(frame);
++
+             let sequence = sequence_of(id);
+             self.flight.record(sequence, id);
+             let mut headers = HeaderSet::new();
+@@ -163,12 +244,7 @@ impl PgTaskBroker {
+                 .insert("x-task-id", id.to_string())
+                 .map_err(|err| AppError::validation(err.to_string()))?;
+             // The durable lane's subject is the operation as the frame
+-            // originally carried it (derived on publish).
+-            let operation = payload
+-                .get(crate::rows::SPEC_KEY)
+-                .and_then(|spec| spec.get("operation"))
+-                .and_then(serde_json::Value::as_str)
+-                .unwrap_or("execution.run");
++            // originally carried it (derived on publish / `kind` column).
+             let subject = Subject::parse(&format!("mas.tasks.{operation}"))
+                 .unwrap_or_else(|_| Subject::parse("mas.tasks.unknown").expect("static"));
+             messages.push(BrokerMessage {
+@@ -268,15 +344,11 @@ impl BrokerPort for PgTaskBroker {
+     }
+ 
+     async fn ensure_consumer(&self, config: ConsumerConfig) -> Result<()> {
+-        // Durable consumers are configless (claim/reap is global); the event
+-        // lane creates its normal durable consumer.
+-        let durable = config.filter.matches(
+-            &Subject::parse("mas.tasks.x")
+-                .map_err(|e| AppError::validation(format!("subject: {e}")))?,
+-        );
+-        if !durable {
+-            self.events.ensure_consumer(config).await?;
+-        }
++        // The durable lane is configless (claim/reap is global), but `fetch`,
++        // `ack`, `consumer_stats` and `dead_letters` all fan out to the event
++        // lane too — so the consumer MUST exist there as well, or every one of
++        // those calls fails with "broker consumer not found".
++        self.events.ensure_consumer(config).await?;
+         Ok(())
+     }
+ 
+diff --git a/enterprise-mas/rust-core/crates/persistence/src/repositories/executions.rs b/enterprise-mas/rust-core/crates/persistence/src/repositories/executions.rs
+index bb3e34d..2d02247 100644
+--- a/enterprise-mas/rust-core/crates/persistence/src/repositories/executions.rs
++++ b/enterprise-mas/rust-core/crates/persistence/src/repositories/executions.rs
+@@ -178,7 +178,7 @@ impl ExecutionStore {
+             "UPDATE executions
+              SET state = jsonb_set(
+                     state,
+-                    '{' || $2 || '}',
++                    ARRAY[$2]::text[],
+                     coalesce(state -> $2, '{}'::jsonb) || jsonb_build_object('idempotency_key', $3),
+                     true
+                  )
+diff --git a/enterprise-mas/rust-core/crates/persistence/src/rows.rs b/enterprise-mas/rust-core/crates/persistence/src/rows.rs
+index 6b1a872..cfbfb2c 100644
+--- a/enterprise-mas/rust-core/crates/persistence/src/rows.rs
++++ b/enterprise-mas/rust-core/crates/persistence/src/rows.rs
+@@ -1278,6 +1278,7 @@ pub struct ScheduleRow {
+ impl ScheduleRow {
+     const MATERIALIZED: &'static [&'static str] = &[
+         "id",
++        "tenant_id",
+         "organization_id",
+         "name",
+         "status",
+@@ -1323,8 +1324,13 @@ impl ScheduleRow {
+     /// Extracts the row from the domain aggregate (organization is NOT a
+     /// domain field — the repository passes it through explicitly).
+     pub fn from_domain(schedule: &Schedule, organization: Uuid) -> Result<Self> {
+-        let (map, spec) = split_spec(&dehydrate("schedules", schedule)?, Self::MATERIALIZED)?;
+-        let mut target = map
++        let full = dehydrate("schedules", schedule)?;
++        let (map, spec) = split_spec(&full, Self::MATERIALIZED)?;
++        // `task_template` and `kind` are domain fields but NOT materialized
++        // columns: they belong to the `target` / `rule` jsonb columns, so they
++        // must be read from the full aggregate — reading them from `map` (the
++        // materialized projection) silently dropped `task_template`.
++        let mut target = full
+             .get("task_template")
+             .map(|t| json!({ "task_template": t.clone() }))
+             .and_then(|v| v.as_object().cloned())
+@@ -1336,11 +1342,7 @@ impl ScheduleRow {
+         if !spec_rest.is_empty() {
+             target.insert(Self::TARGET_SPEC_KEY.to_owned(), Value::Object(spec_rest));
+         }
+-        let rule = match map
+-            .get("kind")
+-            .cloned()
+-            .or_else(|| dehydrate("schedules", schedule).ok()?.get("kind").cloned())
+-        {
++        let rule = match full.get("kind").cloned() {
+             Some(kind) => json!({ "kind": kind }),
+             None => json!({}),
+         };
+diff --git a/enterprise-mas/rust-core/crates/persistence/tests/live_pg.rs b/enterprise-mas/rust-core/crates/persistence/tests/live_pg.rs
+index 694581a..b191490 100644
+--- a/enterprise-mas/rust-core/crates/persistence/tests/live_pg.rs
++++ b/enterprise-mas/rust-core/crates/persistence/tests/live_pg.rs
+@@ -12,7 +12,7 @@ mod support;
+ 
+ use mas_common::enums::{Environment, TaskPriority, TaskStatus, WorkflowStatus};
+ use mas_common::ids::{
+-    AgentId, ExecutionId, OrganizationId, ProjectId, ScheduleId, TaskId, TenantId, UserId,
++    ExecutionId, OrganizationId, ProjectId, ScheduleId, TaskId, TenantId, UserId,
+ };
+ use mas_common::pagination::PageRequest;
+ use mas_common::timestamps::Timestamp;
+@@ -54,7 +54,7 @@ impl Scope {
+ 
+ async fn seed_scope(pool: &sqlx::PgPool, label: &str) -> Scope {
+     let mut conn = pool.acquire().await.expect("connection");
+-    let suffix = &uuid::Uuid::now_v7().to_string()[..8];
++    let suffix = &uuid::Uuid::now_v7().to_string().replace('-', "");
+     let org_slug = format!("acme-{label}-{suffix}");
+     let organization = Organization::create(
+         format!("Acme {label}"),
+@@ -284,14 +284,32 @@ async fn executions_round_trip_and_idempotency() {
+         return;
+     };
+     let scope = seed_scope(&pool, "executions").await;
+-    let store = ExecutionStore::new(pool);
++    let store = ExecutionStore::new(pool.clone());
++
++    let agent = Agent::create(
++        scope.tenant_id(),
++        scope.organization_id(),
++        scope.project_id(),
++        "Exec Agent",
++        Slug::new(&format!(
++            "exec-agent-{}",
++            uuid::Uuid::now_v7().to_string().replace('-', "")
++        ))
++        .expect("slug"),
++        AgentKind::Standard,
++    )
++    .expect("agent");
++    AgentStore::new(pool.clone())
++        .save(&agent)
++        .await
++        .expect("agent save");
+ 
+     let execution = Execution::new(
+         scope.tenant_id(),
+         scope.organization_id(),
+         scope.project_id(),
+         None,
+-        Some(AgentId::new()),
++        Some(agent.id),
+         serde_json::json!({"prompt": "ping"}),
+         format!("corr-{}", uuid::Uuid::now_v7()),
+         "itest-user",
+@@ -400,13 +418,31 @@ async fn tasks_round_trip() {
+         return;
+     };
+     let scope = seed_scope(&pool, "tasks").await;
+-    let store = TaskStore::new(pool);
++    let store = TaskStore::new(pool.clone());
++
++    let agent = Agent::create(
++        scope.tenant_id(),
++        scope.organization_id(),
++        scope.project_id(),
++        "Task Agent",
++        Slug::new(&format!(
++            "task-agent-{}",
++            uuid::Uuid::now_v7().to_string().replace('-', "")
++        ))
++        .expect("slug"),
++        AgentKind::Standard,
++    )
++    .expect("agent");
++    AgentStore::new(pool.clone())
++        .save(&agent)
++        .await
++        .expect("agent save");
+ 
+     let task = Task::new(
+         scope.tenant_id(),
+         scope.organization_id(),
+         scope.project_id(),
+-        None,
++        Some(agent.id),
+         None,
+         "execution.run",
+         serde_json::json!({"itest": true}),
+@@ -535,7 +571,7 @@ async fn broker_publish_fetch_ack_round_trip() {
+         return;
+     };
+     let scope = seed_scope(&pool, "broker").await;
+-    let broker = PgTaskBroker::new(pool);
++    let broker = PgTaskBroker::new(pool.clone());
+ 
+     use mas_messaging::broker::{AckInstruction, BrokerPort, ConsumerConfig, PublishRequest};
+     use mas_messaging::codec::{CodecConfig, JsonEventCodec};
+@@ -611,6 +647,18 @@ async fn broker_publish_fetch_ack_round_trip() {
+         codec.decode_value(&ours.payload).expect("decode");
+     assert_eq!(*decoded.task_id.as_uuid(), task_uuid);
+ 
++    // Production settles the row through the lifecycle store BEFORE acking
++    // (worker/src/consumer.rs): `PgTaskBroker::ack(Ack)` only validates that
++    // the settlement happened. Mirror that order here.
++    let lifecycle = TaskStore::new(pool.clone());
++    let mut settled = lifecycle
++        .load(decoded.task_id)
++        .await
++        .expect("lifecycle load")
++        .expect("task row");
++    settled.complete().expect("complete");
++    lifecycle.save(&settled).await.expect("lifecycle save");
++
+     broker
+         .ack(&consumer, seq, AckInstruction::Ack)
+         .await
+diff --git a/enterprise-mas/rust-core/migrations/0008_billing/up.sql b/enterprise-mas/rust-core/migrations/0008_billing/up.sql
+index ab5dd28..3d4dd93 100644
+--- a/enterprise-mas/rust-core/migrations/0008_billing/up.sql
++++ b/enterprise-mas/rust-core/migrations/0008_billing/up.sql
+@@ -48,11 +48,11 @@ CREATE TABLE quotas (
+     scope       text NOT NULL, -- e.g. tenant / project / agent
+     resource    text NOT NULL, -- e.g. executions.minute, tokens.day
+     max_value   bigint NOT NULL CHECK (max_value >= 0),
+-    window      text NOT NULL CHECK (window IN ('second', 'minute', 'hour', 'day', 'month', 'lifetime')),
++    "window"    text NOT NULL CHECK ("window" IN ('second', 'minute', 'hour', 'day', 'month', 'lifetime')),
+     spec        jsonb NOT NULL DEFAULT '{}'::jsonb,
+     created_at  timestamptz NOT NULL DEFAULT now(),
+     updated_at  timestamptz NOT NULL DEFAULT now(),
+-    UNIQUE (tenant_id, scope, resource, window)
++    UNIQUE (tenant_id, scope, resource, "window")
+ );
+ CREATE TRIGGER quotas_updated_at BEFORE UPDATE ON quotas
+     FOR EACH ROW EXECUTE FUNCTION mas_set_updated_at();

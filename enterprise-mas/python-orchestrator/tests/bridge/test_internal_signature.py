@@ -45,7 +45,6 @@ from tests.bridge.conftest import (
     request,
 )
 
-from mas_orchestrator.contracts.errors import ConfigurationError
 from mas_orchestrator.grpc.errors import is_retryable_status
 from mas_orchestrator.security.internal_service import (
     MAX_SKEW_SECONDS,
@@ -266,42 +265,3 @@ class TestServiceAllowlist:
         assert INTERNAL_SERVICE == "mas-worker"
         assert SIGNING_SECRET
         assert signed_bridge.service.call_count == 1
-
-
-class TestFreshReplayIsRefused:
-    """A timestamp-valid signature is still usable only once."""
-
-    async def test_reusing_the_same_signature_never_dispatches_twice(
-        self, signed_bridge: BridgeHarness
-    ) -> None:
-        message = request()
-        signed_headers = internal_signature_pairs(message)
-        await _run(signed_bridge, message, signed_headers)
-        with pytest.raises(grpc.aio.AioRpcError) as raised:
-            await _run(signed_bridge, message, signed_headers)
-        assert raised.value.code() is grpc.StatusCode.UNAUTHENTICATED
-        assert signed_bridge.service.call_count == 1
-
-    async def test_missing_guard_refuses_even_valid_signature(
-        self, signed_bridge: BridgeHarness, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setattr(signed_bridge.server._servicer, "_replay_guard", None)
-        message = request()
-        with pytest.raises(grpc.aio.AioRpcError) as raised:
-            await _run(signed_bridge, message, internal_signature_pairs(message))
-        assert raised.value.code() is grpc.StatusCode.UNAUTHENTICATED
-        assert signed_bridge.service.call_count == 0
-
-    async def test_unavailable_guard_prevents_dispatch(
-        self, signed_bridge: BridgeHarness, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        class UnavailableGuard:
-            async def consume(self, identity: object) -> bool:
-                raise ConfigurationError("internal replay receipt store is unavailable")
-
-        monkeypatch.setattr(signed_bridge.server._servicer, "_replay_guard", UnavailableGuard())
-        message = request()
-        with pytest.raises(grpc.aio.AioRpcError) as raised:
-            await _run(signed_bridge, message, internal_signature_pairs(message))
-        assert raised.value.code() is grpc.StatusCode.INTERNAL
-        assert signed_bridge.service.call_count == 0

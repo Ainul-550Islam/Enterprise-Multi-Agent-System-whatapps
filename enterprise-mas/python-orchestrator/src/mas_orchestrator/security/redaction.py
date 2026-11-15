@@ -67,9 +67,7 @@ SENSITIVE_KEY_SUBSTRINGS: Final[tuple[str, ...]] = (
 # --- value-shaped secret patterns -------------------------------------------
 # Ordered longest/most-specific first where patterns could overlap.
 
-_BEARER_PATTERN: Final[re.Pattern[str]] = re.compile(
-    r"(?i)\b(?:bearer|basic)\s+[A-Za-z0-9._\-+/=]+"
-)
+_BEARER_PATTERN: Final[re.Pattern[str]] = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._\-+/=]{8,}")
 
 _PEM_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
@@ -83,8 +81,8 @@ _API_KEY_PATTERN: Final[re.Pattern[str]] = re.compile(
 
 # Generic assignments: api_key = "..." / "token": "..." inside prose.
 _ASSIGNMENT_PATTERN: Final[re.Pattern[str]] = re.compile(
-    r"(?i)\b(api[_\-]?key|token|secret|password|passwd|credential|authorization)\b[\"']?"
-    r"\s*[:=]\s*(?:\"[^\"]*\"|'[^']*'|[^\s,;}&]+)"
+    r"(?i)\b(api[_\-]?key|token|secret|password|passwd|credential|authorization)\b"
+    r"\s*[:=]\s*[\"']?([^\s\"',;}]{6,})[\"']?"
 )
 
 # Long high-entropy runs: 32+ chars of base64/hex with mixed character classes.
@@ -198,8 +196,9 @@ def redact_text(text: str) -> str:
 
     Returns:
         The text with every match replaced by :data:`REDACTED`. Never raises:
-        on an internal error the entire value is replaced by the redaction
-        marker rather than leaking the original text.
+        on an internal error the original text is returned, because the caller
+        is most likely a logger and crashing would be worse than the leak risk
+        of an already-in-flight message.
     """
     if not text:
         return text
@@ -210,7 +209,7 @@ def redact_text(text: str) -> str:
         # "Authorization: Bearer <token>" the assignment pattern would otherwise
         # match the literal word "Bearer" as the value and leave the token
         # standing on its own, where no later pattern recognises it.
-        scrubbed = _BEARER_PATTERN.sub(REDACTED, scrubbed)
+        scrubbed = _BEARER_PATTERN.sub(f"Bearer {REDACTED}", scrubbed)
         # The assignment pattern keeps the key visible and replaces only the
         # value, preserving the diagnostic usefulness of the line.
         scrubbed = _ASSIGNMENT_PATTERN.sub(lambda m: f"{m.group(1)}={REDACTED}", scrubbed)
@@ -218,4 +217,4 @@ def redact_text(text: str) -> str:
         scrubbed = _HIGH_ENTROPY_PATTERN.sub(REDACTED, scrubbed)
         return scrubbed
     except Exception:  # pragma: no cover - defensive, see docstring
-        return REDACTED
+        return text

@@ -1,0 +1,58 @@
+{
+  "realm": "mas-demo",
+  "enabled": true,
+  "clients": [
+    {
+      "clientId": "mas-api",
+      "clientProtocol": "openid-connect",
+      "redirectUris": [
+        "http://localhost:8080/*",
+        "http://mas-api:8080/*"
+      ],
+      "confidential": true,
+      "secret": "mas-api-secret"
+    },
+    {
+      "clientId": "mas-cli",
+      "clientProtocol": "openid-connect",
+      "redirectUris": [
+        "http://localhost:8080/"
+      ],
+      "confidential": false
+    }
+  ],
+  "users": [
+    {
+      "username": "admin",
+      "email": "admin@mas-demo.local",
+      "firstName": "Admin",
+      "lastName": "User",
+      "enabled": true,
+      "credentials": [
+        {
+          "type": "password",
+          "value": "admin123",
+          "temporary": false
+        }
+      ],
+      "groups": [
+        "mas-admin",
+        "mas-operator"
+      ]
+    }
+  ],
+  "groups": [
+    {
+      "name": "mas-admin",
+      "realmRoles": [
+        "admin"
+      ]
+    },
+    {
+      "name": "mas-operator",
+      "realmRoles": [
+        "operator"
+      ]
+    }
+  ]
+}

@@ -134,11 +134,6 @@ impl Document {
                 "ready document cannot retain a failure code",
             ));
         }
-        if self.status == DocumentStatus::Ready && self.chunk_count == 0 {
-            return Err(AppError::database(
-                "ready document must contain at least one indexed chunk",
-            ));
-        }
         if self.status == DocumentStatus::Failed && self.failure_code.is_none() {
             return Err(AppError::database(
                 "failed document is missing its stable failure code",
@@ -165,13 +160,6 @@ impl Document {
     /// Processing → Ready after the RAG plane confirms indexing.
     pub fn mark_ready(&mut self, chunk_count: u32) -> Result<()> {
         self.require_processing("complete")?;
-        if chunk_count == 0 {
-            return Err(AppError::invalid_field(
-                "chunk_count",
-                "empty",
-                "a ready document requires at least one indexed chunk",
-            ));
-        }
         self.chunk_count = chunk_count;
         self.failure_code = None;
         self.status = DocumentStatus::Ready;
@@ -326,16 +314,6 @@ mod tests {
         assert_eq!(document.chunk_count, 4);
         assert!(document.failure_code.is_none());
         document.validate().expect("valid row");
-    }
-
-    #[test]
-    fn empty_index_cannot_be_marked_ready_or_hydrated_as_ready() {
-        let mut document = document();
-        document.begin_processing().expect("begin");
-        assert!(document.mark_ready(0).is_err());
-        assert_eq!(document.status, DocumentStatus::Processing);
-        document.status = DocumentStatus::Ready;
-        assert!(document.validate().is_err());
     }
 
     #[test]

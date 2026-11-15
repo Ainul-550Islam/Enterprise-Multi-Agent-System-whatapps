@@ -49,28 +49,18 @@ class SecurityContext:
         tenant_id: Owning tenant. Always required.
         allowed_roles: Roles permitted to read. Empty means no role gate.
         allowed_principals: Explicit principal ids. Empty means no gate.
-        organization_id: Authoritatively resolved organization, if project-scoped.
-        project_id: Authoritatively resolved project, if project-scoped. Data Hub
-            rows fail closed when either is absent or differs from their owner.
+        classification: Minimum sensitivity handled by this index.
     """
 
     tenant_id: str
     allowed_roles: frozenset[str] = frozenset()
     allowed_principals: frozenset[str] = frozenset()
-    organization_id: str | None = None
-    project_id: str | None = None
 
     def __post_init__(self) -> None:
         if not self.tenant_id.strip():
             raise InvalidRequestError(
                 "security context must name a tenant", details={"field": "tenant_id"}
             )
-        if (self.organization_id is None) != (self.project_id is None):
-            raise InvalidRequestError("organization and project scopes must be supplied together")
-        if self.organization_id is not None and (
-            not self.organization_id.strip() or not self.project_id or not self.project_id.strip()
-        ):
-            raise InvalidRequestError("organization and project scopes must not be empty")
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,15 +91,6 @@ class DocumentAccess:
         if not self.required_roles:
             return True
         return bool(self.required_roles & context.allowed_roles)
-
-
-@dataclass(frozen=True, slots=True)
-class DataHubOwnership:
-    """Signed Rust-authorized owner of a Data Hub document in the RAG plane."""
-
-    organization_id: str
-    project_id: str
-    source_id: str
 
 
 @dataclass(frozen=True, slots=True)

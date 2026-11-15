@@ -34,7 +34,6 @@ from mas_orchestrator.contracts.errors import (
     AgentNotFoundError,
     ConfigurationError,
     ExecutionTimeoutError,
-    InvalidRequestError,
 )
 from mas_orchestrator.models.cost import CostLedger
 
@@ -147,7 +146,6 @@ class AgentRuntime:
         state: AgentState | None = None,
         cancel_event: asyncio.Event | None = None,
         agent_id: str | None = None,
-        agent_spec: AgentSpec | None = None,
     ) -> ExecutionResult:
         """Runs one execution end to end.
 
@@ -160,9 +158,6 @@ class AgentRuntime:
             cancel_event: Optional cancellation signal.
             agent_id: Run a specific agent instead of selecting one. The
                 agent must still satisfy the routing policy.
-            agent_spec: An already validated Rust-owned immutable snapshot.
-                Its identity must agree with the authoritative context and
-                it must still satisfy routing policy.
 
         Returns:
             An :class:`ExecutionResult`.
@@ -174,25 +169,7 @@ class AgentRuntime:
         started = time.monotonic()
         ledger = CostLedger(self._pricing) if self._pricing is not None else None
 
-        if agent_spec is None:
-            spec = self._select_agent(context.tenant_id, routing, agent_id)
-        else:
-            if (
-                agent_spec.tenant_id != context.tenant_id
-                or agent_spec.agent_id != context.agent_id
-                or agent_id != context.agent_id
-                or not context.agent_version_id
-                or agent_spec.agent_version_id != context.agent_version_id
-            ):
-                raise InvalidRequestError(
-                    "agent snapshot identity does not match execution context"
-                )
-            if (
-                self._router.evaluate_pinned(agent_spec, routing or AgentRoutingRequest())
-                is not None
-            ):
-                raise AgentNotFoundError("the requested agent does not satisfy the routing policy")
-            spec = agent_spec
+        spec = self._select_agent(context.tenant_id, routing, agent_id)
         agent = self._factory.build(spec, ledger=ledger)
 
         initial = state or _seed(spec, request)
@@ -200,9 +177,13 @@ class AgentRuntime:
 
         try:
             outcome = await self._run_bounded(agent, initial, context, cancel_event)
-        except asyncio.CancelledError:
-            cancel_event.set()
-            raise
+        except asyncio.CancelledError as error:
+            outcome = AgentOutcome(
+                agent_id=spec.agent_id,
+                termination=Termination.CANCELLED,
+                error=error,
+                duration_ms=int((time.monotonic() - started) * 1000),
+            )
 
         duration_ms = int((time.monotonic() - started) * 1000)
         _LOGGER.info(

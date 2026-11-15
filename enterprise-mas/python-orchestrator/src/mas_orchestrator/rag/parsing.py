@@ -23,7 +23,6 @@ from mas_orchestrator.rag.models import DocumentFormat
 MAX_PARSED_CHARS: Final[int] = 8_000_000
 MAX_RAW_INPUT_BYTES: Final[int] = 8 * 1024 * 1024
 MAX_PDF_PAGES: Final[int] = 500
-MAX_JSON_DEPTH: Final[int] = 100
 MAX_CSV_ROWS: Final[int] = 100_000
 MAX_CSV_COLUMNS: Final[int] = 2_000
 MAX_DOCX_MEMBERS: Final[int] = 5_000
@@ -152,41 +151,20 @@ def _parse_json(content: str) -> str:
         raise InvalidRequestError(
             "document is not valid JSON", details={"position": error.pos}
         ) from error
-    except (ValueError, RecursionError) as error:
-        # The decoder can reject enormous integers or excessive nesting without
-        # raising JSONDecodeError. Do not expose its input-dependent message.
-        raise InvalidRequestError("document is not valid bounded JSON") from error
 
     lines: list[str] = []
-    chars = 0
 
-    def walk(value: object, parts: list[str], depth: int, path_length: int) -> None:
-        nonlocal chars
-        if depth > MAX_JSON_DEPTH:
-            raise InvalidRequestError("document JSON nesting exceeds the parser limit")
+    def walk(value: object, path: str) -> None:
         if isinstance(value, dict):
             for key, item in value.items():
-                part = ("." if path_length else "") + key
-                parts.append(part)
-                walk(item, parts, depth + 1, path_length + len(part))
-                parts.pop()
+                walk(item, f"{path}.{key}" if path else str(key))
         elif isinstance(value, list):
             for index, item in enumerate(value):
-                part = f"[{index}]"
-                parts.append(part)
-                walk(item, parts, depth + 1, path_length + len(part))
-                parts.pop()
+                walk(item, f"{path}[{index}]")
         else:
-            # Materialize a path only for leaves: copying a huge parent path
-            # for many empty containers also causes quadratic amplification.
-            # Bound output before retaining each fully flattened line.
-            path = "".join(parts)
-            chars = _append_limited(lines, f"{path}: {value}", chars)
+            lines.append(f"{path}: {value}")
 
-    try:
-        walk(payload, [], 0, 0)
-    except RecursionError as error:
-        raise InvalidRequestError("document JSON nesting exceeds the parser limit") from error
+    walk(payload, "")
     return _normalise("\n".join(lines))
 
 

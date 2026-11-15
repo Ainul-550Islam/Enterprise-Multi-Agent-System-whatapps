@@ -743,18 +743,6 @@ impl AuthorizationService {
         }
     }
 
-    /// Whether a directory-resolved role may delegate an invitation role.
-    ///
-    /// Membership management is required in addition to strict rank ordering:
-    /// a manager may invite only roles below their own. The target role is
-    /// request data, never evidence of the caller's own authority. Platform
-    /// bootstrap is handled separately by the trusted application boundary.
-    #[must_use]
-    pub fn can_invite_role(actor_role: MembershipRole, target_role: MembershipRole) -> bool {
-        Self::role_permits(&actor_role, ResourceKind::Membership, Action::ManageMembers)
-            && actor_role.rank() > target_role.rank()
-    }
-
     /// The single matrix lookup. Deny by default.
     #[must_use]
     pub fn role_permits(role: &MembershipRole, resource: ResourceKind, action: Action) -> bool {
@@ -873,29 +861,6 @@ mod tests {
             tenant_id: tenant(),
             organization_id: org(),
             project_id: None,
-        }
-    }
-
-    #[test]
-    fn membership_invitation_delegation_requires_management_and_strictly_lower_rank() {
-        let roles = [
-            MembershipRole::Owner,
-            MembershipRole::Admin,
-            MembershipRole::Developer,
-            MembershipRole::Operator,
-            MembershipRole::Viewer,
-            MembershipRole::ServiceAccount,
-        ];
-        for actor in roles {
-            for target in roles {
-                let expected = matches!(actor, MembershipRole::Owner | MembershipRole::Admin)
-                    && actor.rank() > target.rank();
-                assert_eq!(
-                    AuthorizationService::can_invite_role(actor, target),
-                    expected,
-                    "{actor:?} -> {target:?}"
-                );
-            }
         }
     }
 

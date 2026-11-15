@@ -32,6 +32,8 @@ use crate::handlers::{
     agents, analytics, api_keys, approvals, control_plane, data_hub, executions, health,
     inbound_webhooks, integrations, internal, notifications, oauth, rollbacks, schedules, search,
     tenancy, workflows, Ctx, MAX_BODY_BYTES,
+    whatsapp_public, whatsapp,
+    billing::{public as billing_public, checkout as billing_checkout},
 };
 use crate::middleware::{authenticated_layer, request_context_layer};
 use crate::response::ApiError;
@@ -39,12 +41,6 @@ use crate::state::AppState;
 
 /// Builds the full HTTP router for the api process.
 pub fn router(state: AppState) -> Router {
-    let data_hub_body_limit = state
-        .data_hub
-        .as_ref()
-        .map_or(data_hub::MAX_DATA_HUB_MULTIPART_BYTES, |service| {
-            data_hub::multipart_body_limit(service.max_upload_bytes())
-        });
     let public = Router::new()
         .route("/v1/health/live", get(health::live))
         .route("/v1/health/ready", get(health::ready))
@@ -56,6 +52,10 @@ pub fn router(state: AppState) -> Router {
             post(inbound_webhooks::ingest)
                 .layer(DefaultBodyLimit::max(mas_integrations::inbound_webhooks::MAX_INBOUND_WEBHOOK_BYTES)),
         )
+        // WhatsApp Cloud API public webhook (hub challenge + signed POST)
+        .route("/v1/public/whatsapp/webhook/{route_id}", post(public_webhook_post))
+        .route("/v1/public/whatsapp/webhook/{route_id}", get(public_webhook_get))
+        .route("/v1/public/billing/stripe/webhook", post(billing_public::handle_stripe_webhook))
         // OAuth callbacks carry an opaque one-shot state; they never accept a
         // tenant, connector, redirect URI, or provider endpoint from query.
         .route(
@@ -63,12 +63,25 @@ pub fn router(state: AppState) -> Router {
             get(oauth::callback),
         );
 
+    .route("/v1/billing/checkout-session", post(billing_checkout::create_checkout_session))
+        .route("/v1/billing/portal-session", post(billing_checkout::create_portal_session))
+
     let protected = Router::new()
         // ---- tenancy / identity ------------------------------------
         .route("/v1/organizations", post(tenancy::register_organization).get(tenancy::list_organizations))
         .route("/v1/tenants", post(tenancy::register_tenant).get(tenancy::list_tenants))
         .route("/v1/projects", post(tenancy::register_project))
         .route("/v1/users", post(tenancy::register_user))
+        // ---- whatsapp -------------------------------------------------
+        .route("/v1/whatsapp/account", post(register_account).get(list_accounts))
+        .route("/v1/whatsapp/inbound", post(protected_inbound))
+        .route("/v1/whatsapp/send/text", post(protected_send_text))
+        .route("/v1/whatsapp/send/template", post(protected_send_template))
+        .route("/v1/whatsapp/status", post(protected_handle_status))
+        .route("/v1/whatsapp/stop", post(protected_handle_stop))
+        .route("/v1/whatsapp/handoff", post(protected_human_handoff))
+        .route("/v1/whatsapp/rotate-credentials", post(protected_rotate_credentials))
+        .route("/v1/whatsapp/execution", post(protected_submit_execution));
         .route("/v1/memberships", post(tenancy::invite_membership))
         // ---- agents -------------------------------------------------
         .route("/v1/agents", post(agents::register).get(agents::list))
@@ -189,12 +202,13 @@ pub fn router(state: AppState) -> Router {
             "/v1/data-sources/{id}/documents",
             get(data_hub::list_documents),
         )
-        // Bound the whole multipart envelope using the configured content
-        // limit plus framing/metadata allowance, then bound individual fields.
+        // This endpoint has its own bounded 64 MiB extractor limit; the Data
+        // Hub application service applies the deployment-specific limit again
+        // before retaining content or calling the Python bridge.
         .route(
             "/v1/documents/upload",
             post(data_hub::upload_document)
-                .layer(DefaultBodyLimit::max(data_hub_body_limit)),
+                .layer(DefaultBodyLimit::max(data_hub::MAX_DATA_HUB_MULTIPART_BYTES)),
         )
         .route(
             "/v1/documents/{id}",
@@ -271,9 +285,6 @@ pub fn router(state: AppState) -> Router {
             state.clone(),
             request_context_layer,
         ))
-        // Outermost: preflight must not enter authentication, request scope,
-        // handlers, or the database. Actual requests still traverse them all.
-        .layer(state.cors.layer())
         .with_state(state)
 }
 
@@ -311,7 +322,8 @@ mod tests {
 
     async fn seeded() -> Seeded {
         let (mut state, store) = inmemory_state_with_store();
-        let system = ServiceContext::system("http-it-1", &Timestamp::now()).expect("ctx");
+        let system =
+            ServiceContext::for_service("seed", "http-it-1", &Timestamp::now()).expect("ctx");
         let organization = state
             .tenancy
             .register_organization(&system, "Acme Ltd.", "Acme", "acme-http")

@@ -189,13 +189,13 @@ def validate_citation(
 
 def validate_citations(
     citations: Sequence[Citation],
-    sources: dict[tuple[str, str], str],
+    sources: dict[str, str],
 ) -> list[CitationCheck]:
     """Validates several citations against their source texts.
 
     Args:
         citations: The citations to check.
-        sources: (document id, chunk id) -> chunk text.
+        sources: Chunk id -> chunk text.
 
     Returns:
         One check per citation. A citation whose chunk is missing from
@@ -205,7 +205,7 @@ def validate_citations(
     """
     checks: list[CitationCheck] = []
     for citation in citations:
-        source = sources.get((citation.document_id, citation.chunk_id))
+        source = sources.get(citation.chunk_id)
         if source is None:
             checks.append(
                 CitationCheck(

@@ -162,9 +162,8 @@ def union_access(rules: list[DocumentAccess]) -> DocumentAccess:
     """Combines several documents' rules into the strictest.
 
     Used when a chunk derives from more than one source. The combination is
-    restrictive in both directions: nonempty role sets are intersected and
-    denials are unioned. Intersection may reject some readers with multiple
-    roles; disjoint restrictions cannot be expressed and fail closed.
+    restrictive in both directions: roles are intersected, so the reader must
+    satisfy every source; denials are unioned, so any source can veto.
 
     Raises:
         InvalidRequestError: If the rules disagree on tenant, or the list is
@@ -186,19 +185,10 @@ def union_access(rules: list[DocumentAccess]) -> DocumentAccess:
     denied: set[str] = set()
     for rule in rules:
         denied |= rule.denied_principals
-        # An empty role set is open to all tenant readers, so it imposes no
-        # additional constraint on another rule. Never encode an empty
-        # intersection of restricted roles as an open rule.
-        if rule.required_roles:
-            if required is None:
-                required = set(rule.required_roles)
-            else:
-                required &= rule.required_roles
-                if not required:
-                    raise InvalidRequestError(
-                        "combined role constraints cannot be represented safely",
-                        details={"field": "required_roles"},
-                    )
+        if required is None:
+            required = set(rule.required_roles)
+        else:
+            required &= rule.required_roles
 
     return DocumentAccess(
         tenant_id=rules[0].tenant_id,

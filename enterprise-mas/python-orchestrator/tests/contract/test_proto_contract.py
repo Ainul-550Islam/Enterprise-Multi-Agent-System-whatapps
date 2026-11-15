@@ -81,7 +81,6 @@ class TestAgentRunRequestShape:
             "idempotency_key",
             "identity",
             "task_attempt_id",
-            "agent_snapshot_json",
         ]
 
     def test_identity_fields_are_strings(self) -> None:
@@ -105,15 +104,6 @@ class TestAgentRunRequestShape:
         decoded = pb.AgentRunRequest.FromString(request.SerializeToString())
         assert decoded.HasField("task_attempt_id")
         assert decoded.task_attempt_id == "attempt-1"
-
-    def test_snapshot_has_additive_wire_number_and_presence(self) -> None:
-        field = pb.AgentRunRequest.DESCRIPTOR.fields_by_name["agent_snapshot_json"]
-        assert field.number == 18
-        assert field.has_presence is True
-        request = pb.AgentRunRequest(agent_snapshot_json='{"version_number":1}')
-        decoded = pb.AgentRunRequest.FromString(request.SerializeToString())
-        assert decoded.HasField("agent_snapshot_json")
-        assert decoded.agent_snapshot_json == '{"version_number":1}'
 
     def test_required_identity_fields_are_not_optional(self) -> None:
         """Mandatory identity is a plain field, not `optional`, in proto3."""

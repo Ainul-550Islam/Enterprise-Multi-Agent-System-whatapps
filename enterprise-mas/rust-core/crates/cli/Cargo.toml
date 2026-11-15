@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 description = "mas' operator CLI: HTTP client + subcommand surface over the public API"
-license = "LicenseRef-Proprietary"
+license = "Proprietary"
 
 [lib]
 name = "mas_cli"

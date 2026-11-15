@@ -43,12 +43,10 @@ from mas_orchestrator.grpc.client import (
     RustCoreClientConfig,
     client_from_settings,
 )
-from mas_orchestrator.grpc.data_hub_servicer import DataHubBridgeServicer
 from mas_orchestrator.grpc.errors import (
     CODE_TO_STATUS,
     STATUS_TO_CODE,
     abort_with_error,
-    details_from_abort,
     error_from_grpc_status,
     is_retryable_status,
     to_grpc_status,
@@ -85,7 +83,6 @@ __all__ = [
     "AgentBridgeServicer",
     "AgentBridgeServicerConfig",
     "ChannelConfig",
-    "DataHubBridgeServicer",
     "GrpcServer",
     "GrpcServerConfig",
     "ManagedChannel",

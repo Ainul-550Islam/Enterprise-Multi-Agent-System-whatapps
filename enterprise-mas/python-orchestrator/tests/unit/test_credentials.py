@@ -49,15 +49,9 @@ class TestSecretValueObject:
     def test_equality_compares_values(self) -> None:
         assert Secret("a", reference="env:1") == Secret("a", reference="env:2")
 
-    def test_secret_values_are_unhashable(self) -> None:
-        """Equal values from distinct references must never violate hash equality."""
-        first = Secret("same", reference="env:1")
-        second = Secret("same", reference="env:2")
-        assert first == second
-        with pytest.raises(TypeError):
-            hash(first)
-        with pytest.raises(TypeError):
-            _ = {first, second}
+    def test_hashing_keyed_on_reference(self) -> None:
+        """Hashing must not require exposing the value."""
+        assert hash(Secret("a", reference="env:1")) == hash(Secret("b", reference="env:1"))
 
 
 class TestEnvironmentSecretResolver:

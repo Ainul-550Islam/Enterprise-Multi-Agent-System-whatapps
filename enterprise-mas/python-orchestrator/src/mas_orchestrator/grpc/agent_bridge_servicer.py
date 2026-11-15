@@ -60,7 +60,7 @@ import logging
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, Final, NoReturn
+from typing import TYPE_CHECKING, Final
 
 from mas_orchestrator.agents.base import Termination
 from mas_orchestrator.agents.runtime import ExecutionResult
@@ -73,7 +73,6 @@ from mas_orchestrator.contracts.errors import (
     TenantContextError,
 )
 from mas_orchestrator.contracts.protocol_version import CURRENT_PROTOCOL_VERSION
-from mas_orchestrator.grpc.agent_snapshot import parse_agent_snapshot
 from mas_orchestrator.grpc.errors import abort_with_error
 from mas_orchestrator.grpc.generated import mas_api_pb2, mas_api_pb2_grpc
 from mas_orchestrator.grpc.metadata import (
@@ -97,14 +96,12 @@ if TYPE_CHECKING:
 
     import grpc
 
-    from mas_orchestrator.agents.base import AgentSpec
     from mas_orchestrator.context import ExecutionContext
     from mas_orchestrator.security.identity import (
         ServiceIdentity,
         ServiceIdentityResolver,
         ServiceScope,
     )
-    from mas_orchestrator.security.internal_replay import InternalReplayGuard
     from mas_orchestrator.services.execution_service import ExecutionService
 
 _LOGGER: Final[logging.Logger] = logging.getLogger(__name__)
@@ -260,7 +257,7 @@ def usage_from_result(result: ExecutionResult) -> mas_api_pb2.AgentUsageMsg | No
 DEFAULT_ALLOWED_INTERNAL_CALLERS: Final[frozenset[str]] = DEFAULT_ALLOWED_CALLERS
 
 
-def _canonical_request_bytes(request: Any | None) -> bytes:
+def _canonical_request_bytes(request: mas_api_pb2.AgentRunRequest | None) -> bytes:
     """Serializes the request exactly as it will be verified.
 
     The signature is bound to the bytes that were sent, so the bytes verified
@@ -343,14 +340,12 @@ class AgentBridgeServicer(mas_api_pb2_grpc.AgentBridgeApiServicer):
         execution_service: ExecutionService,
         identity_resolver: ServiceIdentityResolver,
         config: AgentBridgeServicerConfig | None = None,
-        replay_guard: InternalReplayGuard | None = None,
         telemetry: BridgeTelemetry | NoopTelemetry | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
         self._service = execution_service
         self._resolver = identity_resolver
         self._config = config or AgentBridgeServicerConfig()
-        self._replay_guard = replay_guard
         self._telemetry: BridgeTelemetry | NoopTelemetry = telemetry or NoopTelemetry()
         self._logger = logger or _LOGGER
 
@@ -399,18 +394,6 @@ class AgentBridgeServicer(mas_api_pb2_grpc.AgentBridgeApiServicer):
 
         # --- 6. validate the request body -------------------------------------
         prompt = await self._prompt_from(request, context)
-        try:
-            agent_spec = parse_agent_snapshot(
-                request.agent_snapshot_json,
-                expected_agent_id=request.agent_id,
-                expected_tenant_id=request.tenant_id,
-                expected_organization_id=request.organization_id,
-                expected_project_id=request.project_id,
-                expected_agent_version_id=request.agent_version,
-            ).spec
-        except InvalidRequestError as error:
-            await abort_with_error(context, error)
-            raise
 
         # --- 7, 8, 9. dispatch, bounded by the context, cancellable -----------
         # The clock for the runtime excludes the work done above: the operator
@@ -420,9 +403,7 @@ class AgentBridgeServicer(mas_api_pb2_grpc.AgentBridgeApiServicer):
         cancel_event = asyncio.Event()
         disarm = self._arm_cancellation(context, cancel_event)
         try:
-            result = await self._dispatch(
-                prompt, request, execution_context, cancel_event, context, agent_spec
-            )
+            result = await self._dispatch(prompt, request, execution_context, cancel_event, context)
         except asyncio.CancelledError:
             self._telemetry.cancellation(execution_context)
             raise
@@ -486,11 +467,11 @@ class AgentBridgeServicer(mas_api_pb2_grpc.AgentBridgeApiServicer):
         self,
         metadata: RustCallMetadata,
         context: grpc.aio.ServicerContext,
-        request: Any | None,
+        request: mas_api_pb2.AgentRunRequest | None,
     ) -> None:
         """Verifies the caller's body-bound signature, or refuses the call.
 
-        A v2 signature binds the service, timestamp, nonce, and body hash.
+        The signature is an HMAC over ``v1:<service>:<unix_millis>:<sha256(body)>``.
         The body is re-serialized here from the message Python actually
         received, which is what makes the check meaningful: a signature over
         *a* request is not a signature over *this* request.
@@ -535,17 +516,6 @@ class AgentBridgeServicer(mas_api_pb2_grpc.AgentBridgeApiServicer):
         except AuthenticationError:
             await self._refuse_signature(context, "invalid internal service signature")
 
-        # A valid MAC is not sufficient: consume the nonce atomically before
-        # any authenticated work, and fail closed if the shared store fails.
-        if self._replay_guard is None:
-            await self._refuse_signature(context, "no internal replay guard is configured")
-        try:
-            accepted = await self._replay_guard.consume(verified)
-        except OrchestratorError as error:
-            await abort_with_error(context, error)
-        if not accepted:
-            await self._refuse_signature(context, "internal signature nonce already consumed")
-
         # The proven service id is recorded for the audit line. It is proof of
         # *which process* called, not of which tenant the work belongs to —
         # tenancy stays authoritative in the request body and is reconciled
@@ -563,7 +533,7 @@ class AgentBridgeServicer(mas_api_pb2_grpc.AgentBridgeApiServicer):
         self,
         context: grpc.aio.ServicerContext,
         detail: str,
-    ) -> NoReturn:
+    ) -> None:
         """Refuses a call whose internal signature does not verify.
 
         Every failure produces the same
@@ -599,9 +569,7 @@ class AgentBridgeServicer(mas_api_pb2_grpc.AgentBridgeApiServicer):
         self,
         metadata: RustCallMetadata,
         context: grpc.aio.ServicerContext,
-        request: Any | None = None,
-        *,
-        required_scope: ServiceScope | None = None,
+        request: mas_api_pb2.AgentRunRequest | None = None,
     ) -> ServiceIdentity:
         """Resolves the caller's credential and authorises it.
 
@@ -641,10 +609,10 @@ class AgentBridgeServicer(mas_api_pb2_grpc.AgentBridgeApiServicer):
             await abort_with_error(context, error)
             raise
 
-        required = required_scope if required_scope is not None else self._config.require_scope
+        required = self._config.require_scope
         if required is not None and not identity.has_scope(required):
             refusal = AuthorizationError(
-                "caller is not permitted to perform this operation",
+                "caller is not permitted to execute agents",
                 details={"subject": identity.subject},
             )
             self._telemetry.authorization_failure(None, error=refusal)
@@ -653,29 +621,9 @@ class AgentBridgeServicer(mas_api_pb2_grpc.AgentBridgeApiServicer):
 
         return identity
 
-    async def validate_call_context(
-        self,
-        request: Any,
-        context: grpc.aio.ServicerContext,
-        *,
-        required_scope: ServiceScope,
-    ) -> tuple[RustCallMetadata, ServiceIdentity]:
-        """Authenticate a signed bridge request and reconcile its tenant scope.
-
-        The caller selects the exact capability for its operation; the bearer
-        identity, nonce guard, signed body and tenant checks are the same as
-        the AgentBridge path. A Data Hub scope never implies agent execution.
-        """
-        metadata = extract_call_metadata(tuple(context.invocation_metadata() or ()))
-        identity = await self._authenticate(
-            metadata, context, request, required_scope=required_scope
-        )
-        await self._reconcile_scope(request, metadata, context, identity)
-        return metadata, identity
-
     async def _reconcile_scope(
         self,
-        request: Any,
+        request: mas_api_pb2.AgentRunRequest,
         metadata: RustCallMetadata,
         context: grpc.aio.ServicerContext,
         identity: ServiceIdentity,
@@ -834,7 +782,6 @@ class AgentBridgeServicer(mas_api_pb2_grpc.AgentBridgeApiServicer):
         execution_context: ExecutionContext,
         cancel_event: asyncio.Event,
         context: grpc.aio.ServicerContext,
-        agent_spec: AgentSpec,
     ) -> ExecutionResult:
         """Runs the execution and maps failures onto the right channel.
 
@@ -854,7 +801,6 @@ class AgentBridgeServicer(mas_api_pb2_grpc.AgentBridgeApiServicer):
                     request=prompt,
                     context=execution_context,
                     agent_id=request.agent_id or None,
-                    agent_spec=agent_spec,
                     protocol_version=(request.protocol_version or self._config.protocol_version),
                 ),
                 cancel_event=cancel_event,

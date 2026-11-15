@@ -42,8 +42,7 @@ if TYPE_CHECKING:
 
     from mas_orchestrator.config.settings import ServiceSettings
     from mas_orchestrator.grpc.agent_bridge_servicer import AgentBridgeServicer
-    from mas_orchestrator.grpc.data_hub_servicer import DataHubBridgeServicer
-    from mas_orchestrator.services.lifecycle import Closeable, ShutdownCoordinator
+    from mas_orchestrator.services.lifecycle import ShutdownCoordinator
 
 _LOGGER: Final[logging.Logger] = logging.getLogger(__name__)
 
@@ -202,17 +201,10 @@ class GrpcServer:
         self,
         *,
         servicer: AgentBridgeServicer,
-        data_hub_servicer: DataHubBridgeServicer | None = None,
-        closeables: tuple[Closeable, ...] = (),
         config: GrpcServerConfig | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
         self._servicer = servicer
-        self._data_hub_servicer = data_hub_servicer
-        self._closeables = closeables
-        self._resources_closed = False
-        self._pending_server: aio.Server | None = None
-        self._executor: futures.ThreadPoolExecutor | None = None
         self._config = config or GrpcServerConfig()
         self._logger = logger or _LOGGER
         self._server: aio.Server | None = None
@@ -238,27 +230,6 @@ class GrpcServer:
         return self._server is not None
 
     async def start(self) -> int:
-        """Start only after dependencies are ready, closing owned resources on failure."""
-        if self._server is not None or self._resources_closed:
-            raise RuntimeError("gRPC server is already started or closed")
-        try:
-            if self._data_hub_servicer is not None:
-                await self._data_hub_servicer.startup()
-            return await self._start_listener()
-        except BaseException:
-            if self._pending_server is not None:
-                try:
-                    await self._pending_server.stop(0)
-                except Exception:
-                    self._logger.exception(
-                        "failed to stop gRPC listener after startup failure",
-                        extra={"event": "bridge.start_cleanup_failed"},
-                    )
-                self._pending_server = None
-            await self._close_resources()
-            raise
-
-    async def _start_listener(self) -> int:
         """Builds the server, registers the service and binds the socket.
 
         Returns:
@@ -288,11 +259,11 @@ class GrpcServer:
             )
         )
 
-        self._executor = futures.ThreadPoolExecutor(
-            max_workers=self._config.max_concurrent_rpcs, thread_name_prefix="mas-bridge"
-        )
         server = aio.server(
-            migration_thread_pool=self._executor,
+            migration_thread_pool=futures.ThreadPoolExecutor(
+                max_workers=self._config.max_concurrent_rpcs,
+                thread_name_prefix="mas-bridge",
+            ),
             maximum_concurrent_rpcs=self._config.max_concurrent_rpcs,
             options=(
                 ("grpc.max_receive_message_length", self._config.max_receive_bytes),
@@ -300,16 +271,11 @@ class GrpcServer:
                 ("grpc.so_reuseport", 0),
             ),
         )
-        self._pending_server = server
         # The generated registrar is untyped; the call is a no-op on failure
         # because binding below is what actually validates the address.
         mas_api_pb2_grpc.add_AgentBridgeApiServicer_to_server(  # type: ignore[no-untyped-call]
             self._servicer, server
         )
-        if self._data_hub_servicer is not None:
-            mas_api_pb2_grpc.add_DataHubBridgeApiServicer_to_server(  # type: ignore[no-untyped-call]
-                self._data_hub_servicer, server
-            )
 
         try:
             if server_credentials is None:
@@ -317,6 +283,7 @@ class GrpcServer:
             else:
                 bound = server.add_secure_port(self._config.address, server_credentials)
         except OSError as error:
+            await server.stop(0)
             # Reports the address, never the configuration: a bind failure is
             # an operational fault, and the fix is to free the port or change
             # the configured address.
@@ -326,6 +293,7 @@ class GrpcServer:
             ) from error
 
         if bound == 0:
+            await server.stop(0)
             raise DependencyUnavailableError(
                 f"cannot bind the agent bridge server to {self._config.address}",
                 details={"host": self._config.host, "port": self._config.port},
@@ -333,7 +301,6 @@ class GrpcServer:
 
         await server.start()
         self._server = server
-        self._pending_server = None
         self._bound_port = bound
 
         if self._config.host not in ("127.0.0.1", "localhost", "::1"):
@@ -353,8 +320,7 @@ class GrpcServer:
                 "event": "bridge.listening",
                 "address": self._config.address,
                 "bound_port": bound,
-                "services": ["mas.api.v1.AgentBridgeApi"]
-                + (["mas.api.v1.DataHubBridgeApi"] if self._data_hub_servicer is not None else []),
+                "service": "mas.api.v1.AgentBridgeApi",
                 "transport_security": self._config.transport_security.value,
                 "max_concurrent_rpcs": self._config.max_concurrent_rpcs,
                 "max_receive_bytes": self._config.max_receive_bytes,
@@ -372,7 +338,6 @@ class GrpcServer:
         """
         server = self._server
         if server is None:
-            await self._close_resources()
             return
 
         self._server = None
@@ -383,35 +348,12 @@ class GrpcServer:
                 "grace_seconds": self._config.graceful_stop_seconds,
             },
         )
-        try:
-            await server.stop(self._config.graceful_stop_seconds)
-        finally:
-            self._bound_port = None
-            await self._close_resources()
+        await server.stop(self._config.graceful_stop_seconds)
+        self._bound_port = None
         self._logger.info(
             "agent bridge server stopped",
             extra={"event": "bridge.stopped"},
         )
-
-    async def _close_resources(self) -> None:
-        """Close every owned dependency once, including on failed startup."""
-        if self._resources_closed:
-            return
-        self._resources_closed = True
-        failures: list[Exception] = []
-        for resource in reversed(self._closeables):
-            try:
-                await resource.aclose()
-            except Exception as error:
-                failures.append(error)
-                self._logger.exception(
-                    "failed to close gRPC dependency", extra={"event": "bridge.close_failed"}
-                )
-        if self._executor is not None:
-            self._executor.shutdown(wait=False)
-            self._executor = None
-        if failures:
-            raise failures[0]
 
     def register_with(self, coordinator: ShutdownCoordinator) -> None:
         """Wires this server into the process shutdown coordinator.

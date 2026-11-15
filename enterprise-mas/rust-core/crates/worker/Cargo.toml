@@ -19,7 +19,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 description = "Task consumer process: leases, retries, heartbeats, graceful shutdown"
-license = "LicenseRef-Proprietary"
+license = "Proprietary"
 
 [lib]
 name = "mas_worker"

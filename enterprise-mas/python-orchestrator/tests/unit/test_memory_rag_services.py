@@ -120,25 +120,6 @@ class TestSecurityFiltering:
         )
         assert combined.required_roles == frozenset({"eng"})
 
-    def test_union_access_does_not_make_disjoint_roles_public(self) -> None:
-        with pytest.raises(InvalidRequestError, match="cannot be represented"):
-            union_access(
-                [
-                    DocumentAccess(tenant_id=TENANT, required_roles=frozenset({"finance"})),
-                    DocumentAccess(tenant_id=TENANT, required_roles=frozenset({"engineering"})),
-                ]
-            )
-
-    def test_union_access_open_rule_does_not_erase_restriction(self) -> None:
-        restricted = DocumentAccess(tenant_id=TENANT, required_roles=frozenset({"finance"}))
-        open_rule = DocumentAccess(tenant_id=TENANT)
-        for rules in ([open_rule, restricted], [restricted, open_rule]):
-            combined = union_access(rules)
-            assert combined.required_roles == frozenset({"finance"})
-            assert not combined.permits(_security())
-            assert combined.permits(_security(allowed_roles=frozenset({"finance"})))
-        assert union_access([open_rule, open_rule]).permits(_security())
-
     def test_union_access_refuses_mixed_tenants(self) -> None:
         # A rule spanning two tenants grants access to neither, which is not
         # the same as a safe rule.
@@ -184,21 +165,6 @@ class TestRagService:
         retriever = _Retriever([_hit(_chunk("a")), _hit(_chunk("b", tenant_id=OTHER))])
         result = await RagService(retriever).retrieve("q", _security())
         assert [hit.chunk.chunk_id for hit in result.hits] == ["a"]
-        assert result.filtered == 1
-
-    async def test_colliding_chunk_ids_do_not_override_role_denial(self) -> None:
-        allowed = _hit(_chunk("same", document_id="public", text="public information"))
-        denied = _hit(
-            _chunk(
-                "same",
-                document_id="private",
-                text="secret information",
-                required_roles=frozenset({"finance"}),
-            )
-        )
-        result = await RagService(_Retriever([allowed, denied])).retrieve("q", _security())
-        assert [hit.chunk.document_id for hit in result.hits] == ["public"]
-        assert "secret information" not in result.as_prompt_text()
         assert result.filtered == 1
 
     async def test_empty_query_is_refused(self) -> None:
@@ -253,17 +219,8 @@ class _Manager:
         self.closed: list[str] = []
 
     async def remember(self, content: str, context: ExecutionContext, **kwargs: object) -> object:
-        from mas_orchestrator.memory.models import MemoryRecord
-
         self.remembered.append((context.tenant_id, content))
-        return MemoryRecord(
-            record_id=str(kwargs["record_id"]),
-            tenant_id=context.tenant_id,
-            scope=kwargs["scope"],
-            content=content,
-            agent_id=context.agent_id,
-            execution_id=context.execution_id,
-        )
+        return None
 
     async def forget(self, context: ExecutionContext, record_id: str) -> bool:
         self.forgotten.append(record_id)

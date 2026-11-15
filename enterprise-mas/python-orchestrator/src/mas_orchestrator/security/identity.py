@@ -60,12 +60,6 @@ class ServiceScope(StrEnum):
     INVOKE_API = "invoke_api"
     #: May read health/readiness.
     READ_HEALTH = "read_health"
-    #: May synchronize an authorized Data Hub source.
-    DATA_HUB_SYNC = "data_hub_sync"
-    #: May ingest an authorized Data Hub document.
-    DATA_HUB_INGEST = "data_hub_ingest"
-    #: May purge an authorized Data Hub document.
-    DATA_HUB_PURGE = "data_hub_purge"
 
 
 @dataclass(frozen=True, slots=True)

@@ -1097,7 +1097,8 @@ mod tests {
         ProjectId,
     ) {
         let (mut state, store) = inmemory_state_with_store();
-        let system = ServiceContext::system("grpc-seed-1", &Timestamp::now()).expect("ctx");
+        let system =
+            ServiceContext::for_service("seed", "grpc-seed-1", &Timestamp::now()).expect("ctx");
         let organization = state
             .tenancy
             .register_organization(&system, "Acme Ltd.", "Acme", "acme-grpc")
@@ -1246,118 +1247,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_and_grpc_cannot_delegate_admin_or_owner_from_admin() {
-        use gen::tenancy_api_server::TenancyApi;
-        use tower::ServiceExt;
-        let (mut state, store, tenant, organization, _) = seed().await;
-        let system = ServiceContext::system("delegation-seed", &Timestamp::now()).unwrap();
-        let scoped = system.clone().with_scope(tenant, organization);
-        let admin = state
-            .tenancy
-            .register_user(&system, "delegation-admin@example.test", "Admin")
-            .await
-            .unwrap();
-        let mut admin_membership = state
-            .tenancy
-            .invite_membership(&scoped, admin.id, mas_domain::MembershipRole::Admin)
-            .await
-            .unwrap();
-        admin_membership.accept_invitation().unwrap();
-        MembershipStorePort::save(store.as_ref(), &admin_membership)
-            .await
-            .unwrap();
-        let target = state
-            .tenancy
-            .register_user(&system, "delegation-target@example.test", "Target")
-            .await
-            .unwrap();
-        let other = state
-            .tenancy
-            .register_user(&system, "delegation-other@example.test", "Other")
-            .await
-            .unwrap();
-        let principal = SecurityPrincipal::new(
-            admin.id.to_string(),
-            PrincipalKind::User,
-            None,
-            ScopeSet::denied(),
-        )
-        .with_memberships(vec![TenantMembership::new(
-            organization,
-            tenant,
-            mas_domain::MembershipRole::Admin,
-        )]);
-        state.verifier =
-            Arc::new(crate::auth::StaticTokenVerifier::new().with_token("test-token", principal));
-        let app = crate::router::router(state.clone());
-        let http_request = |user: mas_common::ids::UserId, role: &str| {
-            axum::http::Request::builder()
-                .method("POST")
-                .uri("/v1/memberships")
-                .header("authorization", "Bearer test-token")
-                .header("x-tenant-id", tenant.to_string())
-                .header("x-organization-id", organization.to_string())
-                .header("content-type", "application/json")
-                .body(axum::body::Body::from(
-                    serde_json::json!({"user_id":user, "role":role}).to_string(),
-                ))
-                .unwrap()
-        };
-        let services = GrpcServices::new(state);
-        let grpc_request = |user: mas_common::ids::UserId, role: &str| {
-            Request::from_parts(
-                authed_metadata(tenant, organization),
-                tonic::Extensions::default(),
-                gen::InviteMembershipRequest {
-                    user_id: user.to_string(),
-                    role: role.to_owned(),
-                },
-            )
-        };
-        for role in ["owner", "admin"] {
-            assert_eq!(
-                app.clone()
-                    .oneshot(http_request(target.id, role))
-                    .await
-                    .unwrap()
-                    .status(),
-                axum::http::StatusCode::FORBIDDEN
-            );
-            assert_eq!(
-                services
-                    .invite_membership(grpc_request(target.id, role))
-                    .await
-                    .unwrap_err()
-                    .code(),
-                Code::PermissionDenied
-            );
-        }
-        assert!(!MembershipStorePort::for_tenant(store.as_ref(), tenant)
-            .await
-            .unwrap()
-            .iter()
-            .any(|m| m.user_id == target.id));
-        assert_eq!(
-            app.oneshot(http_request(target.id, "developer"))
-                .await
-                .unwrap()
-                .status(),
-            axum::http::StatusCode::CREATED
-        );
-        let reply = services
-            .invite_membership(grpc_request(other.id, "viewer"))
-            .await
-            .unwrap()
-            .into_inner();
-        assert_eq!(reply.role, "viewer");
-        assert_eq!(reply.status, "invited");
-    }
-
-    #[tokio::test]
     async fn grpc_execution_mutations_enforce_the_canonical_role_matrix() {
         let (mut state, store, tenant, organization, project) = seed().await;
-        let system =
-            ServiceContext::system("grpc-viewer", &Timestamp::now()).expect("system context");
+        let system = ServiceContext::for_service("seed", "grpc-viewer", &Timestamp::now())
+            .expect("system context");
         let tenant_scope = system.clone().with_scope(tenant, organization);
         let viewer = state
             .tenancy

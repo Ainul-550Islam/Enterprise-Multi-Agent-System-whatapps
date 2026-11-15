@@ -34,7 +34,7 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final, Protocol, runtime_checkable
 
-from mas_orchestrator.agents.base import AgentSpec, AgentState, Termination
+from mas_orchestrator.agents.base import AgentState, Termination
 from mas_orchestrator.agents.runtime import AgentRuntime, ExecutionResult
 from mas_orchestrator.contracts.errors import (
     ConfigurationError,
@@ -128,7 +128,6 @@ class ExecutionRequest:
         context: Authoritative execution context.
         routing: Optional agent selection constraints.
         agent_id: Run a specific agent rather than selecting one.
-        agent_spec: Validated immutable agent version supplied by Rust.
         state: Optional starting state.
         protocol_version: The protocol version claimed by the caller.
     """
@@ -139,7 +138,6 @@ class ExecutionRequest:
     agent_id: str | None = None
     state: AgentState | None = None
     protocol_version: str = str(CURRENT_PROTOCOL_VERSION)
-    agent_spec: AgentSpec | None = None
 
     def __post_init__(self) -> None:
         if not self.request.strip():
@@ -247,10 +245,15 @@ class ExecutionService:
                 state=request.state,
                 cancel_event=cancel_event,
                 agent_id=request.agent_id,
-                agent_spec=request.agent_spec,
             )
-        except asyncio.CancelledError:
-            cancel_event.set()
+        except asyncio.CancelledError as error:
+            result = ExecutionResult(
+                execution_id=context.execution_id,
+                agent_id=context.agent_id,
+                termination=Termination.CANCELLED,
+                error=error,
+                duration_ms=int((time.monotonic() - started) * 1000),
+            )
             await self._emit(
                 cancellation(
                     tenant_id=context.tenant_id,
@@ -259,7 +262,6 @@ class ExecutionService:
                     reason="execution was cancelled",
                 )
             )
-            raise
 
         # --- stage 5: output guardrails ---
         if self._guardrails is not None and result.succeeded and result.content:

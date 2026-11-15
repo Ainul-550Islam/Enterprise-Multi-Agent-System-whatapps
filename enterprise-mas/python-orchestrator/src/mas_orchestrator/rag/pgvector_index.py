@@ -1,11 +1,10 @@
 """Tenant-isolated PostgreSQL/pgvector implementation of :class:`VectorIndex`.
 
 This adapter requires a non-privileged login that can assume the dedicated
-``mas_rag`` role and only accesses RAG-owned ``document_chunks`` and
-``rag_document_fences`` while that role is active. Rust-owned
-source/document metadata is never read or written here. Pool startup verifies
-the actual authenticated/session identity rather than trusting a configuration
-label; every RAG transaction then executes
+``mas_rag`` role and only queries ``document_chunks`` while that role is
+active. Rust-owned data-source/document metadata is never read or written
+here. Pool startup verifies the actual authenticated/session identity rather
+than trusting a configuration label; every RAG transaction then executes
 ``SET LOCAL ROLE mas_rag`` and binds the authoritative tenant to the RLS GUC.
 The database policy and SQL predicate therefore enforce the tenant boundary
 independently.
@@ -29,7 +28,7 @@ from mas_orchestrator.contracts.errors import (
     InvalidRequestError,
     RetrievalError,
 )
-from mas_orchestrator.rag.models import Chunk, DataHubOwnership, DocumentAccess, EmbeddedChunk
+from mas_orchestrator.rag.models import Chunk, DocumentAccess, EmbeddedChunk
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Sequence
@@ -38,7 +37,6 @@ if TYPE_CHECKING:
 
 _LOGGER: Final[logging.Logger] = logging.getLogger(__name__)
 MAX_VECTOR_BATCH: Final[int] = 512
-MAX_DOCUMENT_CHUNKS: Final[int] = 2048
 MAX_SEARCH_LIMIT: Final[int] = 200
 VECTOR_DIMENSION_MIN: Final[int] = 1536
 VECTOR_DIMENSION_MAX: Final[int] = 1536
@@ -84,8 +82,6 @@ class PgVectorIndex:
             controlled adapters and unit tests.
         dimensions: Exact embedding-vector dimension selected by configuration.
         batch_size: Maximum number of chunks accepted in one upsert call.
-        allow_unowned_documents: Explicit opt-in for legacy generic RAG rows.
-            Data Hub composition rejects this because those rows lack project scope.
 
     Raises:
         ConfigurationError: If dimensions or batch size violate their hard
@@ -100,7 +96,6 @@ class PgVectorIndex:
         database_role: str = _REQUIRED_ROLE,
         batch_size: int = 128,
         authority_probe: Callable[[], Awaitable[None]] | None = None,
-        allow_unowned_documents: bool = False,
     ) -> None:
         if not VECTOR_DIMENSION_MIN <= dimensions <= VECTOR_DIMENSION_MAX:
             raise ConfigurationError(
@@ -121,7 +116,6 @@ class PgVectorIndex:
         self._dimensions = dimensions
         self._batch_size = batch_size
         self._authority_probe = authority_probe
-        self._allow_unowned_documents = allow_unowned_documents
         self._opened = False
 
     @classmethod
@@ -134,7 +128,6 @@ class PgVectorIndex:
         min_size: int = 1,
         max_size: int = 8,
         batch_size: int = 128,
-        allow_unowned_documents: bool = False,
     ) -> PgVectorIndex:
         """Builds a bounded pool without opening network connections.
 
@@ -215,7 +208,6 @@ class PgVectorIndex:
             database_role=database_role,
             batch_size=batch_size,
             authority_probe=authority_probe,
-            allow_unowned_documents=allow_unowned_documents,
         )
 
     @classmethod
@@ -228,7 +220,6 @@ class PgVectorIndex:
         min_size: int = 1,
         max_size: int = 8,
         batch_size: int = 128,
-        allow_unowned_documents: bool = False,
     ) -> PgVectorIndex:
         """Creates and verifies the RAG-plane pool before returning it."""
         index = cls.deferred(
@@ -238,7 +229,6 @@ class PgVectorIndex:
             min_size=min_size,
             max_size=max_size,
             batch_size=batch_size,
-            allow_unowned_documents=allow_unowned_documents,
         )
         await index.open()
         return index
@@ -276,11 +266,6 @@ class PgVectorIndex:
         self._opened = True
 
     @property
-    def allows_unowned_documents(self) -> bool:
-        """Whether generic, unfenced legacy vectors may be retrieved."""
-        return self._allow_unowned_documents
-
-    @property
     def dimensions(self) -> int:
         """The exact embedding dimension accepted by this index."""
         return self._dimensions
@@ -297,7 +282,6 @@ class PgVectorIndex:
             async with self._pool.connection() as connection, connection.transaction():
                 await _enter_rag_tenant_scope(connection, None)
                 await connection.execute("SELECT 1 FROM document_chunks LIMIT 0")
-                await connection.execute("SELECT 1 FROM rag_document_fences LIMIT 0")
             return True
         except Exception as error:
             _LOGGER.warning(
@@ -341,13 +325,6 @@ class PgVectorIndex:
 
             async with self._pool.connection() as connection, connection.transaction():
                 await _enter_rag_tenant_scope(connection, tenant_id)
-                # A generic writer may not bypass a Data Hub fence. Acquire
-                # document locks in stable order to avoid batch deadlocks.
-                for document_id in sorted(
-                    {_uuid_text(item.chunk.document_id, "document_id") for item in items}
-                ):
-                    await _lock_document(connection, tenant_id, document_id)
-                    await _check_document_fence(connection, tenant_id, document_id, None)
                 for item in items:
                     await connection.execute(
                         """INSERT INTO document_chunks (
@@ -403,102 +380,6 @@ class PgVectorIndex:
                 details={"dependency": "postgres-rag", "batch_size": len(items)},
             ) from error
 
-    async def replace_document(
-        self, items: Sequence[EmbeddedChunk], *, owner: DataHubOwnership | None = None
-    ) -> None:
-        """Atomically replace one complete document after every embedding succeeds.
-
-        A transaction-scoped advisory lock serializes replacements and purges
-        across processes. On validation, insertion, or cancellation failure the
-        transaction rolls back, preserving the previous complete document.
-        """
-        if not items or len(items) > MAX_DOCUMENT_CHUNKS:
-            raise InvalidRequestError(
-                "document chunk count is outside the atomic replacement bound",
-                details={"limit": MAX_DOCUMENT_CHUNKS, "received": len(items)},
-            )
-        tenant_id = _uuid_text(items[0].chunk.access.tenant_id, "tenant_id")
-        document_id = _uuid_text(items[0].chunk.document_id, "document_id")
-        seen: set[str] = set()
-        for item in items:
-            if (
-                _uuid_text(item.chunk.access.tenant_id, "tenant_id") != tenant_id
-                or _uuid_text(item.chunk.document_id, "document_id") != document_id
-            ):
-                raise InvalidRequestError("atomic replacement must contain exactly one document")
-            if item.chunk.chunk_id in seen:
-                raise InvalidRequestError("atomic replacement contains duplicate chunk ids")
-            seen.add(item.chunk.chunk_id)
-            _validate_embedding(item, self._dimensions)
-            if len(item.chunk.text.encode("utf-8")) > 32 * 1024:
-                raise InvalidRequestError("chunk text exceeds the pgvector row bound")
-        try:
-            from pgvector import Vector
-            from psycopg.types.json import Jsonb
-
-            async with self._pool.connection() as connection, connection.transaction():
-                await _enter_rag_tenant_scope(connection, tenant_id)
-                await _lock_document(connection, tenant_id, document_id)
-                await _check_document_fence(connection, tenant_id, document_id, owner)
-                await connection.execute(
-                    "DELETE FROM document_chunks WHERE tenant_id = %s AND document_id = %s",
-                    (UUID(tenant_id), UUID(document_id)),
-                )
-                for item in items:
-                    await connection.execute(
-                        """INSERT INTO document_chunks (
-                                   tenant_id, document_id, chunk_id, ordinal, start_char,
-                                   end_char, chunk_text, embedding, embedding_model, title,
-                                   source_uri, required_roles, denied_principals, metadata
-                               ) VALUES (
-                                   %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
-                               )
-                               ON CONFLICT (tenant_id, document_id, chunk_id)
-                               DO UPDATE SET ordinal = EXCLUDED.ordinal,
-                                             start_char = EXCLUDED.start_char,
-                                             end_char = EXCLUDED.end_char,
-                                             chunk_text = EXCLUDED.chunk_text,
-                                             embedding = EXCLUDED.embedding,
-                                             embedding_model = EXCLUDED.embedding_model,
-                                             title = EXCLUDED.title,
-                                             source_uri = EXCLUDED.source_uri,
-                                             required_roles = EXCLUDED.required_roles,
-                                             denied_principals = EXCLUDED.denied_principals,
-                                             metadata = EXCLUDED.metadata""",
-                        (
-                            UUID(tenant_id),
-                            UUID(item.chunk.document_id),
-                            item.chunk.chunk_id,
-                            item.chunk.index,
-                            item.chunk.start_char,
-                            item.chunk.end_char,
-                            item.chunk.text,
-                            Vector(list(item.vector)),
-                            item.model,
-                            str(item.chunk.metadata.get("title", ""))[:512],
-                            item.chunk.metadata.get("source_uri"),
-                            sorted(item.chunk.access.required_roles),
-                            sorted(item.chunk.access.denied_principals),
-                            Jsonb(dict(item.chunk.metadata)),
-                        ),
-                    )
-        except (ConfigurationError, InvalidRequestError):
-            raise
-        except Exception as error:
-            _LOGGER.error(
-                "RAG atomic document replacement failed",
-                extra={
-                    "event": "rag.pgvector.replace_failed",
-                    "tenant_id": tenant_id,
-                    "document_id": document_id,
-                    "error_type": type(error).__name__,
-                },
-            )
-            raise RetrievalError(
-                "vector document replacement failed",
-                details={"dependency": "postgres-rag", "document_id": document_id},
-            ) from error
-
     async def search(
         self,
         vector: Sequence[float],
@@ -518,47 +399,19 @@ class PgVectorIndex:
                 details={"expected_dimensions": self._dimensions, "received": len(vector)},
             )
         tenant_id = _uuid_text(context.tenant_id, "tenant_id")
-        organization_id = (
-            _scope_uuid(context.organization_id, "organization_id")
-            if context.organization_id is not None
-            else None
-        )
-        project_id = (
-            _scope_uuid(context.project_id, "project_id")
-            if context.project_id is not None
-            else None
-        )
 
         try:
             from pgvector import Vector
-            from psycopg.rows import dict_row
 
             async with self._pool.connection() as connection, connection.transaction():
                 await _enter_rag_tenant_scope(connection, tenant_id)
-                # Pool connections use tuple rows for the authority probe. The
-                # search decoder requires named columns, so configure only this
-                # cursor rather than changing the session-wide row factory.
-                cursor = connection.cursor(row_factory=dict_row)
-                await cursor.execute(
+                cursor = await connection.execute(
                     """SELECT chunk_id, document_id, ordinal, start_char, end_char, chunk_text,
                               embedding, embedding_model, title, source_uri, metadata,
                               required_roles, denied_principals,
                               1.0 - (embedding <=> %s) AS similarity
                        FROM document_chunks
                        WHERE tenant_id = %s
-                         AND NOT EXISTS (
-                             SELECT 1 FROM rag_document_fences AS fence
-                             WHERE fence.tenant_id = document_chunks.tenant_id
-                               AND fence.document_id = document_chunks.document_id
-                               AND (fence.deleted
-                                    OR fence.organization_id IS DISTINCT FROM %s::uuid
-                                    OR fence.project_id IS DISTINCT FROM %s::uuid)
-                         )
-                         AND (%s OR EXISTS (
-                             SELECT 1 FROM rag_document_fences AS owner
-                             WHERE owner.tenant_id = document_chunks.tenant_id
-                               AND owner.document_id = document_chunks.document_id
-                         ))
                          AND (cardinality(required_roles) = 0
                               OR required_roles && %s::text[])
                          AND NOT (denied_principals && %s::text[])
@@ -567,9 +420,6 @@ class PgVectorIndex:
                     (
                         Vector(list(vector)),
                         UUID(tenant_id),
-                        organization_id,
-                        project_id,
-                        self._allow_unowned_documents,
                         sorted(context.allowed_roles),
                         sorted(context.allowed_principals),
                         Vector(list(vector)),
@@ -594,74 +444,6 @@ class PgVectorIndex:
                 details={"dependency": "postgres-rag", "tenant_id": tenant_id},
             ) from error
 
-    async def begin_data_hub_ingest(
-        self, tenant_id: str, document_id: str, owner: DataHubOwnership
-    ) -> None:
-        """Claim a new document or verify its existing active owner before embedding."""
-        tenant_id = _uuid_text(tenant_id, "tenant_id")
-        document_id = _uuid_text(document_id, "document_id")
-        owner_ids = _owner_ids(owner)
-        try:
-            async with self._pool.connection() as connection, connection.transaction():
-                await _enter_rag_tenant_scope(connection, tenant_id)
-                await _lock_document(connection, tenant_id, document_id)
-                row = await _read_document_fence(connection, tenant_id, document_id)
-                if row is None:
-                    await _refuse_unowned_legacy_chunks(connection, tenant_id, document_id)
-                    await connection.execute(
-                        """INSERT INTO rag_document_fences
-                           (tenant_id, document_id, organization_id, project_id, source_id)
-                           VALUES (%s, %s, %s, %s, %s)""",
-                        (UUID(tenant_id), UUID(document_id), *owner_ids),
-                    )
-                else:
-                    _verify_document_fence(row, owner_ids)
-        except (ConfigurationError, InvalidRequestError):
-            raise
-        except Exception as error:
-            raise RetrievalError(
-                "Data Hub document ownership check failed", details={"dependency": "postgres-rag"}
-            ) from error
-
-    async def purge_data_hub_document(
-        self, tenant_id: str, document_id: str, owner: DataHubOwnership
-    ) -> int:
-        """Atomically tombstone and purge an exactly owned document, including absent IDs."""
-        tenant_id = _uuid_text(tenant_id, "tenant_id")
-        document_id = _uuid_text(document_id, "document_id")
-        owner_ids = _owner_ids(owner)
-        try:
-            async with self._pool.connection() as connection, connection.transaction():
-                await _enter_rag_tenant_scope(connection, tenant_id)
-                await _lock_document(connection, tenant_id, document_id)
-                row = await _read_document_fence(connection, tenant_id, document_id)
-                if row is None:
-                    await _refuse_unowned_legacy_chunks(connection, tenant_id, document_id)
-                    await connection.execute(
-                        """INSERT INTO rag_document_fences
-                           (tenant_id, document_id, organization_id, project_id, source_id, deleted)
-                           VALUES (%s, %s, %s, %s, %s, TRUE)""",
-                        (UUID(tenant_id), UUID(document_id), *owner_ids),
-                    )
-                else:
-                    _verify_document_fence(row, owner_ids, allow_deleted=True)
-                    await connection.execute(
-                        """UPDATE rag_document_fences SET deleted = TRUE, updated_at = now()
-                           WHERE tenant_id = %s AND document_id = %s""",
-                        (UUID(tenant_id), UUID(document_id)),
-                    )
-                cursor = await connection.execute(
-                    "DELETE FROM document_chunks WHERE tenant_id = %s AND document_id = %s",
-                    (UUID(tenant_id), UUID(document_id)),
-                )
-                return int(cursor.rowcount)
-        except (ConfigurationError, InvalidRequestError):
-            raise
-        except Exception as error:
-            raise RetrievalError(
-                "Data Hub document purge failed", details={"dependency": "postgres-rag"}
-            ) from error
-
     async def delete_document(self, tenant_id: str, document_id: str) -> int:
         """Deletes all vectors for exactly one tenant/document pair."""
         tenant_uuid = _uuid_text(tenant_id, "tenant_id")
@@ -669,15 +451,11 @@ class PgVectorIndex:
         try:
             async with self._pool.connection() as connection, connection.transaction():
                 await _enter_rag_tenant_scope(connection, tenant_uuid)
-                await _lock_document(connection, tenant_uuid, document_uuid)
-                await _check_document_fence(connection, tenant_uuid, document_uuid, None)
                 cursor = await connection.execute(
                     "DELETE FROM document_chunks WHERE tenant_id = %s AND document_id = %s",
                     (UUID(tenant_uuid), UUID(document_uuid)),
                 )
                 return int(cursor.rowcount)
-        except (ConfigurationError, InvalidRequestError):
-            raise
         except Exception as error:
             _LOGGER.error(
                 "RAG vector delete failed",
@@ -692,69 +470,6 @@ class PgVectorIndex:
                 "vector delete failed",
                 details={"dependency": "postgres-rag", "document_id": document_uuid},
             ) from error
-
-
-def _owner_ids(owner: DataHubOwnership) -> tuple[UUID, UUID, UUID]:
-    return (
-        UUID(_uuid_text(owner.organization_id, "organization_id")),
-        UUID(_uuid_text(owner.project_id, "project_id")),
-        UUID(_uuid_text(owner.source_id, "source_id")),
-    )
-
-
-async def _read_document_fence(connection: _Connection, tenant_id: str, document_id: str) -> Any:
-    cursor = await connection.execute(
-        """SELECT organization_id, project_id, source_id, deleted FROM rag_document_fences
-           WHERE tenant_id = %s AND document_id = %s""",
-        (UUID(tenant_id), UUID(document_id)),
-    )
-    return await cursor.fetchone()
-
-
-def _verify_document_fence(
-    row: Any, owner_ids: tuple[UUID, UUID, UUID], *, allow_deleted: bool = False
-) -> None:
-    if tuple(row[:3]) != owner_ids or (bool(row[3]) and not allow_deleted):
-        raise InvalidRequestError("Data Hub document is unavailable in the requested scope")
-
-
-async def _check_document_fence(
-    connection: _Connection, tenant_id: str, document_id: str, owner: DataHubOwnership | None
-) -> None:
-    row = await _read_document_fence(connection, tenant_id, document_id)
-    if owner is None:
-        if row is not None:
-            raise InvalidRequestError("Data Hub document requires an authorized owner")
-    elif row is None:
-        raise InvalidRequestError("Data Hub document ownership has not been registered")
-    else:
-        _verify_document_fence(row, _owner_ids(owner))
-
-
-async def _refuse_unowned_legacy_chunks(
-    connection: _Connection, tenant_id: str, document_id: str
-) -> None:
-    cursor = await connection.execute(
-        "SELECT 1 FROM document_chunks WHERE tenant_id = %s AND document_id = %s LIMIT 1",
-        (UUID(tenant_id), UUID(document_id)),
-    )
-    if await cursor.fetchone() is not None:
-        raise InvalidRequestError("unowned legacy vectors require operator reconciliation")
-
-
-async def _lock_document(connection: _Connection, tenant_id: str, document_id: str) -> None:
-    """Serialize per-document mutation across all RAG-plane processes."""
-    await connection.execute(
-        "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
-        (f"mas-rag-document:{tenant_id}:{document_id}",),
-    )
-
-
-def _scope_uuid(value: str, field: str) -> UUID:
-    parsed = UUID(_uuid_text(value, field))
-    if parsed.int == 0:
-        raise InvalidRequestError(f"{field} must not be a nil UUID", details={"field": field})
-    return parsed
 
 
 def _uuid_text(value: str, field: str) -> str:
@@ -861,12 +576,6 @@ def _decode_row(row: Any, tenant_id: str) -> tuple[EmbeddedChunk, float]:
         access=access,
         metadata=metadata,
     )
-    # psycopg's pgvector adapter may return a pgvector.Vector rather than an
-    # iterable numpy array (depending on its registered loader). Both expose
-    # to_list/tolist respectively; ordinary iterables remain supported too.
-    raw_vector = row["embedding"]
-    if hasattr(raw_vector, "to_list"):
-        raw_vector = raw_vector.to_list()
-    vector = tuple(float(value) for value in raw_vector)
+    vector = tuple(float(value) for value in row["embedding"])
     model = str(row["embedding_model"])
     return EmbeddedChunk(chunk=chunk, vector=vector, model=model), float(row["similarity"])

@@ -185,8 +185,7 @@ class WebhookTool:
     ) -> None:
         if not config.direct_delivery_enabled:
             raise InvalidRequestError(
-                "direct Python webhook delivery is disabled; "
-                "use the durable Rust integration plane",
+                "direct Python webhook delivery is disabled; use the durable Rust integration plane",
                 details={"reason": "durable_webhook_required"},
             )
         if config.sign_payloads and secret is None:

@@ -1,0 +1,36 @@
+[package]
+name = "mas-billing-stripe"
+version = "1.0.0"
+edition = "2021"
+description = "Stripe billing protocol — customer management, checkout/portal sessions, webhook verification, status mapping, receipt lifecycle. Protocol-only crate; no DB dependencies."
+license = "Proprietary"
+
+[workspace.deps]
+mas-common = { workspace = true }
+mas-integrations = { workspace = true }
+
+[dependencies]
+mas-common = { workspace = true, features = ["full"] }
+mas-integrations = { workspace = true }
+
+# Stripe protocol primitives
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hmac = "0.12"
+sha2 = "0.10"
+subtle = "2"
+
+# Thiserror for error helpers
+thiserror = "2"
+
+# reqwest for Guarded Graph API calls
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Timeout + retry
+tracing = "0.1"
+
+# UUID for customer IDs
+uuid = { version = "1", features = ["v4"] }
+
+# Owned semver if version parsing is needed
+semver = { version = "1", features = ["serde"] }

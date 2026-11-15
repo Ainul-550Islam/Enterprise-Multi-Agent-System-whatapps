@@ -76,25 +76,6 @@ class AgentFactory:
             ConfigurationError: If the spec's kind needs a collaborator that
                 was not supplied.
         """
-        from mas_orchestrator.agents.builtin.platform_assistant import (
-            PLATFORM_ASSISTANT_AGENT_ID,
-            PlatformAssistantAgent,
-        )
-
-        if spec.agent_id == PLATFORM_ASSISTANT_AGENT_ID:
-            if not spec.read_only or spec.kind is not AgentKind.STANDARD or spec.allowed_tools:
-                raise ConfigurationError("platform assistant requires a read-only standard agent")
-            executor = AgentExecutor(
-                spec,
-                router=self._router,
-                provider_for=self._provider_for,
-                tool_executor=None,
-                tool_registry=None,
-                ledger=ledger,
-                config=config,
-            )
-            return PlatformAssistantAgent(spec, executor)
-
         if spec.kind is AgentKind.SUPERVISOR:
             if self._agent_registry is None:
                 raise ConfigurationError(

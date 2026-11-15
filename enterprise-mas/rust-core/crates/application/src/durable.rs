@@ -602,24 +602,6 @@ pub trait DurableExecutionPort: std::fmt::Debug + Send + Sync {
     /// Lists a tenant's executions (reads hide other tenants entirely).
     async fn list_executions(&self, tenant: TenantId, limit: usize) -> Result<Vec<Execution>>;
 
-    /// Lists executions in an optional organization, filtering before the limit.
-    ///
-    /// Implementations that cannot enforce organization scope fail closed;
-    /// filtering a truncated tenant-wide result would omit authorized rows.
-    async fn list_executions_scoped(
-        &self,
-        tenant: TenantId,
-        organization: Option<OrganizationId>,
-        limit: usize,
-    ) -> Result<Vec<Execution>> {
-        if organization.is_some() {
-            return Err(AppError::internal(
-                "durable execution store does not support organization-scoped listing",
-            ));
-        }
-        self.list_executions(tenant, limit).await
-    }
-
     /// Loads one task with its owning execution, scoped to `tenant`.
     async fn load_task(
         &self,

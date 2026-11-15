@@ -31,17 +31,14 @@ Loading order (later wins), matching the Rust Core convention:
 
 from __future__ import annotations
 
-import json
 import os
 from collections.abc import Mapping
-from contextlib import suppress
 from pathlib import Path
 from typing import Any, Final
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
 from mas_orchestrator.config.enums import (
-    DataSourceKind,
     Environment,
     GuardrailFailureMode,
     LogFormat,
@@ -385,96 +382,6 @@ class RagSettings(_Frozen):
         return self
 
 
-class DataHubObjectStorageBinding(_Frozen):
-    """Operator-owned binding of one source and destination to secret references."""
-
-    tenant_id: str = Field(min_length=36, max_length=36)
-    organization_id: str = Field(min_length=36, max_length=36)
-    project_id: str = Field(min_length=36, max_length=36)
-    source_id: str = Field(min_length=36, max_length=36)
-    endpoint_url: str = Field(min_length=1, max_length=2048)
-    bucket: str = Field(min_length=3, max_length=63)
-    prefix: str = Field(default="", max_length=2048)
-    region: str = Field(default="us-east-1", min_length=1, max_length=64)
-    access_key_secret_ref: str = Field(min_length=5, max_length=512)
-    secret_key_secret_ref: str = Field(min_length=5, max_length=512)
-
-    @field_validator("tenant_id", "organization_id", "project_id", "source_id")
-    @classmethod
-    def _canonical_id(cls, value: str) -> str:
-        from uuid import UUID
-
-        parsed = UUID(value)
-        if parsed.int == 0 or str(parsed) != value:
-            raise ValueError("binding identifiers must be non-nil canonical UUIDs")
-        return value
-
-    @field_validator("access_key_secret_ref", "secret_key_secret_ref")
-    @classmethod
-    def _reference_only(cls, value: str) -> str:
-        if not value.startswith(("env:", "file:")) or not value.split(":", 1)[1].strip():
-            raise ValueError("binding credentials must use a supported secret reference")
-        return value
-
-
-class DataHubSettings(_Frozen):
-    """Bounded source ingestion and dedicated RAG credentials by reference."""
-
-    database_url_secret_ref: str | None = Field(default=None, max_length=512)
-    embedding_api_key_secret_ref: str | None = Field(default=None, max_length=512)
-    embedding_model: str = Field(default="text-embedding-3-small", min_length=1, max_length=128)
-    allowed_source_kinds: tuple[DataSourceKind, ...] = (DataSourceKind.UPLOAD,)
-    allowed_mime_types: tuple[str, ...] = (
-        "text/plain",
-        "text/markdown",
-        "text/html",
-        "text/csv",
-        "application/json",
-        "application/pdf",
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    )
-    allowed_web_hosts: tuple[str, ...] = ()
-    allowed_object_hosts: tuple[str, ...] = ()
-    object_storage_bindings: tuple[DataHubObjectStorageBinding, ...] = Field(
-        default=(), max_length=10_000
-    )
-    max_upload_bytes: int = Field(default=2 * 1024 * 1024, ge=1024, le=8 * 1024 * 1024)
-    max_document_bytes: int = Field(default=2 * 1024 * 1024, ge=1024, le=8 * 1024 * 1024)
-    max_sync_bytes: int = Field(default=16 * 1024 * 1024, ge=1024, le=256 * 1024 * 1024)
-    max_pages_per_sync: int = Field(default=100, ge=1, le=10_000)
-    max_crawl_depth: int = Field(default=2, ge=0, le=10)
-
-    @field_validator("object_storage_bindings", mode="before")
-    @classmethod
-    def _parse_object_bindings(cls, value: Any) -> Any:
-        # Nested settings arrive as strings in environment overrides. Accept a
-        # bounded JSON array for immutable operator configuration in containers.
-        if isinstance(value, str):
-            if len(value.encode("utf-8")) > 1024 * 1024:
-                raise ValueError("object storage bindings exceed the configuration byte limit")
-            try:
-                value = json.loads(value)
-            except (ValueError, RecursionError) as error:
-                raise ValueError("object storage bindings must be a JSON array") from error
-        return value
-
-    @model_validator(mode="after")
-    def _consistent_bounds(self) -> DataHubSettings:
-        if (
-            self.max_upload_bytes > self.max_document_bytes
-            or self.max_sync_bytes < self.max_document_bytes
-        ):
-            raise ValueError("data hub byte bounds are inconsistent")
-        if DataSourceKind.WEB in self.allowed_source_kinds and not self.allowed_web_hosts:
-            raise ValueError("web source requires an egress host allowlist")
-        if (
-            DataSourceKind.OBJECT_STORAGE in self.allowed_source_kinds
-            and not self.allowed_object_hosts
-        ):
-            raise ValueError("object storage requires an egress host allowlist")
-        return self
-
-
 class GuardrailSettings(_Frozen):
     """Guardrail behaviour configuration."""
 
@@ -606,10 +513,6 @@ class SecuritySettings(_Frozen):
     #: identity.
     internal_service_secret_ref: str | None = Field(default=None, max_length=256)
 
-    #: Secret reference to the PostgreSQL DSN used for shared replay receipts.
-    #: The runtime role must have insert-only access to the receipt table.
-    internal_replay_database_url_ref: str | None = Field(default=None, max_length=256)
-
     #: Service ids permitted to call this process, in addition to the
     #: built-in default. A syntactically perfect signature from a service
     #: that is not on the allowlist is still a refusal.
@@ -639,7 +542,6 @@ class Settings(_Frozen):
     tools: ToolSettings = Field(default_factory=ToolSettings)
     memory: MemorySettings = Field(default_factory=MemorySettings)
     rag: RagSettings = Field(default_factory=RagSettings)
-    data_hub: DataHubSettings = Field(default_factory=DataHubSettings)
     guardrails: GuardrailSettings = Field(default_factory=GuardrailSettings)
     agents: AgentRuntimeSettings = Field(default_factory=AgentRuntimeSettings)
     observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
@@ -682,9 +584,7 @@ def _read_toml(path: Path) -> Mapping[str, Any]:
         return tomllib.load(handle)
 
 
-def _env_overrides(
-    prefix: str = ENV_PREFIX, *, secret_names: frozenset[str] = frozenset()
-) -> Mapping[str, Any]:
+def _env_overrides(prefix: str = ENV_PREFIX) -> Mapping[str, Any]:
     """Builds a nested override mapping from prefixed environment variables.
 
     ``MAS_ORCH_RUST_CORE__ENDPOINT=host:500`` becomes
@@ -700,11 +600,7 @@ def _env_overrides(
     """
     overrides: dict[str, Any] = {}
     for raw_key, raw_value in os.environ.items():
-        if (
-            not raw_key.startswith(prefix)
-            or raw_key.startswith("MAS_ORCH_SECRET_")
-            or raw_key in secret_names
-        ):
+        if not raw_key.startswith(prefix):
             continue
         parts = raw_key[len(prefix) :].lower().split("__")
         cursor: dict[str, Any] = overrides
@@ -724,31 +620,6 @@ def _env_overrides(
         if leaf:
             cursor[leaf] = raw_value
     return overrides
-
-
-def _configured_secret_env_names(value: Any) -> frozenset[str]:
-    """Extract env references from operator config without resolving or logging them."""
-    found: set[str] = set()
-
-    def visit(item: Any, field: str = "") -> None:
-        if isinstance(item, Mapping):
-            for key, child in item.items():
-                visit(child, str(key).lower())
-        elif isinstance(item, (list, tuple)):
-            for child in item:
-                visit(child, field)
-        elif isinstance(item, str):
-            if field.endswith("_ref") and item.startswith("env:"):
-                name = item[4:].strip()
-                if name:
-                    found.add(name)
-            elif field == "object_storage_bindings" and len(item) <= 1024 * 1024:
-                # Field validation reports malformed configuration.
-                with suppress(ValueError, RecursionError):
-                    visit(json.loads(item))
-
-    visit(value)
-    return frozenset(found)
 
 
 def _deep_merge(base: Mapping[str, Any], overlay: Mapping[str, Any]) -> dict[str, Any]:
@@ -824,33 +695,7 @@ def load_settings(
         if overlay_file is not None:
             merged = _deep_merge(merged, _read_toml(overlay_file))
 
-    # Resolve which env vars are secret values from the layered *references*
-    # before parsing env overrides. Otherwise e.g. MAS_ORCH_BRIDGE_TOKEN is
-    # mistaken for an unknown setting, and Pydantic errors can echo its value.
-    raw_reference_fields = [
-        {key.rsplit("__", 1)[-1].lower(): value}
-        for key, value in os.environ.items()
-        if key.startswith(ENV_PREFIX)
-    ]
-    # Include references from every layer, including superseded settings:
-    # an old injected secret may still exist in the environment after a config
-    # override and must never be validated or rendered as a setting value.
-    secret_names = (
-        _configured_secret_env_names(merged)
-        | _configured_secret_env_names(raw_reference_fields)
-        | _configured_secret_env_names(overrides or {})
-    )
-    if any(
-        name.startswith(ENV_PREFIX)
-        and not name.startswith("MAS_ORCH_SECRET_")
-        and (
-            "__" in name[len(ENV_PREFIX) :]
-            or name[len(ENV_PREFIX) :].lower() in Settings.model_fields
-        )
-        for name in secret_names
-    ):
-        raise ValueError("secret environment name overlaps the settings namespace")
-    merged = _deep_merge(merged, _env_overrides(secret_names=secret_names))
+    merged = _deep_merge(merged, _env_overrides())
     if overrides:
         merged = _deep_merge(merged, overrides)
 
@@ -862,7 +707,6 @@ __all__ = [
     "DEFAULT_MAX_TOOL_RESULT_BYTES",
     "ENV_PREFIX",
     "AgentRuntimeSettings",
-    "DataHubSettings",
     "GuardrailSettings",
     "MemorySettings",
     "ObservabilitySettings",

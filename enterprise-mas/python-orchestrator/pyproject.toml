@@ -11,7 +11,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mas-orchestrator"
-version = "0.1.0"
+version = "1.0.0"
 description = "Python AI Orchestrator for the Enterprise Multi-Agent System: agent runtime, model providers, tools, memory, RAG, guardrails, and Rust Core integration."
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
@@ -53,19 +53,9 @@ dependencies = [
     "protobuf>=7.35.1,<8",
     # Outbound HTTP for provider/tool adapters (SSRF-guarded by our own layer).
     "httpx>=0.27",
-    # Safely parses XML in Data Hub source adapters, imported at startup.
-    "defusedxml>=0.7,<1",
-    # Shared PostgreSQL replay receipts are required by the production bridge.
-    "psycopg[binary]>=3.2,<4",
 ]
 
 [project.optional-dependencies]
-# Durable RAG requires both the vector adapter and Psycopg's separately
-# distributed asynchronous pool. Production images install this extra.
-pgvector = ["pgvector>=0.3,<1", "psycopg-pool>=3.2,<4"]
-# PDF and DOCX parsers are intentionally optional for deployments that do not
-# accept those document types. Production images install both parsers.
-ingest = ["pypdf>=5,<7", "python-docx>=1.1,<2"]
 # Observability extras: OpenTelemetry is optional so the service boots without
 # an exporter configured. Nothing in the AI runtime depends on it being present.
 otel = [

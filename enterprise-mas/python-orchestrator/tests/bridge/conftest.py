@@ -22,7 +22,6 @@ bill per run, and test the provider rather than the bridge.
 from __future__ import annotations
 
 import asyncio
-import json
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -54,18 +53,14 @@ from mas_orchestrator.security.identity import (
     ServiceScope,
     StaticTokenServiceIdentityResolver,
 )
-from mas_orchestrator.security.internal_replay import InMemoryReplayGuard
 from mas_orchestrator.security.internal_service import (
     now_millis,
     signed_internal_signature,
 )
 
-TENANT = "11111111-1111-4111-8111-111111111111"
-OTHER_TENANT = "22222222-2222-4222-8222-222222222222"
-ORGANIZATION = "33333333-3333-4333-8333-333333333333"
-PROJECT = "44444444-4444-4444-8444-444444444444"
-AGENT = "55555555-5555-4555-8555-555555555555"
-AGENT_VERSION = "66666666-6666-4666-8666-666666666666"
+TENANT = "tenant-alpha"
+OTHER_TENANT = "tenant-beta"
+ORGANIZATION = "org-1"
 CREDENTIAL = "bridge-service-token"
 SUBJECT = "rust-core"
 
@@ -99,7 +94,6 @@ class RecordedRun:
     request_text: str
     context: Any
     cancel_event: asyncio.Event
-    agent_spec: Any
 
 
 @dataclass(slots=True)
@@ -136,7 +130,7 @@ class RecordingExecutionService:
             Exception: The configured error, if one was set.
         """
         event = cancel_event if cancel_event is not None else asyncio.Event()
-        self.runs.append(RecordedRun(request.request, request.context, event, request.agent_spec))
+        self.runs.append(RecordedRun(request.request, request.context, event))
 
         if self.delay_seconds:
             if self.honour_cancel:
@@ -213,60 +207,12 @@ def failed_result(
     )
 
 
-def snapshot_json(
-    *,
-    agent_id: str = AGENT,
-    tenant_id: str = TENANT,
-    organization_id: str = ORGANIZATION,
-    project_id: str = PROJECT,
-    agent_version_id: str = AGENT_VERSION,
-    version_number: int = 1,
-    model_hint: str = "provider/model-test",
-    system_prompt: str = "Rust-published test instructions",
-    status: str = "active",
-) -> str:
-    """An immutable published Rust snapshot for bridge tests."""
-    return json.dumps(
-        {
-            "agent_id": agent_id,
-            "tenant_id": tenant_id,
-            "organization_id": organization_id,
-            "project_id": project_id,
-            "agent_version_id": agent_version_id,
-            "version_number": version_number,
-            "configuration_checksum": "a" * 64,
-            "name": "Test Agent",
-            "slug": "test-agent",
-            "kind": "standard",
-            "status": status,
-            "origin": "user",
-            "read_only": False,
-            "configuration": {
-                "description": None,
-                "model_hint": model_hint,
-                "system_prompt": system_prompt,
-                "limits": {
-                    "max_steps": 25,
-                    "max_tool_calls": 50,
-                    "max_delegation_depth": 5,
-                    "timeout_seconds": None,
-                },
-                "tags": [],
-                "allowed_tools": [],
-            },
-        }
-    )
-
-
 def request(
     *,
     tenant_id: str = TENANT,
     organization_id: str = ORGANIZATION,
     input_json: str = "hello",
-    agent_id: str = AGENT,
-    project_id: str = PROJECT,
-    agent_version: str = AGENT_VERSION,
-    agent_snapshot_json: str | None = None,
+    agent_id: str = "platform.default",
     correlation_id: str = "corr-1",
     request_id: str = "req-1",
     execution_id: str = "exec-1",
@@ -293,19 +239,6 @@ def request(
     """
     message = mas_api_pb2.AgentRunRequest(
         agent_id=agent_id,
-        project_id=project_id,
-        agent_version=agent_version,
-        agent_snapshot_json=(
-            snapshot_json(
-                agent_id=agent_id,
-                tenant_id=tenant_id,
-                organization_id=organization_id,
-                project_id=project_id,
-                agent_version_id=agent_version,
-            )
-            if agent_snapshot_json is None
-            else agent_snapshot_json
-        ),
         input_json=input_json,
         correlation_id=correlation_id,
         request_id=request_id,
@@ -611,7 +544,6 @@ async def signed_bridge(execution_service: RecordingExecutionService):
             require_scope=ServiceScope.EXECUTE_AGENT,
             internal_service_secret=SIGNING_SECRET,
         ),
-        replay_guard=InMemoryReplayGuard(),
     )
     server = GrpcServer(servicer=servicer, config=GrpcServerConfig(host="127.0.0.1", port=0))
     port = await server.start()

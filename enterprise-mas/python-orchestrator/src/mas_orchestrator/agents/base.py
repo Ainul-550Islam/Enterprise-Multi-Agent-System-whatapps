@@ -138,7 +138,6 @@ class AgentSpec:
         system_prompt: The agent's instructions.
         limits: Execution ceilings.
         tags: Free-form labels.
-        read_only: Whether the agent is product-owned and immutable.
     """
 
     agent_id: str
@@ -154,7 +153,6 @@ class AgentSpec:
     system_prompt: str = ""
     limits: AgentLimits = field(default_factory=AgentLimits)
     tags: tuple[str, ...] = ()
-    read_only: bool = False
 
     def __post_init__(self) -> None:
         for field_name in ("agent_id", "agent_version_id", "name", "slug", "tenant_id"):

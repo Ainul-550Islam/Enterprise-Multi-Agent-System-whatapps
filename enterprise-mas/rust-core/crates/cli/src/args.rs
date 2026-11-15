@@ -104,73 +104,164 @@ pub enum Command {
     /// Inspect schedules and flip their lifecycle flags.
     #[command(subcommand)]
     Schedule(ScheduleCmd),
+    /// Admin operations (org→tenant→project→owner→API key→default plan).
+    #[command(subcommand)]
+    Admin(AdminCmd),
     /// Inspect agents.
     #[command(subcommand)]
     Agent(ListGet),
     /// Inspect workflows.
     #[command(subcommand)]
     Workflow(ListGet),
+    /// Manage API keys (create, rotate, revoke).
+    #[command(subcommand)]
+    ApiKey(ApiKeyCmd),
 }
 
-/// Execution verbs.
+/// Admin verbs (org→tenant→project→owner→API key→default plan).
 #[derive(Debug, Clone, Subcommand)]
-pub enum ExecutionCmd {
-    /// Submit a new execution (project-scoped, idempotent).
-    Submit(SubmitArgs),
-    /// List executions (scope-filtered by headers).
-    List,
-    /// Show one execution.
-    Get {
-        /// Execution id (UUID).
-        id: Uuid,
-    },
-    /// Transition: `mas execution <start|pause|resume|cancel> <id>`.
-    Start {
-        /// Execution id.
-        id: Uuid,
-    },
-    /// Pause.
-    Pause {
-        /// Execution id.
-        id: Uuid,
-    },
-    /// Resume.
-    Resume {
-        /// Execution id.
-        id: Uuid,
-    },
-    /// Cancel.
-    Cancel {
-        /// Execution id.
-        id: Uuid,
-    },
+pub enum AdminCmd {
+    /// Bootstrap a new organization (idempotent: re-runs are no-ops).
+    Bootstrap(BootstrapArgs),
+    /// Create a new agent under an organization.
+    CreateAgent(CreateAgentArgs),
+    /// Publish an agent (make it available in the org).
+    PublishAgent(PublishAgentArgs),
+    /// Create a new workflow under an organization.
+    CreateWorkflow(CreateWorkflowArgs),
+    /// Create a new API key.
+    CreateApiKey(CreateApiKeyArgs),
+    /// Rotate an API key.
+    RotateApiKey(RotateApiKeyArgs),
+    /// Revoke an API key.
+    RevokeApiKey(RevokeApiKeyArgs),
 }
 
-/// Schedule verbs (register/update stay in provisioning tooling).
+/// Bootstrap arguments (org→tenant→project→owner→API key→default plan).
+#[derive(Debug, Clone, Args)]
+pub struct BootstrapArgs {
+    /// Organization UUID.
+    #[arg(long)]
+    pub organization: Uuid,
+    /// Tenant UUID under the organization.
+    #[arg(long)]
+    pub tenant: Uuid,
+    /// Project UUID under the tenant.
+    #[arg(long)]
+    pub project: Uuid,
+    /// Owner UUID under the project.
+    #[arg(long)]
+    pub owner: Uuid,
+    /// Default plan ID for the project.
+    #[arg(long)]
+    pub default_plan: Option<String>,
+    /// Idempotency key. Default: `cli-{uuid}` (safe replays on shell retry).
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+]
+
+/// Create agent arguments.
+#[derive(Debug, Clone, Args)]
+pub struct CreateAgentArgs {
+    /// Agent name.
+    #[arg(long)]
+    pub name: String,
+    /// Agent description.
+    #[arg(long)]
+    pub description: Option<String>,
+    /// Agent scope (tenant or organization).
+    #[arg(long)]
+    pub scope: Option<String>,
+    /// Agent capabilities.
+    #[arg(long)]
+    pub capabilities: Option<String>,
+    /// Idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+]
+
+/// Publish agent arguments.
+#[derive(Debug, Clone, Args)]
+pub struct PublishAgentArgs {
+    /// Agent ID to publish.
+    #[arg(long)]
+    pub agent_id: Uuid,
+    /// New version to publish.
+    #[arg(long)]
+    pub version: Option<String>,
+    /// Target organization.
+    #[arg(long)]
+    pub organization: Option<Uuid>,
+]
+
+/// Create workflow arguments.
+#[derive(Debug, Clone, Args)]
+pub struct CreateWorkflowArgs {
+    /// Workflow name.
+    #[arg(long)]
+    pub name: String,
+    /// Workflow definition (JSON or @path).
+    #[arg(long)]
+    pub definition: Option<String>,
+    /// Scope (tenant or organization).
+    #[arg(long)]
+    pub scope: Option<String>,
+    /// Idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+]
+
+/// Create API key arguments.
+#[derive(Debug, Clone, Args)]
+pub struct CreateApiKeyArgs {
+    /// Key name/description.
+    #[arg(long)]
+    pub name: String,
+    /// Key permissions/scopes.
+    #[arg(long)]
+    pub permissions: Option<String>,
+    /// Key expires in seconds (0 = never expires).
+    #[arg(long, default_value = "0")]
+    pub expires_in: u64,
+    /// Idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+]
+
+/// Rotate API key arguments.
+#[derive(Debug, Clone, Args)]
+pub struct RotateApiKeyArgs {
+    /// Key to rotate.
+    #[arg(long)]
+    pub key_id: Uuid,
+    /// New key name.
+    #[arg(long)]
+    pub new_name: Option<String>,
+    /// Idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+]
+
+/// Revoke API key arguments.
+#[derive(Debug, Clone, Args)]
+pub struct RevokeApiKeyArgs {
+    /// Key to revoke.
+    #[arg(long)]
+    pub key_id: Uuid,
+    /// Reason for revocation.
+    #[arg(long)]
+    pub reason: Option<String>,
+]
+
+/// API key verbs.
 #[derive(Debug, Clone, Subcommand)]
-pub enum ScheduleCmd {
-    /// List schedules.
-    List,
-    /// Show one schedule.
-    Get {
-        /// Schedule id.
-        id: Uuid,
-    },
-    /// Pause.
-    Pause {
-        /// Schedule id.
-        id: Uuid,
-    },
-    /// Resume.
-    Resume {
-        /// Schedule id.
-        id: Uuid,
-    },
-    /// Disable (terminal).
-    Disable {
-        /// Schedule id.
-        id: Uuid,
-    },
+pub enum ApiKeyCmd {
+    /// Create a new API key.
+    Create(CreateApiKeyArgs),
+    /// Rotate an existing API key.
+    Rotate(RotateApiKeyArgs),
+    /// Revoke an API key.
+    Revoke(RevokeApiKeyArgs),
 }
 
 /// Shared `list|get <id>` shape for read-only resources.
@@ -219,7 +310,7 @@ impl Cli {
 #[cfg(test)]
 mod tests {
     use super::Cli;
-    use super::{Command, ExecutionCmd};
+    use super::{Command, ExecutionCmd, AdminCmd, ApiKeyCmd};
 
     #[test]
     fn parses_submit_with_input_file_and_wait() {
@@ -265,4 +356,64 @@ mod tests {
             Command::Schedule(super::ScheduleCmd::List)
         ));
     }
+
+    #[test]
+    fn parses_admin_bootstrap() {
+        let cli = Cli::parse_from_args([
+            "mas",
+            "admin",
+            "bootstrap",
+            "--organization",
+            "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1",
+            "--tenant",
+            "b2b2b2b2-b2b2-b2b2-b2b2-b2b2b2b2b2b2",
+            "--project",
+            "c3c3c3c3-c3c3-c3c3-c3c3-c3c3c3c3c3c3",
+            "--owner",
+            "d4d4d4d4-d4d4-d4d4-d4d4-d4d4d4d4d4d4",
+        ]);
+        matches!(
+            cli.command,
+            Command::Admin(AdminCmd::Bootstrap(_))
+        );
+    }
+
+    #[test]
+    fn parses_admin_create_agent() {
+        let cli = Cli::parse_from_args([
+            "mas",
+            "admin",
+            "create-agent",
+            "--name",
+            "support-bot",
+            "--organization",
+            "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1",
+            "--tenant",
+            "b2b2b2b2-b2b2-b2b2-b2b2-b2b2b2b2b2b2",
+        ]);
+        matches!(
+            cli.command,
+            Command::Admin(AdminCmd::CreateAgent(_))
+        );
+    }
+
+    #[test]
+    fn parses_api_key_create() {
+        let cli = Cli::parse_from_args([
+            "mas",
+            "api-key",
+            "create",
+            "--name",
+            "operator-key",
+            "--permissions",
+            "exec:read;exec:write",
+            "--organization",
+            "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1",
+        ]);
+        matches!(
+            cli.command,
+            Command::ApiKey(ApiKeyCmd::Create(_))
+        );
+    }
 }
+

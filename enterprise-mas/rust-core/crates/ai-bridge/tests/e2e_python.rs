@@ -34,13 +34,9 @@ use std::time::Duration;
 
 use mas_ai_bridge::{GrpcAgentBridge, GrpcAgentBridgeConfig};
 use mas_common::enums::Environment;
-use mas_common::ids::{
-    AgentId, AgentVersionId, OrganizationId, ProjectId, TaskAttemptId, TaskId, TenantId,
-};
+use mas_common::ids::{AgentId, OrganizationId, ProjectId, TaskAttemptId, TaskId, TenantId};
 use mas_domain::{ResourceLimits, TokenBudget};
-use mas_execution::agent_bridge::{
-    AgentBridge, AgentRunRequest, AgentRunVerdict, AgentRuntimeConfiguration, AgentRuntimeSnapshot,
-};
+use mas_execution::agent_bridge::{AgentBridge, AgentRunRequest, AgentRunVerdict};
 use mas_orchestration::runtime_context::RuntimeContext;
 use mas_security::secret_string::SecretString;
 use uuid::Uuid;
@@ -317,40 +313,14 @@ fn request() -> AgentRunRequest {
     )
     .expect("context");
 
-    let request = AgentRunRequest::from_context(
+    AgentRunRequest::from_context(
         &context,
         AgentId::new(),
         serde_json::json!({"prompt": "hello from rust"}),
         ResourceLimits::default(),
         &TokenBudget::unlimited(),
     )
-    .expect("request");
-    with_snapshot(request)
-}
-
-fn with_snapshot(mut request: AgentRunRequest) -> AgentRunRequest {
-    let version = AgentVersionId::new();
-    request.agent_version = Some(version.to_string());
-    request.agent_snapshot = Some(AgentRuntimeSnapshot {
-        agent_id: request.agent_id,
-        tenant_id: request.tenant_id.expect("tenant"),
-        organization_id: request.organization_id.expect("organization"),
-        project_id: request.project_id.expect("project"),
-        agent_version_id: version,
-        version_number: 1,
-        configuration_checksum: "a".repeat(64),
-        name: "Bridge Test Agent".to_owned(),
-        slug: "bridge-test-agent".to_owned(),
-        kind: "standard".to_owned(),
-        status: "active".to_owned(),
-        origin: "user".to_owned(),
-        read_only: false,
-        configuration: AgentRuntimeConfiguration {
-            description: Some("Bridge test agent".to_owned()),
-            ..Default::default()
-        },
-    });
-    request
+    .expect("request")
 }
 
 /// Converts an unavailable bridge prerequisite into a visible test failure.
@@ -458,7 +428,7 @@ fn scoped_request(
     .expect("request");
     request.task_id = Some(TaskId::from_uuid(task_id));
     request.task_attempt_id = Some(TaskAttemptId::from_uuid(task_attempt_id));
-    with_snapshot(request)
+    request
 }
 
 /// Reads the scope the Python side reported back.

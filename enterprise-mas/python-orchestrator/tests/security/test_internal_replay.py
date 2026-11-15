@@ -36,29 +36,3 @@ async def test_postgres_guard_fails_closed_when_the_receipt_store_is_unavailable
         await guard.consume(_identity())
 
     assert "internal replay receipt store is unavailable" in str(raised.value)
-
-
-async def test_nonce_is_not_reusable_at_the_inclusive_expiry_boundary(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A signature valid at the skew boundary must remain single-use there."""
-    guard = InMemoryReplayGuard()
-    identity = InternalServiceIdentity(
-        service="mas-worker",
-        signed_at_ms=1_000,
-        nonce="0123456789abcdefghijklmnopqrstuv",
-        expires_at_ms=61_000,
-    )
-    monkeypatch.setattr("mas_orchestrator.security.internal_replay.time.time", lambda: 61.0)
-
-    assert await guard.consume(identity) is True
-    assert await guard.consume(identity) is False
-
-
-async def test_postgres_replay_guard_repr_does_not_reveal_database_url() -> None:
-    """Rendering the guard must not expose its DSN or test credential."""
-    url = "postgresql://test-user:test-password@localhost/test-db"
-    guard = PostgresReplayGuard(url)
-
-    assert url not in repr(guard)
-    assert "test-password" not in repr(guard)

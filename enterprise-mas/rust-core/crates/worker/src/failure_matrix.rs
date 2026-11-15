@@ -294,7 +294,6 @@ fn submission_intent(key: &str) -> SubmissionIntent {
         project_id: project(),
         workflow_id: Some(workflow()),
         agent_id: None,
-        agent_version_id: None,
         input: payload(key),
         idempotency_key: Some(key.to_owned()),
         fingerprint: fingerprint(key),

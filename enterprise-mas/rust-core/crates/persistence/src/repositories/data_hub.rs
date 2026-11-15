@@ -188,8 +188,7 @@ impl DocumentStorePort for PostgresDocumentStore {
                 chunk_count = EXCLUDED.chunk_count,
                 failure_code = EXCLUDED.failure_code,
                 updated_at = EXCLUDED.updated_at
-             WHERE documents.tenant_id = EXCLUDED.tenant_id
-               AND (documents.status <> 'deleted' OR EXCLUDED.status = 'deleted')",
+             WHERE documents.tenant_id = EXCLUDED.tenant_id",
         )
         .bind(document.id.into_uuid())
         .bind(document.tenant_id.into_uuid())

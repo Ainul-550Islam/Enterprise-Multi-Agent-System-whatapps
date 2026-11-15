@@ -174,7 +174,6 @@ mod tests {
             input: serde_json::json!({}),
             execution_id: Some(mas_common::ids::ExecutionId::new()),
             agent_id: None,
-            agent_version_id: None,
             workflow_id: None,
             idempotency_key: "idem-1".to_owned(),
             priority: mas_common::enums::TaskPriority::Normal,

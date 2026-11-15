@@ -142,7 +142,7 @@ otlp_endpoint = ""
 # invalid example host intentionally fails closed until replaced at deploy time.
 [oidc]
 issuer = "https://identity.example.invalid/realms/mas"
-# MAS_OIDC_AUDIENCE must pin the access-token audience at deploy time.
+# MAS_OIDC_AUDIENCE may pin the access-token audience at deploy time.
 audience = ""
 jwks_url = "https://identity.example.invalid/realms/mas/protocol/openid-connect/certs"
 algs = ["RS256", "ES256"]
@@ -168,7 +168,7 @@ rollup_lookback_days = 90
 
 # Upload/crawl limits never grow based on request content.
 [data_hub]
-max_upload_bytes = 2097152
-max_document_bytes = 2097152
+max_upload_bytes = 33554432
+max_document_bytes = 33554432
 max_pages_per_sync = 500
 max_crawl_depth = 3

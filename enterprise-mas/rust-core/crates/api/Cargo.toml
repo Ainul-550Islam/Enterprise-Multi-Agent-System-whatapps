@@ -23,7 +23,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 description = "HTTP + gRPC api processes: thin transports over mas-application use-cases"
-license = "LicenseRef-Proprietary"
+license = "Proprietary"
 
 [lib]
 name = "mas_api"
@@ -55,8 +55,6 @@ chrono = { workspace = true }
 
 axum = { workspace = true }
 tower = { workspace = true, features = ["util"] }
-tower-http = { version = "0.6", features = ["cors"] }
-url = { workspace = true }
 tonic = { workspace = true }
 prost = { version = "0.13", features = ["prost-derive"] }
 tokio = { workspace = true, features = ["net", "signal", "rt-multi-thread", "time"] }
@@ -74,8 +72,6 @@ tonic-build = { version = "0.13", default-features = false, features = ["prost",
 protoc-bin-vendored = "3"
 
 [dev-dependencies]
-base64 = { workspace = true }
-ring = { workspace = true }
 mas-cli = { workspace = true }
 mas-policy = { workspace = true }
 reqwest = { workspace = true }

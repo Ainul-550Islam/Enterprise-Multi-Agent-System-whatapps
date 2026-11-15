@@ -131,3 +131,10 @@ __all__ = [
     "validate_contract",
     "validate_statement",
 ]
+
+__all__ = [
+    "send_email",
+    "search_web",
+    "query_database",
+    "execute_code",
+]

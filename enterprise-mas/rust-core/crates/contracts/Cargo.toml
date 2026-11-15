@@ -19,7 +19,6 @@ mas-common.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
-url.workspace = true
 # chrono is pulled in transitively via mas-common::Timestamp; declare for
 # direct use in schema annotations and tests.
 chrono.workspace = true

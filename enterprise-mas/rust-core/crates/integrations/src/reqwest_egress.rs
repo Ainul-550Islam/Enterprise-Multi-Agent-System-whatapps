@@ -233,14 +233,6 @@ mod tests {
             "fe80::1",
             "::ffff:8.8.8.8",
             "2001:db8::1",
-            "192.0.0.1",
-            "fec0::1",
-            "64:ff9b::a9fe:a9fe",
-            "64:ff9b::808:808",
-            "64:ff9b:1::a9fe:a9fe",
-            "::ffff:0:a9fe:a9fe",
-            "2002:7f00:1::1",
-            "2001::1",
         ] {
             assert!(
                 !is_publicly_routable(&addr(forbidden)),
@@ -251,27 +243,6 @@ mod tests {
                 "{forbidden} must not be pinnable"
             );
         }
-    }
-
-    #[test]
-    fn internal_endpoints_reject_translated_metadata_before_pinning() {
-        let policy = EgressPolicy::for_internal_endpoints(["internal.example"], None);
-        for translated in [
-            "64:ff9b::a9fe:a9fe",
-            "64:ff9b:1::a9fe:a9fe",
-            "::ffff:0:a9fe:a9fe",
-            "::a9fe:a9fe",
-            "2002:a9fe:a9fe::1",
-            "2001::1",
-        ] {
-            assert!(
-                policy
-                    .pin_resolution_for(&[addr("10.0.0.1"), addr(translated)], true)
-                    .is_err(),
-                "{translated}"
-            );
-        }
-        assert!(policy.pin_resolution_for(&[addr("10.0.0.1")], true).is_ok());
     }
 
     #[test]

@@ -46,6 +46,7 @@ if TYPE_CHECKING:
         RetrievalHit,
         SecurityContext,
     )
+from mas_orchestrator.rag.security import filter_chunks
 
 if TYPE_CHECKING:
     from mas_orchestrator.events.emitter import EventEmitter
@@ -88,7 +89,7 @@ class RetrievedContext:
         Raises:
             CitationValidationError: If any citation is unsupported.
         """
-        sources = {(hit.chunk.document_id, hit.chunk.chunk_id): hit.chunk.text for hit in self.hits}
+        sources = {hit.chunk.chunk_id: hit.chunk.text for hit in self.hits}
         checks = validate_citations(list(self.citations), sources)
         assert_supported(checks)
 
@@ -151,9 +152,9 @@ class RagService:
 
         # Defence in depth: the retriever filters, and so do we. Filtering
         # twice is cheap; a single missed filter is a disclosure.
-        # Evaluate each hit, not just its chunk ID: two documents may use the
-        # same chunk ID with different tenant or access rules.
-        visible = tuple(hit for hit in hits if hit.chunk.access.permits(security))
+        permitted = filter_chunks([hit.chunk for hit in hits], security)
+        permitted_ids = {chunk.chunk_id for chunk in permitted}
+        visible = tuple(hit for hit in hits if hit.chunk.chunk_id in permitted_ids)
 
         assert_tenant_isolated_documents(visible, security.tenant_id)
 

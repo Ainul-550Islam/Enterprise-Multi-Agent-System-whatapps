@@ -77,7 +77,7 @@ impl ToolStorePort for PostgresToolStore {
         .bind(spec)
         .bind(tool.created_at.into_datetime())
         .bind(tool.updated_at.into_datetime())
-        .execute(scoped.connection())
+        .execute(scoped.connection().as_mut())
         .await
         .map_err(map_sqlx)?;
         if result.rows_affected() != 1 {
@@ -96,7 +96,7 @@ impl ToolStorePort for PostgresToolStore {
         ))
         .bind(tenant.into_uuid())
         .bind(id.into_uuid())
-        .fetch_optional(scoped.connection())
+        .fetch_optional(scoped.connection().as_mut())
         .await
         .map_err(map_sqlx)?;
         row.map(tool_from_row).transpose()
@@ -117,7 +117,7 @@ impl ToolStorePort for PostgresToolStore {
         .bind(tenant.into_uuid())
         .bind(project.map(|id| id.into_uuid()))
         .bind(MAX_TOOL_ROWS)
-        .fetch_all(scoped.connection())
+        .fetch_all(scoped.connection().as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.into_iter().map(tool_from_row).collect()
@@ -144,7 +144,7 @@ impl ToolStorePort for PostgresToolStore {
         .bind(after.map(|cursor| cursor.created_at.into_datetime()))
         .bind(after.map(|cursor| cursor.id.into_uuid()))
         .bind(i64::from(limit.clamp(1, 201)))
-        .fetch_all(scoped.connection())
+        .fetch_all(scoped.connection().as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.into_iter().map(tool_from_row).collect()
@@ -156,7 +156,7 @@ impl ToolStorePort for PostgresToolStore {
         let exists = sqlx::query("SELECT 1 FROM tools WHERE tenant_id = $1 AND id = $2")
             .bind(tenant.into_uuid())
             .bind(tool.into_uuid())
-            .fetch_optional(scoped.connection())
+            .fetch_optional(scoped.connection().as_mut())
             .await
             .map_err(map_sqlx)?
             .is_some();
@@ -166,7 +166,7 @@ impl ToolStorePort for PostgresToolStore {
         let rows = sqlx::query(
             "SELECT grant_spec FROM tool_permissions WHERE tenant_id = $1 AND tool_id = $2 ORDER BY subject ASC LIMIT 513"
         ).bind(tenant.into_uuid()).bind(tool.into_uuid())
-            .fetch_all(scoped.connection()).await.map_err(map_sqlx)?;
+            .fetch_all(scoped.connection().as_mut()).await.map_err(map_sqlx)?;
         rows.into_iter()
             .map(|row| {
                 let value: Value = row.try_get("grant_spec").map_err(map_sqlx)?;
@@ -185,7 +185,7 @@ impl ToolStorePort for PostgresToolStore {
     ) -> Result<()> {
         ensure_permission_set(tenant, tool, permissions)?;
         let mut scoped = crate::scoped_request::connection().await?;
-        let connection = scoped.connection();
+        let connection = scoped.connection().as_mut();
         sqlx::query("SAVEPOINT tool_permission_replace")
             .execute(&mut *connection)
             .await
@@ -251,7 +251,7 @@ impl ToolStorePort for PostgresToolStore {
         }
         ensure_tenant(tenant)?;
         let mut scoped = crate::scoped_request::connection().await?;
-        let connection = scoped.connection();
+        let connection = scoped.connection().as_mut();
         sqlx::query("SAVEPOINT agent_tool_permission_replace")
             .execute(&mut *connection)
             .await

@@ -1,0 +1,71 @@
+version: "3.8"
+
+services:
+
+  # Identity Provider (Keycloak)
+  idp:
+    image: quay.io/keycloak/keycloak:24.0.2
+    environment:
+      KEYCLOAK_HTTP_PORT: 8080
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin123
+    ports:
+      - "8080:8080"
+    command: [
+      "start-dev",
+      "--import-realm",
+    ]
+    volumes:
+      - ./idp/realm-export.json:/opt/keycloak/data/import/realm.json:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/realms/master"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Mock WhatsApp service
+  whatsapp-mock:
+    build: ./scripts/mock-whatsapp
+    environment:
+      - MAS_API_URL=http://mas-api:8080
+      - MAS_API_TOKEN=dev-token
+    depends_on:
+      - idp
+    ports:
+      - "3000:3000"
+
+  # Mock Stripe service
+  stripe-mock:
+    image: postal/stripe-mock:latest
+    environment:
+      - STRIPE_API_KEY=sk_test_mock_key
+      - MAS_API_URL=http://mas-api:8080
+    depends_on:
+      - idp
+    ports:
+      - "10000:10000"
+
+  # mas API server
+  mas-api:
+    build: ..
+    environment:
+      - MAS_API_TOKEN=dev-token
+      - KEYCLOAK_URL=http://idp:8080
+    ports:
+      - "8080:8080"
+    depends_on:
+      - idp
+    volumes:
+      - ./.env:/etc/mas/.env:ro
+
+  # Demo frontend
+  frontend:
+    image: node:20-alpine
+    working_dir: /app
+    command: sh -c "npm install && npm run dev"
+    ports:
+      - "3001:3000"
+    volumes:
+      - ./frontend:/app
+    depends_on:
+      - mas-api

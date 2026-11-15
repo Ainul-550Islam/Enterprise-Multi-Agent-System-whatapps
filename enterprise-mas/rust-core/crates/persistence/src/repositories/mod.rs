@@ -56,6 +56,7 @@ pub mod tasks;
 pub mod tenancy;
 pub mod tools;
 pub mod usage;
+pub mod whatsapp;
 pub mod webhook_admin;
 pub mod webhook_relay;
 pub mod webhooks;

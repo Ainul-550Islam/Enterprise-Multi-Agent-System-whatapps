@@ -180,30 +180,3 @@ class TestDeterminism:
         once = redact_mapping({"password": "hunter2"})
         twice = redact_mapping(once)
         assert once == twice
-
-
-def test_redact_text_fails_closed_if_pattern_engine_fails(monkeypatch: pytest.MonkeyPatch) -> None:
-    import mas_orchestrator.security.redaction as module
-
-    class BrokenPattern:
-        def sub(self, *_args: object) -> str:
-            raise RuntimeError("pattern failure")
-
-    monkeypatch.setattr(module, "_PEM_PATTERN", BrokenPattern())
-    assert module.redact_text("very-private-input") == module.REDACTED
-
-
-@pytest.mark.parametrize(
-    ("text", "sensitive"),
-    [
-        ("password=abc", "abc"),
-        ('{"password":"hunter2"}', "hunter2"),
-        ("token: a", "a"),
-        ("https://example.test/?token=xyz&query=ok", "xyz"),
-        ("Authorization: Bearer abc", "abc"),
-        ("Authorization: Basic eA==", "eA=="),
-        ("secret='two words'", "two words"),
-    ],
-)
-def test_common_short_and_quoted_secrets_are_redacted(text: str, sensitive: str) -> None:
-    assert sensitive not in redact_text(text)

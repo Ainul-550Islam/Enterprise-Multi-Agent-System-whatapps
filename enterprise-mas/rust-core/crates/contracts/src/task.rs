@@ -3,8 +3,7 @@
 use mas_common::enums::{TaskPriority, TaskStatus};
 use mas_common::error::AppError;
 use mas_common::ids::{
-    AgentId, AgentVersionId, ExecutionId, OrganizationId, ProjectId, TaskAttemptId, TaskId,
-    TenantId, WorkflowId,
+    AgentId, ExecutionId, OrganizationId, ProjectId, TaskAttemptId, TaskId, TenantId, WorkflowId,
 };
 use mas_common::pagination::PageRequest;
 use mas_common::result::Result;
@@ -193,10 +192,6 @@ pub struct TaskQueueMessage {
     pub execution_id: Option<ExecutionId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<AgentId>,
-    /// Immutable agent version selected when the task was submitted. Older
-    /// frames may omit it; the durable claim remains the authority.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent_version_id: Option<AgentVersionId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow_id: Option<WorkflowId>,
     /// Global idempotency key — duplicates collapse to the same `task_id`.
@@ -251,7 +246,6 @@ impl TaskQueueMessage {
             input,
             execution_id,
             agent_id,
-            agent_version_id: None,
             workflow_id,
             idempotency_key,
             priority,
@@ -265,13 +259,6 @@ impl TaskQueueMessage {
         };
         staged.validate()?;
         Ok(staged)
-    }
-
-    /// Attaches the immutable agent version selected at submission.
-    #[must_use]
-    pub fn with_agent_version_id(mut self, version_id: AgentVersionId) -> Self {
-        self.agent_version_id = Some(version_id);
-        self
     }
 
     /// Attaches the originating platform request id before publishing.
@@ -295,9 +282,6 @@ impl TaskQueueMessage {
         validation::validate_length("idempotency_key", &self.idempotency_key, 1, 512)?;
         validation::validate_non_empty("correlation_id", &self.correlation_id)?;
         validation::validate_length("correlation_id", &self.correlation_id, 1, 256)?;
-        if self.agent_version_id.is_some() && self.agent_id.is_none() {
-            return Err(AppError::validation("agent_version_id requires agent_id"));
-        }
         if self.max_attempts == 0 {
             return Err(AppError::validation("max_attempts must be at least 1"));
         }
@@ -341,24 +325,6 @@ mod queue_attempt_tests {
         let encoded = serde_json::to_vec(&message()).expect("serialize");
         let decoded: TaskQueueMessage = serde_json::from_slice(&encoded).expect("decode");
         assert_eq!(decoded.task_attempt_id, None);
-    }
-
-    #[test]
-    fn version_pin_round_trips_and_legacy_frames_remain_compatible() {
-        let legacy = serde_json::to_value(message()).expect("legacy frame");
-        assert!(legacy.get("agent_version_id").is_none());
-        let decoded: TaskQueueMessage = serde_json::from_value(legacy).expect("decode legacy");
-        assert_eq!(decoded.agent_version_id, None);
-        let version = AgentVersionId::new();
-        let pinned = message().with_agent_version_id(version);
-        pinned.validate().expect("valid pin");
-        let decoded: TaskQueueMessage =
-            serde_json::from_value(serde_json::to_value(pinned).expect("serialize"))
-                .expect("decode");
-        assert_eq!(decoded.agent_version_id, Some(version));
-        let mut invalid = decoded;
-        invalid.agent_id = None;
-        assert!(invalid.validate().is_err());
     }
 
     #[test]

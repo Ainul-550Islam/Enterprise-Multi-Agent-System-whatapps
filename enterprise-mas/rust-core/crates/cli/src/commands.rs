@@ -127,7 +127,64 @@ async fn execution(client: &MasApiClient, global: &GlobalOpts, cmd: &ExecutionCm
         ExecutionCmd::Cancel { id } => {
             transition(client, global, "executions", *id, "cancel").await
         },
-    }
+    },
+    // Admin commands
+
+    // Admin commands
+    AdminCmd::Bootstrap => {
+        if let Err(msg) = scoped_ok(global) {
+            eprintln!("error: {msg}");
+            return ExitCode::UsageOrTransport;
+        }
+        eprintln!("bootstrap command - use 'mas admin bootstrap' directly");
+        ExitCode::Ok
+    },
+    AdminCmd::CreateAgent { name, scope, capabilities, .. } => {
+        if let Err(msg) = scoped_ok(global) {
+            eprintln!("error: {msg}");
+            return ExitCode::UsageOrTransport;
+        }
+        let body = serde_json::json!({
+            "name": name,
+            "scope": scope,
+            "capabilities": capabilities
+        });
+        let outcome: Outcome<serde_json::Value> = client.post("agents", &body).await;
+        outcome_print_ref(&outcome, global)
+    },
+    AdminCmd::CreateWorkflow { name, definition, .. } => {
+        if let Err(msg) = scoped_ok(global) {
+            eprintln!("error: {msg}");
+            return ExitCode::UsageOrTransport;
+        }
+        let body = serde_json::json!({
+            "name": name,
+            "definition": definition
+        });
+        let outcome: Outcome<serde_json::Value> = client.post("workflows", &body).await;
+        outcome_print_ref(&outcome, global)
+    },
+    AdminCmd::CreateApiKey { name, permissions, .. } => {
+        if let Err(msg) = scoped_ok(global) {
+            eprintln!("error: {msg}");
+            return ExitCode::UsageOrTransport;
+        }
+        let body = serde_json::json!({
+            "name": name,
+            "permissions": permissions
+        });
+        let outcome: Outcome<serde_json::Value> = client.post("api-keys", &body).await;
+        outcome_print_ref(&outcome, global)
+    },
+    AdminCmd::RevokeApiKey { key_id, .. } => {
+        if let Err(msg) = scoped_ok(global) {
+            eprintln!("error: {msg}");
+            return ExitCode::UsageOrTransport;
+        }
+        let outcome: Outcome<serde_json::Value> = client.del(&format!("api-keys/{key_id}")).await;
+        outcome_print_ref(&outcome, global)
+    },
+}
 }
 
 async fn submit(client: &MasApiClient, global: &GlobalOpts, args: &SubmitArgs) -> ExitCode {

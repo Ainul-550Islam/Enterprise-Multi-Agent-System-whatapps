@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from mas_orchestrator.contracts.errors import ConfigurationError
@@ -43,7 +43,7 @@ class InMemoryReplayGuard:
         now_ms = int(time.time() * 1000)
         key = (identity.service, identity.nonce)
         async with self._lock:
-            expired = [key for key, expiry in self._receipts.items() if expiry < now_ms]
+            expired = [key for key, expiry in self._receipts.items() if expiry <= now_ms]
             for expired_key in expired:
                 del self._receipts[expired_key]
             if key in self._receipts:
@@ -56,7 +56,7 @@ class InMemoryReplayGuard:
 class PostgresReplayGuard:
     """Cross-replica PostgreSQL nonce consumer used by production composition."""
 
-    database_url: str = field(repr=False)
+    database_url: str
 
     async def consume(self, identity: InternalServiceIdentity) -> bool:
         """Inserts one receipt with conflict-as-replay semantics."""
@@ -78,7 +78,8 @@ class PostgresReplayGuard:
                     INSERT INTO internal_request_receipts
                         (service_name, nonce, signed_at_ms, expires_at)
                     VALUES (%s, %s, %s, to_timestamp(%s / 1000.0))
-                    ON CONFLICT DO NOTHING
+                    ON CONFLICT (service_name, nonce) DO NOTHING
+                    RETURNING nonce
                     """,
                     (
                         identity.service,
@@ -87,9 +88,7 @@ class PostgresReplayGuard:
                         identity.expires_at_ms,
                     ),
                 )
-                # The request-serving role has INSERT but not SELECT on this
-                # table. A conflict target or RETURNING would require SELECT.
-                return cursor.rowcount == 1
+                return await cursor.fetchone() is not None
         except Exception as error:
             # Authentication must fail closed when the shared receipt authority
             # is unavailable.  Do not expose driver/database detail to callers.

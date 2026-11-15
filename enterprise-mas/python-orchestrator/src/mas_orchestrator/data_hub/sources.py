@@ -13,6 +13,7 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import re
 from collections import deque
 from dataclasses import dataclass
@@ -20,16 +21,7 @@ from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from typing import TYPE_CHECKING, Final
-from urllib.parse import (
-    parse_qsl,
-    quote,
-    quote_from_bytes,
-    unquote_to_bytes,
-    urldefrag,
-    urljoin,
-    urlsplit,
-    urlunsplit,
-)
+from urllib.parse import parse_qsl, quote, urldefrag, urlencode, urljoin, urlsplit, urlunsplit
 
 from defusedxml import ElementTree
 
@@ -53,11 +45,10 @@ if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
     from xml.etree.ElementTree import Element
 
-    from mas_orchestrator.config.settings import DataHubObjectStorageBinding
-
+_LOGGER: Final[logging.Logger] = logging.getLogger(__name__)
 _DEFAULT_REGION: Final[str] = "us-east-1"
 _S3_DATE_FORMAT: Final[str] = "%Y%m%dT%H%M%SZ"
-_CURSOR_VERSION: Final[int] = 3
+_CURSOR_VERSION: Final[int] = 2
 _MAX_CURSOR_ENTRIES: Final[int] = 10_000
 _MAX_START_URLS: Final[int] = 25
 
@@ -161,22 +152,11 @@ class WebCrawlAdapter:
         max_pages = _bounded_int(
             source.config.get("max_pages"), self._max_pages, 1, self._max_pages
         )
-        fingerprint = _source_fingerprint(source)
-        previous = _source_cursor(source.cursor, fingerprint)
+        previous = _decode_cursor(source.cursor)
         next_etags = dict(previous)
         queue: deque[tuple[str, int, str]] = deque()
         scheduled: set[str] = set()
         for root in roots:
-            if (
-                len(root.encode("utf-8")) > 2048
-                or root.strip() != root
-                or "?" in root
-                or "#" in root
-                or any(ord(char) < 32 or ord(char) == 127 for char in root)
-            ):
-                raise InvalidRequestError(
-                    "web source start URLs must not contain query, fragment or controls"
-                )
             canonical = _validate_https_url(root, self._allowed_hosts)
             if canonical not in scheduled:
                 scheduled.add(canonical)
@@ -216,10 +196,10 @@ class WebCrawlAdapter:
                 continue
             discovered += 1
             etag = _header(response.headers, "etag")
-            before_cursor = _encode_cursor(next_etags, fingerprint=fingerprint)
+            before_cursor = _encode_cursor(next_etags)
             if etag:
                 next_etags[url] = etag[:512]
-            after_cursor = _encode_cursor(next_etags, fingerprint=fingerprint)
+            after_cursor = _encode_cursor(next_etags)
             if not etag or previous.get(url) != etag:
                 # The request's per-response ceiling is the remaining aggregate
                 # transfer budget, so retaining the body cannot cross the sync bound.
@@ -251,9 +231,7 @@ class WebCrawlAdapter:
                         scheduled.add(absolute)
                         queue.append((absolute, depth + 1, root_host))
 
-        return SourceSyncResult(
-            tuple(changed), _encode_cursor(next_etags, fingerprint=fingerprint), discovered
-        )
+        return SourceSyncResult(tuple(changed), _encode_cursor(next_etags), discovered)
 
 
 def _collect_links(body: bytes, *, max_links: int) -> _LinkCollector:
@@ -279,23 +257,10 @@ def _validate_link(
 ) -> str | None:
     """Resolves one crawl target, staying on its configured origin host."""
     candidate = raw.strip()
-    if (
-        not candidate
-        or len(candidate.encode("utf-8")) > 2048
-        or "\\" in candidate
-        or any(ord(char) < 32 or ord(char) == 127 for char in raw)
-        or candidate.startswith(("#", "mailto:", "tel:", "javascript:", "data:"))
-    ):
+    if not candidate or candidate.startswith(("#", "mailto:", "tel:", "javascript:", "data:")):
         return None
-    # HTML is untrusted: an unrelated or malformed link is not a source
-    # configuration error and must not make the whole sync fail.
-    try:
-        absolute = urljoin(base_url, candidate)
-        canonical = _validate_https_url(absolute, allowed_hosts)
-    except (InvalidRequestError, ToolPermissionDeniedError, ValueError):
-        return None
-    if len(canonical.encode("utf-8")) > 2048:
-        return None
+    absolute = urljoin(base_url, candidate)
+    canonical = _validate_https_url(absolute, allowed_hosts)
     if (urlsplit(canonical).hostname or "").lower() != root_host.lower():
         return None
     return canonical
@@ -354,7 +319,6 @@ class S3CompatibleAdapter:
         max_pages: int,
         max_document_bytes: int,
         max_sync_bytes: int,
-        bindings: Sequence[DataHubObjectStorageBinding] = (),
     ) -> None:
         hosts = frozenset(
             host.strip().rstrip(".").lower() for host in allowed_hosts if host.strip()
@@ -368,7 +332,6 @@ class S3CompatibleAdapter:
         ):
             raise ConfigurationError("object-storage bounds are invalid")
         self._allowed_hosts = hosts
-        self._bindings = tuple(bindings)
         self._max_pages = max_pages
         self._max_document_bytes = max_document_bytes
         self._max_sync_bytes = max_sync_bytes
@@ -400,39 +363,13 @@ class S3CompatibleAdapter:
         endpoint, bucket, prefix, region = _s3_config(source.config, self._allowed_hosts)
         access_ref = _required_config_string(source.config, "access_key_secret_ref")
         secret_ref = _required_config_string(source.config, "secret_key_secret_ref")
-        if not any(
-            binding.tenant_id == source.tenant_id.lower()
-            and binding.organization_id == source.organization_id.lower()
-            and binding.project_id == source.project_id.lower()
-            and binding.source_id == source.source_id.lower()
-            and binding.endpoint_url == endpoint
-            and binding.bucket == bucket
-            and binding.prefix == prefix
-            and binding.region == region
-            and binding.access_key_secret_ref == access_ref
-            and binding.secret_key_secret_ref == secret_ref
-            for binding in self._bindings
-        ):
-            # References arrive from tenant-controlled source metadata. An
-            # authorized Rust snapshot is not proof that the process may read
-            # an arbitrary env var or mounted file, nor send it to a different
-            # allowed host. Require an operator-owned exact scope/destination
-            # binding before either reference is resolved.
-            raise ToolPermissionDeniedError(
-                "object storage credential binding is not authorized",
-                details={"reason": "unapproved_source_binding"},
-            )
         access_key = resolve_secret(access_ref).reveal()
         secret_key = resolve_secret(secret_ref).reveal()
-        fingerprint = _source_fingerprint(source)
-        previous = _source_cursor(source.cursor, fingerprint)
+        previous = _decode_cursor(source.cursor)
         changed: list[DiscoveredDocument] = []
         next_etags = dict(previous)
         continuation = previous.continuation
         start_after = previous.start_after
-        # This adapter resumes mid-page via StartAfter, which is safe only for
-        # providers returning strictly lexicographically ordered keys.
-        last_seen = start_after
         transfer_bytes = 0
         discovered = 0
 
@@ -443,7 +380,6 @@ class S3CompatibleAdapter:
                     tuple(changed),
                     _encode_cursor(
                         next_etags,
-                        fingerprint=fingerprint,
                         continuation=continuation,
                         start_after=start_after,
                     ),
@@ -482,18 +418,9 @@ class S3CompatibleAdapter:
             exhausted_by_cap = False
             for item in _children(root, "Contents"):
                 key = _child_text(item, "Key")
-                if (
-                    not key
-                    or not key.startswith(prefix)
-                    or "\\" in key
-                    or any(segment in {".", ".."} for segment in key.split("/"))
-                ):
-                    # HTTP clients and intermediate proxies may normalize dot
-                    # segments or backslashes, changing the object addressed
-                    # after the listing's prefix check. Fail before a GET or
-                    # checkpoint rather than retrieving a different key.
-                    raise ModelProviderError("object-storage listing contains an unsafe key")
-                etag = _s3_etag(_child_text(item, "ETag"))
+                if not key or not key.startswith(prefix):
+                    continue
+                etag = _child_text(item, "ETag").strip('"')
                 size_text = _child_text(item, "Size")
                 try:
                     size = int(size_text)
@@ -503,34 +430,27 @@ class S3CompatibleAdapter:
                     ) from error
                 if size < 0:
                     raise ModelProviderError("object-storage listing has a negative object size")
-                if size == 0:
-                    # The ingestion domain rejects empty content. Do not
-                    # checkpoint it or send an unsatisfiable byte range.
-                    raise ModelProviderError("object-storage object is empty")
                 if discovered >= self._max_pages:
                     exhausted_by_cap = True
                     break
-
-                if last_seen is not None and key <= last_seen:
-                    raise ModelProviderError("object-storage listing keys are not strictly ordered")
-                last_seen = key
 
                 # This is the exact cursor to retain if this item cannot be
                 # indexed.  It resumes after every successful preceding item.
                 before_cursor = _encode_cursor(
                     next_etags,
-                    fingerprint=fingerprint,
                     continuation=None,
                     start_after=start_after,
                 )
                 if size > self._max_document_bytes:
-                    # Skipping and checkpointing an oversized replacement can
-                    # leave older indexed content searchable while reporting a
-                    # successful sync. Fail the batch without advancing instead.
-                    raise ModelProviderError(
-                        "object-storage object exceeds the configured document byte limit",
-                        details={"limit_bytes": self._max_document_bytes},
+                    _LOGGER.warning(
+                        "object skipped because it exceeds the configured byte cap",
+                        extra={"event": "data_hub.object_skipped", "source_id": source.source_id},
                     )
+                    if etag:
+                        next_etags[key] = etag[:512]
+                    start_after = key
+                    discovered += 1
+                    continue
                 if etag and previous.get(key) == etag:
                     start_after = key
                     discovered += 1
@@ -546,7 +466,6 @@ class S3CompatibleAdapter:
                 content = await self._read_object(
                     object_url,
                     size=size,
-                    expected_etag=etag,
                     region=region,
                     access_key=access_key,
                     secret_key=secret_key,
@@ -558,9 +477,7 @@ class S3CompatibleAdapter:
                 if etag:
                     next_etags[key] = etag[:512]
                 start_after = key
-                after_cursor = _encode_cursor(
-                    next_etags, fingerprint=fingerprint, continuation=None, start_after=key
-                )
+                after_cursor = _encode_cursor(next_etags, continuation=None, start_after=key)
                 locator = f"{endpoint.rstrip('/')}/{quote(bucket, safe='')}/{quote(key, safe='/')}"
                 changed.append(
                     DiscoveredDocument(
@@ -580,42 +497,18 @@ class S3CompatibleAdapter:
             if exhausted_by_cap or discovered >= self._max_pages:
                 return SourceSyncResult(
                     tuple(changed),
-                    _encode_cursor(
-                        next_etags,
-                        fingerprint=fingerprint,
-                        continuation=None,
-                        start_after=start_after,
-                    ),
+                    _encode_cursor(next_etags, continuation=None, start_after=start_after),
                     discovered,
                 )
-            truncation = _child_text(root, "IsTruncated").strip().lower()
-            next_continuation = _child_text(root, "NextContinuationToken") or None
-            if truncation not in {"true", "false"}:
-                raise ModelProviderError("object-storage listing has invalid pagination metadata")
-            if truncation == "true":
-                if (
-                    next_continuation is None
-                    or len(next_continuation) > 4096
-                    or next_continuation == continuation
-                ):
-                    raise ModelProviderError("object-storage listing has invalid continuation")
-            elif next_continuation is not None:
-                raise ModelProviderError("object-storage listing has unexpected continuation")
-            continuation = next_continuation
-            # Persist the last key alongside a continuation token so a later
-            # request can detect out-of-order pages before it skips data.
-            if truncation == "false":
-                start_after = None
+            is_truncated = _child_text(root, "IsTruncated").lower() == "true"
+            continuation = _child_text(root, "NextContinuationToken") or None
+            start_after = None
+            if not is_truncated or continuation is None:
                 break
 
         return SourceSyncResult(
             tuple(changed),
-            _encode_cursor(
-                next_etags,
-                fingerprint=fingerprint,
-                continuation=continuation,
-                start_after=start_after,
-            ),
+            _encode_cursor(next_etags, continuation=continuation, start_after=start_after),
             discovered,
         )
 
@@ -624,22 +517,20 @@ class S3CompatibleAdapter:
         url: str,
         *,
         size: int,
-        expected_etag: str,
         region: str,
         access_key: str,
         secret_key: str,
         max_response_bytes: int,
     ) -> bytes:
         """Uses a single bounded byte range and validates the server response."""
-        # If-Match pins the GET to the exact version from the listing.
-        headers = {"if-match": f'"{expected_etag}"', "range": f"bytes=0-{size - 1}"}
+        end = max(0, min(size - 1, self._max_document_bytes - 1))
         response = await self._request_signed(
             "GET",
             url,
             region=region,
             access_key=access_key,
             secret_key=secret_key,
-            extra_headers=headers,
+            extra_headers={"range": f"bytes=0-{end}"},
             max_response_bytes=max_response_bytes,
         )
         if response.status_code not in (200, 206):
@@ -654,20 +545,10 @@ class S3CompatibleAdapter:
                 "object-storage response length does not match the bounded listing",
                 details={"expected_bytes": size, "received_bytes": len(response.body)},
             )
-        # Some S3-compatible gateways ignore conditional requests. Require a
-        # matching response ETag as a second check before checkpointing.
-        response_etag = _s3_etag(_header(response.headers, "etag"))
-        if response_etag != expected_etag:
-            raise ModelProviderError("object-storage object changed during synchronization")
-        if response.status_code == 206:
-            content_range = _header(response.headers, "content-range")
+        content_range = _header(response.headers, "content-range")
+        if response.status_code == 206 and content_range:
             match = re.fullmatch(r"bytes 0-(\d+)/(\d+)", content_range.strip())
-            if (
-                size == 0
-                or match is None
-                or int(match.group(1)) != size - 1
-                or int(match.group(2)) != size
-            ):
+            if match is None or int(match.group(2)) != size:
                 raise ModelProviderError("object-storage range response is inconsistent")
         return response.body
 
@@ -726,11 +607,7 @@ def _s3_config(
     if not re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", bucket) or ".." in bucket:
         raise InvalidRequestError("object-storage bucket name is invalid")
     prefix = str(config.get("prefix", ""))
-    if (
-        prefix.startswith("/")
-        or "\\" in prefix
-        or any(segment in {".", ".."} for segment in prefix.split("/"))
-    ):
+    if prefix.startswith("/") or ".." in prefix.split("/"):
         raise InvalidRequestError("object-storage prefix is invalid")
     region = str(config.get("region", _DEFAULT_REGION))
     if not re.fullmatch(r"[a-z0-9-]{1,64}", region):
@@ -739,46 +616,12 @@ def _s3_config(
     return normalized_endpoint, bucket, prefix, region
 
 
-def _s3_etag(raw: str) -> str:
-    """Validate a bounded strong ETag before using it in a signed header.
-
-    The ETag is opaque, not necessarily an MD5 (multipart/encrypted objects).
-    Accept the usual quoted S3 representation or a bare compatible value,
-    but never accept weak tags, header controls, quotes or backslashes.
-    """
-    value = raw.strip()
-    if value.startswith('"') and value.endswith('"') and len(value) >= 2:
-        value = value[1:-1]
-    if (
-        not value
-        or len(value) > 512
-        or value.startswith("W/")
-        or any(not (0x21 <= ord(char) <= 0x7E) or char in {'"', "\\"} for char in value)
-    ):
-        raise ModelProviderError("object-storage ETag is missing or malformed")
-    return value
-
-
 def _s3_url(endpoint: str, bucket: str, query: Sequence[tuple[str, str]], *, key: str = "") -> str:
     """Builds a path-style S3 URL with deterministic query encoding."""
     base = f"{endpoint}/{quote(bucket, safe='')}"
     if key:
         base += f"/{quote(key, safe='/')}"
-    return f"{base}?{_s3_canonical_query(query)}" if query else base
-
-
-def _s3_canonical_query(query: Sequence[tuple[str, str]]) -> str:
-    """Encode each parameter before sorting, as required by S3 SigV4."""
-    encoded = sorted((quote(key, safe="-_.~"), quote(value, safe="-_.~")) for key, value in query)
-    return "&".join(f"{key}={value}" for key, value in encoded)
-
-
-def _s3_canonical_path(path: str) -> str:
-    """Encode each URL path segment once, preserving escaped slash bytes."""
-    return "/".join(
-        quote_from_bytes(unquote_to_bytes(segment), safe="-_.~")
-        for segment in (path or "/").split("/")
-    )
+    return f"{base}?{urlencode(sorted(query), doseq=True, safe='~')}" if query else base
 
 
 def _sigv4_headers(
@@ -808,10 +651,12 @@ def _sigv4_headers(
         headers.update({key.lower(): value.strip() for key, value in extra_headers.items()})
     signed_headers = ";".join(sorted(headers))
     canonical_headers = "".join(f"{key}:{headers[key]}\n" for key in sorted(headers))
-    # S3 is the SigV4 exception: it does not normalize or double-encode
-    # the path. Sorting is over encoded query keys and values, not raw text.
-    canonical_uri = _s3_canonical_path(parsed.path)
-    canonical_query = _s3_canonical_query(parse_qsl(parsed.query, keep_blank_values=True))
+    canonical_uri = quote(parsed.path or "/", safe="/-_.~!$&'()*+,;=:@")
+    canonical_query = urlencode(
+        sorted(parse_qsl(parsed.query, keep_blank_values=True)),
+        doseq=True,
+        safe="~",
+    )
     canonical_request = "\n".join(
         (
             method.upper(),
@@ -862,41 +707,10 @@ class _CursorEtags(dict[str, str]):
         *,
         continuation: str | None = None,
         start_after: str | None = None,
-        fingerprint: str | None = None,
     ) -> None:
         super().__init__(etags or {})
         self.continuation = continuation
         self.start_after = start_after
-        self.fingerprint = fingerprint
-
-
-def _source_fingerprint(source: DataHubSource) -> str:
-    """Bind checkpoints to source ownership, adapter settings and exact ACL."""
-    snapshot = {
-        "source_id": source.source_id,
-        "tenant_id": source.tenant_id,
-        "organization_id": source.organization_id,
-        "project_id": source.project_id,
-        "kind": source.kind.value,
-        "name": source.name,
-        "config": dict(source.config),
-        "credential_secret_ref": source.credential_secret_ref,
-        "required_roles": sorted(source.required_roles),
-        "denied_principals": sorted(source.denied_principals),
-    }
-    try:
-        encoded = json.dumps(
-            snapshot, sort_keys=True, separators=(",", ":"), allow_nan=False
-        ).encode()
-    except (TypeError, ValueError) as error:
-        raise InvalidRequestError("Data Hub source snapshot is not canonical JSON") from error
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def _source_cursor(cursor: str | None, fingerprint: str) -> _CursorEtags:
-    """Invalidate old ETags and resume position after a source/ACL change."""
-    previous = _decode_cursor(cursor)
-    return previous if previous.fingerprint == fingerprint else _CursorEtags()
 
 
 def _decode_cursor(cursor: str | None) -> _CursorEtags:
@@ -913,25 +727,18 @@ def _decode_cursor(cursor: str | None) -> _CursorEtags:
     if not isinstance(payload, dict) or not isinstance(payload.get("etags"), dict):
         raise InvalidRequestError("Data Hub source cursor has an unsupported shape")
     version = payload.get("v")
-    if version not in (1, 2, _CURSOR_VERSION) or len(payload["etags"]) > _MAX_CURSOR_ENTRIES:
+    if version not in (1, _CURSOR_VERSION) or len(payload["etags"]) > _MAX_CURSOR_ENTRIES:
         raise InvalidRequestError("Data Hub source cursor has an unsupported shape")
     etags = payload["etags"]
     if any(not isinstance(key, str) or not isinstance(value, str) for key, value in etags.items()):
         raise InvalidRequestError("Data Hub source cursor has an unsupported shape")
-    continuation = payload.get("continuation") if version in (2, _CURSOR_VERSION) else None
-    start_after = payload.get("start_after") if version in (2, _CURSOR_VERSION) else None
+    continuation = payload.get("continuation") if version == _CURSOR_VERSION else None
+    start_after = payload.get("start_after") if version == _CURSOR_VERSION else None
     if continuation is not None and (not isinstance(continuation, str) or len(continuation) > 4096):
         raise InvalidRequestError("Data Hub source cursor has an invalid continuation")
     if start_after is not None and (not isinstance(start_after, str) or len(start_after) > 2048):
         raise InvalidRequestError("Data Hub source cursor has an invalid resume key")
-    fingerprint = payload.get("fingerprint") if version == _CURSOR_VERSION else None
-    if fingerprint is not None and (
-        not isinstance(fingerprint, str) or re.fullmatch(r"[0-9a-f]{64}", fingerprint) is None
-    ):
-        raise InvalidRequestError("Data Hub source cursor has an invalid fingerprint")
-    return _CursorEtags(
-        dict(etags), continuation=continuation, start_after=start_after, fingerprint=fingerprint
-    )
+    return _CursorEtags(dict(etags), continuation=continuation, start_after=start_after)
 
 
 def _encode_cursor(
@@ -939,38 +746,14 @@ def _encode_cursor(
     *,
     continuation: str | None = None,
     start_after: str | None = None,
-    fingerprint: str | None = None,
 ) -> str:
     """Serializes bounded ETags and resumable listing state without padding."""
-    if continuation is not None and (not continuation or len(continuation) > 4096):
-        raise InvalidRequestError("Data Hub source cursor has an invalid continuation")
-    if start_after is not None and (not start_after or len(start_after) > 2048):
-        raise InvalidRequestError("Data Hub source cursor has an invalid resume key")
-    payload: dict[str, object] = {"v": _CURSOR_VERSION, "etags": {}}
-    if fingerprint is not None:
-        if re.fullmatch(r"[0-9a-f]{64}", fingerprint) is None:
-            raise InvalidRequestError("Data Hub source cursor has an invalid fingerprint")
-        payload["fingerprint"] = fingerprint
+    selected = sorted(etags.items())[-_MAX_CURSOR_ENTRIES:]
+    payload: dict[str, object] = {"v": _CURSOR_VERSION, "etags": dict(selected)}
     if continuation:
-        payload["continuation"] = continuation
+        payload["continuation"] = continuation[:4096]
     if start_after:
-        payload["start_after"] = start_after
-    # Keep the resume metadata exact; ETags are only a cache and losing an
-    # entry causes a safe re-fetch. A fixed entry-count cap alone can exceed
-    # the bridge's byte bound and permanently wedge a large source.
-    base = json.dumps(payload, separators=(",", ":"), sort_keys=True)
-    raw_limit = (64 * 1024 // 4) * 3
-    remaining = raw_limit - len(base.encode("utf-8"))
-    if remaining < 0:
-        raise InvalidRequestError("Data Hub source cursor exceeds its size limit")
-    selected: dict[str, str] = {}
-    for key, value in reversed(sorted(etags.items())[-_MAX_CURSOR_ENTRIES:]):
-        entry = json.dumps(key) + ":" + json.dumps(value)
-        cost = len(entry.encode("utf-8")) + bool(selected)
-        if cost <= remaining:
-            selected[key] = value
-            remaining -= cost
-    payload["etags"] = selected
+        payload["start_after"] = start_after[:2048]
     raw = json.dumps(payload, separators=(",", ":"), sort_keys=True)
     encoded = base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii").rstrip("=")
     if len(encoded) > 64 * 1024:

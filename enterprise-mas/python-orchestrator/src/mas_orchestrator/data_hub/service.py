@@ -26,15 +26,9 @@ from mas_orchestrator.contracts.errors import (
     RetrievalError,
     ToolPermissionDeniedError,
 )
-from mas_orchestrator.data_hub.models import DataHubDocument, DataHubSource, require_scope_uuid
+from mas_orchestrator.data_hub.models import DataHubDocument, DataHubSource
 from mas_orchestrator.data_hub.sources import SourceSyncResult
-from mas_orchestrator.rag.models import (
-    DataHubOwnership,
-    DocumentAccess,
-    DocumentFormat,
-    IngestResult,
-    SourceDocument,
-)
+from mas_orchestrator.rag.models import DocumentAccess, DocumentFormat, IngestResult, SourceDocument
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -113,11 +107,6 @@ class DataHubService:
             if not isinstance(index, PgVectorIndex):
                 raise ConfigurationError(
                     "pgvector was selected but the composed index is not PgVectorIndex",
-                    details={"field": "rag.vector_backend"},
-                )
-            if index.allows_unowned_documents:
-                raise ConfigurationError(
-                    "Data Hub cannot retrieve unowned vector documents",
                     details={"field": "rag.vector_backend"},
                 )
 
@@ -216,17 +205,7 @@ class DataHubService:
         )
         pipeline = self._require_pipeline()
         try:
-            owner = DataHubOwnership(
-                organization_id=document.organization_id,
-                project_id=document.project_id,
-                source_id=document.source_id,
-            )
-            if self._rag_settings.vector_backend is VectorBackend.PGVECTOR:
-                result: IngestResult = await pipeline.ingest(
-                    source, format=source.format, data_hub_owner=owner
-                )
-            else:
-                result = await pipeline.ingest(source, format=source.format)
+            result: IngestResult = await pipeline.ingest(source, format=source.format)
         except Exception as error:
             if isinstance(error, (InvalidRequestError, RetrievalError, ConfigurationError)):
                 raise
@@ -241,10 +220,7 @@ class DataHubService:
                 details={"document_id": document.document_id, "reason": result.skipped_reason},
             )
         if result.embedded_count != result.chunk_count:
-            # Atomic pipelines have not published the failed attempt at all;
-            # deleting here would destroy the previous complete document.
-            if not pipeline.atomic_document_replace:
-                await pipeline.remove(source)
+            await pipeline.remove(source)
             raise RetrievalError(
                 "Data Hub document was not indexed completely",
                 details={
@@ -390,38 +366,14 @@ class DataHubService:
             errors=tuple(errors),
         )
 
-    async def purge_document(
-        self,
-        *,
-        tenant_id: str,
-        organization_id: str,
-        project_id: str,
-        source_id: str,
-        document_id: str,
-    ) -> int:
-        """Permanently fence and purge one exactly owned Data Hub document."""
+    async def purge_document(self, *, tenant_id: str, document_id: str) -> int:
+        """Removes all vector and lexical records for one signed tenant/document."""
         self._require_enabled()
-        for field, value in (
-            ("tenant_id", tenant_id),
-            ("organization_id", organization_id),
-            ("project_id", project_id),
-            ("source_id", source_id),
-            ("document_id", document_id),
-        ):
-            require_scope_uuid(value, field)
+        _require_uuid(tenant_id, "tenant_id")
+        _require_uuid(document_id, "document_id")
         if self._index is None:
             raise ConfigurationError("Data Hub vector index is not configured")
-        if self._rag_settings.vector_backend is VectorBackend.PGVECTOR:
-            purge = getattr(self._index, "purge_data_hub_document", None)
-            if not callable(purge):
-                raise ConfigurationError("Data Hub requires a fenced vector index")
-            removed = int(
-                await purge(
-                    tenant_id, document_id, DataHubOwnership(organization_id, project_id, source_id)
-                )
-            )
-        else:
-            removed = await self._index.delete_document(tenant_id, document_id)
+        removed = await self._index.delete_document(tenant_id, document_id)
         pipeline_lexical = getattr(self._pipeline, "_lexical", None)
         if pipeline_lexical is not None:
             await pipeline_lexical.delete_document(tenant_id, document_id)
@@ -486,27 +438,16 @@ def _safe_source_uri(value: str | None) -> str | None:
     """Removes fragments/query secrets and rejects unsafe citation URLs."""
     if value is None:
         return None
-    if (
-        len(value) > 2048
-        or value.strip() != value
-        or "\\" in value
-        or any(ord(character) < 32 or ord(character) == 127 for character in value)
-    ):
+    if len(value) > 2048 or any(character in value for character in "\r\n\x00"):
         raise InvalidRequestError("Data Hub source URI is malformed")
-    try:
-        parsed = urlsplit(value)
-        if parsed.username is not None or parsed.password is not None:
-            raise InvalidRequestError("Data Hub source URI must not include user credentials")
-        if parsed.scheme:
-            if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
-                raise InvalidRequestError("Data Hub source URI uses an unsupported URL")
-            # Parsing the port forces rejection of malformed or out-of-range ports.
-            _ = parsed.port
-        elif parsed.netloc or value.startswith("//"):
-            raise InvalidRequestError("Data Hub source URI must not be protocol-relative")
-    except ValueError as error:
-        raise InvalidRequestError("Data Hub source URI is malformed") from error
-    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+    parsed = urlsplit(value)
+    if parsed.scheme and parsed.scheme.lower() not in {"http", "https"}:
+        raise InvalidRequestError("Data Hub source URI uses an unsupported scheme")
+    if parsed.username is not None or parsed.password is not None:
+        raise InvalidRequestError("Data Hub source URI must not include user credentials")
+    return (
+        urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", "")) if parsed.scheme else value
+    )
 
 
 def _safe_metadata(value: Mapping[str, Any]) -> dict[str, Any]:
@@ -531,3 +472,11 @@ def _safe_metadata(value: Mapping[str, Any]) -> dict[str, Any]:
         if len(result) >= 32:
             break
     return result
+
+
+def _require_uuid(value: str, field: str) -> None:
+    """Validates the tenant/document scope before issuing a vector operation."""
+    try:
+        uuid.UUID(value)
+    except (ValueError, AttributeError, TypeError) as error:
+        raise InvalidRequestError(f"{field} must be a UUID", details={"field": field}) from error

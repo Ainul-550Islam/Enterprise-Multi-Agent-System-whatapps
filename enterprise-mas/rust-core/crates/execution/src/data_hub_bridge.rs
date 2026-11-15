@@ -243,15 +243,13 @@ pub struct DataHubPurgeDocumentResult {
     pub removed_chunks: u64,
 }
 
-type ScopedDocumentKey = (TenantId, OrganizationId, ProjectId, Uuid, Uuid);
-
 /// Deterministic in-memory bridge used only by the explicit in-memory API
 /// lane and tests. It validates authoritative scope and exact digests, keeps
 /// only derived chunk counts, and never pretends to be a production vector
 /// store. Durable composition always uses `mas-ai-bridge::GrpcDataHubBridge`.
 #[derive(Debug, Default)]
 pub struct InMemoryDataHubBridge {
-    chunks: Mutex<BTreeMap<ScopedDocumentKey, u32>>,
+    chunks: Mutex<BTreeMap<(TenantId, Uuid), u32>>,
 }
 
 impl InMemoryDataHubBridge {
@@ -317,13 +315,7 @@ impl DataHubBridgePort for InMemoryDataHubBridge {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(
-                (
-                    request.context.tenant_id,
-                    request.context.organization_id,
-                    request.context.project_id,
-                    request.source_id,
-                    request.document_id,
-                ),
+                (request.context.tenant_id, request.document_id),
                 chunk_count,
             );
         Ok(DataHubDocumentIngestionResult {
@@ -350,13 +342,7 @@ impl DataHubBridgePort for InMemoryDataHubBridge {
             .chunks
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&(
-                request.context.tenant_id,
-                request.context.organization_id,
-                request.context.project_id,
-                request.source_id,
-                request.document_id,
-            ))
+            .remove(&(request.context.tenant_id, request.document_id))
             .unwrap_or_default();
         Ok(DataHubPurgeDocumentResult {
             document_id: request.document_id,

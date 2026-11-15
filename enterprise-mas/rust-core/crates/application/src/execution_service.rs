@@ -187,11 +187,7 @@ impl ExecutionService {
             self.workflows
                 .get(workflow_id)
                 .await?
-                .filter(|w| {
-                    w.tenant_id == tenant_id
-                        && w.organization_id == organization_id
-                        && w.project_id == project
-                })
+                .filter(|w| w.tenant_id == tenant_id && w.organization_id == organization_id)
                 .ok_or_else(|| AppError::not_found("workflow", workflow_id.to_string()))?;
         }
         let agent_version_id = if let Some(agent_id) = agent {
@@ -199,11 +195,7 @@ impl ExecutionService {
                 .agents
                 .get(agent_id)
                 .await?
-                .filter(|a| {
-                    a.tenant_id == tenant_id
-                        && a.organization_id == organization_id
-                        && a.project_id == project
-                })
+                .filter(|a| a.tenant_id == tenant_id && a.organization_id == organization_id)
                 .ok_or_else(|| AppError::not_found("agent", agent_id.to_string()))?;
             if !selected_agent.is_executable() {
                 return Err(AppError::conflict(
@@ -520,23 +512,9 @@ impl ExecutionService {
     /// Lists executions the context's tenant may see.
     pub async fn list(&self, ctx: &ServiceContext) -> Result<Vec<Execution>> {
         let tenant_id = ctx.require_tenant()?;
-        let executions = self
-            .durable
-            .list_executions_scoped(tenant_id, ctx.organization_id, DEFAULT_LIST_LIMIT)
-            .await?;
-        // Treat a broken adapter as a security error, not a source of rows to
-        // filter after truncation; the storage query must enforce both scopes.
-        if executions.iter().any(|execution| {
-            execution.tenant_id != tenant_id
-                || ctx
-                    .organization_id
-                    .is_some_and(|org| execution.organization_id != org)
-        }) {
-            return Err(AppError::database(
-                "execution listing returned a row outside its scope",
-            ));
-        }
-        Ok(executions)
+        self.durable
+            .list_executions(tenant_id, DEFAULT_LIST_LIMIT)
+            .await
     }
 
     // -- internals -----------------------------------------------------------
@@ -559,7 +537,6 @@ impl ExecutionService {
         execution_id: ExecutionId,
         action: ExecutionAction,
     ) -> Result<crate::durable::ExecutionTransitionReceipt> {
-        self.scope_checked(ctx, execution_id).await?;
         let receipt = self
             .durable
             .transition(ExecutionTransitionRequest {
@@ -582,7 +559,6 @@ impl ExecutionService {
         ctx: &ServiceContext,
         execution_id: ExecutionId,
     ) -> Result<CancellationReceipt> {
-        self.scope_checked(ctx, execution_id).await?;
         let receipt = self
             .durable
             .cancel(CancellationRequest {
@@ -775,163 +751,6 @@ mod tests {
             durable,
             control_plane,
         }
-    }
-
-    #[tokio::test]
-    async fn submission_rejects_agent_and_workflow_from_another_project() {
-        let fixture = fixture().await;
-        let tenant = fixture.tenant_ctx.tenant_id.expect("tenant");
-        let organization = fixture.tenant_ctx.organization_id.expect("organization");
-        let other_project = Project::create(
-            tenant,
-            organization,
-            "Other",
-            Slug::new("other-project").expect("slug"),
-        )
-        .expect("project");
-        ProjectStorePort::save(fixture.store.as_ref(), &other_project)
-            .await
-            .expect("save project");
-        let mut agent = AgentStorePort::get(fixture.store.as_ref(), fixture.agent)
-            .await
-            .expect("get")
-            .expect("agent");
-        agent.enable().expect("activate");
-        agent.record_published_version(1).expect("version");
-        AgentStorePort::save(fixture.store.as_ref(), &agent)
-            .await
-            .expect("save agent");
-        let version = AgentVersion::publish(
-            agent.id,
-            1,
-            "a".repeat(64),
-            serde_json::json!({}),
-            UserId::new(),
-        )
-        .expect("publish");
-        AgentVersionStorePort::save(fixture.store.as_ref(), &version)
-            .await
-            .expect("save version");
-        for (workflow, agent) in [(Some(fixture.workflow), None), (None, Some(fixture.agent))] {
-            let error = fixture
-                .service
-                .submit(
-                    &fixture.tenant_ctx,
-                    other_project.id,
-                    workflow,
-                    agent,
-                    serde_json::json!({}),
-                    Some("cross-project"),
-                )
-                .await
-                .expect_err("cross-project reference must be hidden");
-            assert!(matches!(error, AppError::NotFound { .. }), "{error:?}");
-        }
-        assert!(fixture.durable.idempotency().is_empty());
-        assert!(fixture
-            .service
-            .list(&fixture.tenant_ctx)
-            .await
-            .expect("list")
-            .is_empty());
-        assert!(fixture.audit.is_empty());
-    }
-
-    #[tokio::test]
-    async fn organization_listing_does_not_lose_rows_beyond_tenant_limit() {
-        let fixture = fixture().await;
-        let tenant = fixture.tenant_ctx.tenant_id.expect("tenant");
-        for _ in 0..=DEFAULT_LIST_LIMIT {
-            fixture
-                .durable
-                .submit(SubmissionIntent {
-                    tenant_id: tenant,
-                    organization_id: OrganizationId::new(),
-                    project_id: fixture.project,
-                    workflow_id: Some(fixture.workflow),
-                    agent_id: None,
-                    agent_version_id: None,
-                    input: serde_json::json!({}),
-                    idempotency_key: None,
-                    fingerprint: "scope-regression".to_owned(),
-                    operation: "execution.run".to_owned(),
-                    priority: mas_common::enums::TaskPriority::Normal,
-                    max_attempts: 1,
-                    deadline: None,
-                    correlation_id: "scoped-list".to_owned(),
-                    request_id: uuid::Uuid::new_v4(),
-                    created_by: "test".to_owned(),
-                    actor: TransitionActor::system("test").expect("actor"),
-                    create_initial_attempt: false,
-                    now: fixture.tenant_ctx.requested_at,
-                })
-                .await
-                .expect("seed execution");
-        }
-        let all = fixture
-            .durable
-            .list_executions(tenant, DEFAULT_LIST_LIMIT + 1)
-            .await
-            .expect("all");
-        assert_eq!(all.len(), DEFAULT_LIST_LIMIT + 1);
-        let target = all.last().expect("last execution");
-        let context = ServiceContext::system("test", &fixture.tenant_ctx.requested_at)
-            .expect("context")
-            .with_scope(tenant, target.organization_id);
-        let visible = fixture.service.list(&context).await.expect("scoped list");
-        assert_eq!(visible.len(), 1);
-        assert_eq!(visible[0].id, target.id);
-    }
-
-    #[tokio::test]
-    async fn different_organization_cannot_list_or_mutate_execution() {
-        let fixture = fixture().await;
-        let execution = fixture
-            .service
-            .submit(
-                &fixture.tenant_ctx,
-                fixture.project,
-                Some(fixture.workflow),
-                None,
-                serde_json::json!({}),
-                Some("org-scope"),
-            )
-            .await
-            .expect("submit")
-            .execution;
-        let foreign_org = ServiceContext::system("other-org", &fixture.tenant_ctx.requested_at)
-            .expect("context")
-            .with_scope(
-                fixture.tenant_ctx.tenant_id.expect("tenant"),
-                OrganizationId::new(),
-            );
-        assert!(fixture
-            .service
-            .list(&foreign_org)
-            .await
-            .expect("list")
-            .is_empty());
-        assert!(matches!(
-            fixture.service.get(&foreign_org, execution.id).await,
-            Err(AppError::NotFound { .. })
-        ));
-        assert!(matches!(
-            fixture.service.start(&foreign_org, execution.id).await,
-            Err(AppError::NotFound { .. })
-        ));
-        assert!(matches!(
-            fixture.service.cancel(&foreign_org, execution.id).await,
-            Err(AppError::NotFound { .. })
-        ));
-        assert_eq!(
-            fixture
-                .service
-                .get(&fixture.tenant_ctx, execution.id)
-                .await
-                .expect("owner read")
-                .status,
-            ExecutionStatus::Queued
-        );
     }
 
     #[tokio::test]

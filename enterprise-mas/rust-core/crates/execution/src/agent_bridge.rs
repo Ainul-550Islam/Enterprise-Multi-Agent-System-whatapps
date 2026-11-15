@@ -39,11 +39,6 @@ use serde_json::Value;
 use std::fmt;
 use std::time::Duration;
 
-pub use crate::agent_runtime_snapshot::{
-    AgentRuntimeConfiguration, AgentRuntimeLimits, AgentRuntimeSnapshot,
-    AgentRuntimeSnapshotResolver,
-};
-
 /// Final status of an agent run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -82,9 +77,6 @@ pub struct AgentRunRequest {
     /// Pinned agent version when required (None = current published).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_version: Option<String>,
-    /// Immutable versioned configuration, resolved by the authoritative worker.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent_snapshot: Option<AgentRuntimeSnapshot>,
     #[serde(default)]
     pub input: Value,
     /// End-to-end trace key (execution correlation id).
@@ -153,7 +145,6 @@ impl AgentRunRequest {
         Ok(Self {
             agent_id,
             agent_version: None,
-            agent_snapshot: None,
             input,
             correlation_id: context.correlation_id().to_owned(),
             deadline: deadline.expires_at(),

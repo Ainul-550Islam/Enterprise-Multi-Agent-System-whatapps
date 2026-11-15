@@ -1,0 +1,12 @@
+{
+  "name": "approval-flow",
+  "description": "Three-step approval workflow",
+  "steps": [
+    "review",
+    "approve",
+    "notify"
+  ],
+  "timeout_minutes": 480,
+  "on_completion": "notify-stakeholders",
+  "on_failure": "escalate"
+}

@@ -43,7 +43,6 @@ from mas_orchestrator.security.identity import (
     ServiceScope,
     StaticTokenServiceIdentityResolver,
 )
-from mas_orchestrator.security.internal_replay import InMemoryReplayGuard
 
 #: Credential the Rust side must present. Matches the Rust test constant.
 DEFAULT_TOKEN = "bridge-service-token"
@@ -215,7 +214,6 @@ async def _serve(options: argparse.Namespace) -> None:
             behaviour=options.behaviour, delay_seconds=options.delay
         ),
         identity_resolver=resolver,
-        replay_guard=InMemoryReplayGuard(),
         config=AgentBridgeServicerConfig(
             require_scope=ServiceScope.EXECUTE_AGENT,
             # A configured secret makes the signature mandatory, which is the

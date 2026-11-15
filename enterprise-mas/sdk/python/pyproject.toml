@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "mas-sdk"
+version = "0.1.0"
+description = "mas SDK for Python - client, models, errors, SSE, pagination"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.24.0",
+    "pydantic>=2.5.0",
+    "uuid>=2.0.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.version]
+latest = "70.0.0"

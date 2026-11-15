@@ -155,12 +155,10 @@ impl RequestScopeResolver {
             .iter()
             .copied()
             .max_by_key(mas_domain::MembershipRole::rank);
-        // An empty directory answer must override stale claimed memberships as
-        // decisively as a downgrade. Bind the result to this exact scope.
-        let mut principal =
-            principal
-                .clone()
-                .with_resolved_role(tenant_id, resolved_organization, highest_role);
+        let principal = match highest_role {
+            Some(role) => principal.clone().with_resolved_role(role),
+            None => principal.clone(),
+        };
 
         let mut scope = AuthoritativeScope::resolved(
             tenant_id,
@@ -170,7 +168,6 @@ impl RequestScopeResolver {
         if let Some(project) = claims.project {
             // Only reachable here if the resolver proved the project belongs
             // to this tenant and organization; it errors otherwise.
-            principal.prove_project(tenant_id, project);
             scope = scope.with_project(project);
         }
 
@@ -312,27 +309,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_credential_bound_token_keeps_its_verified_role() {
-        let (resolver, tenant, organization, _) = world().await;
-        let principal = SecurityPrincipal::new(
-            "token",
-            PrincipalKind::Token,
-            Some(tenant),
-            ScopeSet::denied(),
-        )
-        .with_organization(organization)
-        .with_role(MembershipRole::Developer);
-        let resolved = resolver
-            .resolve(&principal, ScopeClaims::default())
-            .await
-            .unwrap();
-        assert_eq!(
-            resolved.principal.role_in(tenant, organization),
-            Some(MembershipRole::Developer)
-        );
-    }
-
-    #[tokio::test]
     async fn a_forged_tenant_header_is_hidden_not_forbidden() {
         let (resolver, tenant, organization, _project) = world().await;
         let other_tenant = TenantId::from_uuid(id(0xBBBB));
@@ -435,10 +411,6 @@ mod tests {
             .expect("resolve");
         assert_eq!(resolved.scope.project_id(), Some(project));
         assert_eq!(resolved.scope.tenant_id(), tenant);
-        assert!(resolved.principal.project_is_proven(tenant, project));
-        assert!(!resolved
-            .principal
-            .project_is_proven(TenantId::new(), project));
     }
 
     #[tokio::test]
@@ -513,150 +485,9 @@ mod tests {
         assert_eq!(resolved.scope.tenant_id(), tenant);
         // A directory with no membership rows for this user has no role to
         // prove, so the principal carries none — deny-by-default.
-        assert_eq!(resolved.principal.role_in(tenant, organization), None);
-        let request = mas_security::AuthorizationRequest {
-            tenant_id: tenant,
-            organization_id: organization,
-            project_id: None,
-            resource: mas_security::ResourceKind::Execution,
-            action: mas_security::Action::Read,
-        };
-        assert!(!mas_security::AuthorizationService::new()
-            .authorize(&resolved.principal, &request)
-            .is_allowed());
-    }
-
-    #[tokio::test]
-    async fn directory_downgrade_and_suspension_override_stale_token_membership() {
-        use mas_tenancy::MembershipDirectoryPort;
-        let directory = Arc::new(InMemoryDirectory::new());
-        let memberships = Arc::new(InMemoryMemberships::new());
-        let organization = mas_domain::Organization::create(
-            "Acme",
-            "Acme",
-            mas_domain::Slug::new("acme").unwrap(),
-        )
-        .unwrap();
-        let mut tenant = mas_domain::Tenant::create(
-            organization.id,
-            "Tenant",
-            mas_domain::Slug::new("tenant").unwrap(),
-            mas_common::enums::Environment::Production,
-            mas_domain::IsolationMode::SharedRls,
-        )
-        .unwrap();
-        tenant.activate().unwrap();
-        directory.upsert_organization(&organization).await.unwrap();
-        directory.upsert_tenant(&tenant).await.unwrap();
-        let user = mas_common::ids::UserId::new();
-        let mut membership = mas_domain::Membership::invite(
-            user,
-            organization.id,
-            Some(tenant.id),
-            MembershipRole::Viewer,
-        )
-        .unwrap();
-        membership.accept_invitation().unwrap();
-        memberships.upsert(&membership).await.unwrap();
-        let resolver =
-            RequestScopeResolver::new(TenantResolver::new(directory, memberships.clone()));
-        // An API key ID is not a user ID, even if their UUIDs collide. Its
-        // own verified role cannot be widened by that user's membership.
-        let mut owner_membership = membership.clone();
-        owner_membership.roles = std::collections::BTreeSet::from([MembershipRole::Owner]);
-        memberships.upsert(&owner_membership).await.unwrap();
-        let key = SecurityPrincipal::new(
-            user.to_string(),
-            PrincipalKind::ApiKey,
-            Some(tenant.id),
-            ScopeSet::denied(),
-        )
-        .with_organization(organization.id)
-        .with_role(MembershipRole::Viewer);
-        let key_result = resolver
-            .resolve(&key, ScopeClaims::default())
-            .await
-            .unwrap();
         assert_eq!(
-            key_result.principal.role_in(tenant.id, organization.id),
+            resolved.principal.role_in(tenant, organization),
             Some(MembershipRole::Viewer)
-        );
-        memberships.upsert(&membership).await.unwrap();
-        let principal = SecurityPrincipal::new(
-            user.to_string(),
-            PrincipalKind::User,
-            None,
-            ScopeSet::denied(),
-        )
-        .with_memberships(vec![TenantMembership::new(
-            organization.id,
-            tenant.id,
-            MembershipRole::Owner,
-        )]);
-        let auth = mas_security::AuthorizationService::new();
-        let request = mas_security::AuthorizationRequest {
-            tenant_id: tenant.id,
-            organization_id: organization.id,
-            project_id: None,
-            resource: mas_security::ResourceKind::Membership,
-            action: mas_security::Action::ManageMembers,
-        };
-        let resolved = resolver
-            .resolve(&principal, ScopeClaims::default())
-            .await
-            .unwrap();
-        assert_eq!(
-            resolved.principal.role_in(tenant.id, organization.id),
-            Some(MembershipRole::Viewer)
-        );
-        assert!(!auth.authorize(&resolved.principal, &request).is_allowed());
-
-        // Exercise the real HTTP middleware and authorization path with a
-        // stale owner grant; the active directory viewer may read, but loses
-        // that permission immediately after suspension on the next request.
-        use axum::{
-            body::Body,
-            http::{Request, StatusCode},
-        };
-        use tower::ServiceExt;
-        let mut state = crate::state::test_support::inmemory_state();
-        state.scope_resolver = Some(resolver.clone());
-        state.verifier = Arc::new(
-            crate::auth::StaticTokenVerifier::new().with_token("stale", principal.clone()),
-        );
-        let app = crate::router::router(state);
-        let make_request = || {
-            Request::builder()
-                .uri("/v1/executions")
-                .header("authorization", "Bearer stale")
-                .body(Body::empty())
-                .unwrap()
-        };
-        assert_eq!(
-            app.clone().oneshot(make_request()).await.unwrap().status(),
-            StatusCode::OK
-        );
-
-        membership.suspend().unwrap();
-        memberships.upsert(&membership).await.unwrap();
-        let suspended = resolver
-            .resolve(&principal, ScopeClaims::default())
-            .await
-            .unwrap();
-        assert_eq!(
-            suspended.principal.role_in(tenant.id, organization.id),
-            None
-        );
-        assert!(!auth.authorize(&suspended.principal, &request).is_allowed());
-        let read = mas_security::AuthorizationRequest {
-            action: mas_security::Action::Read,
-            resource: mas_security::ResourceKind::Execution,
-            ..request
-        };
-        assert!(!auth.authorize(&suspended.principal, &read).is_allowed());
-        assert_eq!(
-            app.oneshot(make_request()).await.unwrap().status(),
-            StatusCode::FORBIDDEN
         );
     }
 

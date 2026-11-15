@@ -33,9 +33,6 @@ Derived from migrations 0001–0053 and the implemented crates/modules in
 - SSE stream (`/v1/stream`) with per-tenant/per-principal connection caps
 - Governance: `/v1/auth/me`, `/v1/audit-events`, `/v1/policies`, `/v1/quotas`,
   `/v1/usage/summary`
-- SSE stream (`/v1/stream`) with per-tenant/per-principal connection caps
-- Governance: `/v1/auth/me`, `/v1/audit-events`, `/v1/policies`, `/v1/quotas`,
-  `/v1/usage/summary`
 - Persistence: SQLx pool, RLS context, 53 migrations (0001–0053), migration
   runner with FNV-1a checksum ledger and advisory-lock apply
 - Worker: lease-fenced consumer, retry with full jitter, delivery-ceiling DLQ,

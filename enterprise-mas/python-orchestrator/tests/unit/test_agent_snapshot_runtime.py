@@ -25,7 +25,7 @@ class RejectingRegistry:
 
 
 class AllowRouter:
-    def evaluate_pinned(self, spec: AgentSpec, routing: Any) -> None:
+    def evaluate(self, spec: AgentSpec, routing: Any) -> None:
         return None
 
     def select(self, tenant_id: str, routing: Any) -> AgentSpec:

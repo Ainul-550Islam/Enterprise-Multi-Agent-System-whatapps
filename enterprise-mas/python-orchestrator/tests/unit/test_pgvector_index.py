@@ -193,7 +193,6 @@ async def test_health_check_uses_transaction_local_rag_role_before_table_probe()
         ("SELECT 1", None),
         (_SET_LOCAL_RAG_ROLE_SQL, None),
         ("SELECT 1 FROM document_chunks LIMIT 0", None),
-        ("SELECT 1 FROM rag_document_fences LIMIT 0", None),
     ]
 
 

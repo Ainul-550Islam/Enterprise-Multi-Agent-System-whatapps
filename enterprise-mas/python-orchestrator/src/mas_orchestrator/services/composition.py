@@ -55,7 +55,6 @@ if TYPE_CHECKING:
     from mas_orchestrator.agents.runtime import AgentRuntime
     from mas_orchestrator.agents.tenant_registry import TenantScopedAgentRegistry
     from mas_orchestrator.config.settings import Settings
-    from mas_orchestrator.data_hub.service import DataHubService
     from mas_orchestrator.models.cost import PricingTable
     from mas_orchestrator.models.registry import ModelRegistry
     from mas_orchestrator.providers.factory import ProviderBundle, ProviderSpec
@@ -101,14 +100,10 @@ class RuntimeBundle:
     identity_resolver: ServiceIdentityResolver
     providers: ProviderBundle
     agent_registry: TenantScopedAgentRegistry
-    data_hub_service: DataHubService
 
     async def aclose(self) -> None:
-        """Close both the Data Hub and model provider resources."""
-        try:
-            await self.data_hub_service.aclose()
-        finally:
-            await self.providers.aclose()
+        """Closes every provider transport owned by the bundle."""
+        await self.providers.aclose()
 
     def describe(self) -> dict[str, object]:
         """A log-safe summary of what was composed.
@@ -222,15 +217,16 @@ def build_identity_resolver(settings: Settings) -> ServiceIdentityResolver:
             details={"field": "security.service_token_ref"},
         ) from error
 
-    scopes = {ServiceScope.EXECUTE_AGENT, ServiceScope.INVOKE_API, ServiceScope.READ_HEALTH}
-    if settings.rag.enabled:
-        scopes.update(
-            {ServiceScope.DATA_HUB_SYNC, ServiceScope.DATA_HUB_INGEST, ServiceScope.DATA_HUB_PURGE}
-        )
     return StaticTokenServiceIdentityResolver(
         token=token,
         subject="rust-core",
-        scopes=frozenset(scopes),
+        scopes=frozenset(
+            {
+                ServiceScope.EXECUTE_AGENT,
+                ServiceScope.INVOKE_API,
+                ServiceScope.READ_HEALTH,
+            }
+        ),
     )
 
 
@@ -257,7 +253,6 @@ def build_runtime_bundle(settings: Settings) -> RuntimeBundle:
     from mas_orchestrator.agents.router import AgentRouter, build_policy
     from mas_orchestrator.agents.runtime import AgentRuntime, RuntimeConfig
     from mas_orchestrator.agents.tenant_registry import TenantScopedAgentRegistry
-    from mas_orchestrator.data_hub.composition import build_data_hub_service
     from mas_orchestrator.models.registry import ModelRegistry
     from mas_orchestrator.models.router import ModelRouter
     from mas_orchestrator.models.router import build_policy as build_model_policy
@@ -332,7 +327,6 @@ def build_runtime_bundle(settings: Settings) -> RuntimeBundle:
         identity_resolver=build_identity_resolver(settings),
         providers=providers,
         agent_registry=agent_registry,
-        data_hub_service=build_data_hub_service(settings),
     )
 
     _LOGGER.info(

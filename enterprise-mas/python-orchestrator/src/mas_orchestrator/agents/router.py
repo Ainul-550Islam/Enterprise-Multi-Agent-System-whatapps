@@ -93,17 +93,7 @@ class AgentRouter:
         """Returns ``None`` if the agent is eligible, otherwise the reason."""
         if not self._policy.is_allowed(spec.agent_id):
             return AgentRejection(spec.agent_id, "not_allowlisted")
-        return self.evaluate_pinned(spec, request)
 
-    def evaluate_pinned(
-        self, spec: AgentSpec, request: AgentRoutingRequest
-    ) -> AgentRejection | None:
-        """Evaluate a Rust-authorized snapshot without substituting local catalog policy.
-
-        The caller must validate signed Rust identity and scope before using this
-        method; Python's static catalog is not an authority over Rust agents.
-        All lifecycle and request constraints still apply.
-        """
         if not spec.is_runnable:
             return AgentRejection(spec.agent_id, f"agent_{spec.status.value}")
 

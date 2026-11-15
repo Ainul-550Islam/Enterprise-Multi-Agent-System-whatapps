@@ -4,7 +4,7 @@
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 0.1.0   | :white_check_mark: (current development line) |
+| 1.0.x   | :white_check_mark: (current development line) |
 
 Earlier releases are not supported.
 

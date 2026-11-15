@@ -13,20 +13,6 @@ use mas_common::validation;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// Maximum encoded source cursor in bytes, matching the Python bridge.
-pub const MAX_SOURCE_CURSOR_BYTES: usize = 64 * 1024;
-
-fn validate_cursor(cursor: Option<&str>) -> Result<()> {
-    if cursor.is_some_and(|value| value.len() > MAX_SOURCE_CURSOR_BYTES) {
-        return Err(AppError::invalid_field(
-            "sync_cursor",
-            "too_long",
-            "source cursor exceeds its byte limit",
-        ));
-    }
-    Ok(())
-}
-
 string_enum! {
     /// Supported Data Hub source adapter.
     DataSourceKind {
@@ -146,8 +132,6 @@ impl DataSource {
             .map_err(|_| AppError::database("data source name violates its persisted invariant"))?;
         validate_config(&self.config)
             .map_err(|_| AppError::database("data source config contains an invalid value"))?;
-        validate_cursor(self.sync_cursor.as_deref())
-            .map_err(|_| AppError::database("data source cursor exceeds its persisted limit"))?;
         Ok(())
     }
 
@@ -185,25 +169,14 @@ impl DataSource {
     /// Syncing → Active and persist the opaque adapter cursor.
     pub fn complete_sync(&mut self, cursor: Option<String>, at: Timestamp) -> Result<()> {
         self.require_syncing("complete")?;
-        validate_cursor(cursor.as_deref())?;
+        if let Some(cursor) = cursor.as_deref() {
+            validation::validate_length("sync_cursor", cursor, 0, 4096)?;
+        }
         self.sync_cursor = cursor;
         self.last_synced_at = Some(at);
         self.last_failure_code = None;
         self.status = DataSourceStatus::Active;
         self.touch();
-        Ok(())
-    }
-
-    /// Syncing → Error with the retry checkpoint for a partially indexed batch.
-    /// The last successful sync time is intentionally left unchanged.
-    pub fn fail_sync_with_cursor(
-        &mut self,
-        cursor: Option<String>,
-        failure_code: impl Into<String>,
-    ) -> Result<()> {
-        validate_cursor(cursor.as_deref())?;
-        self.fail_sync(failure_code)?;
-        self.sync_cursor = cursor;
         Ok(())
     }
 
@@ -380,30 +353,6 @@ mod tests {
             source.last_failure_code.as_deref(),
             Some("upstream_timeout")
         );
-    }
-
-    #[test]
-    fn cursor_limit_matches_bridge_bytes_and_invalid_partial_is_atomic() {
-        let mut source = source();
-        source.activate().expect("activate");
-        source.begin_sync().expect("begin");
-        source
-            .complete_sync(Some("a".repeat(MAX_SOURCE_CURSOR_BYTES)), Timestamp::now())
-            .expect("boundary");
-        source.begin_sync().expect("begin");
-        assert!(source
-            .fail_sync_with_cursor(
-                Some("é".repeat(MAX_SOURCE_CURSOR_BYTES / 2 + 1)),
-                "partial_sync"
-            )
-            .is_err());
-        assert_eq!(source.status, DataSourceStatus::Syncing);
-        assert_eq!(
-            source.sync_cursor.as_ref().expect("cursor").len(),
-            MAX_SOURCE_CURSOR_BYTES
-        );
-        source.sync_cursor = Some("a".repeat(MAX_SOURCE_CURSOR_BYTES + 1));
-        assert!(source.validate().is_err());
     }
 
     #[test]

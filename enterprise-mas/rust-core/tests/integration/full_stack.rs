@@ -55,7 +55,7 @@ struct FixtureScope {
 /// same calls `mas-api --dev-inmemory` makes) and returns the ids.
 async fn seed_scope(state: &mut AppState, store: &Arc<InMemoryServices>) -> FixtureScope {
     let system =
-        ServiceContext::system("root-it-1", &Timestamp::now()).expect("ctx");
+        ServiceContext::for_service("root-it", "root-it-1", &Timestamp::now()).expect("ctx");
     let organization = state
         .tenancy
         .register_organization(&system, "Acme Ltd.", "Acme", "acme-root-it")

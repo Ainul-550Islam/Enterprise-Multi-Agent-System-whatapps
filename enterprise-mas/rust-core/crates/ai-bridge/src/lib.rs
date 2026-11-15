@@ -67,9 +67,6 @@ pub mod gen {
 use gen::agent_bridge_api_client::AgentBridgeApiClient;
 use gen::{agent_run_reply, AgentRunReply, BridgeHealthReply, ResourceLimitsMsg};
 
-mod data_hub;
-pub use data_hub::{GrpcDataHubBridge, GrpcDataHubBridgeConfig};
-
 /// Metadata key carrying the bearer credential, matching the platform-wide
 /// header name used by the HTTP surface.
 const AUTHORIZATION_HEADER: &str = "authorization";
@@ -88,7 +85,7 @@ const PROTOCOL_VERSION_HEADER: &str = "x-ai-protocol-version";
 const IDEMPOTENCY_HEADER: &str = "idempotency-key";
 
 /// The AI wire protocol version this adapter speaks.
-const AI_PROTOCOL_VERSION: &str = "1.1.0";
+const AI_PROTOCOL_VERSION: &str = "1.0.0";
 
 /// A deadline shorter than this is not worth a round trip: fail fast instead of
 /// starting work that cannot finish.
@@ -187,7 +184,6 @@ impl Default for GrpcAgentBridgeConfig {
 #[derive(Debug, Clone)]
 pub struct GrpcAgentBridge {
     client: AgentBridgeApiClient<tonic::transport::Channel>,
-    channel: tonic::transport::Channel,
     config: GrpcAgentBridgeConfig,
 }
 
@@ -251,14 +247,10 @@ impl GrpcAgentBridge {
             AppError::external_service("ai-orchestrator", format!("connect failed: {}", err))
         })?;
 
-        let client = AgentBridgeApiClient::new(channel.clone())
-            .max_decoding_message_size(config.max_response_bytes);
+        let client =
+            AgentBridgeApiClient::new(channel).max_decoding_message_size(config.max_response_bytes);
 
-        Ok(Self {
-            client,
-            channel,
-            config,
-        })
+        Ok(Self { client, config })
     }
 
     /// Computes the RPC timeout for a request.
@@ -288,12 +280,6 @@ impl GrpcAgentBridge {
         Ok(gen::AgentRunRequest {
             agent_id: request.agent_id.to_string(),
             agent_version: request.agent_version.clone(),
-            agent_snapshot_json: request
-                .agent_snapshot
-                .as_ref()
-                .map(serde_json::to_string)
-                .transpose()
-                .map_err(|err| AppError::serialization(format!("agent snapshot: {err}")))?,
             input_json: serde_json::to_string(&request.input)
                 .map_err(|err| AppError::serialization(format!("agent input: {err}")))?,
             correlation_id: request.correlation_id.clone(),
@@ -644,7 +630,6 @@ fn annotate(error: AppError, suffix: &str) -> AppError {
         Timeout(message) => Timeout(push(message)),
         Cancelled(message) => Cancelled(push(message)),
         Database(message) => Database(push(message)),
-        Unavailable(message) => Unavailable(push(message)),
         Messaging(message) => Messaging(push(message)),
         Serialization(message) => Serialization(push(message)),
         ExternalService { service, message } => ExternalService {
@@ -804,43 +789,6 @@ mod tests {
     }
 
     #[test]
-    fn immutable_agent_snapshot_is_carried_in_signed_wire_body() {
-        use mas_execution::agent_bridge::{AgentRuntimeConfiguration, AgentRuntimeSnapshot};
-        use prost::Message;
-        let mut request = request();
-        let snapshot = AgentRuntimeSnapshot {
-            agent_id: request.agent_id,
-            tenant_id: request.tenant_id.expect("tenant"),
-            organization_id: request.organization_id.expect("organization"),
-            project_id: request.project_id.expect("project"),
-            agent_version_id: mas_common::ids::AgentVersionId::new(),
-            version_number: 7,
-            configuration_checksum: "a".repeat(64),
-            name: "Snapshot Agent".to_owned(),
-            slug: "snapshot-agent".to_owned(),
-            kind: "standard".to_owned(),
-            status: "active".to_owned(),
-            origin: "user".to_owned(),
-            read_only: false,
-            configuration: AgentRuntimeConfiguration {
-                system_prompt: "published instructions".to_owned(),
-                ..Default::default()
-            },
-        };
-        let without_snapshot = GrpcAgentBridge::encode_request(&request).expect("legacy wire");
-        request.agent_snapshot = Some(snapshot.clone());
-        let wire = GrpcAgentBridge::encode_request(&request).expect("snapshot wire");
-        let decoded: AgentRuntimeSnapshot = serde_json::from_str(
-            wire.agent_snapshot_json
-                .as_deref()
-                .expect("snapshot included"),
-        )
-        .expect("valid snapshot");
-        assert_eq!(decoded, snapshot);
-        assert_ne!(wire.encode_to_vec(), without_snapshot.encode_to_vec());
-    }
-
-    #[test]
     fn from_context_populates_the_authoritative_scope() {
         let request = request();
         assert!(request.tenant_id.is_some(), "tenant scope is mandatory");
@@ -888,7 +836,6 @@ mod tests {
         gen::AgentRunRequest {
             agent_id: "00000000-0000-0000-0000-000000000001".to_owned(),
             agent_version: Some("v1".to_owned()),
-            agent_snapshot_json: None,
             input_json: "{\"prompt\":\"hi\"}".to_owned(),
             correlation_id: "corr-1".to_owned(),
             request_id: "req-1".to_owned(),
@@ -1259,20 +1206,6 @@ mod tests {
             rendered.contains("request_id=req-9"),
             "request id must be joinable: {rendered}"
         );
-    }
-
-    #[test]
-    fn unavailable_annotation_preserves_error_kind_and_details() {
-        let error = annotate(
-            AppError::Unavailable("upstream offline".to_owned()),
-            "[code=x]",
-        );
-        match error {
-            AppError::Unavailable(message) => {
-                assert_eq!(message, "upstream offline [code=x]");
-            },
-            other => panic!("expected unavailable error, got {other:?}"),
-        }
     }
 
     #[test]

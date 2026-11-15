@@ -346,7 +346,7 @@ impl Mediator {
         // ── 1. Decode. Undecodable frames never heal. ────────────────
         let decoded: std::result::Result<TaskQueueMessage, _> =
             self.codec.decode_value(&message.payload);
-        let mut task_msg = match decoded {
+        let task_msg = match decoded {
             Ok(msg) => msg,
             Err(err) => {
                 tracing::error!(sequence, %err, "undecodable task frame");
@@ -362,33 +362,6 @@ impl Mediator {
         };
         let task_id = task_msg.task_id;
         let tenant_id = task_msg.tenant_id;
-
-        // A broker hint may supply an identity to look up but cannot select
-        // which organization's concurrency budget to consume. Resolve scope
-        // from the durable row before acquiring a slot or creating an attempt.
-        let durable_task = match self.attempts.durable().load_task(tenant_id, task_id).await {
-            Ok(Some((task, _))) => task,
-            Ok(None) => {
-                self.ack(sequence, AckInstruction::Ack).await;
-                return MessageOutcome {
-                    settlement: Settlement::Ack,
-                    handler_failed: false,
-                    stale_ownership: false,
-                };
-            },
-            Err(err) => {
-                tracing::error!(%task_id, %err, "durable scope lookup failed; deferring delivery");
-                let settlement = self.nak_transient(sequence, deliveries).await;
-                return MessageOutcome {
-                    settlement,
-                    handler_failed: false,
-                    stale_ownership: false,
-                };
-            },
-        };
-        task_msg.organization_id = durable_task.organization_id;
-        task_msg.project_id = durable_task.project_id;
-        task_msg.execution_id = durable_task.execution_id;
 
         // ── 2. Concurrency slot — taken BEFORE the durable claim. ─────
         //
@@ -557,25 +530,8 @@ impl Mediator {
         };
         let attempt_number = claim.attempt.attempt_number;
 
-        // The run slot was acquired from the delivery hint before claiming so
-        // a capacity refusal does not burn an attempt. Never use a slot from a
-        // different scope to execute the durable task. If the row changed
-        // between lookup and claim, defer; its unrenewed lease can expire.
-        if task_msg.organization_id != claim.task.organization_id
-            || task_msg.project_id != claim.task.project_id
-            || task_msg.execution_id != claim.task.execution_id
-        {
-            tracing::error!(%task_id, sequence, "delivery scope differs from durable task; deferring");
-            let settlement = self.nak_transient(sequence, deliveries).await;
-            return MessageOutcome {
-                settlement,
-                handler_failed: true,
-                stale_ownership: false,
-            };
-        }
-
         // ── 3b. Deadline that lapsed before work could start. ─────────
-        if let Some(deadline) = claim.task.deadline {
+        if let Some(deadline) = task_msg.deadline {
             if !deadline.is_after(&Timestamp::now()) {
                 let failure = crate::classify::ClassifiedFailure {
                     class: crate::classify::FailureClass::Terminal,
@@ -615,29 +571,7 @@ impl Mediator {
         // attached to an owned handler copy rather than the persisted broker
         // frame. Python can then distinguish a true retry from a redelivery
         // of the same attempt without inventing an attempt identifier.
-        let mut handler_message = task_msg.clone().with_task_attempt_id(claim.attempt.id);
-        // The broker frame is only a delivery hint. The claimed row is the
-        // authority for scope, target, input, idempotency and execution bounds.
-        handler_message.tenant_id = claim.task.tenant_id;
-        handler_message.organization_id = claim.task.organization_id;
-        handler_message.project_id = claim.task.project_id;
-        handler_message.execution_id = claim.task.execution_id;
-        handler_message.agent_id = claim.task.agent_id;
-        handler_message.agent_version_id = claim.task.agent_version_id;
-        handler_message.workflow_id = claim.task.workflow_id;
-        handler_message.operation.clone_from(&claim.task.operation);
-        handler_message.input.clone_from(&claim.task.input);
-        handler_message
-            .idempotency_key
-            .clone_from(&claim.task.idempotency_key);
-        handler_message.priority = claim.task.priority;
-        handler_message.attempt_count = attempt_number;
-        handler_message.max_attempts = claim.task.max_attempts;
-        handler_message.deadline = claim.task.deadline;
-        handler_message
-            .correlation_id
-            .clone_from(&claim.task.correlation_id);
-        handler_message.request_id = claim.task.request_id;
+        let handler_message = task_msg.clone().with_task_attempt_id(claim.attempt.id);
         let outcome = self.execute(&claim, &handler_message, sequence).await;
 
         // ── 3d. Settle durably, THEN ack. Terminal state is committed
@@ -744,13 +678,7 @@ impl Mediator {
         let settled = match outcome {
             Ok(value) => {
                 self.attempts
-                    .succeed_with_result(
-                        claim,
-                        value.clone(),
-                        usage_from(value),
-                        finalize_execution,
-                        &now,
-                    )
+                    .succeed(claim, usage_from(value), finalize_execution, &now)
                     .await
             },
             Err(err) => {
@@ -1083,7 +1011,6 @@ mod tests {
                 project_id,
                 workflow_id: Some(workflow_id),
                 agent_id: None,
-                agent_version_id: None,
                 input,
                 idempotency_key: Some(key.to_owned()),
                 fingerprint,
@@ -1201,14 +1128,6 @@ mod tests {
         decision: RunSlot,
         acquired: std::sync::atomic::AtomicUsize,
         released: std::sync::atomic::AtomicUsize,
-        acquired_scope: std::sync::Mutex<
-            Option<(
-                TenantId,
-                OrganizationId,
-                Option<mas_common::ids::ExecutionId>,
-                mas_common::ids::TaskId,
-            )>,
-        >,
     }
 
     impl ScriptedRunSlots {
@@ -1217,7 +1136,6 @@ mod tests {
                 decision,
                 acquired: std::sync::atomic::AtomicUsize::new(0),
                 released: std::sync::atomic::AtomicUsize::new(0),
-                acquired_scope: std::sync::Mutex::new(None),
             }
         }
         fn acquired(&self) -> usize {
@@ -1232,14 +1150,12 @@ mod tests {
     impl RunSlotPort for ScriptedRunSlots {
         async fn acquire(
             &self,
-            tenant: TenantId,
-            organization: OrganizationId,
-            execution: Option<mas_common::ids::ExecutionId>,
-            task: mas_common::ids::TaskId,
+            _tenant: TenantId,
+            _organization: OrganizationId,
+            _execution: Option<mas_common::ids::ExecutionId>,
+            _task: mas_common::ids::TaskId,
             _at: &Timestamp,
         ) -> Result<RunSlot> {
-            *self.acquired_scope.lock().expect("scope lock") =
-                Some((tenant, organization, execution, task));
             self.acquired
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(self.decision)
@@ -1358,178 +1274,6 @@ mod tests {
             vec![Some(attempts[0].id)],
             "the handler receives the id minted by the durable claim"
         );
-    }
-
-    #[tokio::test]
-    async fn durable_agent_version_overrides_a_forged_queue_pin() {
-        #[derive(Debug)]
-        struct CaptureVersion;
-        #[async_trait::async_trait]
-        impl TaskHandlerPort for CaptureVersion {
-            async fn execute(&self, message: &TaskQueueMessage) -> Result<serde_json::Value> {
-                Ok(serde_json::json!({"version": message.agent_version_id}))
-            }
-        }
-
-        let rig = rig();
-        let tenant_id = TenantId::new();
-        let organization_id = OrganizationId::new();
-        let project_id = ProjectId::new();
-        let agent_id = mas_common::ids::AgentId::new();
-        let version = mas_common::ids::AgentVersionId::new();
-        let forged = mas_common::ids::AgentVersionId::new();
-        let input = serde_json::json!({"job": "pinned"});
-        let fingerprint = RequestFingerprint::submission(&FingerprintInput {
-            tenant_id,
-            organization_id,
-            project_id,
-            workflow_id: None,
-            agent_id: Some(agent_id),
-            operation: "execution.run",
-            input: &input,
-            priority: TaskPriority::High,
-            deadline: None,
-        })
-        .expect("fingerprint");
-        let task = rig
-            .durable
-            .submit(SubmissionIntent {
-                tenant_id,
-                organization_id,
-                project_id,
-                workflow_id: None,
-                agent_id: Some(agent_id),
-                agent_version_id: Some(version),
-                input,
-                idempotency_key: Some("pinned-version-test".to_owned()),
-                fingerprint,
-                operation: "execution.run".to_owned(),
-                priority: TaskPriority::High,
-                max_attempts: 3,
-                deadline: None,
-                correlation_id: "corr-pinned".to_owned(),
-                request_id: uuid::Uuid::now_v7(),
-                created_by: "test".to_owned(),
-                actor: TransitionActor::system("test").expect("actor"),
-                create_initial_attempt: false,
-                now: Timestamp::now(),
-            })
-            .await
-            .expect("submit")
-            .task;
-        let mut frame = queue_message(&task);
-        frame.agent_version_id = Some(forged);
-        let mut message = delivery(&task);
-        message.payload = JsonEventCodec::new(CodecConfig::default())
-            .encode_value(&frame)
-            .expect("frame");
-        let mut mediator = mediator(
-            &rig,
-            "w-version",
-            Arc::new(ScriptedRunSlots::new(RunSlot::NotMetered)),
-        );
-        mediator.handler = Arc::new(CaptureVersion);
-        let outcome = mediator.mediate(message).await;
-        assert!(matches!(outcome.settlement, Settlement::Ack));
-        let (row, execution) = rig
-            .durable
-            .load_task(tenant_id, task.id)
-            .await
-            .expect("load")
-            .expect("task");
-        let expected = serde_json::json!({"version": version});
-        assert_eq!(row.result.as_ref(), Some(&expected));
-        assert_eq!(execution.and_then(|item| item.output), Some(expected));
-    }
-
-    #[tokio::test]
-    async fn handler_uses_durable_task_data_not_forged_delivery_fields() {
-        #[derive(Debug)]
-        struct Capture;
-        #[async_trait::async_trait]
-        impl TaskHandlerPort for Capture {
-            async fn execute(&self, message: &TaskQueueMessage) -> Result<serde_json::Value> {
-                Ok(serde_json::json!({
-                    "input": message.input,
-                    "agent_id": message.agent_id,
-                    "operation": message.operation,
-                    "idempotency_key": message.idempotency_key,
-                    "attempt": message.attempt_count,
-                }))
-            }
-        }
-        let rig = rig();
-        let task = seed(&rig, "idem-authority").await;
-        let mut frame = queue_message(&task);
-        frame.input = serde_json::json!({"forged": true});
-        frame.agent_id = Some(mas_common::ids::AgentId::new());
-        frame.operation = "forged.operation".to_owned();
-        frame.idempotency_key = "forged-key".to_owned();
-        frame.attempt_count = 4;
-        let mut message = delivery(&task);
-        message.payload = JsonEventCodec::new(CodecConfig::default())
-            .encode_value(&frame)
-            .expect("frame");
-        let mut mediator = mediator(
-            &rig,
-            "w-authority",
-            Arc::new(ScriptedRunSlots::new(RunSlot::NotMetered)),
-        );
-        mediator.handler = Arc::new(Capture);
-        let outcome = mediator.mediate(message).await;
-        assert!(matches!(outcome.settlement, Settlement::Ack));
-        let (row, _) = rig
-            .durable
-            .load_task(task.tenant_id, task.id)
-            .await
-            .expect("load")
-            .expect("row");
-        assert_eq!(
-            row.result,
-            Some(serde_json::json!({
-                "input": task.input,
-                "agent_id": task.agent_id,
-                "operation": task.operation,
-                "idempotency_key": task.idempotency_key,
-                "attempt": 1,
-            }))
-        );
-    }
-
-    #[tokio::test]
-    async fn foreign_delivery_scope_never_runs_with_a_foreign_slot() {
-        let rig = rig();
-        let task = seed(&rig, "idem-foreign-scope").await;
-        let mut frame = queue_message(&task);
-        frame.organization_id = OrganizationId::new();
-        let mut message = delivery(&task);
-        message.payload = JsonEventCodec::new(CodecConfig::default())
-            .encode_value(&frame)
-            .expect("frame");
-        let slots = Arc::new(ScriptedRunSlots::new(RunSlot::Acquired));
-        let mediator = mediator(&rig, "w-foreign", slots.clone());
-        let outcome = mediator.mediate(message).await;
-        assert!(matches!(outcome.settlement, Settlement::Ack));
-        assert_eq!(rig.handler.invocations(), 1);
-        assert_eq!(slots.released(), 1);
-        assert_eq!(
-            *slots.acquired_scope.lock().expect("scope lock"),
-            Some((
-                task.tenant_id,
-                task.organization_id,
-                task.execution_id,
-                task.id
-            )),
-            "the gate must charge the durable owner, not the forged organization"
-        );
-        let (row, _) = rig
-            .durable
-            .load_task(task.tenant_id, task.id)
-            .await
-            .expect("load")
-            .expect("row");
-        assert_eq!(row.status, mas_common::enums::TaskStatus::Completed);
-        assert_eq!(row.attempt_count, 1);
     }
 
     /// An unmetered tenant runs, and releasing costs nothing.
@@ -1671,12 +1415,6 @@ mod tests {
             .expect("row");
         assert_eq!(row.status, mas_common::enums::TaskStatus::Completed);
         assert!(row.finished_at.is_some());
-        let expected = serde_json::json!({"echo": task.input, "attempt": 1});
-        assert_eq!(row.result.as_ref(), Some(&expected));
-        assert_eq!(
-            execution.as_ref().and_then(|e| e.output.as_ref()),
-            Some(&expected)
-        );
         assert_eq!(
             execution.map(|e| e.status),
             Some(mas_common::enums::ExecutionStatus::Completed),

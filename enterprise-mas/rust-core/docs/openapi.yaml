@@ -31,6 +31,7 @@ tags:
   - name: billing
   - name: admin
   - name: governance
+  - name: whatsapp
   - name: tooling
   - name: public
 paths:
@@ -751,11 +752,6 @@ paths:
       tags: [data-hub]
       summary: List data sources
       security: [{bearerAuth: []}]
-      parameters:
-        - name: project_id
-          in: query
-          required: true
-          schema: {type: string, format: uuid}
       responses:
         '200':
           $ref: '#/components/responses/OkList'
@@ -786,8 +782,8 @@ paths:
       parameters:
         - $ref: '#/components/parameters/Id'
       responses:
-        '200':
-          $ref: '#/components/responses/Ok'
+        '202':
+          $ref: '#/components/responses/Accepted'
   /v1/data-sources/{id}/documents:
     get:
       tags: [data-hub]
@@ -941,7 +937,23 @@ paths:
       responses:
         '200':
           $ref: '#/components/responses/OkList'
-  /v1/billing/receipts/{provider}/{event_id}:
+  /v1/billing/receipts/{provider}/{event_id}
+  /v1/whatsapp/account:
+    get:
+      tags: [whatsapp]
+      summary: List WhatsApp accounts
+  /v1/whatsapp/inbound:
+    post:
+      tags: [whatsapp]
+      summary: Handle inbound WhatsApp webhook
+  /v1/whatsapp/send/text:
+    post:
+      tags: [whatsapp]
+      summary: Send text message
+  /v1/whatsapp/send/template:
+    post:
+      tags: [whatsapp]
+      summary: Send template message/v1/billing/receipts/{provider}/{event_id}:
     get:
       tags: [billing]
       summary: Get receipt
@@ -1385,6 +1397,12 @@ components:
       required: true
       schema:
         type: string
+    Provider:
+      name: provider
+      in: path
+      required: true
+      schema:
+        type: string
     EventId:
       name: event_id
       in: path
@@ -1602,78 +1620,26 @@ components:
               cron:
                 type: string
     DataSource:
-      required: true
       content:
         application/json:
           schema:
             type: object
-            required: [project_id, name, kind, config]
-            additionalProperties: false
+            required: [name, kind]
             properties:
-              project_id:
-                type: string
-                format: uuid
               name:
                 type: string
               kind:
                 type: string
-                enum: [upload, object_storage, web]
-              config:
-                type: object
-                description: >-
-                  Non-secret settings. Common keys are required_roles,
-                  denied_principals and credential_secret_ref. Web accepts url,
-                  start_urls, max_depth and max_pages. Object storage accepts
-                  endpoint_url, bucket, prefix, region, access_key_secret_ref and
-                  secret_key_secret_ref. Unsupported keys are rejected. Configured
-                  URLs must be HTTPS and cannot contain userinfo, query strings,
-                  fragments or nonstandard ports. URL and secret-reference values
-                  are replaced with [configured] in returned source metadata.
-              credential_id:
-                type: string
-                format: uuid
-                nullable: true
     DocumentUpload:
-      required: true
       content:
         multipart/form-data:
           schema:
             type: object
-            additionalProperties: false
-            required: [request, content]
+            required: [file]
             properties:
-              request:
-                type: object
-                required: [source_id, title, mime_type, size_bytes, content_sha256, access_policy]
-                additionalProperties: false
-                properties:
-                  source_id: {type: string, format: uuid}
-                  title: {type: string}
-                  mime_type: {type: string}
-                  size_bytes: {type: integer, minimum: 1}
-                  content_sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
-                  access_policy:
-                    type: object
-                    additionalProperties: false
-                    description: >-
-                      Empty lists impose no role restriction or principal denial.
-                      Upload policy is combined with the source policy: denial
-                      lists are unioned, nonempty role lists are conservatively
-                      intersected, and disjoint role lists are rejected.
-                    properties:
-                      required_roles:
-                        type: array
-                        items: {type: string}
-                      denied_principals:
-                        type: array
-                        items: {type: string}
-                  metadata: {type: object}
-              content:
+              file:
                 type: string
                 format: binary
-          encoding:
-            request:
-              contentType: application/json
     Policy:
       content:
         application/json:
