@@ -25,7 +25,10 @@ import hashlib
 import hmac
 import json
 import logging
+import threading
 import time
+import uuid
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Final, Protocol, runtime_checkable
 
@@ -47,6 +50,11 @@ DEFAULT_TIMEOUT_SECONDS: Final[float] = 15.0
 #: Signature header name.
 SIGNATURE_HEADER: Final[str] = "x-mas-signature"
 TIMESTAMP_HEADER: Final[str] = "x-mas-timestamp"
+
+#: Per-delivery identity, included in the signed material so a receiver can
+#: deduplicate on it: the id cannot be stripped or swapped without breaking
+#: the signature.
+DELIVERY_ID_HEADER: Final[str] = "x-mas-delivery-id"
 
 #: How far a signature timestamp may drift. Bounds replay without requiring
 #: the receiver to keep state.
@@ -185,7 +193,8 @@ class WebhookTool:
     ) -> None:
         if not config.direct_delivery_enabled:
             raise InvalidRequestError(
-                "direct Python webhook delivery is disabled; use the durable Rust integration plane",
+                "direct Python webhook delivery is disabled; use the durable "
+                "Rust integration plane",
                 details={"reason": "durable_webhook_required"},
             )
         if config.sign_payloads and secret is None:
@@ -275,8 +284,10 @@ class WebhookTool:
         }
         if self._config.sign_payloads and self._secret is not None:
             timestamp = str(int(time.time()))
+            delivery_id = uuid.uuid4().hex
             headers[TIMESTAMP_HEADER] = timestamp
-            headers[SIGNATURE_HEADER] = self._sign(body, timestamp)
+            headers[DELIVERY_ID_HEADER] = delivery_id
+            headers[SIGNATURE_HEADER] = self._sign(body, timestamp, delivery_id)
 
         try:
             status = await self._transport.post(
@@ -318,11 +329,13 @@ class WebhookTool:
             "delivered": True,
         }
 
-    def _sign(self, body: bytes, timestamp: str) -> str:
-        """Signs the timestamped canonical body.
+    def _sign(self, body: bytes, timestamp: str, delivery_id: str) -> str:
+        """Signs the delivery id, timestamp and canonical body.
 
-        The timestamp is inside the signed material, so a captured request
-        cannot be replayed with a fresh timestamp.
+        Both the timestamp and the per-delivery id are inside the signed
+        material: a captured request cannot be replayed with a fresh
+        timestamp, and the delivery id cannot be stripped or swapped, so a
+        receiver can safely deduplicate on it.
 
         The signature covers the **canonical** form produced by
         :func:`canonical_bytes`, not the exact bytes on the wire: the transport
@@ -331,25 +344,90 @@ class WebhookTool:
         arrangement commercial webhook senders use.
         """
         assert self._secret is not None
-        message = f"{timestamp}.".encode() + body
+        message = f"{timestamp}.{delivery_id}.".encode() + body
         digest = hmac.new(self._secret.key_material.encode(), message, hashlib.sha256).hexdigest()
         return f"sha256={digest}"
 
     @staticmethod
-    def verify(body: bytes, timestamp: str, signature: str, *, key: str) -> bool:
+    def verify(
+        body: bytes,
+        timestamp: str,
+        delivery_id: str,
+        signature: str,
+        *,
+        key: str,
+        dedup: DeliveryDedup | None = None,
+    ) -> bool:
         """Verifies a signature, for use by a receiver.
 
         Uses a constant-time comparison, so a rejected signature does not leak
-        how close it was.
+        how close it was. The signature covers the delivery id and the
+        timestamp, so neither can be altered after capture.
+
+        Pass a :class:`DeliveryDedup` as *dedup* to make the check
+        replay-proof: a genuine-but-already-processed delivery is then
+        rejected instead of reprocessed. Without it, a captured delivery
+        verifies for as long as its timestamp is inside the skew window —
+        signature verification alone cannot tell the original from a replay.
         """
         if not timestamp.isdigit():
             return False
         if abs(time.time() - int(timestamp)) > MAX_CLOCK_SKEW_SECONDS:
             return False
+        if not delivery_id or len(delivery_id) > 128:
+            return False
         expected = hmac.new(
-            key.encode(), f"{timestamp}.".encode() + body, hashlib.sha256
+            key.encode(), f"{timestamp}.{delivery_id}.".encode() + body, hashlib.sha256
         ).hexdigest()
-        return hmac.compare_digest(f"sha256={expected}", signature)
+        if not hmac.compare_digest(f"sha256={expected}", signature):
+            return False
+        # Without a dedup guard a captured delivery verifies for as long as
+        # its timestamp is inside the skew window (documented above). With
+        # one, a verified-but-already-processed delivery is dropped: that is
+        # what makes capture-and-replay inside the skew window useless.
+        return dedup is None or dedup.seen_or_record(delivery_id)
+
+
+class DeliveryDedup:
+    """Receiver-side replay guard keyed by the signed delivery id.
+
+    A captured request replays inside the skew window with its original
+    timestamp and delivery id intact — the signature verifies, because the
+    bytes are genuine. The only way for a receiver to tell a replay from the
+    original is to remember which delivery ids it has already processed, so
+    this class records them atomically: two concurrent copies of the same
+    delivery cannot both pass the check.
+
+    The store is process-local and bounded (oldest entries are evicted).
+    A receiver behind several workers must back the same contract with a
+    durable, shared store; the signed delivery id is a safe key for one
+    because it cannot be forged or swapped without breaking the signature.
+    """
+
+    def __init__(self, *, max_entries: int = 8192) -> None:
+        if max_entries < 1:
+            raise InvalidRequestError("webhook dedup capacity must be positive")
+        self._lock = threading.Lock()
+        self._seen: OrderedDict[str, None] = OrderedDict()
+        self._max_entries = max_entries
+
+    def seen_or_record(self, delivery_id: str) -> bool:
+        """Records *delivery_id* and reports whether it is new.
+
+        Returns:
+            ``True`` when this id had not been seen before (it is recorded
+            now); ``False`` when it is a replay. The check and the record are
+            one atomic step under a lock, so concurrent duplicates cannot
+            both observe "new".
+        """
+        with self._lock:
+            if delivery_id in self._seen:
+                self._seen.move_to_end(delivery_id)
+                return False
+            self._seen[delivery_id] = None
+            while len(self._seen) > self._max_entries:
+                self._seen.popitem(last=False)
+            return True
 
 
 class _GuardedTransport:
@@ -406,7 +484,10 @@ def build_webhook_tool(
     """Builds a definition/handler pair ready for registration.
 
     Declared non-idempotent: two identical posts are two deliveries, and a
-    receiver that is not deduplicating will process both.
+    receiver that is not deduplicating will process both. Each delivery
+    carries a signed, unique delivery id (``x-mas-delivery-id``), so a
+    receiver that *is* deduplicating can drop captured replays of an earlier
+    delivery while still processing deliberate re-sends.
     """
     settings = config or WebhookToolConfig(
         targets=frozenset(targets), direct_delivery_enabled=direct_delivery_enabled

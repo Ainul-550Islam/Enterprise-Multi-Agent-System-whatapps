@@ -19,7 +19,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Final
 
-from mas_orchestrator.prompts.whatsapp_assistant import WHATSAPP_SYSTEM_PROMPT
+from mas_orchestrator.config.enums import Environment
 from mas_orchestrator.contracts.errors import ConfigurationError, PromptRenderError
 from mas_orchestrator.prompts.hashing import fingerprint_template
 
@@ -117,7 +117,11 @@ class PromptRegistry:
             "prompt registered",
             extra={
                 "event": "prompt.registered",
-                "name": template.name,
+                # ``name`` is reserved by LogRecord (it is the logger name);
+                # passing it through ``extra`` raises KeyError as soon as the
+                # INFO level is actually enabled. ``prompt_name`` keeps the
+                # structured field readable without colliding.
+                "prompt_name": template.name,
                 "version": template.version,
                 "fingerprint": template.fingerprint,
             },
@@ -201,11 +205,3 @@ def next_version(
         variables=(previous.variables if variables is None else frozenset(variables)),
         description=previous.description if description is None else description,
     )
-
-    # WhatsApp assistant prompt
-    whatsapp_assistant = create_prompt(
-        name="whatsapp_assistant",
-        template=WHATSAPP_SYSTEM_PROMPT,
-        variables=frozenset(),
-        description="System prompt for the WhatsApp support agent",
-        version=1),

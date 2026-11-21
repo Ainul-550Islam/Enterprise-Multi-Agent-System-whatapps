@@ -1,0 +1,56 @@
+{
+  "title": "MAS Quota & Usage",
+  "uid": "mas-quota",
+  "tags": ["mas", "quota", "usage"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "refresh": "1m",
+  "time": { "from": "now-24h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Submissions refused at the door (outcome label)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "expr": "sum(rate(mas_execution_submissions_total[5m])) by (outcome)",
+          "legendFormat": "{{outcome}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Idempotency conflicts vs stale ownership",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        { "expr": "sum(rate(mas_idempotency_conflicts_total[5m]))", "legendFormat": "idempotency conflicts" },
+        { "expr": "sum(rate(mas_stale_worker_rejections_total[5m]))", "legendFormat": "stale worker rejections" }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Failed executions and dead letters",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 8 },
+      "targets": [
+        { "expr": "sum(rate(mas_execution_failed_total[5m]))", "legendFormat": "failed" },
+        { "expr": "sum(rate(mas_dead_lettered_total[5m]))", "legendFormat": "dead lettered" },
+        { "expr": "sum(rate(mas_task_retries_total[5m]))", "legendFormat": "retries" }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Cardinality drops (registry fuse)",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 16 },
+      "targets": [
+        {
+          "expr": "sum(mas_metrics_cardinality_dropped_total)",
+          "legendFormat": "dropped series"
+        }
+      ]
+    }
+  ]
+}

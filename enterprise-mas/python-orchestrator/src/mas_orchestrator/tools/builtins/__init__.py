@@ -31,12 +31,14 @@ from mas_orchestrator.tools.builtins.code import (
     SandboxLimits,
     SandboxResult,
     build_code_tool,
+    default_code_backend,
 )
 from mas_orchestrator.tools.builtins.database import (
     DatabaseBackend,
     DatabaseTool,
     DatabaseToolConfig,
     build_database_tool,
+    default_database_backend,
     normalise_statement,
     validate_statement,
 )
@@ -45,6 +47,7 @@ from mas_orchestrator.tools.builtins.email import (
     EmailTool,
     EmailToolConfig,
     build_email_tool,
+    default_email_backend,
     is_valid_address,
 )
 from mas_orchestrator.tools.builtins.http import (
@@ -71,6 +74,7 @@ from mas_orchestrator.tools.builtins.search import (
     SearchTool,
     SearchToolConfig,
     build_search_tool,
+    default_search_backend,
     looks_like_url,
 )
 from mas_orchestrator.tools.builtins.webhook import (
@@ -123,6 +127,10 @@ __all__ = [
     "build_search_tool",
     "build_webhook_tool",
     "canonical_bytes",
+    "default_code_backend",
+    "default_database_backend",
+    "default_email_backend",
+    "default_search_backend",
     "deny_reason",
     "is_valid_address",
     "looks_like_url",
@@ -130,11 +138,4 @@ __all__ = [
     "require_allowed_language",
     "validate_contract",
     "validate_statement",
-]
-
-__all__ = [
-    "send_email",
-    "search_web",
-    "query_database",
-    "execute_code",
 ]

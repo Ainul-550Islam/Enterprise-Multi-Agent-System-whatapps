@@ -1,0 +1,90 @@
+{
+  "realm": "enterprise-mas",
+  "enabled": true,
+  "displayName": "Enterprise MAS",
+  "registrationAllowed": false,
+  "loginWithEmailAllowed": true,
+  "resetPasswordAllowed": true,
+  "editUsernameAllowed": false,
+  "bruteForceProtected": true,
+  "permanentLockout": false,
+  "failureFactor": 5,
+  "sslRequired": "external",
+  "accessTokenLifespan": 300,
+  "ssoSessionIdleTimeout": 1800,
+  "ssoSessionMaxLifespan": 36000,
+  "clients": [
+    {
+      "clientId": "mas-web",
+      "name": "Enterprise MAS Dashboard",
+      "enabled": true,
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "redirectUris": ["http://localhost:3000/*", "http://localhost:3000/api/auth/callback"],
+      "webOrigins": ["http://localhost:3000"],
+      "protocol": "openid-connect",
+      "attributes": {
+        "pkce.code.challenge.method": "S256"
+      }
+    },
+    {
+      "clientId": "mas-api",
+      "name": "Enterprise MAS API resource server",
+      "enabled": true,
+      "publicClient": false,
+      "standardFlowEnabled": false,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": true,
+      "secret": "${MAS_IDP_API_CLIENT_SECRET}",
+      "protocol": "openid-connect",
+      "fullScopeAllowed": true
+    }
+  ],
+  "roles": {
+    "realm": [
+      { "name": "mas-admin", "description": "Full platform administration" },
+      { "name": "mas-operator", "description": "Execution and schedule operations" },
+      { "name": "mas-viewer", "description": "Read-only dashboards" }
+    ]
+  },
+  "users": [
+    {
+      "username": "demo-admin",
+      "enabled": true,
+      "emailVerified": true,
+      "firstName": "Demo",
+      "lastName": "Admin",
+      "email": "demo-admin@example.invalid",
+      "credentials": [
+        { "type": "password", "value": "${MAS_IDP_DEMO_PASSWORD:-demo-only}", "temporary": true }
+      ],
+      "realmRoles": ["mas-admin"]
+    }
+  ],
+  "clientScopes": [
+    {
+      "name": "mas-tenant-scope",
+      "protocol": "openid-connect",
+      "attributes": { "include.in.token.scope": "true" },
+      "protocolMappers": [
+        {
+          "name": "tenant-id",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "consentRequired": false,
+          "config": {
+            "user.attribute": "tenant_id",
+            "claim.name": "tenant_id",
+            "jsonType.label": "String",
+            "id.token.claim": "true",
+            "access.token.claim": "true"
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -30,6 +30,17 @@ pub trait UsageReadPort: Send + Sync + fmt::Debug {
     ) -> Result<Vec<(String, u64)>>;
     /// Lists currently configured quotas and their authoritative counter values.
     async fn quota_snapshots(&self, tenant: TenantId) -> Result<Vec<(Quota, u64)>>;
+    /// Ledger listing for `GET /v1/usage`: the tenant's raw usage records in
+    /// `[from, to)`, newest first, at most `limit` rows. Reads the same
+    /// `usage_records` ledger the quota aggregates read — one table, one
+    /// truth, whether the lane runs on Postgres or in memory.
+    async fn records(
+        &self,
+        tenant: TenantId,
+        from: Timestamp,
+        to: Timestamp,
+        limit: u16,
+    ) -> Result<Vec<mas_domain::usage::UsageRecord>>;
 }
 
 /// Usage and quota read service.
@@ -104,6 +115,17 @@ impl UsageService {
             })
             .collect()
     }
+
+    /// Lists the tenant's raw usage ledger in `[from, to)`, newest first.
+    pub async fn records(
+        &self,
+        tenant: TenantId,
+        from: Timestamp,
+        to: Timestamp,
+        limit: u16,
+    ) -> Result<Vec<mas_domain::usage::UsageRecord>> {
+        self.port.records(tenant, from, to, limit).await
+    }
 }
 
 /// Mapping helper used by persistence adapters to reject unknown database dimensions.
@@ -150,6 +172,15 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone())
+        }
+        async fn records(
+            &self,
+            _tenant: TenantId,
+            _from: Timestamp,
+            _to: Timestamp,
+            _limit: u16,
+        ) -> Result<Vec<mas_domain::usage::UsageRecord>> {
+            Ok(Vec::new())
         }
     }
 

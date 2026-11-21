@@ -104,7 +104,7 @@ PROTOCOL_VERSION_HEADER: Final[str] = "x-ai-protocol-version"
 TRACEPARENT_HEADER: Final[str] = "traceparent"
 #: gRPC's own deadline header, parsed separately.
 GRPC_TIMEOUT_HEADER: Final[str] = "grpc-timeout"
-#: Body-bound internal signature (``v1:<service>:<millis>:<hmac-hex>``).
+#: One-time body-bound signature (``v2:<service>:<millis>:<nonce>:<hmac-hex>``).
 #:
 #: The names must match ``mas_security::internal_service`` on the Rust side
 #: byte for byte; a rename on one side turns every call into an

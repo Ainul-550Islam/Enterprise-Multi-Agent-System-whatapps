@@ -1,219 +1,249 @@
-/// Outbound message builders for WhatsApp Cloud API.
-///
-/// Each builder produces a JSON payload ready for the Graph API `messages`
-/// endpoint.  The caller is responsible for routing through the guarded
-/// `GraphClient` (see `client.rs`) which applies mime/size allowlists and
-/// SSRF guards.
-use serde::Serialize;
-use crate::config::WhatsAppAccountConfig;
+//! Outbound payload construction — the single place the Graph API send body
+//! shape is defined.
+//!
+//! Building the JSON here (instead of at call sites) keeps three invariants
+//! enforceable in one place:
+//!
+//! * the `messaging_product: "whatsapp"` + recipient shape is always correct;
+//! * a template send always carries name + language + components together;
+//! * payloads serialize through `serde`, so a shape change breaks compile
+//!   time tests rather than production sends.
 
-/// Builder for outbound WhatsApp messages.
-/// All methods return a `serde_json::Value` that can be serialised and
-/// sent via the Graph API.
-#[derive(Clone, Debug)]
-pub struct OutboundBuilder {
-    /// The WABA/phone-number this message is sent from
-    account: WhatsAppAccountConfig,
+use mas_common::error::AppError;
+use mas_common::result::Result;
+use serde_json::{json, Value};
+
+/// An outbound send, before serialization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutboundPayload {
+    /// Free-form text send.
+    Text {
+        /// Recipient phone number (international format).
+        to: String,
+        /// Message body (1..=4096 chars, WhatsApp limit).
+        body: String,
+    },
+    /// Approved-template send.
+    Template {
+        /// Recipient phone number (international format).
+        to: String,
+        /// Template name registered with WhatsApp.
+        name: String,
+        /// BCP-47 language code the template is approved for.
+        language: String,
+        /// Rendered body parameters, in template placeholder order.
+        parameters: Vec<String>,
+    },
+    /// Interactive reply buttons.
+    InteractiveButtons {
+        /// Recipient phone number.
+        to: String,
+        /// Body text above the buttons.
+        body: String,
+        /// Up to three button titles.
+        buttons: Vec<(String, String)>,
+    },
+    /// Interactive list.
+    InteractiveList {
+        /// Recipient phone number.
+        to: String,
+        /// Body text.
+        body: String,
+        /// Button label that opens the list.
+        button: String,
+        /// Section title.
+        section_title: String,
+        /// Row id + title pairs.
+        rows: Vec<(String, String)>,
+    },
+    /// Media send (`image`/`audio`/`document`/`video`) by Graph media id.
+    Media {
+        /// Recipient phone number.
+        to: String,
+        /// Graph media type.
+        kind: String,
+        /// Graph media id.
+        media_id: String,
+        /// Optional caption.
+        caption: Option<String>,
+    },
+    /// Mark an inbound message as read.
+    MarkAsRead {
+        /// The inbound `wamid`.
+        message_id: String,
+    },
 }
 
-impl OutboundBuilder {
-    /// Create a new builder bound to the given account config.
-    pub fn new(account: WhatsAppAccountConfig) -> Self {
-        OutboundBuilder { account }
-    }
-
-    /// Send a simple text message to a WhatsApp number.
-    /// The `to` number must be in international format without the leading
-    /// `+` (e.g. "15551234567").
-    pub fn text(mut self, to: &str, body: &str) -> serde_json::Value {
-        serde_json::json!({
-            "messaging_product": "whatsapp",
-            "to": to,
-            "type": "text",
-            "text": {"body": body}
-        })
-    }
-
-    /// Send a template message.
-    /// The template must already be approved by Meta. `template_name` and
-    /// `language_code` must match the approved template exactly.
-    pub fn template(mut self, to: &str, template_name: &str, language_code: &str, components: &[(&str, &str)]) -> serde_json::Value {
-        let comps: Vec<serde_json::Value> = components.iter().map(|(key, val)| {
-            serde_json::json!({"@type": key, "@value": val})
-        }).collect();
-        serde_json::json!({
-            "messaging_product": "whatsapp",
-            "to": to,
-            "type": "template",
-            "template": {
-                "name": template_name,
-                "language": {"code": language_code},
-                "components": comps
-            }
-        })
-    }
-
-    /// Send an interactive button message.
-    pub fn button(mut self, to: &str, text: &str, button_text: &str, payload: &str) -> serde_json::Value {
-        serde_json::json!({
-            "messaging_product": "whatsapp",
-            "to": to,
-            "type": "interactive",
-            "interactive": {
-                "type": "button",
-                "button": {"type": "reply", "text": button_text, "payload": payload},
-                "action": {"name": "reply", "button_reply": {"text": button_text, "payload": payload}}
-            }
-        })
-    }
-
-    /// Send an interactive list message.
-    pub fn list(mut self, to: &str, title: &str, description: Option<&str>, sections: &[(&str, &str, &str)]) -> serde_json::Value {
-        let rows: Vec<serde_json::Value> = sections.iter().map(|(t, d, c)| {
-            serde_json::json!({
-                "title": t,
-                "description": d,
-                "confirmation": c
-            })
-        }).collect();
-        serde_json::json!({
-            "messaging_product": "whatsapp",
-            "to": to,
-            "type": "interactive",
-            "interactive": {
-                "type": "list",
-                "template": {
-                    "headers": [{"type": "text", "text": title}],
-                    "body": {"text": description.unwrap_or_default()},
-                    "sections": {"rows": rows}
+impl OutboundPayload {
+    /// Serializes to the Graph API `messages` body.
+    pub fn to_graph_json(&self) -> Result<Value> {
+        match self {
+            OutboundPayload::Text { to, body } => {
+                if body.is_empty() || body.len() > 4096 {
+                    return Err(AppError::Validation {
+                        message: "text body must be 1..=4096 chars".into(),
+                        issues: Vec::new(),
+                    });
                 }
-            }
-        })
+                Ok(json!({
+                    "messaging_product": "whatsapp",
+                    "recipient_type": "individual",
+                    "to": to,
+                    "type": "text",
+                    "text": { "preview_url": false, "body": body },
+                }))
+            },
+            OutboundPayload::Template {
+                to,
+                name,
+                language,
+                parameters,
+            } => {
+                if name.is_empty() || language.is_empty() {
+                    return Err(AppError::Validation {
+                        message: "template name and language are required".into(),
+                        issues: Vec::new(),
+                    });
+                }
+                let mut components = Vec::new();
+                if !parameters.is_empty() {
+                    components.push(json!({
+                        "type": "body",
+                        "parameters": parameters
+                            .iter()
+                            .map(|p| json!({ "type": "text", "text": p }))
+                            .collect::<Vec<_>>(),
+                    }));
+                }
+                Ok(json!({
+                    "messaging_product": "whatsapp",
+                    "recipient_type": "individual",
+                    "to": to,
+                    "type": "template",
+                    "template": {
+                        "name": name,
+                        "language": { "code": language },
+                        "components": components,
+                    },
+                }))
+            },
+            OutboundPayload::InteractiveButtons { to, body, buttons } => {
+                if buttons.is_empty() || buttons.len() > 3 {
+                    return Err(AppError::Validation {
+                        message: "interactive buttons must be 1..=3".into(),
+                        issues: Vec::new(),
+                    });
+                }
+                let button_rows: Vec<Value> = buttons
+                    .iter()
+                    .map(|(id, title)| {
+                        json!({
+                            "type": "reply",
+                            "reply": { "id": id, "title": title },
+                        })
+                    })
+                    .collect();
+                Ok(json!({
+                    "messaging_product": "whatsapp",
+                    "recipient_type": "individual",
+                    "to": to,
+                    "type": "interactive",
+                    "interactive": {
+                        "type": "button",
+                        "body": { "text": body },
+                        "action": { "buttons": button_rows },
+                    },
+                }))
+            },
+            OutboundPayload::InteractiveList {
+                to,
+                body,
+                button,
+                section_title,
+                rows,
+            } => {
+                if rows.is_empty() || rows.len() > 10 {
+                    return Err(AppError::Validation {
+                        message: "interactive list rows must be 1..=10".into(),
+                        issues: Vec::new(),
+                    });
+                }
+                let list_rows: Vec<Value> = rows
+                    .iter()
+                    .map(|(id, title)| json!({ "id": id, "title": title }))
+                    .collect();
+                Ok(json!({
+                    "messaging_product": "whatsapp",
+                    "recipient_type": "individual",
+                    "to": to,
+                    "type": "interactive",
+                    "interactive": {
+                        "type": "list",
+                        "body": { "text": body },
+                        "action": {
+                            "button": button,
+                            "sections": [{
+                                "title": section_title,
+                                "rows": list_rows,
+                            }],
+                        },
+                    },
+                }))
+            },
+            OutboundPayload::Media {
+                to,
+                kind,
+                media_id,
+                caption,
+            } => {
+                if !matches!(kind.as_str(), "image" | "audio" | "video" | "document") {
+                    return Err(AppError::Validation {
+                        message: "media kind must be image|audio|video|document".into(),
+                        issues: Vec::new(),
+                    });
+                }
+                let mut media = json!({ "id": media_id });
+                if let Some(caption) = caption {
+                    if kind == "image" || kind == "document" {
+                        media["caption"] = json!(caption);
+                    }
+                }
+                let mut body = json!({
+                    "messaging_product": "whatsapp",
+                    "recipient_type": "individual",
+                    "to": to,
+                    "type": kind,
+                });
+                body[kind] = media;
+                Ok(body)
+            },
+            OutboundPayload::MarkAsRead { message_id } => {
+                if message_id.is_empty() {
+                    return Err(AppError::Validation {
+                        message: "mark-as-read requires a message id".into(),
+                        issues: Vec::new(),
+                    });
+                }
+                Ok(json!({
+                    "messaging_product": "whatsapp",
+                    "status": "read",
+                    "message_id": message_id,
+                }))
+            },
+        }
     }
-
-    /// Send an image message.
-    pub fn image(mut self, to: &str, caption: Option<&str>) -> serde_json::Value {
-        let obj: serde_json::Value = serde_json::json!({
-            "messaging_product": "whatsapp",
-            "to": to,
-            "type": "image",
-            "image": {"caption": caption.unwrap_or_default()}
-        });
-        obj
-    }
-
-    /// Send a document message.
-    pub fn document(mut self, to: &str, filename: &str, mime_type: &str) -> serde_json::Value {
-        serde_json::json!({
-            "messaging_product": "whatsapp",
-            "to": to,
-            "type": "document",
-            "document": {"filename": filename, "mime_type": mime_type}
-        })
-    }
-
-    /// Send a status update (mark-as-read).
-    pub fn mark_as_read(mut self, message_id: &str) -> serde_json::Value {
-        serde_json::json!({
-            "messaging_product": "whatsapp",
-            "status": "read",
-            "message_id": message_id
-        })
-    }
-}
-
-/// Convenience constructors
-/// ------------
-
-/// Create a text message builder.
-pub fn text_builder(account: WhatsAppAccountConfig, to: &str, body: &str) -> serde_json::Value {
-    OutboundBuilder::new(account).text(to, body)
-}
-
-/// Create a template message builder.
-pub fn template_builder(account: WhatsAppAccountConfig, to: &str, template_name: &str, language_code: &str, components: &[(&str, &str)]) -> serde_json::Value {
-    OutboundBuilder::new(account).template(to, template_name, language_code, components)
-}
-
-/// Create a button builder.
-pub fn button_builder(account: WhatsAppAccountConfig, to: &str, text: &str, button_text: &str, payload: &str) -> serde_json::Value {
-    OutboundBuilder::new(account).button(to, text, button_text, payload)
-}
-
-/// Create a list builder.
-pub fn list_builder(account: WhatsAppAccountConfig, to: &str, title: &str, description: Option<&str>, sections: &[(&str, &str, &str)]) -> serde_json::Value {
-    OutboundBuilder::new(account).list(to, title, description, sections)
-}
-
-/// Create an image message builder.
-pub fn image_builder(account: WhatsAppAccountConfig, to: &str, caption: Option<&str>) -> serde_json::Value {
-    OutboundBuilder::new(account).image(to, caption)
-}
-
-/// Create a document message builder.
-pub fn document_builder(account: WhatsAppAccountConfig, to: &str, filename: &str, mime_type: &str) -> serde_json::Value {
-    OutboundBuilder::new(account).document(to, filename, mime_type)
-}
-
-/// Create a mark-as-read builder.
-pub fn mark_as_read_builder(account: WhatsAppAccountConfig, message_id: &str) -> serde_json::Value {
-    OutboundBuilder::new(account).mark_as_read(message_id)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::WhatsAppAccountConfig;
-    use uuid::Uuid;
-
-    fn make_account() -> WhatsAppAccountConfig {
-        WhatsAppAccountConfig {
-            waba_id: Uuid::new_v4(),
-            phone_number_id: Uuid::new_v4(),
-            graph_version: "v20.0".into(),
-            app_secret_ref: "ref-app-secret".into(),
-            access_token_ref: "ref-access-token".into(),
-            verify_token_ref: "ref-verify-token".into(),
-        }
-    }
 
     #[test]
-    fn test_text_builder() {
-        let account = make_account();
-        let payload = text_builder(account, "15551234567", "Hello world");
-        assert!(payload["to"].as_str() == Some("15551234567"));
-        assert!(payload["text"]["body"].as_str() == Some("Hello world"));
-    }
-
-    #[test]
-    fn test_template_builder() {
-        let account = make_account();
-        let components &[("body", "Hello")]; // simplified
-        let payload = template_builder(account, "15551234567", "template-name", "en", &[("body", "Hello")]);
-        assert!(payload["to"].as_str() == Some("15551234567"));
-        assert!(payload["template"]["name"].as_str() == Some("template-name"));
-    }
-
-    #[test]
-    fn test_button_builder() {
-        let account = make_account();
-        let payload = button_builder(account, "15551234567", "Choose option", "Option A", "payload-a");
-        assert!(payload["to"].as_str() == Some("15551234567"));
-        assert!(payload["interactive"]["button"]["text"].as_str() == Some("Option A"));
-    }
-
-    #[test]
-    fn test_list_builder() {
-        let account = make_account();
-        let payload = list_builder(account, "15551234567", "Select item", Some("Pick one"), &[("One", "Description one", "1")]);
-        assert!(payload["to"].as_str() == Some("15551234567"));
-    }
-
-    #[test]
-    fn test_mark_as_read_builder() {
-        let account = make_account();
-        let payload = mark_as_read_builder(account, "wamid-abc");
-        assert!(payload["message_id"].as_str() == Some("wamid-abc"));
-        assert!(payload["status"].as_str() == Some("read"));
+    fn rejects_empty_text() {
+        let p = OutboundPayload::Text {
+            to: "15551234567".into(),
+            body: String::new(),
+        };
+        assert!(p.to_graph_json().is_err());
     }
 }

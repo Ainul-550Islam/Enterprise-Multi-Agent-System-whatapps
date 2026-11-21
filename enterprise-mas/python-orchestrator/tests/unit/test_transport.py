@@ -41,7 +41,10 @@ class TestValidateTransportSecurity:
 
     @pytest.mark.parametrize("environment", [Environment.DEVELOPMENT, Environment.TEST])
     def test_insecure_allowed_in_dev_and_test(self, environment: Environment) -> None:
-        validate_transport_security(TransportSecurity.INSECURE, environment, direction="client")
+        assert (
+            validate_transport_security(TransportSecurity.INSECURE, environment, direction="client")
+            is None
+        )
 
     @pytest.mark.parametrize("environment", [Environment.STAGING, Environment.PRODUCTION])
     def test_insecure_refused_in_staging_and_production(self, environment: Environment) -> None:
@@ -58,7 +61,10 @@ class TestValidateTransportSecurity:
 
     def test_tls_and_mtls_are_always_allowed(self) -> None:
         for security in (TransportSecurity.TLS, TransportSecurity.MTLS):
-            validate_transport_security(security, Environment.PRODUCTION, direction="client")
+            assert (
+                validate_transport_security(security, Environment.PRODUCTION, direction="client")
+                is None
+            )
 
     def test_allowed_environment_set_is_exactly_dev_and_test(self) -> None:
         assert {

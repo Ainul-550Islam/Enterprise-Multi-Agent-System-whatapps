@@ -182,6 +182,28 @@ impl UsageStorePort for PostgresUsageStore {
 
 #[async_trait]
 impl UsageReadPort for PostgresUsageStore {
+    async fn records(
+        &self,
+        tenant: TenantId,
+        from: Timestamp,
+        to: Timestamp,
+        limit: u16,
+    ) -> Result<Vec<UsageRecord>> {
+        if scoped_request::current_scope()?.tenant_id() != tenant {
+            return Err(AppError::not_found("usage", tenant.to_string()));
+        }
+        let mut executor = scoped_request::connection().await?;
+        Self::list_page_in(
+            executor.connection().as_mut(),
+            tenant,
+            from,
+            to,
+            None,
+            limit,
+        )
+        .await
+    }
+
     async fn totals(
         &self,
         tenant: TenantId,

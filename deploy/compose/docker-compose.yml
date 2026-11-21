@@ -115,6 +115,39 @@ services:
     networks:
       - mas
 
+  # --- demo plane additions (moved from enterprise-mas/deploy; additive only) ---
+  idp:
+    image: quay.io/keycloak/keycloak:26.0
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${MAS_IDP_ADMIN_USER:-admin}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${MAS_IDP_ADMIN_PASSWORD:-admin}
+    volumes:
+      - ./idp/realm-export.json:/opt/keycloak/data/import/realm-export.json:ro
+    ports:
+      - "8081:8080"
+    networks:
+      - mas
+
+  web:
+    image: enterprise-mas/web:local
+    build:
+      context: ../..
+      dockerfile: deploy/docker/web.Dockerfile
+    environment:
+      MAS_API_URL: http://api:8080
+      SESSION_SECRET: ${SESSION_SECRET:-dev-session-secret-must-be-32-chars-min}
+      OIDC_ISSUER: ${OIDC_ISSUER:-}
+      OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:-mas-web}
+      OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:-}
+    ports:
+      - "3000:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - mas
+
 networks:
   mas:
     driver: bridge

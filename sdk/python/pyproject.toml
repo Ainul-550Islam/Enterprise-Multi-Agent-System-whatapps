@@ -1,0 +1,20 @@
+[project]
+name = "mas-sdk"
+version = "1.1.0"
+description = "Python SDK for the Enterprise MAS API (executions, schedules, events)."
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["mas_sdk"]

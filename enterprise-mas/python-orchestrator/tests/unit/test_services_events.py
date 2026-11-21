@@ -9,6 +9,8 @@ turn into a successful execution.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from mas_orchestrator.agents.base import Termination
@@ -378,12 +380,14 @@ class TestIdempotency:
     def test_unknown_reader_reports_unknown(self) -> None:
         import asyncio
 
-        assert asyncio.run(UnknownStateReader().state_of("e")) is ExecutionState.UNKNOWN
+        assert (
+            asyncio.run(UnknownStateReader().state_of("e", tenant_id="t")) is ExecutionState.UNKNOWN
+        )
 
     @pytest.mark.asyncio
     async def test_evaluate_uses_the_reader(self) -> None:
         class _Reader:
-            async def state_of(self, execution_id: str) -> ExecutionState:
+            async def state_of(self, execution_id: str, *, tenant_id: str) -> ExecutionState:
                 return ExecutionState.SUCCEEDED
 
         from mas_orchestrator.services.idempotency import evaluate
@@ -430,12 +434,14 @@ class TestExecutionService:
         guardrails: object = None,
         sink: CollectingSink | None = None,
         reporter: object = None,
+        state_reader: object = None,
     ) -> ExecutionService:
         return build_execution_service(
             runtime,  # type: ignore[arg-type]
             guardrails=guardrails,  # type: ignore[arg-type]
             emitter=EventEmitter(sink or NullSink()),
             reporter=reporter,  # type: ignore[arg-type]
+            state_reader=state_reader,  # type: ignore[arg-type]
         )
 
     @pytest.mark.asyncio
@@ -479,7 +485,7 @@ class TestExecutionService:
     @pytest.mark.asyncio
     async def test_duplicate_delivery_is_skipped(self) -> None:
         class _Reader:
-            async def state_of(self, execution_id: str) -> ExecutionState:
+            async def state_of(self, execution_id: str, *, tenant_id: str) -> ExecutionState:
                 return ExecutionState.SUCCEEDED
 
         sink = CollectingSink()
@@ -497,7 +503,7 @@ class TestExecutionService:
 
     @pytest.mark.asyncio
     async def test_state_transition_is_reported(self) -> None:
-        recorded: list[tuple[str, str, str | None]] = []
+        recorded: list[tuple[str, str, str | None, str | None]] = []
 
         class _Reporter:
             async def report(
@@ -507,12 +513,13 @@ class TestExecutionService:
                 termination: str,
                 duration_ms: int,
                 error_code: str | None = None,
+                tenant_id: str | None = None,
             ) -> None:
-                recorded.append((execution_id, termination, error_code))
+                recorded.append((execution_id, termination, error_code, tenant_id))
 
         service = self._service(_FakeRuntime(), reporter=_Reporter())
         await service.execute(ExecutionRequest(request="hello", context=_context()))
-        assert recorded == [("exec-1", "completed", None)]
+        assert recorded == [("exec-1", "completed", None, "tenant-1")]
 
     @pytest.mark.asyncio
     async def test_guardrail_rejection_fails_the_run(self) -> None:
@@ -551,7 +558,7 @@ class TestExecutionService:
     @pytest.mark.asyncio
     async def test_logging_reporter_does_not_raise(self) -> None:
         reporter = LoggingStateReporter()
-        await reporter.report("e", termination="completed", duration_ms=1)
+        assert await reporter.report("e", termination="completed", duration_ms=1) is None
 
 
 class _FakeRuntime:
@@ -568,3 +575,304 @@ class _FakeRuntime:
             content="the answer",
             duration_ms=1,
         )
+
+
+class TestAuthoritativeState:
+    """C-08: the idempotency stage decides against authoritative Rust state."""
+
+    @staticmethod
+    def _reader(state: ExecutionState) -> object:
+        class _Reader:
+            async def state_of(self, execution_id: str, *, tenant_id: str) -> ExecutionState:
+                return state
+
+        return _Reader()
+
+    @pytest.mark.asyncio
+    async def test_running_state_refuses_the_delivery(self) -> None:
+        """A duplicate of an in-flight execution must not read as success."""
+        from mas_orchestrator.services.execution_state import ExecutionInProgressError
+
+        service = build_execution_service(
+            _FakeRuntime(),
+            state_reader=self._reader(ExecutionState.RUNNING),  # type: ignore[arg-type]
+        )
+        request = ExecutionRequest(request="hello", context=_context())
+        with pytest.raises(ExecutionInProgressError) as caught:
+            await service.execute(request)
+        assert caught.value.execution_id == _context().execution_id
+        assert caught.value.state is ExecutionState.RUNNING
+        assert caught.value.retryable is True
+
+    @pytest.mark.asyncio
+    async def test_duplicate_failed_reports_authoritative_failure(self) -> None:
+        """A redelivery of a failed run must not report a fresh success."""
+        from mas_orchestrator.agents.base import Termination
+
+        service = build_execution_service(
+            _FakeRuntime(),
+            state_reader=self._reader(ExecutionState.FAILED),  # type: ignore[arg-type]
+        )
+        request = ExecutionRequest(request="hello", context=_context())
+        result = await service.execute(request)
+        assert result.termination is Termination.FAILED
+
+    @pytest.mark.asyncio
+    async def test_duplicate_cancelled_reports_authoritative_cancellation(self) -> None:
+        from mas_orchestrator.agents.base import Termination
+
+        service = build_execution_service(
+            _FakeRuntime(),
+            state_reader=self._reader(ExecutionState.CANCELLED),  # type: ignore[arg-type]
+        )
+        request = ExecutionRequest(request="hello", context=_context())
+        result = await service.execute(request)
+        assert result.termination is Termination.CANCELLED
+
+    @pytest.mark.asyncio
+    async def test_duplicate_succeeded_still_reports_completion(self) -> None:
+        from mas_orchestrator.agents.base import Termination
+
+        service = build_execution_service(
+            _FakeRuntime(),
+            state_reader=self._reader(ExecutionState.SUCCEEDED),  # type: ignore[arg-type]
+        )
+        request = ExecutionRequest(request="hello", context=_context())
+        result = await service.execute(request)
+        assert result.termination is Termination.COMPLETED
+        assert result.content == ""
+
+    # -- RustExecutionStateReader ------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_rust_state_reader_maps_statuses(self) -> None:
+        from mas_orchestrator.services.execution_state import RustExecutionStateReader
+
+        expected = {
+            "pending": ExecutionState.PENDING,
+            "running": ExecutionState.RUNNING,
+            "paused": ExecutionState.RUNNING,
+            "completed": ExecutionState.SUCCEEDED,
+            "failed": ExecutionState.FAILED,
+            "cancelled": ExecutionState.CANCELLED,
+            "timed_out": ExecutionState.TIMED_OUT,
+        }
+        for status, state in expected.items():
+            reader = RustExecutionStateReader(_FakePool(row=(status,)))
+            assert await reader.state_of("e", tenant_id="t") is state
+
+    @pytest.mark.asyncio
+    async def test_rust_state_reader_reports_unknown_without_a_row(self) -> None:
+        from mas_orchestrator.services.execution_state import RustExecutionStateReader
+
+        reader = RustExecutionStateReader(_FakePool(row=None))
+        assert await reader.state_of("e", tenant_id="t") is ExecutionState.UNKNOWN
+
+    @pytest.mark.asyncio
+    async def test_rust_state_reader_reports_unknown_on_database_failure(self) -> None:
+        """The reader answers; it never raises. Unknown has a safe meaning."""
+        from mas_orchestrator.services.execution_state import RustExecutionStateReader
+
+        class _BrokenPool:
+            def connection(self) -> object:
+                raise RuntimeError("database unavailable")
+
+        reader = RustExecutionStateReader(_BrokenPool())
+        assert await reader.state_of("e", tenant_id="t") is ExecutionState.UNKNOWN
+
+    @pytest.mark.asyncio
+    async def test_rust_state_reader_scopes_the_tenant(self) -> None:
+        """The row-level security policy is armed with the caller's tenant."""
+        from mas_orchestrator.services.execution_state import RustExecutionStateReader
+
+        pool = _FakePool(row=("completed",))
+        reader = RustExecutionStateReader(pool)
+        await reader.state_of("e", tenant_id="tenant-42")
+        tenant_binds = [params for sql, params in pool.log if "set_config" in sql]
+        assert tenant_binds == [("tenant-42",)]
+        lookups = [params for sql, params in pool.log if sql.startswith("SELECT status")]
+        assert lookups == [("e",)]
+
+
+class _FakeCursor:
+    def __init__(self, row: object) -> None:
+        self._row = row
+
+    async def fetchone(self) -> object:
+        return self._row
+
+
+class _FakeConnection:
+    def __init__(self, pool: _FakePool) -> None:
+        self._pool = pool
+
+    async def execute(self, sql: str, params: object = None) -> _FakeCursor:
+        self._pool.log.append((sql, params))
+        if sql.startswith("SELECT status"):
+            return _FakeCursor(self._pool.row)
+        return _FakeCursor(None)
+
+    def transaction(self) -> _FakeConnection:
+        return self
+
+    async def __aenter__(self) -> _FakeConnection:
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        return None
+
+
+class _FakePool:
+    def __init__(self, *, row: object) -> None:
+        self.row = row
+        self.log: list[tuple[str, object]] = []
+
+    def connection(self) -> _FakeConnection:
+        return _FakeConnection(self)
+
+
+class _ReporterCursor:
+    def __init__(self, *, row: object = None, rowcount: int = 0) -> None:
+        self._row = row
+        self.rowcount = rowcount
+
+    async def fetchone(self) -> object:
+        return self._row
+
+
+class _ReporterConnection:
+    """Connection fake scripting the reporter's statement sequence."""
+
+    def __init__(self, pool: _ReporterPool) -> None:
+        self._pool = pool
+
+    async def execute(self, sql: str, params: object = None) -> _ReporterCursor:
+        self._pool.log.append((sql, params))
+        if "set_config" in sql:
+            return _ReporterCursor(row=(None,))
+        if sql.startswith("UPDATE executions"):
+            return _ReporterCursor(rowcount=self._pool.update_rowcount)
+        return _ReporterCursor(row=self._pool.row)
+
+    def transaction(self) -> _ReporterConnection:
+        return self
+
+    async def __aenter__(self) -> _ReporterConnection:
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        return None
+
+
+class _ReporterPool:
+    def __init__(self, *, update_rowcount: int = 1, row: object = None) -> None:
+        self.update_rowcount = update_rowcount
+        self.row = row
+        self.log: list[tuple[str, object]] = []
+
+    def connection(self) -> _ReporterConnection:
+        return _ReporterConnection(self)
+
+
+class TestDurableStateReporter:
+    """RustStateTransitionReporter — the durable write-back to Rust's ledger."""
+
+    @staticmethod
+    def _reporter(pool: object) -> object:
+        from mas_orchestrator.services.execution_state import (
+            RustStateTransitionReporter,
+        )
+
+        return RustStateTransitionReporter(pool)  # type: ignore[arg-type]
+
+    @pytest.mark.asyncio
+    async def test_durable_reporter_writes_the_terminal_transition(self) -> None:
+        pool = _ReporterPool(update_rowcount=1)
+        await self._reporter(pool).report(
+            "exec-1", termination="completed", duration_ms=5, tenant_id="tenant-42"
+        )
+        updates = [params for sql, params in pool.log if sql.startswith("UPDATE")]
+        assert updates == [("completed", None, "exec-1")]
+
+    @pytest.mark.asyncio
+    async def test_durable_reporter_scopes_the_report_to_the_tenant(self) -> None:
+        """The row-level security policy is armed with the caller's tenant."""
+        pool = _ReporterPool(update_rowcount=1)
+        await self._reporter(pool).report(
+            "exec-1", termination="completed", duration_ms=5, tenant_id="tenant-42"
+        )
+        tenant_binds = [params for sql, params in pool.log if "set_config" in sql]
+        assert tenant_binds == [("tenant-42",)]
+
+    @pytest.mark.asyncio
+    async def test_durable_reporter_maps_limit_terminations_to_failure(self) -> None:
+        pool = _ReporterPool(update_rowcount=1)
+        await self._reporter(pool).report(
+            "exec-1",
+            termination="deadline",
+            duration_ms=5,
+            error_code="TIMED_OUT",
+            tenant_id="tenant-42",
+        )
+        updates = [params for sql, params in pool.log if sql.startswith("UPDATE")]
+        (status, error, execution_id) = updates[0]
+        assert status == "failed"
+        assert execution_id == "exec-1"
+        record = json.loads(error)
+        assert record["code"] == "TIMED_OUT"
+        assert record["termination"] == "deadline"
+
+    @pytest.mark.asyncio
+    async def test_durable_reporter_refuses_an_unscoped_report(self) -> None:
+        """A durable write without the authoritative tenant must not happen."""
+        from mas_orchestrator.services.execution_state import StateReportError
+
+        with pytest.raises(StateReportError):
+            await self._reporter(_ReporterPool()).report(
+                "exec-1", termination="completed", duration_ms=5
+            )
+
+    @pytest.mark.asyncio
+    async def test_durable_reporter_raises_on_database_failure(self) -> None:
+        """A reporter that cannot deliver must raise, never swallow."""
+        from mas_orchestrator.services.execution_state import StateReportError
+
+        class _BrokenPool:
+            def connection(self) -> object:
+                raise OSError("database unavailable")
+
+        with pytest.raises(StateReportError):
+            await self._reporter(_BrokenPool()).report(
+                "exec-1", termination="completed", duration_ms=5, tenant_id="tenant-42"
+            )
+
+    @pytest.mark.asyncio
+    async def test_durable_reporter_is_idempotent_on_redelivery(self) -> None:
+        """The ledger already holds the same terminal fact — delivered."""
+        pool = _ReporterPool(update_rowcount=0, row=("completed",))
+        assert (
+            await self._reporter(pool).report(
+                "exec-1", termination="completed", duration_ms=5, tenant_id="tenant-42"
+            )
+            is None
+        )
+
+    @pytest.mark.asyncio
+    async def test_durable_reporter_refuses_a_conflicting_fact(self) -> None:
+        from mas_orchestrator.services.execution_state import StateReportError
+
+        pool = _ReporterPool(update_rowcount=0, row=("cancelled",))
+        with pytest.raises(StateReportError):
+            await self._reporter(pool).report(
+                "exec-1", termination="completed", duration_ms=5, tenant_id="tenant-42"
+            )
+
+    @pytest.mark.asyncio
+    async def test_durable_reporter_raises_for_an_unknown_execution(self) -> None:
+        from mas_orchestrator.services.execution_state import StateReportError
+
+        pool = _ReporterPool(update_rowcount=0, row=None)
+        with pytest.raises(StateReportError):
+            await self._reporter(pool).report(
+                "exec-1", termination="completed", duration_ms=5, tenant_id="tenant-42"
+            )

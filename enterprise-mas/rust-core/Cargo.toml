@@ -21,14 +21,9 @@
 # tenancy, policies, quota, eventing and persistence. No LLM/provider business
 # logic lives in this workspace (see README.md).
 #
-# Workspace members are added incrementally as each crate is implemented:
-#   [done] crates/common, crates/domain, crates/contracts, crates/orchestration
-#   [done] crates/execution, crates/policy, crates/security, crates/tenancy,
-#          crates/events
-#   [todo] crates/messaging,
-#          crates/persistence, crates/scheduling, crates/quota,
-#          crates/integrations, crates/observability, crates/application,
-#          crates/api, crates/worker, crates/scheduler-service, crates/cli
+# Every workspace member is implemented (review M-4; the old incremental
+# [todo] header went stale once the listed crates shipped): the authoritative
+# member list is the [workspace] table below.
 # ============================================================================
 
 [workspace]
@@ -56,13 +51,12 @@ members = [
     "crates/worker-service",
     "crates/cli",
     "crates/ai-bridge",
+    "crates/billing-stripe",
+    "crates/channel-whatsapp",
 ]
 
 [workspace.package]
-version = "1.0.0"
-
-[workspace.members]
-channel-whatsapp = "crates/channel-whatsapp"
+version = "1.1.0"
 edition = "2021"
 rust-version = "1.85.0"
 license = "Proprietary"
@@ -96,6 +90,8 @@ mas-api = { path = "crates/api" }
 mas-worker = { path = "crates/worker" }
 mas-scheduler-service = { path = "crates/scheduler-service" }
 mas-worker-service = { path = "crates/worker-service" }
+mas-billing-stripe = { path = "crates/billing-stripe" }
+mas-channel-whatsapp = { path = "crates/channel-whatsapp" }
 mas-cli = { path = "crates/cli" }
 mas-ai-bridge = { path = "crates/ai-bridge" }
 

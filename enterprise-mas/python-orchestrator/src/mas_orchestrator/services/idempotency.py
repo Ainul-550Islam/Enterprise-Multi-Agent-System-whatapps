@@ -78,12 +78,18 @@ class IdempotencyDecision:
 class ExecutionStateReader(Protocol):
     """Reads authoritative execution state from Rust."""
 
-    async def state_of(self, execution_id: str) -> ExecutionState:
+    async def state_of(self, execution_id: str, *, tenant_id: str) -> ExecutionState:
         """Returns the current authoritative state.
 
-        Implementations must return :attr:`ExecutionState.UNKNOWN` when the
-        state cannot be determined, rather than raising: an unknown state has a
-        defined, safe interpretation.
+        Args:
+            execution_id: The execution to look up.
+            tenant_id: The authoritative tenant scope. Implementations must
+                confine the lookup to it: the state of an execution in another
+                tenant must never be observable here.
+
+        Returns:
+            The state, or :attr:`ExecutionState.UNKNOWN` when it cannot be
+            determined — an unknown state has a defined, safe interpretation.
         """
         ...
 
@@ -96,7 +102,7 @@ class UnknownStateReader:
     the alternative, guessing that an execution is done, would drop real work.
     """
 
-    async def state_of(self, execution_id: str) -> ExecutionState:
+    async def state_of(self, execution_id: str, *, tenant_id: str) -> ExecutionState:
         """Always reports unknown."""
         return ExecutionState.UNKNOWN
 
@@ -207,7 +213,7 @@ async def evaluate(
         An :class:`IdempotencyDecision`.
     """
     key = invocation_key(context, attempt=attempt)
-    state = await reader.state_of(context.execution_id)
+    state = await reader.state_of(context.execution_id, tenant_id=context.tenant_id)
     decision = decide(state, key)
 
     if decision.action is not DuplicateAction.PROCEED:

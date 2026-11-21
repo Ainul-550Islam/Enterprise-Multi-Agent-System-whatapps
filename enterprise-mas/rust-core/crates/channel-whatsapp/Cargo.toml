@@ -1,38 +1,18 @@
 [package]
 name = "mas-channel-whatsapp"
-version = "1.0.0"
-edition = "2021"
-description = "WhatsApp Cloud API channel protocol — HMAC webhook verify, inbound/outbound message models, Graph API client with guarded egress, template/rate-limit/notification-channel-adapter"
-license = "Proprietary"
-
-[workspace.deps]
-mas-common = { workspace = true }
-mas-contracts = { workspace = true }
-mas-integrations = { workspace = true }
+description = "WhatsApp channel boundary: inbound webhook verification/parsing and outbound payload construction."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
 
 [dependencies]
-mas-common = { workspace = true, features = ["full"] }
-mas-contracts = { workspace = true }
-mas-integrations = { workspace = true }
+mas-common = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
-# WhatsApp protocol primitives
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-hmac = "0.12"
-sha2 = "0.10"
-subtle = "2"
-
-# Thiserror for error helpers
-thiserror = "2"
-
-# Timeout + retry for Graph client
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-
-# Small util
-uuid = { version = "1", features = ["v4"] }
-
-# Tracing for instrumented calls
-tracing = "0.1"
-
-# Owned semver if version parsing is needed
-semver = { version = "1", features = ["serde"] }
+[dev-dependencies]
+serde_json = { workspace = true }

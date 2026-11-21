@@ -1,7 +1,9 @@
 //! PURPOSE: OpenAPI <-> router parity.
 //!
 //! Parses `docs/openapi.yaml` and the real route tables in
-//! `crates/api/src/router.rs`, `routes_governance.rs` and `routes_tooling.rs`;
+//! `crates/api/src/router.rs`, `routes_governance.rs`, `routes_tooling.rs`
+//! and `routes_whatsapp.rs` (both the `/v1/` and the provider `/webhooks/`
+//! surface);
 //! fails if a router route is missing from the spec, or the spec lists a
 //! route the router does not serve (method + path template). Runs in CI as
 //! the `openapi-parity` job.
@@ -43,7 +45,7 @@ fn router_routes(source: &str) -> BTreeSet<Route> {
             .and_then(|rest| rest.split('"').next())
             .unwrap_or("")
             .to_string();
-        if !path.starts_with("/v1/") {
+        if !(path.starts_with("/v1/") || path.starts_with("/webhooks/") || path == "/health") {
             remaining = seg;
             continue;
         }
@@ -76,12 +78,18 @@ fn spec_routes(yaml: &str) -> BTreeSet<Route> {
     let mut current_path: Option<String> = None;
     for line in yaml.lines() {
         let trimmed = line.trim_start();
-        if let Some(path) = trimmed.strip_prefix("/v1/") {
-            if path.ends_with(':') {
-                if let Some(stripped) = path.strip_suffix(':') {
-                    current_path = Some(format!("/v1/{}", stripped));
+        let mut matched_prefix = false;
+        for prefix in ["/v1/", "/webhooks/", "/health"] {
+            if let Some(path) = trimmed.strip_prefix(prefix) {
+                matched_prefix = true;
+                if path.ends_with(':') {
+                    if let Some(stripped) = path.strip_suffix(':') {
+                        current_path = Some(format!("{prefix}{stripped}"));
+                    }
                 }
             }
+        }
+        if matched_prefix {
             continue;
         }
         if let Some(method) = trimmed
@@ -120,12 +128,13 @@ fn rust_core() -> PathBuf {
 #[test]
 fn openapi_matches_router() {
     let rust = rust_core();
-    // Router routes live in three source files; merge them all.
+    // Router routes live in four source files; merge them all.
     let mut router = BTreeSet::new();
     for file in [
         "crates/api/src/router.rs",
         "crates/api/src/routes_governance.rs",
         "crates/api/src/routes_tooling.rs",
+        "crates/api/src/routes_whatsapp.rs",
     ] {
         let source =
             std::fs::read_to_string(rust.join(file)).unwrap_or_else(|_| panic!("{file} readable"));
@@ -158,6 +167,63 @@ fn openapi_matches_router() {
 
     if !failures.is_empty() {
         let mut msg = "openapi/router parity failed:\n".to_owned();
+        for f in failures {
+            msg.push_str(&format!("  - {f}\n"));
+        }
+        panic!("{msg}");
+    }
+}
+
+/// The bundled `docs/openapi.json` (served at `GET /v1/openapi.json`) must
+/// document exactly the routes the edited `docs/openapi.yaml` documents.
+/// Regenerate the JSON with `rust-core/scripts/openapi_to_json.py` after any
+/// YAML edit; this test is what keeps the served bundle honest.
+#[test]
+fn openapi_json_bundle_matches_yaml() {
+    let rust = rust_core();
+    let yaml_text = std::fs::read_to_string(rust.join("docs/openapi.yaml"))
+        .expect("docs/openapi.yaml readable");
+    let json_text = std::fs::read_to_string(rust.join("docs/openapi.json"))
+        .expect("docs/openapi.json readable");
+
+    let spec = spec_routes(&yaml_text);
+    let value: serde_json::Value =
+        serde_json::from_str(&json_text).expect("docs/openapi.json is valid JSON");
+    let paths = value
+        .get("paths")
+        .and_then(serde_json::Value::as_object)
+        .expect("document has a paths object");
+
+    let mut bundle = BTreeSet::new();
+    for (path, item) in paths {
+        let methods = item.as_object().expect("path item is an object");
+        for method in ["get", "post", "put", "patch", "delete"] {
+            if methods.contains_key(method) {
+                bundle.insert(Route {
+                    method: method.to_owned(),
+                    path: path.clone(),
+                });
+            }
+        }
+    }
+
+    let mut failures = Vec::new();
+    for r in spec.difference(&bundle) {
+        failures.push(format!(
+            "yaml documents route missing from openapi.json bundle: {} {}",
+            r.method, r.path
+        ));
+    }
+    for r in bundle.difference(&spec) {
+        failures.push(format!(
+            "openapi.json bundle documents route missing from yaml: {} {}",
+            r.method, r.path
+        ));
+    }
+    if !failures.is_empty() {
+        let mut msg =
+            "openapi.json/yaml parity failed (run rust-core/scripts/openapi_to_json.py):\n"
+                .to_owned();
         for f in failures {
             msg.push_str(&format!("  - {f}\n"));
         }

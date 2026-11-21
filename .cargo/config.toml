@@ -1,0 +1,14 @@
+# Repository-level Cargo config (CI / tooling).
+# The rust-core workspace also has enterprise-mas/rust-core/.cargo/config.toml.
+
+[net]
+retry = 3
+git-fetch-with-cli = false
+offline = false
+
+[registries.crates-io]
+protocol = "sparse"
+
+[term]
+color = "auto"
+verbose = false

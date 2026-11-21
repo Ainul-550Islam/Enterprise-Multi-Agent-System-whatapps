@@ -346,13 +346,14 @@ impl AttemptCoordinator {
     pub async fn succeed(
         &self,
         claim: &TaskClaim,
+        result: serde_json::Value,
         usage: mas_application::durable::ExecutionUsage,
         finalize_execution: bool,
         at: &Timestamp,
     ) -> Result<SettlementReceipt> {
         self.settle(
             claim,
-            TaskOutcome::Succeeded { usage },
+            TaskOutcome::Succeeded { result, usage },
             finalize_execution,
             at,
         )
@@ -599,6 +600,7 @@ mod tests {
                 project_id: ProjectId::from_uuid(uuid::Uuid::from_u128(2)),
                 workflow_id: Some(WorkflowId::from_uuid(uuid::Uuid::from_u128(3))),
                 agent_id: None,
+                agent_version_id: None,
                 input,
                 idempotency_key: Some(key.to_owned()),
                 fingerprint,
@@ -686,7 +688,13 @@ mod tests {
 
         // Settling one attempt frees exactly one slot.
         coordinator
-            .succeed(&first[0], ExecutionUsage::default(), true, &now())
+            .succeed(
+                &first[0],
+                serde_json::Value::Null,
+                ExecutionUsage::default(),
+                true,
+                &now(),
+            )
             .await
             .expect("settle");
         assert_eq!(
@@ -717,7 +725,13 @@ mod tests {
 
         // A finishes late and tries to record its success. It must be rejected.
         let error = worker_a
-            .succeed(&claim, ExecutionUsage::default(), true, &after_lapse)
+            .succeed(
+                &claim,
+                serde_json::Value::Null,
+                ExecutionUsage::default(),
+                true,
+                &after_lapse,
+            )
             .await
             .expect_err("a stale worker must not overwrite newer state");
         assert!(matches!(error, AppError::Conflict(_)), "{error:?}");
@@ -737,10 +751,68 @@ mod tests {
 
         let claim = owner.claim(4, &now()).await.expect("claim").remove(0);
         let error = stranger
-            .succeed(&claim, ExecutionUsage::default(), false, &now())
+            .succeed(
+                &claim,
+                serde_json::Value::Null,
+                ExecutionUsage::default(),
+                false,
+                &now(),
+            )
             .await
             .expect_err("a non-owner must be rejected");
         assert!(matches!(error, AppError::Conflict(_)));
+    }
+
+    #[tokio::test]
+    async fn settlement_persists_the_output_json_for_reload_and_replay() {
+        let store = Arc::new(InMemoryDurableExecution::new());
+        seed(&store, "k1").await;
+        let coordinator = build(store.clone(), "w-1", 4);
+        let claim = coordinator.claim(4, &now()).await.expect("claim").remove(0);
+        let execution_id = claim.task.execution_id.expect("execution");
+        let output = serde_json::json!({
+            "answer": "こんにちは",
+            "rows": [1, 2, 3],
+            "nested": {"ok": true},
+        });
+        let usage = ExecutionUsage {
+            provider: Some("openai".to_owned()),
+            model: Some("gpt-4o-mini".to_owned()),
+            tokens_input: 10,
+            tokens_output: 5,
+            tool_calls: 0,
+            steps: 1,
+            cost_micros: None,
+        };
+
+        let receipt = coordinator
+            .succeed(&claim, output.clone(), usage.clone(), true, &now())
+            .await
+            .expect("settle");
+
+        // The output survives settlement on the returned receipt…
+        assert_eq!(
+            receipt.execution.as_ref().and_then(|e| e.output.as_ref()),
+            Some(&output)
+        );
+        // …and round-trips through a reload from the durable store.
+        let reloaded = store.execution(execution_id).expect("reloaded");
+        assert_eq!(reloaded.output.as_ref(), Some(&output));
+
+        // An idempotent replay of the settlement is rejected and can never
+        // rewrite the recorded output.
+        let replay = coordinator
+            .succeed(
+                &claim,
+                serde_json::json!({"answer": "tampered"}),
+                usage,
+                true,
+                &now(),
+            )
+            .await;
+        assert!(replay.is_err(), "a stale settlement must be rejected");
+        let after = store.execution(execution_id).expect("reloaded");
+        assert_eq!(after.output.as_ref(), Some(&output));
     }
 
     #[tokio::test]
@@ -753,6 +825,7 @@ mod tests {
         let receipt = coordinator
             .succeed(
                 &claim,
+                serde_json::Value::Null,
                 ExecutionUsage {
                     provider: Some("openai".to_owned()),
                     model: Some("gpt-4o-mini".to_owned()),

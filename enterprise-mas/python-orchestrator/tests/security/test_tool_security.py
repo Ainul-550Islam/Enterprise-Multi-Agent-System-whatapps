@@ -538,8 +538,17 @@ class TestTransportReuse:
 
     @pytest.mark.asyncio
     async def test_closing_the_tool_closes_the_transport(self) -> None:
-        tool = HttpTool(HttpToolConfig(allowed_hosts={"api.example.com"}))
+        class _ClosingSpy:
+            def __init__(self) -> None:
+                self.closed = False
+
+            async def aclose(self) -> None:
+                self.closed = True
+
+        transport = _ClosingSpy()
+        tool = HttpTool(HttpToolConfig(allowed_hosts={"api.example.com"}), transport=transport)  # type: ignore[arg-type]
         await tool.aclose()
+        assert transport.closed is True
 
     @pytest.mark.asyncio
     async def test_registry_closes_handlers(self) -> None:

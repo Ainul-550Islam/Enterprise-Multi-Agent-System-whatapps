@@ -1,0 +1,29 @@
+scope-P0 — deleted files
+=========================
+
+These files were removed from the repository root by this repair (P0-7 hygiene).
+
+Deleted (tracked in git, removal staged):
+  .profile
+  IMPLEMENTATION_REPORT.md
+  RUST_PYTHON_BRIDGE_PHASE16_FILES.md
+  enterprise-mas-code-review-report.md
+
+Notes
+-----
+* `RUST_PYTHON_BRIDGE_PHASE16_FILES.md` at the repository root was the generated
+  Phase 16 deliverable. A different, committed report of the same name still exists
+  at `enterprise-mas/reports/RUST_PYTHON_BRIDGE_PHASE16_FILES.md`; it was not
+  touched. The root copy is regenerated on demand by
+  `enterprise-mas/python-orchestrator/build_phase16_deliverable.py`, which now runs
+  as the `completeness` job in `.github/workflows/ci.yml`.
+* `enterprise-mas-code-review-report.md` is superseded by
+  `docs/REVIEW_RESOLUTION.md`, which re-checks every C-01…C-12 / W-01…W-08 finding
+  against the current code with `file:line` evidence.
+* `.profile` and `IMPLEMENTATION_REPORT.md` were stale root artefacts with no
+  reference from the build, CI or docs.
+
+Not deleted, deliberately
+-------------------------
+* `CODE_REVIEW_2026-11-15.md` — the review produced for the original request
+  ("read my code carefully"); it is not part of the P0-7 list.

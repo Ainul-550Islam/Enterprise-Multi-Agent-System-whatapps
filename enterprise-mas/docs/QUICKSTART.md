@@ -34,9 +34,11 @@ curl -s http://127.0.0.1:8080/v1/health/live   # 200, stable envelope
 curl -s http://127.0.0.1:8080/v1/health/ready   # 200 when postgres ready
 ```
 
-Authenticate with a dev token the code really supports (`MAS_DEV_TOKENS` only
-in `--dev-inmemory`; production rejects static tokens via
-`enforce_production_guardrails`). Then:
+Authenticate with a dev token **you declared** — the dev lane has no built-in
+credentials (review M-6). `scripts/dev-up.sh` declares
+`MAS_DEV_TOKENS=dev-token:dev-user:user` for local bring-up (override it in
+your environment if you prefer); production rejects static tokens via
+`enforce_production_guardrails`. Then:
 
 ```bash
 curl -s -H "Authorization: Bearer <dev-token>" \

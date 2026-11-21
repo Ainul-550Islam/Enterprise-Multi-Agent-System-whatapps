@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING, Any, Final, Protocol, runtime_checkable
 from mas_orchestrator.agents.base import AgentState, Termination
 from mas_orchestrator.agents.runtime import AgentRuntime, ExecutionResult
 from mas_orchestrator.contracts.errors import (
+    CancellationRequestedError,
     ConfigurationError,
     InvalidRequestError,
     ProtocolError,
@@ -54,19 +55,32 @@ from mas_orchestrator.events.types import (
     model_tokens,
     request_received,
 )
+from mas_orchestrator.services.execution_state import ExecutionInProgressError
 from mas_orchestrator.services.idempotency import (
     DuplicateAction,
+    ExecutionState,
     ExecutionStateReader,
     UnknownStateReader,
     evaluate,
 )
 
 if TYPE_CHECKING:
+    from mas_orchestrator.agents.base import AgentSpec
     from mas_orchestrator.agents.router import AgentRoutingRequest
     from mas_orchestrator.context import ExecutionContext
     from mas_orchestrator.guardrails.manager import GuardrailManager
 
 _LOGGER: Final[logging.Logger] = logging.getLogger(__name__)
+
+#: A duplicate of a finished execution reports the *authoritative* termination,
+#: never a fresh success: a redelivery of a failed run must not read as
+#: "completed with empty output".
+_TERMINATION_FOR_STATE: Final[dict[ExecutionState, Termination]] = {
+    ExecutionState.SUCCEEDED: Termination.COMPLETED,
+    ExecutionState.FAILED: Termination.FAILED,
+    ExecutionState.CANCELLED: Termination.CANCELLED,
+    ExecutionState.TIMED_OUT: Termination.DEADLINE,
+}
 
 
 @runtime_checkable
@@ -85,8 +99,15 @@ class StateTransitionReporter(Protocol):
         termination: str,
         duration_ms: int,
         error_code: str | None = None,
+        tenant_id: str | None = None,
     ) -> None:
-        """Reports the outcome of an execution."""
+        """Reports the outcome of an execution.
+
+        ``tenant_id`` is the authoritative tenant of the execution: a durable
+        report must be tenant-scoped (the same contract as
+        ``ExecutionStateReader.state_of``), so a reporter that persists
+        transitions needs it and must refuse an unscoped write.
+        """
         ...
 
 
@@ -105,6 +126,7 @@ class LoggingStateReporter:
         termination: str,
         duration_ms: int,
         error_code: str | None = None,
+        tenant_id: str | None = None,
     ) -> None:
         """Logs rather than reporting."""
         _LOGGER.info(
@@ -115,6 +137,7 @@ class LoggingStateReporter:
                 "termination": termination,
                 "duration_ms": duration_ms,
                 "error_code": error_code,
+                "tenant_id": tenant_id,
             },
         )
 
@@ -128,6 +151,7 @@ class ExecutionRequest:
         context: Authoritative execution context.
         routing: Optional agent selection constraints.
         agent_id: Run a specific agent rather than selecting one.
+        agent_spec: Optional immutable Rust-resolved definition for this run.
         state: Optional starting state.
         protocol_version: The protocol version claimed by the caller.
     """
@@ -136,12 +160,38 @@ class ExecutionRequest:
     context: ExecutionContext
     routing: AgentRoutingRequest | None = None
     agent_id: str | None = None
+    agent_spec: AgentSpec | None = None
     state: AgentState | None = None
     protocol_version: str = str(CURRENT_PROTOCOL_VERSION)
 
     def __post_init__(self) -> None:
         if not self.request.strip():
             raise InvalidRequestError("request must not be empty", details={"field": "request"})
+        if self.agent_spec is not None:
+            selected_agent_id = self.agent_id or self.context.agent_id
+            if self.agent_spec.agent_id != selected_agent_id:
+                raise InvalidRequestError(
+                    "Rust-resolved agent snapshot does not match the requested agent",
+                    details={"field": "agent_id"},
+                )
+            if self.agent_spec.tenant_id != self.context.tenant_id:
+                raise InvalidRequestError(
+                    "Rust-resolved agent snapshot does not match the execution tenant",
+                    details={"field": "tenant_id"},
+                )
+            if (
+                self.context.agent_version_id is not None
+                and self.agent_spec.agent_version_id != self.context.agent_version_id
+            ):
+                raise InvalidRequestError(
+                    "Rust-resolved agent snapshot does not match the pinned version",
+                    details={"field": "agent_version_id"},
+                )
+            if not self.agent_spec.is_runnable:
+                raise InvalidRequestError(
+                    "Rust-resolved agent snapshot is not runnable",
+                    details={"field": "agent_spec.status"},
+                )
 
 
 class ExecutionService:
@@ -201,12 +251,25 @@ class ExecutionService:
         # --- stage 2: idempotency, decided by authoritative state ---
         cancel_event = cancel_event or asyncio.Event()
         decision = await evaluate(context, self._state_reader)
+        if decision.action is DuplicateAction.WAIT:
+            # The execution is in flight elsewhere. This delivery must not be
+            # serialised as a successful empty result: "already running" and
+            # "completed" are different facts, and the caller must see which.
+            raise ExecutionInProgressError(
+                f"execution {context.execution_id} is already in progress",
+                execution_id=context.execution_id,
+                state=decision.state,
+                invocation_key=decision.invocation_key,
+            )
         if decision.action is not DuplicateAction.PROCEED:
             duration_ms = int((time.monotonic() - started) * 1000)
+            # SKIP/REPLAY of a finished execution reports the authoritative
+            # termination rather than a fresh success.
+            termination = _TERMINATION_FOR_STATE.get(decision.state, Termination.COMPLETED)
             result = ExecutionResult(
                 execution_id=context.execution_id,
                 agent_id=context.agent_id,
-                termination=Termination.COMPLETED,
+                termination=termination,
                 content="",
                 duration_ms=duration_ms,
             )
@@ -245,8 +308,19 @@ class ExecutionService:
                 state=request.state,
                 cancel_event=cancel_event,
                 agent_id=request.agent_id,
+                agent_spec=request.agent_spec,
             )
-        except asyncio.CancelledError as error:
+        except asyncio.CancelledError:
+            # Task cancellation is a control-flow signal, not a normal result.
+            # Re-raising lets the gRPC bridge cancel in-flight provider/tool
+            # calls and prevents a cancelled RPC from being reported as a
+            # completed execution.
+            cancel_event.set()
+            raise
+        except CancellationRequestedError as error:
+            # Cooperative cancellation (for example a wire cancellation that
+            # arrived before the servicer task itself was cancelled) still has
+            # a durable, explicit cancellation outcome.
             result = ExecutionResult(
                 execution_id=context.execution_id,
                 agent_id=context.agent_id,
@@ -284,7 +358,7 @@ class ExecutionService:
         )
 
         # --- stage 8: report the canonical state transition to Rust ---
-        await self._report(context.execution_id, result, duration_ms)
+        await self._report(context.execution_id, result, duration_ms, tenant_id=context.tenant_id)
 
         return result
 
@@ -407,17 +481,33 @@ class ExecutionService:
         execution_id: str,
         result: ExecutionResult,
         duration_ms: int,
+        *,
+        tenant_id: str | None = None,
     ) -> None:
-        """Reports the terminal state to Rust."""
+        """Reports the terminal state to Rust.
+
+        A reporter that cannot deliver must raise (see
+        ``StateTransitionReporter``); the raise is logged and re-raised so the
+        caller sees the delivery failure instead of a swallowed transition.
+        """
         error_code = None
         if result.error is not None:
             error_code = getattr(getattr(result.error, "code", None), "value", None)
-        await self._reporter.report(
-            execution_id,
-            termination=result.termination.value,
-            duration_ms=duration_ms,
-            error_code=error_code,
-        )
+        try:
+            await self._reporter.report(
+                execution_id,
+                termination=result.termination.value,
+                duration_ms=duration_ms,
+                error_code=error_code,
+                tenant_id=tenant_id,
+            )
+        except Exception:
+            _LOGGER.exception(
+                "state transition of %s could not be reported to Rust",
+                execution_id,
+                extra={"event": "execution.state_report_failed"},
+            )
+            raise
 
     async def _emit(self, event: Any) -> None:
         """Emits one event, never letting telemetry fail an execution."""

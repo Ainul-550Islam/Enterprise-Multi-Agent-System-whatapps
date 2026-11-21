@@ -107,6 +107,13 @@ def materialise_catalog(
                 details={"index": index, "kind": repr(kind)},
             )
 
+        read_only = template.get("read_only", False)
+        if not isinstance(read_only, bool):
+            raise ConfigurationError(
+                "agent catalog read_only field must be a boolean",
+                details={"index": index, "field": "read_only"},
+            )
+
         spec = AgentSpec(
             agent_id=str(template["agent_id"]),
             agent_version_id=str(template.get("agent_version_id", "1")),
@@ -123,6 +130,7 @@ def materialise_catalog(
             allowed_tools=frozenset(str(item) for item in _sequence(template, "allowed_tools")),
             system_prompt=str(template.get("system_prompt", "")),
             tags=tuple(str(item) for item in _sequence(template, "tags")),
+            read_only=read_only,
         )
         limits = template.get("limits")
         if limits is not None:
@@ -272,6 +280,41 @@ class TenantScopedAgentRegistry:
             details={"catalog": sorted(self.catalog_ids)},
         )
 
+    def register_builtin(self, template: Mapping[str, object]) -> None:
+        """Adds one product-owned, read-only template during startup only.
+
+        The ordinary :meth:`register` path remains permanently refused. This
+        narrow hook exists for built-ins compiled into the service; it is
+        closed as soon as a tenant is materialised or the factory is bound, so
+        request handling can never mutate the cross-tenant catalog.
+        """
+        candidate = dict(template)
+        candidate["read_only"] = True
+        agent_id = str(candidate.get("agent_id", "")).strip()
+        if not agent_id:
+            raise ConfigurationError(
+                "built-in agent template must name an id",
+                details={"field": "agent_id"},
+            )
+        with self._lock:
+            if self._by_tenant or self._factory is not None:
+                raise ConfigurationError(
+                    "built-in agents must be registered before registry startup completes",
+                    details={"agent_id": agent_id},
+                )
+            existing = next(
+                (entry for entry in self._catalog if str(entry.get("agent_id", "")) == agent_id),
+                None,
+            )
+            if existing is not None:
+                if dict(existing) == candidate:
+                    return
+                raise ConfigurationError(
+                    "built-in agent id collides with a different catalog entry",
+                    details={"agent_id": agent_id},
+                )
+            self._catalog = (*self._catalog, candidate)
+
     def specs_for(self, tenant_id: str) -> tuple[AgentSpec, ...]:
         """Materialises and returns every spec for *tenant_id*.
 
@@ -341,6 +384,13 @@ class TenantScopedAgentRegistry:
     def has(self, tenant_id: str, agent_id: str) -> bool:
         """Whether *tenant_id* has *agent_id*."""
         return any(spec.agent_id == agent_id for spec in self.specs_for(tenant_id))
+
+    def is_read_only(self, tenant_id: str, agent_id: str) -> bool:
+        """Whether the tenant-visible agent is a product-owned built-in."""
+        try:
+            return self.spec(tenant_id, agent_id).read_only
+        except AgentNotFoundError:
+            return False
 
     def list_agents(self, tenant_id: str) -> tuple[AgentSpec, ...]:
         """Every agent for a tenant, sorted by id."""

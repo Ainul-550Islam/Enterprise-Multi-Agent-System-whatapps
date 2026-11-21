@@ -280,6 +280,55 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn in_progress_heartbeats_and_the_final_ack_share_one_persistent_receipt() {
+        let store = InMemoryDeliveryReceiptStore::default();
+        let task_id = Uuid::now_v7();
+        let receipt = store
+            .reserve(reservation(task_id))
+            .await
+            .expect("reserve")
+            .expect("live receipt");
+
+        // Multiple InProgress heartbeats extend the same persistent receipt.
+        for _ in 0..3 {
+            let later = receipt_expiry(Timestamp::now(), std::time::Duration::from_secs(60))
+                .expect("expiry");
+            assert!(store.renew(receipt, later).await.expect("renew"));
+        }
+
+        // A concurrent duplicate delivery defers to the same live receipt —
+        // never a second owner of the task.
+        assert!(store
+            .reserve(reservation(task_id))
+            .await
+            .expect("reserve")
+            .is_none());
+
+        // The final ACK settles that same receipt before the broker is signalled.
+        assert!(store
+            .settle(receipt, DeliveryReceiptSettlement::Acked)
+            .await
+            .expect("settle"));
+
+        // Restart-visible store state: the ACK is terminal and durable. The
+        // receipt cannot be renewed or re-settled, and a redelivery reserves a
+        // fresh receipt instead of rerouting the settled ACK to an event lane.
+        let later =
+            receipt_expiry(Timestamp::now(), std::time::Duration::from_secs(60)).expect("expiry");
+        assert!(!store.renew(receipt, later).await.expect("renew"));
+        assert!(!store
+            .settle(receipt, DeliveryReceiptSettlement::Acked)
+            .await
+            .expect("settle"));
+        let redelivered = store
+            .reserve(reservation(task_id))
+            .await
+            .expect("reserve")
+            .expect("fresh receipt");
+        assert!(redelivered.sequence > receipt.sequence);
+    }
+
     #[test]
     fn reservation_rejects_non_live_or_out_of_range_delivery_facts() {
         let task_id = Uuid::now_v7();

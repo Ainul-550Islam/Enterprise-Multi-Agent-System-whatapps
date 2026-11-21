@@ -1,0 +1,6 @@
+{
+  "name": "Demo Research Team",
+  "slug": "research-team",
+  "kind": "standard",
+  "description": "Supervisor-shaped demo agent: plans a research question, then delegates search steps."
+}

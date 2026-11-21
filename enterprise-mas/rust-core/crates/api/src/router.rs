@@ -29,11 +29,9 @@ use axum::routing::{get, post, put};
 use axum::Router;
 
 use crate::handlers::{
-    agents, analytics, api_keys, approvals, control_plane, data_hub, executions, health,
+    agents, analytics, api_keys, approvals, control_plane, data_hub, discovery, executions, health,
     inbound_webhooks, integrations, internal, notifications, oauth, rollbacks, schedules, search,
     tenancy, workflows, Ctx, MAX_BODY_BYTES,
-    whatsapp_public, whatsapp,
-    billing::{public as billing_public, checkout as billing_checkout},
 };
 use crate::middleware::{authenticated_layer, request_context_layer};
 use crate::response::ApiError;
@@ -42,8 +40,12 @@ use crate::state::AppState;
 /// Builds the full HTTP router for the api process.
 pub fn router(state: AppState) -> Router {
     let public = Router::new()
+        .route("/health", get(health::live))
         .route("/v1/health/live", get(health::live))
         .route("/v1/health/ready", get(health::ready))
+        // The OpenAPI document itself, public like any discovery surface:
+        // it describes the contract, it holds no tenant data.
+        .route("/v1/openapi.json", get(discovery::openapi_json))
         // Public only in the narrow provider-callback sense: its route id
         // selects server-owned metadata and its handler verifies an HMAC before
         // receipt insertion. No user/API-key authentication is applicable.
@@ -52,10 +54,9 @@ pub fn router(state: AppState) -> Router {
             post(inbound_webhooks::ingest)
                 .layer(DefaultBodyLimit::max(mas_integrations::inbound_webhooks::MAX_INBOUND_WEBHOOK_BYTES)),
         )
-        // WhatsApp Cloud API public webhook (hub challenge + signed POST)
-        .route("/v1/public/whatsapp/webhook/{route_id}", post(public_webhook_post))
-        .route("/v1/public/whatsapp/webhook/{route_id}", get(public_webhook_get))
-        .route("/v1/public/billing/stripe/webhook", post(billing_public::handle_stripe_webhook))
+        // Provider webhooks: public by necessity, authenticated by the
+        // signature over the raw body inside the handler.
+        .merge(crate::routes_whatsapp::public_routes())
         // OAuth callbacks carry an opaque one-shot state; they never accept a
         // tenant, connector, redirect URI, or provider endpoint from query.
         .route(
@@ -63,26 +64,34 @@ pub fn router(state: AppState) -> Router {
             get(oauth::callback),
         );
 
-    .route("/v1/billing/checkout-session", post(billing_checkout::create_checkout_session))
-        .route("/v1/billing/portal-session", post(billing_checkout::create_portal_session))
-
     let protected = Router::new()
         // ---- tenancy / identity ------------------------------------
+        .route(
+            "/v1/models/status",
+            get(discovery::models_status),
+        )
+        .route(
+            "/v1/models/status/{provider}",
+            get(discovery::models_status_provider),
+        )
+        .route("/v1/platforms", get(discovery::platforms))
+        .route(
+            "/v1/platforms/whatsapp/health",
+            get(discovery::whatsapp_health),
+        )
         .route("/v1/organizations", post(tenancy::register_organization).get(tenancy::list_organizations))
         .route("/v1/tenants", post(tenancy::register_tenant).get(tenancy::list_tenants))
+        .route(
+            "/v1/tenants/{tenant_id}/activate",
+            post(tenancy::activate_tenant),
+        )
         .route("/v1/projects", post(tenancy::register_project))
-        .route("/v1/users", post(tenancy::register_user))
-        // ---- whatsapp -------------------------------------------------
-        .route("/v1/whatsapp/account", post(register_account).get(list_accounts))
-        .route("/v1/whatsapp/inbound", post(protected_inbound))
-        .route("/v1/whatsapp/send/text", post(protected_send_text))
-        .route("/v1/whatsapp/send/template", post(protected_send_template))
-        .route("/v1/whatsapp/status", post(protected_handle_status))
-        .route("/v1/whatsapp/stop", post(protected_handle_stop))
-        .route("/v1/whatsapp/handoff", post(protected_human_handoff))
-        .route("/v1/whatsapp/rotate-credentials", post(protected_rotate_credentials))
-        .route("/v1/whatsapp/execution", post(protected_submit_execution));
+        .route("/v1/users", post(tenancy::register_user).get(tenancy::list_users))
         .route("/v1/memberships", post(tenancy::invite_membership))
+        .route(
+            "/v1/memberships/{membership_id}/accept",
+            post(tenancy::accept_membership),
+        )
         // ---- agents -------------------------------------------------
         .route("/v1/agents", post(agents::register).get(agents::list))
         .route("/v1/agents/{agent_id}", get(agents::get))
@@ -183,6 +192,10 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/executions/{execution_id}/pause", post(executions::pause))
         .route("/v1/executions/{execution_id}/resume", post(executions::resume))
         .route("/v1/executions/{execution_id}/cancel", post(executions::cancel))
+        .route(
+            "/v1/executions/{execution_id}/signal",
+            post(executions::signal),
+        )
         // ---- schedules ----------------------------------------------
         .route("/v1/schedules", post(schedules::register).get(schedules::list))
         .route("/v1/schedules/{schedule_id}", get(schedules::get))
@@ -263,6 +276,7 @@ pub fn router(state: AppState) -> Router {
         // Registered through the additive route group so this table keeps one
         // line per surface and the auth envelope above stays the only one.
         .merge(crate::routes_governance::routes())
+        .merge(crate::routes_whatsapp::protected_routes())
         // ---- tooling (tools, connector admin, webhook ops, SSE, assistant)
         .merge(crate::routes_tooling::routes())
         .route_layer(axum::middleware::from_fn_with_state(state.clone(), authenticated_layer))
@@ -510,6 +524,110 @@ mod tests {
             .expect("response");
         assert_eq!(response.status(), StatusCode::OK);
         assert!(json_body(response).await["data"].is_array());
+    }
+
+    #[tokio::test]
+    async fn the_activate_route_moves_a_provisioned_tenant_to_operational() {
+        let mut state = inmemory_state();
+        // Setup through the service layer; the transition itself goes over
+        // the HTTP surface under a platform identity.
+        let system =
+            ServiceContext::for_service("seed", "http-activate", &Timestamp::now()).expect("ctx");
+        let organization = state
+            .tenancy
+            .register_organization(&system, "Activate Ltd.", "Activate", "activate-http")
+            .await
+            .expect("org");
+        let org_scoped = system.clone().with_scope(TenantId::new(), organization.id);
+        let tenant = state
+            .tenancy
+            .register_tenant(
+                &org_scoped,
+                "Prov",
+                "prov-http",
+                mas_common::enums::Environment::Staging,
+                mas_domain::IsolationMode::SharedRls,
+            )
+            .await
+            .expect("tenant");
+        state.verifier = Arc::new(
+            crate::auth::StaticTokenVerifier::new()
+                .with_token("platform-token", mas_security::SecurityPrincipal::system()),
+        );
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/v1/tenants/{}/activate", tenant.id))
+                    .header(header::AUTHORIZATION, "Bearer platform-token")
+                    .header("x-organization-id", organization.id.to_string())
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = json_body(response).await;
+        assert_eq!(body["data"]["status"], "active");
+    }
+
+    #[tokio::test]
+    async fn an_invitation_can_be_accepted_over_http() {
+        let seeded = seeded().await;
+        let created = seeded
+            .router
+            .clone()
+            .oneshot(scoped_request(
+                &seeded,
+                Method::POST,
+                "/v1/users",
+                Some(serde_json::json!({
+                    "email": "invitee@example.test",
+                    "display_name": "Invitee",
+                })),
+            ))
+            .await
+            .expect("response");
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let user_id = json_body(created).await["data"]["id"]
+            .as_str()
+            .expect("user id")
+            .to_string();
+        let invited = seeded
+            .router
+            .clone()
+            .oneshot(scoped_request(
+                &seeded,
+                Method::POST,
+                "/v1/memberships",
+                Some(serde_json::json!({
+                    "user_id": user_id,
+                    "role": "developer",
+                })),
+            ))
+            .await
+            .expect("response");
+        assert_eq!(invited.status(), StatusCode::CREATED);
+        let membership_body = json_body(invited).await;
+        assert_eq!(membership_body["data"]["status"], "invited");
+        let membership_id = membership_body["data"]["id"]
+            .as_str()
+            .expect("membership id")
+            .to_string();
+        let accepted = seeded
+            .router
+            .clone()
+            .oneshot(scoped_request(
+                &seeded,
+                Method::POST,
+                &format!("/v1/memberships/{membership_id}/accept"),
+                None,
+            ))
+            .await
+            .expect("response");
+        assert_eq!(accepted.status(), StatusCode::CREATED);
+        let body = json_body(accepted).await;
+        assert_eq!(body["data"]["status"], "active");
     }
 
     #[tokio::test]

@@ -144,7 +144,7 @@ class TestRequireScope:
         identity = ServiceIdentity(
             subject="svc", issuer="test", scopes=frozenset({ServiceScope.EXECUTE_AGENT})
         )
-        require_scope(identity, ServiceScope.EXECUTE_AGENT)
+        assert require_scope(identity, ServiceScope.EXECUTE_AGENT) is None
 
     def test_missing_scope_raises(self) -> None:
         identity = ServiceIdentity(subject="svc", issuer="test", scopes=frozenset())

@@ -36,6 +36,7 @@ from mas_orchestrator.main import (
 from mas_orchestrator.services.lifecycle import DrainReport, ShutdownPhase, exit_code_for
 
 _RUST_CORE_TOKEN_REF_ENV = "MAS_ORCH_RUST_CORE__BEARER_TOKEN_SECRET_REF"
+_RUST_CORE_TRANSPORT_ENV = "MAS_ORCH_RUST_CORE__TRANSPORT"
 
 
 def _set_valid_bootstrap_environment(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -79,6 +80,11 @@ class TestBootstrap:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        # The invalid combination is stated explicitly, not inferred from
+        # ambient defaults: an environment overlay may legitimately configure
+        # transport="insecure" for development, which is a *valid* state that
+        # must not trip this rule.
+        monkeypatch.setenv(_RUST_CORE_TRANSPORT_ENV, "tls")
         monkeypatch.delenv(_RUST_CORE_TOKEN_REF_ENV, raising=False)
 
         with pytest.raises(ConfigurationError, match=r"rust_core\.bearer_token_secret_ref"):
@@ -181,11 +187,14 @@ class TestSignalHandlers:
         try:
             install_signal_handlers(coordinator, loop)
         finally:
+            installed = 0
             for signum in SHUTDOWN_SIGNALS:
                 try:
-                    loop.remove_signal_handler(signum)
+                    if loop.remove_signal_handler(signum) is not None:
+                        installed += 1
                 except (NotImplementedError, RuntimeError):
                     signal.signal(signum, signal.SIG_DFL)
+            assert installed == len(SHUTDOWN_SIGNALS)
 
 
 class TestAppConfig:

@@ -265,50 +265,67 @@ impl AuditReadPort for InMemoryAuditReadPort {
         after: Option<&AuditPosition>,
         limit: u16,
     ) -> Result<Vec<AuditEvent>> {
-        let mut events: Vec<_> = self
-            .events
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .filter(|event| event.tenant_id == Some(tenant))
-            .filter(|event| filter.actor.as_ref().is_none_or(|v| &event.actor.id == v))
-            .filter(|event| {
-                filter
-                    .action
-                    .as_ref()
-                    .is_none_or(|v| event.action.starts_with(v))
-            })
-            .filter(|event| {
-                filter
-                    .resource
-                    .as_ref()
-                    .is_none_or(|v| &event.resource_type == v)
-            })
-            .filter(|event| {
-                filter
-                    .outcome
-                    .as_ref()
-                    .is_none_or(|v| event.outcome.to_string() == *v)
-            })
-            .filter(|event| filter.from.is_none_or(|v| !event.occurred_at.is_before(&v)))
-            .filter(|event| filter.to.is_none_or(|v| event.occurred_at.is_before(&v)))
-            .filter(|event| {
-                after.is_none_or(|p| {
-                    event.occurred_at.to_unix_ms() < p.occurred_at_ms
-                        || (event.occurred_at.to_unix_ms() == p.occurred_at_ms
-                            && event.id.to_string() < p.id)
-                })
-            })
-            .cloned()
-            .collect();
-        events.sort_by(|a, b| {
-            b.occurred_at
-                .cmp(&a.occurred_at)
-                .then_with(|| b.id.cmp(&a.id))
-        });
-        events.truncate(usize::from(limit));
-        Ok(events)
+        Ok(filter_page(
+            &self.events.lock().unwrap_or_else(|e| e.into_inner()),
+            tenant,
+            filter,
+            after,
+            limit,
+        ))
     }
+}
+
+/// Shared page filtering for in-memory audit read ports (service tests and
+/// the dev lane's live sink). Mirrors the SQL keyset semantics exactly:
+/// tenant + every filter applied, newest-first `(occurred_at, id)` keyset
+/// positioned `after` the cursor, at most `limit` rows returned.
+pub(crate) fn filter_page(
+    source: &[AuditEvent],
+    tenant: TenantId,
+    filter: &AuditReadFilter,
+    after: Option<&AuditPosition>,
+    limit: u16,
+) -> Vec<AuditEvent> {
+    let mut events: Vec<_> = source
+        .iter()
+        .filter(|event| event.tenant_id == Some(tenant))
+        .filter(|event| filter.actor.as_ref().is_none_or(|v| &event.actor.id == v))
+        .filter(|event| {
+            filter
+                .action
+                .as_ref()
+                .is_none_or(|v| event.action.starts_with(v))
+        })
+        .filter(|event| {
+            filter
+                .resource
+                .as_ref()
+                .is_none_or(|v| &event.resource_type == v)
+        })
+        .filter(|event| {
+            filter
+                .outcome
+                .as_ref()
+                .is_none_or(|v| event.outcome.to_string() == *v)
+        })
+        .filter(|event| filter.from.is_none_or(|v| !event.occurred_at.is_before(&v)))
+        .filter(|event| filter.to.is_none_or(|v| event.occurred_at.is_before(&v)))
+        .filter(|event| {
+            after.is_none_or(|p| {
+                event.occurred_at.to_unix_ms() < p.occurred_at_ms
+                    || (event.occurred_at.to_unix_ms() == p.occurred_at_ms
+                        && event.id.to_string() < p.id)
+            })
+        })
+        .cloned()
+        .collect();
+    events.sort_by(|a, b| {
+        b.occurred_at
+            .cmp(&a.occurred_at)
+            .then_with(|| b.id.cmp(&a.id))
+    });
+    events.truncate(usize::from(limit));
+    events
 }
 
 #[cfg(test)]

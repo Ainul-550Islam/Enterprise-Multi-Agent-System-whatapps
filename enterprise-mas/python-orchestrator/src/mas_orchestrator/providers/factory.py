@@ -9,8 +9,8 @@ This is the composition root for the model layer. It is the only place that:
 Two rules keep production safe:
 
 **No secret literals.** Every credential arrives as a *reference*
-(env:NAME, file:PATH) and is resolved through
-mas_orchestrator.security.credentials. A factory that accepted a raw key
+(``env:NAME``, ``file:PATH``) and is resolved through
+:mod:`mas_orchestrator.security.credentials`. A factory that accepted a raw key
 string would make it easy to ship a key in config, so it does not.
 
 **Disabled means disabled.** A provider whose configuration says it is disabled
@@ -19,9 +19,8 @@ path, because a provider that exists but cannot work is a runtime landmine:
 it would be selected by the router and then fail.
 
 Unknown or misconfigured providers raise
-mas_orchestrator.contracts.errors.ConfigurationError at startup rather
+:class:`~mas_orchestrator.contracts.errors.ConfigurationError` at startup rather
 than degrading at call time.
-
 """
 
 from __future__ import annotations
@@ -38,24 +37,37 @@ if TYPE_CHECKING:
     from mas_orchestrator.models.registry import ModelRegistry
     from mas_orchestrator.models.types import ModelCapabilities
     from mas_orchestrator.providers.anthropic import AnthropicProvider
+    from mas_orchestrator.providers.azure import (
+        AzureOpenAIProvider,
+        AzureProviderConfig,
+    )
     from mas_orchestrator.providers.compatible import (
         CompatibleProvider,
         CompatibleProviderConfig,
     )
     from mas_orchestrator.providers.gemini import GeminiProvider
-    from mas_orchestrator.providers.azure_openai import AzureOpenAIProvider
     from mas_orchestrator.providers.openai import OpenAIProvider
 
 _LOGGER: Final[logging.Logger] = logging.getLogger(__name__)
 
+__all__ = [
+    "COMPATIBLE_PRESET_IDS",
+    "PROVIDER_IDS",
+    "ProviderBundle",
+    "ProviderSpec",
+    "build_providers",
+]
+
+#: OpenAI-compatible presets. They share CompatibleProvider and still require
+#: an operator-supplied endpoint (never a model-chosen host).
+COMPATIBLE_PRESET_IDS: Final[frozenset[str]] = frozenset(
+    {"compatible", "ollama", "vllm", "groq", "openrouter"}
+)
+
 #: Provider ids this factory knows how to construct.
-PROVIDER_IDS: Final[frozenset[str]] = frozenset({
-    "openai",
-    "anthropic",
-    "compatible",
-    "gemini",
-    "azure_openai",
-})
+PROVIDER_IDS: Final[frozenset[str]] = frozenset(
+    {"openai", "anthropic", "gemini", "azure"} | COMPATIBLE_PRESET_IDS
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,14 +79,15 @@ class ProviderSpec:
         enabled: Whether to construct it. A disabled provider is skipped
             entirely rather than built in a non-working state.
         api_key_secret_ref: Secret reference for the credential, e.g.
-            env:MAS_OPENAI_API_KEY. Required for openai and anthropic.
+            ``env:MAS_OPENAI_API_KEY``. Required for ``openai`` and
+            ``anthropic``.
         base_url: Override for the API base URL. Must remain on an allowlisted
-            host; for arbitrary hosts use compatible.
+            host; for arbitrary hosts use ``compatible``.
         organization: Optional OpenAI organization header.
         connect_timeout_seconds: Connection budget.
         read_timeout_seconds: Per-read budget.
-        compatible: Endpoint configuration, required when provider_id is
-            compatible.
+        compatible: Endpoint configuration, required when ``provider_id`` is
+            ``compatible``.
     """
 
     provider_id: str
@@ -85,6 +98,7 @@ class ProviderSpec:
     connect_timeout_seconds: float = 5.0
     read_timeout_seconds: float = 60.0
     compatible: CompatibleProviderConfig | None = None
+    azure: AzureProviderConfig | None = None
 
     def __post_init__(self) -> None:
         """Validates the specification.
@@ -92,7 +106,7 @@ class ProviderSpec:
         Raises:
             ConfigurationError: If the provider id is unknown, if timeouts are
                 non-positive, if a credential reference is missing for a
-                provider that needs one, or if compatible is set for a
+                provider that needs one, or if ``compatible`` is set for a
                 non-compatible provider (which would silently ignore it).
         """
         if not self.provider_id.strip():
@@ -117,13 +131,23 @@ class ProviderSpec:
                     "read": self.read_timeout_seconds,
                 },
             )
-        if self.compatible is not None and self.provider_id != "compatible":
+        if self.compatible is not None and self.provider_id not in COMPATIBLE_PRESET_IDS:
             raise ConfigurationError(
-                "compatible configuration is only valid for the compatible provider",
+                "compatible configuration is only valid for compatible presets",
                 details={"provider": self.provider_id},
             )
-        if self.provider_id == "compatible":
+        if self.azure is not None and self.provider_id != "azure":
+            raise ConfigurationError(
+                "azure configuration is only valid for the azure provider",
+                details={"provider": self.provider_id},
+            )
+        if self.provider_id in COMPATIBLE_PRESET_IDS:
             return
+        if self.provider_id == "azure" and self.azure is None:
+            raise ConfigurationError(
+                "azure provider requires an endpoint configuration",
+                details={"provider": self.provider_id},
+            )
         if not self.api_key_secret_ref:
             raise ConfigurationError(
                 "provider requires a credential secret reference",
@@ -165,13 +189,6 @@ class ProviderBundle:
                     extra={"provider": getattr(provider, "provider_id", "unknown")},
                 )
 
-__all__ = [
-    "PROVIDER_IDS",
-    "ProviderBundle",
-    "ProviderSpec",
-    "build_providers",
-]
-
 
 def build_providers(
     specs: list[ProviderSpec],
@@ -195,7 +212,11 @@ def build_providers(
         ConfigurationError: If any specification is invalid, or if a duplicate
             provider id is configured (which would make lookup order matter).
     """
-    from mas_orchestrator.models.registry import ModelRegistry
+    from mas_orchestrator.providers.anthropic import AnthropicProvider
+    from mas_orchestrator.providers.azure import AzureOpenAIProvider
+    from mas_orchestrator.providers.compatible import CompatibleProvider
+    from mas_orchestrator.providers.gemini import GeminiProvider
+    from mas_orchestrator.providers.openai import OpenAIProvider
 
     bundle = ProviderBundle()
     seen: set[str] = set()
@@ -216,9 +237,31 @@ def build_providers(
             )
             continue
 
-        provider: object
+        provider: (
+            OpenAIProvider
+            | AnthropicProvider
+            | CompatibleProvider
+            | GeminiProvider
+            | AzureOpenAIProvider
+        )
 
-        if spec.provider_id == "openai":
+        if spec.provider_id == "gemini":
+            assert spec.api_key_secret_ref is not None  # validated in __post_init__
+            provider = GeminiProvider(
+                resolve_secret(spec.api_key_secret_ref),
+                connect_timeout_seconds=spec.connect_timeout_seconds,
+                read_timeout_seconds=spec.read_timeout_seconds,
+            )
+        elif spec.provider_id == "azure":
+            assert spec.api_key_secret_ref is not None  # validated in __post_init__
+            assert spec.azure is not None  # validated in __post_init__
+            provider = AzureOpenAIProvider(
+                resolve_secret(spec.api_key_secret_ref),
+                spec.azure,
+                connect_timeout_seconds=spec.connect_timeout_seconds,
+                read_timeout_seconds=spec.read_timeout_seconds,
+            )
+        elif spec.provider_id == "openai":
             assert spec.api_key_secret_ref is not None  # validated in __post_init__
             provider = OpenAIProvider(
                 resolve_secret(spec.api_key_secret_ref),
@@ -235,27 +278,7 @@ def build_providers(
                 connect_timeout_seconds=spec.connect_timeout_seconds,
                 read_timeout_seconds=spec.read_timeout_seconds,
             )
-        elif spec.provider_id == "gemini":
-            assert spec.api_key_secret_ref is not None
-            provider = GeminiProvider(
-                resolve_secret(spec.api_key_secret_ref),
-                base_url=spec.base_url or "https://generativelanguage.googleapis.com/v1",
-                connect_timeout_seconds=spec.connect_timeout_seconds,
-                read_timeout_seconds=spec.read_timeout_seconds,
-            )
-        elif spec.provider_id == "azure_openai":
-            assert spec.api_key_secret_ref is not None
-            provider = AzureOpenAIProvider(
-                resolve_secret(spec.api_key_secret_ref),
-                base_url=spec.base_url or "https://api.openai.com/v1/deployments",
-                api_version=spec.compatible.get("api_version", "2024-02-15") if spec.compatible else "2024-02-15",
-                deployment_name=spec.compatible.get("deployment_name", "gpt-4") if spec.compatible else "gpt-4"
-                if spec.compatible
-                else "gpt-4",
-                connect_timeout_seconds=spec.connect_timeout_seconds,
-                read_timeout_seconds=spec.read_timeout_seconds,
-            )
-        else:  # compatible
+        else:
             if spec.compatible is None:
                 raise ConfigurationError(
                     "compatible provider requires an endpoint configuration",

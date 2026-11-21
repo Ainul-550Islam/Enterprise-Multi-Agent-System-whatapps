@@ -312,6 +312,51 @@ pub static MIGRATIONS: &[Migration] = &[
         "runtime_role_sequence_usage",
         "../../../migrations/0053_runtime_role_sequence_usage/up.sql"
     ),
+    migration!(
+        54,
+        "memory_plane_role",
+        "../../../migrations/0054_memory_plane_role/up.sql"
+    ),
+    migration!(
+        55,
+        "whatsapp_channels",
+        "../../../migrations/0055_whatsapp_channels/up.sql"
+    ),
+    migration!(
+        56,
+        "whatsapp_messages",
+        "../../../migrations/0056_whatsapp_messages/up.sql"
+    ),
+    migration!(
+        57,
+        "billing_customers",
+        "../../../migrations/0057_billing_customers/up.sql"
+    ),
+    migration!(
+        58,
+        "plan_prices",
+        "../../../migrations/0058_plan_prices/up.sql"
+    ),
+    migration!(
+        59,
+        "billing_checkout_sessions",
+        "../../../migrations/0059_billing_checkout_sessions/up.sql"
+    ),
+    migration!(
+        60,
+        "billing_event_applications",
+        "../../../migrations/0060_billing_event_applications/up.sql"
+    ),
+    migration!(
+        61,
+        "cross_tenant_guard",
+        "../../../migrations/0061_cross_tenant_guard/up.sql"
+    ),
+    migration!(
+        62,
+        "whatsapp_inbox",
+        "../../../migrations/0062_whatsapp_inbox/up.sql"
+    ),
 ];
 
 /// A migration already recorded in the database.
@@ -645,12 +690,9 @@ mod tests {
     #[test]
     fn registry_is_contiguous_and_ordered() {
         validate_registry().expect("registry must be valid");
-        assert_eq!(MIGRATIONS.len(), 53);
+        assert_eq!(MIGRATIONS.len(), 62);
         assert_eq!(MIGRATIONS.first().map(|m| m.name), Some("extensions"));
-        assert_eq!(
-            MIGRATIONS.last().map(|m| m.name),
-            Some("runtime_role_sequence_usage")
-        );
+        assert_eq!(MIGRATIONS.last().map(|m| m.name), Some("whatsapp_inbox"));
         let search_indexes = MIGRATIONS
             .iter()
             .find(|migration| migration.name == "bounded_search_indexes")
@@ -769,7 +811,3 @@ mod tests {
         assert!(plan_pending(&renamed).is_err());
     }
 }
-
-    migration!(        54,        "whatsapp_accounts",        "../../../migrations/0054_whatsapp_accounts/up.sql"),
-    migration!(        55,        "whatsapp_conversations",        "../../../migrations/0055_whatsapp_conversations/up.sql"),
-    migration!(        56,        "whatsapp_templates",        "../../../migrations/0056_whatsapp_templates/up.sql"),

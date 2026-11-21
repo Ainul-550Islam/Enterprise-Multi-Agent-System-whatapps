@@ -100,6 +100,51 @@ impl AuditSinkPort for InMemoryAuditSink {
     }
 }
 
+/// Read port over the same live in-memory sink, so a lane that composes the
+/// sink (tests, dev bring-up) can also answer audit *queries* against the
+/// very events it recorded — with the same filter and keyset semantics as
+/// the SQL port.
+#[async_trait]
+impl crate::audit_query_service::AuditReadPort for InMemoryAuditSink {
+    async fn read_page(
+        &self,
+        tenant: mas_common::ids::TenantId,
+        filter: &crate::audit_query_service::AuditReadFilter,
+        after: Option<&crate::audit_query_service::AuditPosition>,
+        limit: u16,
+    ) -> Result<Vec<AuditEvent>> {
+        Ok(crate::audit_query_service::filter_page(
+            &self.events.lock().unwrap_or_else(|e| e.into_inner()),
+            tenant,
+            filter,
+            after,
+            limit,
+        ))
+    }
+}
+
+/// Shared-handle delegation: composition passes `Arc<InMemoryAuditSink>`
+/// around the lane, and ports are consumed as boxed trait objects.
+#[async_trait]
+impl crate::audit_query_service::AuditReadPort for std::sync::Arc<InMemoryAuditSink> {
+    async fn read_page(
+        &self,
+        tenant: mas_common::ids::TenantId,
+        filter: &crate::audit_query_service::AuditReadFilter,
+        after: Option<&crate::audit_query_service::AuditPosition>,
+        limit: u16,
+    ) -> Result<Vec<AuditEvent>> {
+        crate::audit_query_service::AuditReadPort::read_page(
+            self.as_ref(),
+            tenant,
+            filter,
+            after,
+            limit,
+        )
+        .await
+    }
+}
+
 /// The canonical security-key lifecycle writes to the same append-only sink
 /// as application mutations; it does not get a separate, lossy audit path.
 #[async_trait]

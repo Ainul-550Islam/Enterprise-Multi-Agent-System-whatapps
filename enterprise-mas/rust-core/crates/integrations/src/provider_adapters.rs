@@ -155,6 +155,52 @@ where
                 }
                 append_path(base, &format!("/services/data/{version}/limits"))
             },
+            "whatsapp" => {
+                // The Cloud API addresses a business account by its
+                // phone-number id, not by a tenant-supplied base URL. Only the
+                // version and the numeric id come from config; the host is
+                // fixed so an operator cannot redirect the probe elsewhere.
+                let phone_number_id = connector
+                    .config
+                    .get("phone_number_id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        AppError::invalid_field(
+                            "config.phone_number_id",
+                            "required",
+                            "WhatsApp probes require the business phone-number id",
+                        )
+                    })?;
+                if phone_number_id.is_empty()
+                    || phone_number_id.len() > 64
+                    || !phone_number_id.bytes().all(|byte| byte.is_ascii_digit())
+                {
+                    return Err(AppError::invalid_field(
+                        "config.phone_number_id",
+                        "invalid_format",
+                        "WhatsApp phone-number id must be a numeric token",
+                    ));
+                }
+                let version = connector
+                    .config
+                    .get("api_version")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("v21.0");
+                if version.len() > 16
+                    || !version
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'.')
+                {
+                    return Err(AppError::invalid_field(
+                        "config.api_version",
+                        "invalid_format",
+                        "WhatsApp API version must be a short alphanumeric token",
+                    ));
+                }
+                SafeUrl::parse(&format!(
+                    "https://graph.facebook.com/{version}/{phone_number_id}?fields=id"
+                ))
+            },
             "generic-webhook" => required_safe_config_url(connector, "default_url"),
             // Non-HTTP protocol adapters must be installed explicitly. This
             // hard error is safer than a TCP/DNS-only "probe" that would mark
@@ -314,6 +360,64 @@ mod tests {
         async fn send(&self, _request: &HttpRequest) -> Result<crate::http_guard::HttpResponse> {
             Ok(crate::http_guard::HttpResponse::new(200))
         }
+    }
+
+    #[derive(Debug)]
+    struct BearerCredential;
+
+    #[async_trait]
+    impl ConnectorCredentialPort for BearerCredential {
+        async fn resolve_authorization(
+            &self,
+            _connector: &Connector,
+        ) -> Result<ProviderAuthorization> {
+            Ok(ProviderAuthorization::Bearer(SecretString::new(
+                "test-token".to_owned(),
+            )))
+        }
+    }
+
+    #[tokio::test]
+    async fn whatsapp_probe_uses_the_fixed_cloud_api_host() {
+        let mut connector = Connector::register(
+            TenantId::new(),
+            OrganizationId::new(),
+            "whatsapp",
+            "support",
+            ConnectorAuthMode::ApiKey,
+        )
+        .expect("connector");
+        connector.config.insert(
+            "phone_number_id".to_owned(),
+            serde_json::Value::String("1234567890".to_owned()),
+        );
+        let probe = HttpProviderProbe::new(
+            GuardedHttpClient::new(FakeHttp, EgressPolicy::default()),
+            BearerCredential,
+        );
+        assert!(probe.probe(&connector).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn whatsapp_probe_refuses_a_non_numeric_phone_number_id() {
+        let mut connector = Connector::register(
+            TenantId::new(),
+            OrganizationId::new(),
+            "whatsapp",
+            "support",
+            ConnectorAuthMode::ApiKey,
+        )
+        .expect("connector");
+        connector.config.insert(
+            "phone_number_id".to_owned(),
+            serde_json::Value::String("1234567890'; DROP TABLE tasks;--".to_owned()),
+        );
+        let probe = HttpProviderProbe::new(
+            GuardedHttpClient::new(FakeHttp, EgressPolicy::default()),
+            BearerCredential,
+        );
+        let error = probe.probe(&connector).await.expect_err("must refuse");
+        assert!(format!("{error:?}").contains("invalid_format"));
     }
 
     #[tokio::test]

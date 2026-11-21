@@ -221,30 +221,29 @@ pub async fn list_usage(
     Ctx(ctx): Ctx,
 ) -> ApiResult<Vec<UsageView>> {
     let tenant = scoped_tenant(&ctx).map_err(|e| crate::response::ApiError::new(e, &ctx))?;
-    let stores = state
-        .control_plane_stores()
-        .map_err(|e| crate::response::ApiError::new(e, &ctx))?;
     // The ledger's read is window-scoped, so "all usage" is expressed as the
     // widest window the clock can name rather than as a query with no bound —
     // an unbounded scan over a billing table is how a read endpoint becomes an
-    // outage.
-    let rows = stores
-        .usage
-        .for_tenant_between(
+    // outage. The read goes through the usage service's ledger port, which
+    // reads the same `usage_records` table in every lane instead of depending
+    // on the Postgres-only control-plane stores.
+    let rows = state
+        .usage_service(&ctx)?
+        .records(
             tenant,
-            &Timestamp::from_unix_seconds(0).unwrap_or_else(|_| Timestamp::now()),
-            &Timestamp::now(),
-            page_size(&page),
+            Timestamp::from_unix_seconds(0).unwrap_or_else(|_| Timestamp::now()),
+            Timestamp::now(),
+            u16::try_from(page_size(&page).clamp(1, i64::from(u16::MAX))).unwrap_or(u16::MAX),
         )
         .await
         .map_err(|e| crate::response::ApiError::new(e, &ctx))?;
     let views = rows
         .into_iter()
         .map(|row| UsageView {
-            id: mas_common::ids::UsageRecordId::from_uuid(row.id),
-            resource: row.resource,
-            quantity: row.quantity,
-            occurred_at: Timestamp::from_datetime(row.occurred_at).to_rfc3339_millis(),
+            id: row.id,
+            resource: row.dimension.as_str().to_owned(),
+            quantity: i64::try_from(row.quantity).unwrap_or(i64::MAX),
+            occurred_at: row.occurred_at.to_rfc3339_millis(),
         })
         .collect();
     Ok(ok(&ctx, views))

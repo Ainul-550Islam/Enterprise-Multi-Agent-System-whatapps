@@ -1,0 +1,37 @@
+{
+  "kind": "WorkflowDefinition",
+  "apiVersion": "mas/v1",
+  "metadata": {
+    "name": "Demo Support Pipeline",
+    "slug": "demo-support-pipeline",
+    "labels": { "demo": "true" }
+  },
+  "spec": {
+    "description": "Collects the customer message, drafts a reply, escalates refunds.",
+    "graph": {
+      "nodes": [
+        {
+          "id": "classify",
+          "type": "agent_step",
+          "config": { "agent_slug": "demo-support-agent", "input": "{{customer_message}}" }
+        },
+        {
+          "id": "draft",
+          "type": "agent_step",
+          "config": { "agent_slug": "demo-support-agent", "input": "{{classify.output}}" }
+        },
+        {
+          "id": "escalate",
+          "type": "human_approval",
+          "config": { "when": "{{classify.intent}} == 'refund'", "sla_minutes": 30 }
+        }
+      ],
+      "edges": [
+        { "from": "classify", "to": "draft" },
+        { "from": "draft", "to": "escalate" }
+      ]
+    },
+    "policies": { "quota_dimension": "executions", "retry": { "max_attempts": 3 } },
+    "workflows": { "catch_up": "latest", "overlap": "forbid" }
+  }
+}

@@ -116,6 +116,18 @@ class VectorBackend(StrEnum):
     DISABLED = "disabled"
 
 
+class DataSourceKind(StrEnum):
+    """Data Hub source kinds accepted by the ingestion plane.
+
+    Values are wire/configuration contracts shared with Rust's
+    ``DataSourceKind`` domain enum.
+    """
+
+    UPLOAD = "upload"
+    OBJECT_STORAGE = "object_storage"
+    WEB = "web"
+
+
 class ToolExecutionMode(StrEnum):
     """How tool code execution is performed.
 
@@ -148,14 +160,67 @@ class GuardrailFailureMode(StrEnum):
         return self is GuardrailFailureMode.FAIL_CLOSED
 
 
+class ProviderKind(StrEnum):
+    """The provider families the runtime knows how to drive.
+
+    A configured provider id must classify into exactly one kind — the kind
+    decides which adapter the provider factory builds and which host policy
+    applies. ``gemini`` and ``azure`` are first-class kinds (not folded into
+    "compatible"), because their wire shapes and SSRF host rules differ.
+    """
+
+    OPENAI = "openai"
+    ANTHROPIC = "anthropic"
+    COMPATIBLE = "compatible"
+    GEMINI = "gemini"
+    AZURE = "azure"
+
+
+def classify_provider_kind(provider_id: str) -> ProviderKind:
+    """Classifies a provider id into its :class:`ProviderKind`.
+
+    Matching is prefix-based on the normalised id so tenants can run several
+    deployments per family (``azure-prod``, ``gemini-eu``). Unknown ids raise
+    :class:`ValueError` — configuration validation turns that into a
+    :class:`~mas_orchestrator.config.validation.ConfigViolation` with the
+    offending field named.
+    """
+    normalised = provider_id.strip().lower()
+    if normalised.startswith(("gemini", "google-gemini", "google_gemini")):
+        return ProviderKind.GEMINI
+    if normalised.startswith(("azure", "azure-openai", "azure_openai")):
+        return ProviderKind.AZURE
+    if normalised.startswith(("anthropic", "claude")):
+        return ProviderKind.ANTHROPIC
+    if normalised.startswith(("openai", "gpt")):
+        return ProviderKind.OPENAI
+    if normalised.startswith(
+        (
+            "compatible",
+            "ollama",
+            "vllm",
+            "groq",
+            "openrouter",
+            "together",
+            "fireworks",
+            "mistral",
+        )
+    ):
+        return ProviderKind.COMPATIBLE
+    raise ValueError(f"unknown provider kind for id {provider_id!r}")
+
+
 __all__ = [
+    "DataSourceKind",
     "Environment",
     "GuardrailFailureMode",
     "LogFormat",
     "MemoryBackend",
+    "ProviderKind",
     "ProviderMode",
     "StrEnum",
     "ToolExecutionMode",
     "TransportSecurity",
     "VectorBackend",
+    "classify_provider_kind",
 ]

@@ -5,7 +5,7 @@
 use axum::extract::{Path, State};
 use axum::Json;
 use mas_common::ids::{ExecutionId, ProjectId};
-use mas_contracts::execution::{ExecutionResponse, StartExecutionRequest};
+use mas_contracts::execution::{ExecutionResponse, SignalExecutionRequest, StartExecutionRequest};
 
 use crate::handlers::Ctx;
 use crate::response::{created, replayed, ApiResult, IntoApiResult};
@@ -100,6 +100,35 @@ pub async fn cancel(
         .map_err(|e| crate::response::ApiError::new(e, &ctx))?;
     let response = mas_application::dto::execution_response(&execution);
     Ok(crate::response::ok(&ctx, response))
+}
+
+/// `POST /v1/executions/{execution_id}/signal` — lifecycle alias. The body's
+/// `signal` verb dispatches to the same service transitions (and the same
+/// per-transition authorization) as the dedicated `start`/`pause`/`resume`/
+/// `cancel` routes; it exists so callers that carry the verb in the body use
+/// one endpoint without a second, divergent state machine.
+pub async fn signal(
+    State(state): State<AppState>,
+    Path(execution_id): Path<ExecutionId>,
+    Ctx(ctx): Ctx,
+    Json(body): Json<SignalExecutionRequest>,
+) -> ApiResult<ExecutionResponse> {
+    body.validate()
+        .map_err(|e| crate::response::ApiError::new(e, &ctx))?;
+    match body.signal.as_str() {
+        "start" => transition(state, ctx, execution_id, Transition::Start).await,
+        "pause" => transition(state, ctx, execution_id, Transition::Pause).await,
+        "resume" => transition(state, ctx, execution_id, Transition::Resume).await,
+        _ => {
+            let service_ctx = authorized_execution(&ctx, mas_security::Action::Cancel)?;
+            state
+                .executions
+                .request_cancellation(&service_ctx, execution_id)
+                .await
+                .map(|execution| mas_application::dto::execution_response(&execution))
+                .into_api(&ctx)
+        },
+    }
 }
 
 /// `GET /v1/executions/{execution_id}`.

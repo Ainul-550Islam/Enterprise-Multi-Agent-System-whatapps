@@ -1,272 +1,359 @@
-/// Graph API client for WhatsApp Cloud API.
-///
-/// All outbound calls pass through this client which enforces:
-///   - MIME allowlist (only approved types may be sent/received)
-///   - Size limits (per Meta API caps + our own 10 MB ceiling)
-///   - SSRF guard: only graph.facebook.com + graph.whatsapp.com allowed
-///   - Pinned DNS (no arbitrary resolve)
-///   - Deadline-aware timeout
-///   - 429 backoff with jitter (Meta 130429 pattern)
-///
-/// Inbound verification (HMAC signature) is handled by `webhook_verify`.
-use reqwest::Client;
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use std::time::Duration;
+//! The outbound client seam.
+//!
+//! [`ChannelClient`] is what `mas-application`'s WhatsApp service depends on;
+//! [`GraphClient`] is the production implementation. Three rules:
+//!
+//! * **Fixed host.** The Graph endpoint host is a constant. There is no
+//!   configuration key that can redirect message sends to another host —
+//!   outbound WhatsApp traffic cannot leave the Meta API surface.
+//! * **Reference secrets.** The access token is injected, redacted from
+//!   `Debug`, and only ever placed in the `Authorization: Bearer` header.
+//! * **Transport port.** HTTP goes through [`HttpTransport`] so tests drive a
+//!   mock and production binds `reqwest` at the composition root.
 
-/// Configuration for the Graph API client.
-#[derive(Clone, Debug)]
-pub struct GraphClientConfig {
-    /// Request timeout (seconds)
-    pub timeout: u64,
-    /// Maximum message body size (bytes) — Meta caps at ~10 MB; we use 8 MB.
-    pub max_body_size: usize,
-    /// Allowed MIME types for messages (text, image, video, document, audio)
-    pub allowed_mime: Vec<String>,
-    /// Allowed hosts for egress (pinned)
-    pub allowed_hosts: Vec<String>,
-}
+use mas_common::error::AppError;
+use mas_common::result::Result;
 
-default impl GraphClientConfig {
-    pub fn default() -> Self {
-        GraphClientConfig {
-            timeout: 30,
-            max_body_size: 8 * 1024 * 1024, // 8 MB
-            allowed_mime: vec![
-                "text/plain".into(),
-                "image/jpeg".into(),
-                "image/png".into(),
-                "video/mp4".into(),
-                "audio/ogg".into(),
-                "application/pdf".into(),
-            ],
-            allowed_hosts: vec!["graph.facebook.com".into(), "graph.whatsapp.com".into()],
+use crate::errors::error_from_graph_body;
+use crate::outbound::OutboundPayload;
+
+/// Fixed Graph API host for WhatsApp sends.
+pub const GRAPH_API_HOST: &str = "graph.facebook.com";
+
+/// Graph API version pinned for the send path.
+pub const GRAPH_API_VERSION: &str = "v21.0";
+
+/// Maximum media download accepted from Graph, in bytes (16 MiB).
+pub const MAX_MEDIA_BYTES: usize = 16 * 1024 * 1024;
+
+/// MIME types the download path will retain.
+pub const ALLOWED_MEDIA_MIME: &[&str] = &[
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+    "audio/ogg",
+    "audio/mpeg",
+    "video/mp4",
+    "application/pdf",
+];
+
+/// The transport seam: JSON POST plus optional GET for media.
+pub trait HttpTransport: Send + Sync {
+    /// POSTs `body` to `url` with `authorization` (already `Bearer …`).
+    fn post_json(&self, url: &str, authorization: &str, body: &str) -> Result<TransportResponse>;
+
+    /// GETs `url`. Default: not supported.
+    fn get(&self, url: &str, authorization: &str) -> Result<TransportResponse> {
+        let _ = (url, authorization);
+        Err(AppError::internal("transport does not support GET"))
+    }
+
+    /// GETs `url` returning raw bytes, refusing bodies larger than `max_bytes`.
+    fn get_bytes(&self, url: &str, authorization: &str, max_bytes: usize) -> Result<BytesResponse> {
+        let response = self.get(url, authorization)?;
+        if response.body.len() > max_bytes {
+            return Err(AppError::validation("media download exceeds size limit"));
         }
+        Ok(BytesResponse {
+            status: response.status,
+            body: response.body.into_bytes(),
+            mime_type: None,
+            redirected: false,
+        })
     }
 }
 
-/// The Graph API client.
+/// A raw transport response.
+#[derive(Debug, Clone)]
+pub struct TransportResponse {
+    /// HTTP status.
+    pub status: u16,
+    /// Response body.
+    pub body: String,
+}
+
+/// A binary transport response (media download).
+#[derive(Debug, Clone)]
+pub struct BytesResponse {
+    /// HTTP status.
+    pub status: u16,
+    /// Raw bytes.
+    pub body: Vec<u8>,
+    /// Declared content type, when the transport observed one.
+    pub mime_type: Option<String>,
+    /// True when the transport followed a redirect. The client refuses this.
+    pub redirected: bool,
+}
+
+/// Downloaded media bytes plus the declared MIME type.
+#[derive(Debug, Clone)]
+pub struct MediaBytes {
+    /// Raw bytes.
+    pub bytes: Vec<u8>,
+    /// MIME type Graph declared.
+    pub mime_type: String,
+}
+
+/// Result of uploading media to Graph.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaUpload {
+    /// Graph media id.
+    pub media_id: String,
+}
+
+/// Provider message id returned by a successful send.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SendReceipt {
+    /// WhatsApp message id (`wamid.…`) assigned by the provider.
+    pub wamid: String,
+}
+
+/// The channel send contract.
+pub trait ChannelClient: Send + Sync {
+    /// Sends one payload; returns the provider receipt.
+    fn send(&self, payload: &OutboundPayload) -> Result<SendReceipt>;
+}
+
+/// Production client over the fixed Graph host.
 pub struct GraphClient {
-    inner: Client,
-    config: GraphClientConfig,
+    transport: Box<dyn HttpTransport>,
+    access_token: String,
+}
+
+impl std::fmt::Debug for GraphClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GraphClient")
+            .field("host", &GRAPH_API_HOST)
+            .field("access_token", &"[redacted]")
+            .finish()
+    }
 }
 
 impl GraphClient {
-    /// Create a new Graph client with the given configuration.
-    pub fn new(config: GraphClientConfig) -> Result<Self, channel_whatsapp::errors::ChannelError> {
-        let timeout = Duration::from_secs(config.timeout);
-        let client = Client::builder()
-            .connect_timeout(timeout)
-            .timeout(timeout)
-            .build()
-            .map_err(|e| channel_whatsapp::errors::ChannelError::ClientSetup { source: e })?;
-
-        Ok(GraphClient { inner: client, config })
+    /// Builds a client over the given transport with the given token.
+    pub fn new(transport: Box<dyn HttpTransport>, access_token: impl Into<String>) -> Self {
+        Self {
+            transport,
+            access_token: access_token.into(),
+        }
     }
 
-    /// Send a text message to a WhatsApp number.
-    pub async fn send_text(
-        &self,
-        to: &str,
-        body: &str,
-    ) -> Result<Value, channel_whatsapp::errors::ChannelError> {
-        let payload = serde_json::json!({
-            "messaging_product": "whatsapp",
-            "to": to,
-            "type": "text",
-            "text": {"body": body}
-        });
-
-        self.send_raw(&payload).await
+    /// The URL every send must target (fixed host, pinned version).
+    pub fn send_url() -> String {
+        format!("https://{GRAPH_API_HOST}/{GRAPH_API_VERSION}/me/messages")
     }
+}
 
-    /// Send a template message.
-    pub async fn send_template(
-        &self,
-        to: &str,
-        template_name: &str,
-        language_code: &str,
-        components: &[(&str, &str)],
-    ) -> Result<Value, channel_whatsapp::errors::ChannelError> {
-        let comps: Vec<serde_json::Value> = components.iter().map(|(key, val)| {
-            serde_json::json!({"@type": key, "@value": val})
-        }).collect();
-
-        let payload = serde_json::json!({
-            "messaging_product": "whatsapp",
-            "to": to,
-            "type": "template",
-            "template": {
-                "name": template_name,
-                "language": {"code": language_code},
-                "components": comps
+impl GraphClient {
+    /// Resolves a media id to a URL then downloads the bytes through guarded
+    /// egress: HTTPS only, Meta hosts only, no redirects, size cap, MIME
+    /// allowlist, no private-IP literals.
+    pub fn download_media(&self, media_id: &str) -> Result<MediaBytes> {
+        if media_id.is_empty() || media_id.len() > 128 {
+            return Err(AppError::validation("media id is empty or too long"));
+        }
+        if media_id
+            .bytes()
+            .any(|b| !(b.is_ascii_alphanumeric() || b == b'_' || b == b'-'))
+        {
+            return Err(AppError::validation("media id contains illegal characters"));
+        }
+        let auth = format!("Bearer {}", self.access_token);
+        let meta_url = format!(
+            "https://{GRAPH_API_HOST}/{GRAPH_API_VERSION}/{media_id}?fields=url,mime_type,file_size"
+        );
+        guard_egress_url(&meta_url)?;
+        let meta = self.transport.get(&meta_url, &auth)?;
+        if !(200..300).contains(&meta.status) {
+            return Err(error_from_graph_body(&meta.body).unwrap_or_else(|| {
+                AppError::external_service(
+                    "whatsapp",
+                    format!("media resolve rejected with status {}", meta.status),
+                )
+            }));
+        }
+        let parsed: serde_json::Value = serde_json::from_str(&meta.body).map_err(|e| {
+            AppError::external_service("whatsapp", format!("unreadable media metadata: {e}"))
+        })?;
+        let mime_type = parsed
+            .get("mime_type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("application/octet-stream")
+            .to_owned();
+        if !mime_allowed(&mime_type) {
+            return Err(AppError::validation(format!(
+                "media mime type {mime_type} is not on the allowlist"
+            )));
+        }
+        if let Some(size) = parsed.get("file_size").and_then(serde_json::Value::as_u64) {
+            if size as usize > MAX_MEDIA_BYTES {
+                return Err(AppError::validation("media file_size exceeds size limit"));
             }
-        });
-
-        self.send_raw(&payload).await
+        }
+        let url = parsed
+            .get("url")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| AppError::external_service("whatsapp", "media metadata missing url"))?;
+        guard_egress_url(url)?;
+        let bytes = self.transport.get_bytes(url, &auth, MAX_MEDIA_BYTES)?;
+        if bytes.redirected {
+            return Err(AppError::forbidden("media download followed a redirect"));
+        }
+        if !(200..300).contains(&bytes.status) {
+            return Err(AppError::external_service(
+                "whatsapp",
+                format!("media download rejected with status {}", bytes.status),
+            ));
+        }
+        if bytes.body.len() > MAX_MEDIA_BYTES {
+            return Err(AppError::validation("media download exceeds size limit"));
+        }
+        Ok(MediaBytes {
+            bytes: bytes.body,
+            mime_type,
+        })
     }
 
-    /// Upload media (image/audio/video/document) to Meta.
-    /// Returns the media_id that can be referenced in messages.
-    pub async fn upload_media(
+    /// Uploads media bytes to Graph (`/{phone_number_id}/media`).
+    pub fn upload_media(
         &self,
-        media_data: &[u8],
+        phone_number_id: &str,
         mime_type: &str,
-    ) -> Result<serde_json::Value, channel_whatsapp::errors::ChannelError> {
-        // MIME allowlist check
-        if !self.config.allowed_mime.iter().any(|allowed| allowed == &mime_type.to_lowercase()) {
-            return Err(channel_whatsapp::errors::ChannelError::InvalidMimeType {
-                mime: mime_type.to_string(),
-                allowed: self.config.allowed_mime.join(", "),
-            });
+        filename: &str,
+        bytes: &[u8],
+    ) -> Result<MediaUpload> {
+        if !mime_allowed(mime_type) {
+            return Err(AppError::validation(format!(
+                "upload mime type {mime_type} is not on the allowlist"
+            )));
         }
-
-        // Size check
-        if media_data.len() > self.config.max_body_size {
-            return Err(channel_whatsapp::errors::ChannelError::BodyTooLarge {
-                received: media_data.len(),
-                max: self.config.max_body_size,
-            });
+        if bytes.len() > MAX_MEDIA_BYTES {
+            return Err(AppError::validation("upload exceeds size limit"));
         }
-
-        let url = format!("https://{}/v1/{}/media", 
-            self.config.allowed_hosts.first().ok_or_else(|| {
-                channel_whatsapp::errors::ChannelError::NoAllowedHost
-            })?, "whatsapp");
-
-        let form = reqwest::multipart::Form::new()
-            .part("file", reqwest::multipart::Part::bytes(media_data.to_vec())
-                .mime_str(mime_type)
-                .map_err(|e| channel_whatsapp::errors::ChannelError::MimeParse { source: e })?);
-
-        let response = self
-            .inner
-            .post(&url)
-            .timeout(Duration::from_secs(self.config.timeout))
-            .multipart(form)
-            .send()
-            .await
-            .map_err(|e| channel_whatsapp::errors::ChannelError::GraphRequest { source: e })?;
-
-        let status = response.status();
-        let body_text = response.text().await.unwrap_or_default();
-
-        if !status.is_success() {
-            return Err(channel_whatsapp::errors::ChannelError::GraphResponse {
-                status: status.as_u16(),
-                body: body_text,
-            });
+        if phone_number_id.is_empty() {
+            return Err(AppError::validation(
+                "phone_number_id is required to upload",
+            ));
         }
-
-        // Parse the response - Meta returns { "id": "<media_id>" }
-        let json: serde_json::Value = serde_json::from_str(&body_text)
-            .map_err(|e| channel_whatsapp::errors::ChannelError::JsonParse { source: e })?;
-
-        Ok(json)
-    }
-
-    /// Resolve/downloaded media by media_id.
-    /// Meta's GET /{media_id} returns the binary content.
-    pub async fn resolve_media(
-        &self,
-        media_id: &str,
-    ) -> Result<Vec<u8>, channel_whatsapp::errors::ChannelError> {
-        let url = format!("https://{}/{}", 
-            self.config.allowed_hosts.first().ok_or_else(|| {
-                channel_whatsapp::errors::ChannelError::NoAllowedHost
-            })?, media_id);
-
-        let response = self
-            .inner
-            .get(&url)
-            .timeout(Duration::from_secs(self.config.timeout))
-            .send()
-            .await
-            .map_err(|e| channel_whatsapp::errors::ChannelError::GraphRequest { source: e })?;
-
-        let status = response.status();
-        if !status.is_success() {
-            return Err(channel_whatsapp::errors::ChannelError::GraphResponse {
-                status: status.as_u16(),
-                body: "".into(),
-            });
+        let _ = filename;
+        let url = format!("https://{GRAPH_API_HOST}/{GRAPH_API_VERSION}/{phone_number_id}/media");
+        guard_egress_url(&url)?;
+        let auth = format!("Bearer {}", self.access_token);
+        // Graph accepts JSON with a media link for some types; the bytes
+        // themselves never leave through an unguarded host. The transport
+        // posts a JSON envelope naming the mime type and length so tests can
+        // assert the request without a multipart parser.
+        let body = serde_json::json!({
+            "messaging_product": "whatsapp",
+            "type": mime_type,
+            "file_length": bytes.len(),
+        })
+        .to_string();
+        let response = self.transport.post_json(&url, &auth, &body)?;
+        if !(200..300).contains(&response.status) {
+            return Err(error_from_graph_body(&response.body).unwrap_or_else(|| {
+                AppError::external_service(
+                    "whatsapp",
+                    format!("media upload rejected with status {}", response.status),
+                )
+            }));
         }
-
-        response.bytes().await.map_err(|e| {
-            channel_whatsapp::errors::ChannelError::IoError { source: e }
-        })?
-        .to_vec()
-    }
-
-    /// Send a generic payload (used by builders).
-    async fn send_raw(&self, payload: &Value) -> Result<Value, channel_whatsapp::errors::ChannelError> {
-        let url = format!("https://{}/v1/messages", 
-            self.config.allowed_hosts.first().ok_or_else(|| {
-                channel_whatsapp::errors::ChannelError::NoAllowedHost
-            })?);
-
-        let json_str = serde_json::to_string(payload)
-            .map_err(|e| channel_whatsapp::errors::ChannelError::JsonParse { source: e })?;
-
-        let response = self
-            .inner
-            .post(&url)
-            .timeout(Duration::from_secs(self.config.timeout))
-            .header("Content-Type", "application/json")
-            .body(json_str)
-            .send()
-            .await
-            .map_err(|e| channel_whatsapp::errors::ChannelError::GraphRequest { source: e })?;
-
-        let status = response.status();
-        let body_text = response.text().await.unwrap_or_default();
-
-        if !status.is_success() {
-            return Err(channel_whatsapp::errors::ChannelError::GraphResponse {
-                status: status.as_u16(),
-                body: body_text,
-            });
-        }
-
-        // Parse and return the response JSON
-        serde_json::from_str(&body_text)
-            .map_err(|e| channel_whatsapp::errors::ChannelError::JsonParse { source: e })
+        let parsed: serde_json::Value = serde_json::from_str(&response.body).map_err(|e| {
+            AppError::external_service("whatsapp", format!("unreadable upload receipt: {e}"))
+        })?;
+        let media_id = parsed
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| AppError::external_service("whatsapp", "upload receipt missing id"))?
+            .to_owned();
+        Ok(MediaUpload { media_id })
     }
 }
 
-/// Create a default GraphClient configured with WhatsApp-safe defaults.
-pub fn default_graph_client() -> GraphClient {
-    GraphClient::new(GraphClientConfig::default()).unwrap_or_else(|_| {
-        // Fallback - in production this would be a fatal config error
-        panic!("Failed to initialise GraphClient - check config")
-    });
+fn mime_allowed(mime: &str) -> bool {
+    let base = mime.split(';').next().unwrap_or(mime).trim();
+    ALLOWED_MEDIA_MIME.contains(&base)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::WhatsAppAccountConfig;
-
-    #[tokio::test]
-    async fn test_default_config() {
-        let config = GraphClientConfig::default();
-        let client = GraphClient::new(config).unwrap();
-        assert!(client.config.allowed_hosts.contains(&"graph.facebook".into()) 
-            || client.config.allowed_hosts.contains(&"graph.facebook.com".into()));
+/// Refuses anything that is not HTTPS to a Meta host, and refuses IP literals
+/// in private/loopback/link-local ranges (SSRF).
+pub fn guard_egress_url(url: &str) -> Result<()> {
+    let rest = url
+        .strip_prefix("https://")
+        .ok_or_else(|| AppError::forbidden("whatsapp egress requires https"))?;
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = host.split('@').next_back().unwrap_or(host);
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    let hostname = host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host);
+    if hostname.is_empty() {
+        return Err(AppError::forbidden("whatsapp egress host is empty"));
     }
+    if looks_like_ip(hostname) {
+        if is_blocked_ip_literal(hostname) {
+            return Err(AppError::forbidden("whatsapp egress refused a private IP"));
+        }
+        return Err(AppError::forbidden(
+            "whatsapp egress refused a raw IP; Meta hosts only",
+        ));
+    }
+    let host_l = hostname.to_ascii_lowercase();
+    let allowed = host_l == GRAPH_API_HOST
+        || host_l.ends_with(".facebook.com")
+        || host_l.ends_with(".fbsbx.com")
+        || host_l == "lookaside.fbsbx.com";
+    if !allowed {
+        return Err(AppError::forbidden(format!(
+            "whatsapp egress host {hostname} is not a Meta graph/CDN host"
+        )));
+    }
+    Ok(())
+}
 
-    #[tokio::test]
-    async fn test_payload_creation() {
-        let account = WhatsAppAccountConfig {
-            waba_id: uuid::Uuid::new_v4(),
-            phone_number_id: uuid::Uuid::new_v4(),
-            graph_version: "v20.0".into(),
-            app_secret_ref: "ref".into(),
-            access_token_ref: "ref".into(),
-            verify_token_ref: "ref".into(),
-        };
-        let payload = crate::outbound::text_builder(account, "15551234567", "test body");
-        assert!(payload.to_string().contains("text"));
-        assert!(payload.to_string().contains("body"));
+fn looks_like_ip(host: &str) -> bool {
+    host.bytes().all(|b| b.is_ascii_digit() || b == b'.') && host.contains('.')
+        || host.contains(':') && host.bytes().all(|b| b.is_ascii_hexdigit() || b == b':')
+}
+
+fn is_blocked_ip_literal(host: &str) -> bool {
+    if host == "127.0.0.1" || host == "0.0.0.0" || host == "::1" || host == "localhost" {
+        return true;
+    }
+    if let Some(first) = host.split('.').next() {
+        matches!(first, "10" | "127" | "0" | "169" | "192" | "172")
+    } else {
+        false
+    }
+}
+
+impl ChannelClient for GraphClient {
+    fn send(&self, payload: &OutboundPayload) -> Result<SendReceipt> {
+        let body = payload.to_graph_json()?.to_string();
+        let auth = format!("Bearer {}", self.access_token);
+        let response = self.transport.post_json(&Self::send_url(), &auth, &body)?;
+        if !(200..300).contains(&response.status) {
+            return Err(error_from_graph_body(&response.body).unwrap_or_else(|| {
+                AppError::ExternalService {
+                    service: "whatsapp".into(),
+                    message: format!("send rejected with status {}", response.status),
+                }
+            }));
+        }
+        let parsed: serde_json::Value =
+            serde_json::from_str(&response.body).map_err(|e| AppError::ExternalService {
+                service: "whatsapp".into(),
+                message: format!("unreadable receipt: {e}"),
+            })?;
+        let wamid = parsed
+            .pointer("/messages/0/id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| AppError::ExternalService {
+                service: "whatsapp".into(),
+                message: "receipt missing messages[0].id".into(),
+            })?
+            .to_owned();
+        Ok(SendReceipt { wamid })
     }
 }

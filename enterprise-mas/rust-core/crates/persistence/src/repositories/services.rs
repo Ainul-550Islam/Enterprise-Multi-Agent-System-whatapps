@@ -494,6 +494,19 @@ impl UserStorePort for PgServices {
         .map_err(map_sqlx)?;
         row.as_ref().map(user_from).transpose()
     }
+
+    async fn list(&self) -> Result<Vec<User>> {
+        // Same RLS scoping as `get`: the catalogue lists exactly the rows the
+        // caller's request scope can already see, never a global dump.
+        let mut scoped = crate::scoped_request::connection().await?;
+        let rows = sqlx::query(&format!(
+            "SELECT {USER_COLUMNS} FROM users ORDER BY created_at ASC"
+        ))
+        .fetch_all(scoped.connection().as_mut())
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(user_from).collect()
+    }
 }
 
 #[async_trait::async_trait]

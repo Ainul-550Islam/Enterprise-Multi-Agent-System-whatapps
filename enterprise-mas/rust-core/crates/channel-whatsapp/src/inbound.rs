@@ -1,295 +1,303 @@
-/// Inbound message models and normaliser for WhatsApp Cloud API payloads.
-///
-/// WhatsApp sends a variety of message kinds. We normalise them into a small
-/// set of `MessageKind` variants. Fields that are not relevant to our use
-/// cases are dropped; the callee receives only what it can act on.
-///
-/// All payloads are received via the signed webhook POST (see `webhook_verify`).
-/// The raw Meta JSON is normalised here; no schema validation is performed in
-/// this crate — the application layer may add validation if needed.
-use serde::Deserialize;
+//! Inbound webhook parsing: the Meta WhatsApp Cloud API envelope → typed
+//! messages and status updates.
+//!
+//! The envelope is hostile input. Parsing is therefore:
+//!
+//! * **shape-tolerant** — unknown fields are ignored (Meta adds fields
+//!   without notice);
+//! * **shape-strict on the spine** — an envelope without
+//!   `entry[].changes[].value` is a `Serialization` error, not a silent
+//!   empty result, so a format change surfaces loudly;
+//! * **lossless on identity** — `wamid` ids and raw timestamps survive
+//!   verbatim, because dedup and audit keys depend on them.
+
+use mas_common::error::AppError;
+use mas_common::result::Result;
 use serde_json::Value;
-use std::borrow::Cow;
 
-/// The ultimate normalised inbound message that the control plane processes.
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+use crate::errors::GraphError;
+
+/// A single inbound message, normalized from the webhook envelope.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InboundMessage {
-    /// WhatsApp-assigned message ID (unique per account)
+    /// WhatsApp message id (`wamid.…`) — the idempotency key upstream.
     pub wamid: String,
-    /// WhatsApp-assigned sender ID (wa_id)
-    pub wa_id: String,
-    /// Message kind — what sort of message this is
-    pub kind: MessageKind,
-    /// Timestamp when Meta received the message (epoch-ms, optional)
-    #[serde(skip_option)]
-    pub timestamp: Option<i64>,
-    /// Account route identifier (for multi-tenant routing)
-    pub route_id: String,
+    /// Sender phone number in international format.
+    pub from: String,
+    /// Provider timestamp (unix seconds, as sent).
+    pub timestamp: String,
+    /// What the message carries.
+    pub kind: InboundKind,
 }
 
-/// Enum of supported WhatsApp message kinds.
-///
-/// Variants cover the full range of message types Meta can send. Unknown
-/// types are mapped to `Unsupported` so the control plane never crashes on
-/// a new kind; it is simply logged/replayed.
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-pub enum MessageKind {
-    /// Text message (plain or quoted)
-    Text { body: String, quote: Option<String> },
-    /// Image message
-    Image { caption: Option<String> },
-    /// Audio message (speech-to-text handled by orchestrator)
-    Audio { mime_type: String, sha256: String, duration_ms: Option<u32> },
-    /// Video message
-    Video { caption: Option<String>, mime_type: String, sha256: String, duration_ms: Option<u32> },
-    /// Document message
-    Document { filename: Option<String>, mime_type: String, sha256: String, size_bytes: u64 },
-    /// Location message
-    Location { latitude: f64, longitude: f64, name: Option<String>, address: Option<String> },
-    /// Interactive message (button, list)
-    Interactive { kind: InteractiveKind, body: String, title: Option<String>, description: Option<String> },
-    /// Button interactive component
-    Button { payload: String, text: String },
-    /// List interactive component
-    List { title: String, description: Option<String>, sections: Vec<ListSection> },
-    /// Reaction (emoji on an existing message)
+/// Message payload kinds the channel handles.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InboundKind {
+    /// `type: text` — plain text body.
+    Text { body: String },
+    /// `type: audio|image|video|document` — media reference (id + mime).
+    Media { media_id: String, mime_type: String },
+    /// `type: location`.
+    Location {
+        latitude: String,
+        longitude: String,
+        name: String,
+        address: String,
+    },
+    /// `type: reaction`.
     Reaction { emoji: String, message_id: String },
-    /// Unsupported / unknown type
-    Unsupported { raw: Value },
+    /// `type: button` or `interactive.button_reply`.
+    Button { payload: String, text: String },
+    /// `interactive.list_reply`.
+    ListReply { payload: String, title: String },
+    /// Declared `unsupported` type.
+    Unsupported { raw_type: String },
+    /// Any other type: kept visible instead of silently dropped.
+    Other { raw_type: String },
 }
 
-/// Interactive sub-kind.
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-pub enum InteractiveKind {
-    Button,
-    List,
+/// Delivery status values Meta emits on `statuses[]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeliveryStatus {
+    /// Accepted by Graph.
+    Sent,
+    /// Delivered to the device.
+    Delivered,
+    /// Read by the recipient.
+    Read,
+    /// Failed; see [`StatusUpdate::errors`].
+    Failed,
+    /// A future value Meta has not documented here.
+    Other(String),
 }
 
-/// A section in a WhatsApp list message.
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct ListSection {
-    /// Row title
-    pub title: String,
-    /// Row description (optional)
-    pub description: Option<String>,
-    /// Rows (up to 10)
-    pub rows: Vec<ListRow>,
+impl DeliveryStatus {
+    /// Parses a raw status string.
+    #[must_use]
+    pub fn parse(raw: &str) -> Self {
+        match raw {
+            "sent" => Self::Sent,
+            "delivered" => Self::Delivered,
+            "read" => Self::Read,
+            "failed" => Self::Failed,
+            other => Self::Other(other.to_owned()),
+        }
+    }
+
+    /// Wire value.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Sent => "sent",
+            Self::Delivered => "delivered",
+            Self::Read => "read",
+            Self::Failed => "failed",
+            Self::Other(raw) => raw,
+        }
+    }
 }
 
-/// A row in a WhatsApp list message.
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct ListRow {
-    /// Row title (truncated by Meta to 24 chars)
-    pub title: String,
-    /// Row description (optional, truncated by Meta to 72 chars)
-    pub description: Option<String>,
-    /// Confirmation text (shown when user selects this row)
-    pub confirmation: Option<String>,
-    /// The row's payload value (the `id` sent back when user selects)
-    pub id: String,
+/// A delivery/status update keyed by `wamid`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusUpdate {
+    /// The `wamid` this status belongs to.
+    pub wamid: String,
+    /// `sent` | `delivered` | `read` | `failed` (or future values).
+    pub status: DeliveryStatus,
+    /// Provider timestamp (unix seconds, as sent).
+    pub timestamp: String,
+    /// Meta error objects, populated on `failed`.
+    pub errors: Vec<GraphError>,
 }
 
-/// Normalise a raw WhatsApp JSON payload into `InboundMessage`.
-///
-/// The raw payload is the JSON body that Meta POSTs to the webhook URL.
-/// This function:
-///   - Parses the outer structure
-///   - Maps the `entry[changes[value.messages[...]]]` path into our types
-///   - Maps unknown message kinds to `MessageKind::Unsupported`
-///   - Extracts `wamid`, `wa_id`, `kind`, and `route_id` (from webhook path)
-///
-/// Returns `Err` if the payload structure is unrecognised.
-#[instrument(skip(raw))]
-pub fn normalise(raw: &Value, route_id: &str) -> Result<InboundMessage, ChannelError> {
-    let entry = raw.get("entry")
-        .and_then(|e| e.as_array())
-        .and_then(|a| a.first())
-        .ok_or_else(|| ChannelError::MalformedPayload("missing 'entry'".into()))?;
+/// Everything parsed out of one webhook POST.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InboundBatch {
+    /// Messages in envelope order.
+    pub messages: Vec<InboundMessage>,
+    /// Status updates in envelope order.
+    pub statuses: Vec<StatusUpdate>,
+}
 
-    let changes = entry.get("changes")
-        .and_then(|c| c.as_array())
-        .and_then(|a| a.first())
-        .ok_or_else(|| ChannelError::MalformedPayload("missing 'changes'".into()))?;
+impl InboundBatch {
+    /// True when the envelope carried nothing actionable.
+    pub fn is_empty(&self) -> bool {
+        self.messages.is_empty() && self.statuses.is_empty()
+    }
+}
 
-    let value = changes.get("value")
-        .and_then(|v| v.as_object())
-        .ok_or_else(|| ChannelError::MalformedPayload("missing 'value'".into()))?;
+/// Parses one webhook envelope (already signature-verified).
+pub fn parse_envelope(body: &[u8]) -> Result<InboundBatch> {
+    let root: Value = serde_json::from_slice(body)
+        .map_err(|e| AppError::Serialization(format!("whatsapp envelope: {e}")))?;
+    let entries = root
+        .get("entry")
+        .and_then(Value::as_array)
+        .ok_or_else(|| AppError::Serialization("whatsapp envelope missing entry[]".into()))?;
 
-    let messages = value.get("messages")
-        .and_then(|m| m.as_array())
-        .and_then(|a| a.first());
-
-    let message = messages.ok_or_else(|| {
-        // It could be a status update, not a message
-        ChannelError::UnsupportedMessageType("no message object".into())
-    })?;
-
-    let wamid = message.get("id")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .ok_or_else(|| ChannelError::MalformedPayload("missing wamid".into()))?;
-
-    let wa_id_obj = message.get("from");
-    let wa_id = wa_id_obj
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .unwrap_or_default();
-
-    let kind = match message.get("type").and_then(|v| v.as_str()) {
-        Some("text") => {
-            let body = message.get("text").and_then(|t| t.get("body")).and_then(|b| b.as_str())
-                .map(|s| s.to_string())
-                .unwrap_or_default();
-            let quote = message.get("text")
-                .and_then(|t| t.get("quote"))
-                .and_then(|q| q.as_str())
-                .map(|s| s.to_string());
-            MessageKind::Text { body, quote }
-        }
-        Some("image") => {
-            let caption = message.get("image").and_then(|i| i.get("caption")).and_then(|c| c.as_str())
-                .map(|s| s.to_string());
-            let mime_type = message.get("image").and_then(|i| i.get("mime_type")).and_then(|m| m.as_str())
-                .map(|s| s.to_string()).unwrap_or_else(|| "image/jpeg".into());
-            let sha256 = message.get("image").and_then(|i| i.get("sha256")).and_then(|s| s.as_str())
-                .map(|s| s.to_string()).unwrap_or_default();
-            let duration_ms = None; // images don't have duration
-            MessageKind::Image { caption }
-        }
-        Some("audio") => {
-            let mime_type = message.get("audio").and_then(|a| a.get("mime_type")).and_then(|m| m.as_str())
-                .map(|s| s.to_string()).unwrap_or_else(|| "audio/ogg".into());
-            let sha256 = message.get("audio").and_then(|a| a.get("sha256")).and_then(|s| s.as_str())
-                .map(|s| s.to_string()).unwrap_or_default();
-            let duration_ms = message.get("audio").and_then(|a| a.get("duration_ms")).and_then(|v| v.as_u64())
-                .map(|v| v as u32);
-            MessageKind::Audio { mime_type, sha256, duration_ms }
-        }
-        Some("video") => {
-            let caption = message.get("video").and_then(|v| v.get("caption")).and_then(|c| c.as_str())
-                .map(|s| s.to_string());
-            let mime_type = message.get("video").and_then(|v| v.get("mime_type")).and_then(|m| m.as_str())
-                .map(|s| s.to_string()).unwrap_or_else(|| "video/mp4".into());
-            let sha256 = message.get("video").and_then(|v| v.get("sha256")).and_then(|s| s.as_str())
-                .map(|s| s.to_string()).unwrap_or_default();
-            let duration_ms = message.get("video").and_then(|v| v.get("duration_ms")).and_then(|v| v.as_u64())
-                .map(|v| v as u32);
-            MessageKind::Video { caption, mime_type, sha256, duration_ms }
-        }
-        Some("document") => {
-            let filename = message.get("document").and_then(|d| d.get("filename")).and_then(|f| f.as_str())
-                .map(|s| s.to_string());
-            let mime_type = message.get("document").and_then(|d| d.get("mime_type")).and_then(|m| m.as_str())
-                .map(|s| s.to_string()).unwrap_or_else(|| "application/octet-stream".into());
-            let sha256 = message.get("document").and_then(|d| d.get("sha256")).and_then(|s| s.as_str())
-                .map(|s| s.to_string()).unwrap_or_default();
-            let size_bytes = message.get("document").and_then(|d| d.get("size")).and_then(|v| v.as_u64())
-                .map(|v| v as u64).unwrap_or(0);
-            MessageKind::Document { filename, mime_type, sha256, size_bytes }
-        }
-        Some("location") => {
-            let latitude = message.get("location").and_then(|l| l.get("latitude")).and_then(|v| v.as_f64())
-                .ok_or_else(|| ChannelError::MalformedPayload("missing latitude".into()))?;
-            let longitude = message.get("location").and_then(|l| l.get("longitude")).and_then(|v| v.as_f64())
-                .ok_or_else(|| ChannelError::MalformedPayload("missing longitude".into()))?;
-            let name = message.get("location").and_then(|l| l.get("name")).and_then(|n| n.as_str())
-                .map(|s| s.to_string());
-            let address = message.get("location").and_then(|l| l.get("address")).and_then(|a| a.as_str())
-                .map(|s| s.to_string());
-            MessageKind::Location { latitude, longitude, name, address }
-        }
-        Some("interactive") => {
-            let interactive = message.get("interactive").and_then(|i| i.as_object())
-                .ok_or_else(|| ChannelError::MalformedPayload("missing interactive object".into()))?;
-            let kind = interactive.get("type").and_then(|t| t.as_str())
-                .and_then(|t| match t.as_str() {
-                    "button" => InteractiveKind::Button,
-                    "list" => InteractiveKind::List,
-                    other => InteractiveKind::Button, // fallback, will be mapped
-                })
-                .unwrap_or(InteractiveKind::Button);
-            let body = interactive.get("body")
-                .and_then(|b| b.get("text"))
-                .and_then(|t| t.as_str())
-                .map(|s| s.to_string())
-                .unwrap_or_default();
-            let title = interactive.get("header")
-                .and_then(|h| h.get("text"))
-                .and_then(|t| t.as_str())
-                .map(|s| s.to_string());
-            let description = interactive.get("footer")
-                .and_then(|f| f.as_str())
-                .map(|s| s.to_string());
-            let (button, list) = match kind {
-                InteractiveKind::Button => {
-                    let button_obj = interactive.get("button").and_then(|b| b.as_object())
-                        .ok_or_else(|| ChannelError::MalformedPayload("missing button object".into()))?;
-                    let payload = button_obj.get("payload").and_then(|p| p.as_str()).map(|s| s.to_string()).unwrap_or_default();
-                    let btn_text = button_obj.get("text").and_then(|t| t.as_str()).map(|s| s.to_string()).unwrap_or_default();
-                    (MessageKind::Button { payload, text: btn_text }, None)
+    let mut batch = InboundBatch::default();
+    for entry in entries {
+        let changes = entry
+            .get("changes")
+            .and_then(Value::as_array)
+            .ok_or_else(|| AppError::Serialization("whatsapp entry missing changes[]".into()))?;
+        for change in changes {
+            let value = change
+                .get("value")
+                .ok_or_else(|| AppError::Serialization("whatsapp change missing value".into()))?;
+            if let Some(msgs) = value.get("messages").and_then(Value::as_array) {
+                for m in msgs {
+                    batch.messages.push(parse_message(m)?);
                 }
-                InteractiveKind::List => {
-                    let list_obj = interactive.get("list").and_then(|l| l.as_object())
-                        .ok_or_else(|| ChannelError::MalformedPayload("missing list object".into()))?;
-                    let title = list_obj.get("title").and_then(|t| t.as_str()).map(|s| s.to_string()).unwrap_or_default();
-                    let description = list_obj.get("description").and_then(|d| d.as_str()).map(|s| s.to_string());
-                    let sections = list_obj.get("sections").and_then(|s| s.as_array())
-                        .map(|arr| arr.iter().filter_map(|r| r.as_object()).collect())
-                        .unwrap_or_default();
-                    let rows = sections.iter().map(|s| ListRow {
-                        title: s.get("title").and_then(|t| t.as_str()).map(|t| t.to_string()).unwrap_or_default(),
-                        description: s.get("description").and_then(|d| d.as_str()).map(|d| d.to_string()),
-                        confirmation: s.get("confirmation").and_then(|c| c.as_str()).map(|c| c.to_string()),
-                        id: s.get("id").and_then(|i| i.as_str()).map(|i| i.to_string()).unwrap_or_default(),
-                    }).collect();
-                    (None, MessageKind::List { title, description, sections, rows })
+            }
+            if let Some(statuses) = value.get("statuses").and_then(Value::as_array) {
+                for s in statuses {
+                    batch.statuses.push(parse_status(s)?);
                 }
-            };
-            // We need to combine; for now emit Interactive as a wrapper.
-            // The caller can pattern-match on the sub-kind.
-            MessageKind::Interactive { kind, body, title, description }
+            }
         }
-        Some("reaction") => {
-            let emoji = message.get("reaction").and_then(|r| r.get("emoji")).and_then(|e| e.as_str())
-                .map(|s| s.to_string()).unwrap_or_default();
-            let msg_id = message.get("reaction").and_then(|r| r.get("message_id")).and_then(|m| m.as_str())
-                .map(|s| s.to_string()).unwrap_or_default();
-            MessageKind::Reaction { emoji, message_id }
-        }
-        Some(other) => MessageKind::Unsupported { raw: message.clone() },
-        None => MessageKind::Unsupported { raw: message.clone() },
+    }
+    Ok(batch)
+}
+
+fn req_str(v: &Value, key: &str) -> Result<String> {
+    v.get(key)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| AppError::Serialization(format!("whatsapp message missing {key}")))
+}
+
+fn parse_message(m: &Value) -> Result<InboundMessage> {
+    let wamid = req_str(m, "id")?;
+    let from = req_str(m, "from")?;
+    let timestamp = req_str(m, "timestamp")?;
+    let raw_type = m
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_owned();
+    let kind = match raw_type.as_str() {
+        "text" => InboundKind::Text {
+            body: m
+                .get("text")
+                .and_then(|t| t.get("body"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+        },
+        "audio" | "image" | "video" | "document" => {
+            let media = m.get(&raw_type).cloned().unwrap_or(Value::Null);
+            InboundKind::Media {
+                media_id: req_str(&media, "id")?,
+                mime_type: media
+                    .get("mime_type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("application/octet-stream")
+                    .to_owned(),
+            }
+        },
+        "button" => {
+            let button = m.get("button").cloned().unwrap_or(Value::Null);
+            InboundKind::Button {
+                payload: req_str(&button, "payload")?,
+                text: button
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+            }
+        },
+        "interactive" => {
+            let interactive = m.get("interactive").cloned().unwrap_or(Value::Null);
+            if let Some(reply) = interactive.get("button_reply") {
+                InboundKind::Button {
+                    payload: req_str(reply, "id")?,
+                    text: reply
+                        .get("title")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                }
+            } else if let Some(reply) = interactive.get("list_reply") {
+                InboundKind::ListReply {
+                    payload: req_str(reply, "id")?,
+                    title: reply
+                        .get("title")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                }
+            } else {
+                InboundKind::Other {
+                    raw_type: "interactive".to_owned(),
+                }
+            }
+        },
+        "location" => {
+            let loc = m.get("location").cloned().unwrap_or(Value::Null);
+            InboundKind::Location {
+                latitude: json_coord(&loc, "latitude"),
+                longitude: json_coord(&loc, "longitude"),
+                name: loc
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                address: loc
+                    .get("address")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+            }
+        },
+        "reaction" => {
+            let reaction = m.get("reaction").cloned().unwrap_or(Value::Null);
+            InboundKind::Reaction {
+                emoji: reaction
+                    .get("emoji")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                message_id: reaction
+                    .get("message_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+            }
+        },
+        "unsupported" => InboundKind::Unsupported {
+            raw_type: "unsupported".to_owned(),
+        },
+        other => InboundKind::Other {
+            raw_type: other.to_owned(),
+        },
     };
-
     Ok(InboundMessage {
         wamid,
-        wa_id,
+        from,
+        timestamp,
         kind,
-        timestamp: None, // we'll extract if needed from entry timing
-        route_id: route_id.to_string(),
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_text_normalisation() {
-        let raw = serde_json::json!({
-            "entry": [{"changes": [{"value": {"messages": [{"id": "wamid-123", "from": "15551234567", "type": "text", "text": {"body": "Hello", "quote": "Hi"}}]}]}]}
-        });
-        let msg = normalise(&raw, "route-whatsapp-1").unwrap();
-        assert_eq!(msg.wamid, "wamid-123");
-        assert_eq!(msg.wa_id, "15551234567");
-        assert!(matches!(msg.kind, MessageKind::Text { body: "Hello", quote: Some(q) if q == "Hi" }));
+fn json_coord(v: &Value, key: &str) -> String {
+    match v.get(key) {
+        Some(Value::Number(n)) => n.to_string(),
+        Some(Value::String(s)) => s.clone(),
+        _ => String::new(),
     }
+}
 
-    #[test]
-    fn test_unsupported_fallback() {
-        let raw = serde_json::json!({
-            "entry": [{"changes": [{"value": {"messages": [{"id": "wamid-999", "from": "15551234567", "type": "unknown_type"}]]}]}]
-        });
-        let msg = normalise(&raw, "route-whatsapp-1").unwrap();
-        assert!(matches!(msg.kind, MessageKind::Unsupported { .. }));
-    }
+fn parse_status(s: &Value) -> Result<StatusUpdate> {
+    let errors = s
+        .get("errors")
+        .and_then(Value::as_array)
+        .map(|arr| arr.iter().filter_map(GraphError::from_value).collect())
+        .unwrap_or_default();
+    Ok(StatusUpdate {
+        wamid: req_str(s, "id")?,
+        status: DeliveryStatus::parse(&req_str(s, "status")?),
+        timestamp: req_str(s, "timestamp")?,
+        errors,
+    })
 }

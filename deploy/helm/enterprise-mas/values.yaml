@@ -112,3 +112,24 @@ hpa:
   workerMinReplicas: 2
   workerMaxReplicas: 20
   targetCPUUtilizationPercentage: 70
+
+# --- web dashboard (Next.js standalone BFF) ---
+web:
+  enabled: true
+  replicas: 2
+  apiBaseUrl: "http://api:8080"
+  host: app.mas.example.com
+  existingSecret: mas-web-secrets
+  oidcIssuer: ""
+  oidcClientId: mas-web
+  image:
+    repository: enterprise-mas/web
+    tag: local
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 1
+      memory: 512Mi

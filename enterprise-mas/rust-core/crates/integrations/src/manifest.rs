@@ -205,6 +205,18 @@ pub fn builtin_manifests() -> Vec<ProviderManifest> {
         .allow_config(["default_channel"])
         .describe("Slack workspace messaging connector"),
         ProviderManifest::new(
+            "whatsapp",
+            "WhatsApp Business",
+            ConnectorCategory::Messaging,
+            vec![ConnectorAuthMode::ApiKey],
+        )
+        .expect("builtin manifest whatsapp")
+        .require_config(["phone_number_id"])
+        .allow_config(["api_version"])
+        .describe(
+            "WhatsApp Business Cloud API messaging connector (access token via SecretReference)",
+        ),
+        ProviderManifest::new(
             "salesforce",
             "Salesforce",
             ConnectorCategory::Crm,
@@ -356,6 +368,22 @@ mod tests {
         assert!(
             manifest.validate_key_contract(&config).is_ok(),
             "complete contract accepted"
+        );
+    }
+
+    #[test]
+    fn whatsapp_manifest_declares_its_credential_free_contract() {
+        let builtins = builtin_manifests();
+        let whatsapp = builtins
+            .iter()
+            .find(|m| m.provider == "whatsapp")
+            .expect("whatsapp builtin manifest");
+        assert_eq!(whatsapp.category, ConnectorCategory::Messaging);
+        assert_eq!(whatsapp.supported_auth, vec![ConnectorAuthMode::ApiKey]);
+        assert!(whatsapp.required_config.contains("phone_number_id"));
+        assert!(
+            !whatsapp.required_config.contains("access_token"),
+            "a manifest must never require secret material in config"
         );
     }
 

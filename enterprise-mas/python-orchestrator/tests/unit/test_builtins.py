@@ -9,6 +9,7 @@ do something it was not configured to do?
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
 import pytest
@@ -18,15 +19,19 @@ from mas_orchestrator.contracts.errors import (
     InvalidRequestError,
     ToolFailedError,
 )
+from mas_orchestrator.security.credentials import Secret
+from mas_orchestrator.tools.builtins.code import default_code_backend
 from mas_orchestrator.tools.builtins.database import (
     DatabaseTool,
     DatabaseToolConfig,
+    default_database_backend,
     normalise_statement,
     validate_statement,
 )
 from mas_orchestrator.tools.builtins.email import (
     EmailTool,
     EmailToolConfig,
+    default_email_backend,
     is_valid_address,
     normalise_domain,
 )
@@ -46,9 +51,11 @@ from mas_orchestrator.tools.builtins.search import (
     SearchResult,
     SearchTool,
     SearchToolConfig,
+    default_search_backend,
     looks_like_url,
 )
 from mas_orchestrator.tools.builtins.webhook import (
+    DeliveryDedup,
     StaticSecret,
     WebhookTarget,
     WebhookTool,
@@ -365,6 +372,7 @@ class TestWebhook:
         )
         await tool.invoke({"target_id": "crm", "event": "lead.created", "payload": {}}, _context())
         assert transport.posts[0]["headers"]["x-mas-signature"]
+        assert transport.posts[0]["headers"]["x-mas-delivery-id"]
 
     def test_target_ids_are_exposed_for_the_prompt(self) -> None:
         tool = WebhookTool(config=_webhook_config())
@@ -447,3 +455,221 @@ class TestSandbox:
 
     def test_write_durability_flag(self) -> None:
         assert not _contract(filesystem=FilesystemMode.EPHEMERAL).writes_are_durable
+
+
+class TestWebhookReplay:
+    """W-04: a signed delivery id plus receiver-side dedup closes replay.
+
+    Signature verification alone cannot tell the original delivery from a
+    byte-identical replay inside the skew window; a receiver must also
+    remember which signed delivery ids it has processed.
+    """
+
+    KEY = "k" * 32
+
+    async def _delivered(self) -> tuple[bytes, dict[str, str]]:
+        transport = _Transport()
+        tool = WebhookTool(
+            config=_webhook_config(sign_payloads=True),
+            secret=StaticSecret(self.KEY, environment="development"),
+            transport=transport,
+        )
+        await tool.invoke(
+            {"target_id": "crm", "event": "lead.created", "payload": {"id": 1}}, _context()
+        )
+        headers = transport.posts[0]["headers"]
+        body: bytes = transport.posts[0]["body"]
+        return body, headers
+
+    async def test_delivery_id_is_inside_the_signed_material(self) -> None:
+        body, headers = await self._delivered()
+        assert WebhookTool.verify(
+            body,
+            headers["x-mas-timestamp"],
+            headers["x-mas-delivery-id"],
+            headers["x-mas-signature"],
+            key=self.KEY,
+        )
+        # Swapping the signed id breaks the signature: the id cannot be
+        # stripped or replaced to dodge a receiver's dedup.
+        assert not WebhookTool.verify(
+            body,
+            headers["x-mas-timestamp"],
+            "other-delivery-id",
+            headers["x-mas-signature"],
+            key=self.KEY,
+        )
+
+    async def test_captured_replay_is_dropped_by_dedup(self) -> None:
+        body, headers = await self._delivered()
+        args = (
+            body,
+            headers["x-mas-timestamp"],
+            headers["x-mas-delivery-id"],
+            headers["x-mas-signature"],
+        )
+        # Without a dedup guard a captured delivery verifies forever inside
+        # the skew window — documented, and exactly why receivers must pass one.
+        assert WebhookTool.verify(*args, key=self.KEY)
+        assert WebhookTool.verify(*args, key=self.KEY)
+
+        dedup = DeliveryDedup()
+        assert WebhookTool.verify(*args, key=self.KEY, dedup=dedup)
+        assert not WebhookTool.verify(*args, key=self.KEY, dedup=dedup)
+
+    async def test_fresh_timestamp_cannot_resurrect_a_captured_delivery(self) -> None:
+        body, headers = await self._delivered()
+        fresh = str(int(time.time()) + 1)
+        assert not WebhookTool.verify(
+            body,
+            fresh,
+            headers["x-mas-delivery-id"],
+            headers["x-mas-signature"],
+            key=self.KEY,
+        )
+
+    async def test_failed_verifications_do_not_consume_the_delivery_id(self) -> None:
+        body, headers = await self._delivered()
+        dedup = DeliveryDedup()
+        args = (
+            body,
+            headers["x-mas-timestamp"],
+            headers["x-mas-delivery-id"],
+            "sha256=" + "0" * 64,
+        )
+        assert not WebhookTool.verify(*args, key=self.KEY, dedup=dedup)
+        # The forged attempt must not poison the id: the genuine delivery
+        # still processes exactly once.
+        good = (
+            body,
+            headers["x-mas-timestamp"],
+            headers["x-mas-delivery-id"],
+            headers["x-mas-signature"],
+        )
+        assert WebhookTool.verify(*good, key=self.KEY, dedup=dedup)
+        assert not WebhookTool.verify(*good, key=self.KEY, dedup=dedup)
+
+    async def test_verify_rejects_missing_or_oversized_delivery_id(self) -> None:
+        body, headers = await self._delivered()
+        for bad_id in ("", "x" * 129):
+            assert not WebhookTool.verify(
+                body,
+                headers["x-mas-timestamp"],
+                bad_id,
+                headers["x-mas-signature"],
+                key=self.KEY,
+            )
+
+    def test_dedup_is_atomic_under_concurrency(self) -> None:
+        """Two concurrent copies of one delivery must not both pass."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        dedup = DeliveryDedup()
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            outcomes = list(pool.map(lambda _: dedup.seen_or_record("dup-1"), range(64)))
+        assert outcomes.count(True) == 1
+        assert outcomes.count(False) == 63
+
+    def test_dedup_capacity_is_bounded(self) -> None:
+        dedup = DeliveryDedup(max_entries=2)
+        assert dedup.seen_or_record("a") is True
+        assert dedup.seen_or_record("b") is True
+        assert dedup.seen_or_record("a") is False
+        assert dedup.seen_or_record("c") is True  # evicts the oldest ("b")
+        assert dedup.seen_or_record("b") is True  # was evicted; recorded again
+
+    def test_dedup_refuses_a_nonpositive_capacity(self) -> None:
+        from mas_orchestrator.contracts.errors import InvalidRequestError
+
+        with pytest.raises(InvalidRequestError):
+            DeliveryDedup(max_entries=0)
+
+
+class _HookTransport:
+    """Minimal guarded transport stand-in (adapters only probe ``request``)."""
+
+    def request(self, *args: Any, **kwargs: Any) -> Any:  # pragma: no cover
+        raise AssertionError("the factory hook must not call the network")
+
+
+class _HookPool:
+    """Minimal pool stand-in (the adapter probes ``connection``)."""
+
+    async def connection(self, *args: Any, **kwargs: Any) -> Any:  # pragma: no cover
+        raise AssertionError("the factory hook must not open connections")
+
+
+class TestDefaultBackendHooks:
+    """The backend-factory hooks wire the real adapters from tools.backends."""
+
+    def test_email_hook_builds_smtp_and_sendgrid(self) -> None:
+        from mas_orchestrator.tools.backends.email import (
+            SendGridEmailBackend,
+            SmtpEmailBackend,
+        )
+
+        smtp = default_email_backend(
+            "smtp", host="smtp.example.test", port=587, from_address="bot@example.test"
+        )
+        assert isinstance(smtp, SmtpEmailBackend)
+
+        sendgrid = default_email_backend(
+            "sendgrid",
+            transport=_HookTransport(),
+            api_key=Secret("sg-key", reference="test://hooks"),
+            from_address="bot@example.test",
+        )
+        assert isinstance(sendgrid, SendGridEmailBackend)
+
+    def test_email_hook_rejects_unknown_kind_and_bad_settings(self) -> None:
+        with pytest.raises(ConfigurationError) as unknown:
+            default_email_backend("postfix")
+        assert unknown.value.details == {"kind": "postfix"}
+
+        with pytest.raises(ConfigurationError) as mismatch:
+            default_email_backend("smtp", host="smtp.example.test")
+        assert mismatch.value.details["kind"] == "smtp"
+
+    def test_search_hook_builds_every_adapter(self) -> None:
+        from mas_orchestrator.tools.backends.search import (
+            BraveSearchBackend,
+            SearxngSearchBackend,
+            TavilySearchBackend,
+        )
+
+        brave = default_search_backend(
+            "brave",
+            transport=_HookTransport(),
+            api_key=Secret("brave-key", reference="test://hooks"),
+        )
+        tavily = default_search_backend(
+            "tavily",
+            transport=_HookTransport(),
+            api_key=Secret("tavily-key", reference="test://hooks"),
+        )
+        searxng = default_search_backend(
+            "searxng", transport=_HookTransport(), base_url="https://sx.example.test"
+        )
+        assert isinstance(brave, BraveSearchBackend)
+        assert isinstance(tavily, TavilySearchBackend)
+        assert isinstance(searxng, SearxngSearchBackend)
+
+        with pytest.raises(ConfigurationError):
+            default_search_backend("bing", transport=_HookTransport())
+
+    def test_database_hook_builds_read_only_postgres(self) -> None:
+        from mas_orchestrator.tools.backends.database import PostgresReadOnlyBackend
+
+        pool = _HookPool()
+        backend = default_database_backend(pool=pool)
+        assert isinstance(backend, PostgresReadOnlyBackend)
+
+    def test_code_hook_builds_remote_sandbox(self) -> None:
+        from mas_orchestrator.tools.backends.sandbox import RemoteSandboxBackend
+
+        sandbox = default_code_backend(
+            transport=_HookTransport(),
+            endpoint_url="https://sandbox.example.test",
+            api_key=Secret("sbx-key", reference="test://hooks"),
+        )
+        assert isinstance(sandbox, RemoteSandboxBackend)

@@ -46,6 +46,7 @@ pub mod approval_service;
 pub mod assistant_service;
 pub mod audit;
 pub mod audit_query_service;
+pub mod billing_service;
 pub mod connector_service;
 pub mod context;
 pub mod control_plane;
@@ -64,8 +65,6 @@ pub mod inbound_webhook_service;
 pub mod integration_service;
 /// Durable recipient notification lifecycle and stable feed pagination.
 pub mod notification_service;
-/// Stripe billing service — checkout, portal, webhook handling, receipt lifecycle.
-pub mod billing_service;
 /// Authenticated connector-bound OAuth authorization initiation.
 pub mod oauth_authorization_service;
 pub mod pipeline_log;
@@ -80,6 +79,6 @@ pub mod tenancy_service;
 mod tenant_isolation;
 pub mod tool_service;
 pub mod usage_service;
-pub mod whatsapp_service;
 pub mod webhook_service;
+pub mod whatsapp_service;
 pub mod workflow_service;

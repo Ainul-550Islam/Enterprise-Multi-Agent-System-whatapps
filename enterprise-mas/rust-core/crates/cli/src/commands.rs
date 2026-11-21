@@ -11,7 +11,10 @@ use mas_common::enums::ExecutionStatus;
 use mas_common::ids::{AgentId, WorkflowId};
 use mas_contracts::execution::{ExecutionResponse, StartExecutionRequest};
 
-use crate::args::{Command, ExecutionCmd, ListGet, ScheduleCmd, SubmitArgs};
+use crate::args::{
+    AdminCmd, AdminPlanCmd, AdminSubscriptionCmd, ApiKeyCmd, Command, ExecutionCmd, ListGet,
+    ScheduleCmd, SubmitArgs,
+};
 use crate::client::{ClientConfig, MasApiClient, Outcome, Response};
 use crate::render::{render_data, render_envelope_error};
 use crate::GlobalOpts;
@@ -43,6 +46,8 @@ pub async fn run(global: &GlobalOpts, command: &Command) -> ExitCode {
         Command::Schedule(cmd) => schedule(&client, global, cmd).await,
         Command::Agent(verbs) => scoped_read(&client, global, "agents", verbs).await,
         Command::Workflow(verbs) => scoped_read(&client, global, "workflows", verbs).await,
+        Command::ApiKey(cmd) => api_key(&client, global, cmd).await,
+        Command::Admin(cmd) => admin(&client, global, cmd).await,
     }
 }
 
@@ -59,7 +64,7 @@ fn client_from(global: &GlobalOpts) -> mas_common::result::Result<MasApiClient> 
 
 /// Scoped routes require tenant + organization headers or the API answers
 /// 401/400 with VALIDATION — fail locally with the actionable message.
-fn scoped_ok(global: &GlobalOpts) -> Result<(), String> {
+pub fn scoped_ok(global: &GlobalOpts) -> Result<(), String> {
     if global.tenant.is_none() || global.organization.is_none() {
         return Err("missing scope: pass --tenant and --organization \
              (or MAS_TENANT_ID / MAS_ORGANIZATION_ID)"
@@ -127,64 +132,7 @@ async fn execution(client: &MasApiClient, global: &GlobalOpts, cmd: &ExecutionCm
         ExecutionCmd::Cancel { id } => {
             transition(client, global, "executions", *id, "cancel").await
         },
-    },
-    // Admin commands
-
-    // Admin commands
-    AdminCmd::Bootstrap => {
-        if let Err(msg) = scoped_ok(global) {
-            eprintln!("error: {msg}");
-            return ExitCode::UsageOrTransport;
-        }
-        eprintln!("bootstrap command - use 'mas admin bootstrap' directly");
-        ExitCode::Ok
-    },
-    AdminCmd::CreateAgent { name, scope, capabilities, .. } => {
-        if let Err(msg) = scoped_ok(global) {
-            eprintln!("error: {msg}");
-            return ExitCode::UsageOrTransport;
-        }
-        let body = serde_json::json!({
-            "name": name,
-            "scope": scope,
-            "capabilities": capabilities
-        });
-        let outcome: Outcome<serde_json::Value> = client.post("agents", &body).await;
-        outcome_print_ref(&outcome, global)
-    },
-    AdminCmd::CreateWorkflow { name, definition, .. } => {
-        if let Err(msg) = scoped_ok(global) {
-            eprintln!("error: {msg}");
-            return ExitCode::UsageOrTransport;
-        }
-        let body = serde_json::json!({
-            "name": name,
-            "definition": definition
-        });
-        let outcome: Outcome<serde_json::Value> = client.post("workflows", &body).await;
-        outcome_print_ref(&outcome, global)
-    },
-    AdminCmd::CreateApiKey { name, permissions, .. } => {
-        if let Err(msg) = scoped_ok(global) {
-            eprintln!("error: {msg}");
-            return ExitCode::UsageOrTransport;
-        }
-        let body = serde_json::json!({
-            "name": name,
-            "permissions": permissions
-        });
-        let outcome: Outcome<serde_json::Value> = client.post("api-keys", &body).await;
-        outcome_print_ref(&outcome, global)
-    },
-    AdminCmd::RevokeApiKey { key_id, .. } => {
-        if let Err(msg) = scoped_ok(global) {
-            eprintln!("error: {msg}");
-            return ExitCode::UsageOrTransport;
-        }
-        let outcome: Outcome<serde_json::Value> = client.del(&format!("api-keys/{key_id}")).await;
-        outcome_print_ref(&outcome, global)
-    },
-}
+    }
 }
 
 async fn submit(client: &MasApiClient, global: &GlobalOpts, args: &SubmitArgs) -> ExitCode {
@@ -310,6 +258,174 @@ async fn schedule(client: &MasApiClient, global: &GlobalOpts, cmd: &ScheduleCmd)
         ScheduleCmd::Resume { id } => transition(client, global, "schedules", *id, "resume").await,
         ScheduleCmd::Disable { id } => {
             transition(client, global, "schedules", *id, "disable").await
+        },
+    }
+}
+
+async fn api_key(client: &MasApiClient, global: &GlobalOpts, cmd: &ApiKeyCmd) -> ExitCode {
+    match cmd {
+        ApiKeyCmd::List => scoped_read(client, global, "api-keys", &ListGet::List).await,
+        ApiKeyCmd::Create {
+            name,
+            scopes,
+            expires_at,
+        } => {
+            if let Err(msg) = scoped_ok(global) {
+                eprintln!("error: {msg}");
+                return ExitCode::UsageOrTransport;
+            }
+            let expires_at = match expires_at {
+                Some(raw) => match mas_common::timestamps::Timestamp::parse_rfc3339(raw) {
+                    Ok(ts) => Some(ts),
+                    Err(err) => {
+                        eprintln!("error: --expires-at is not RFC 3339: {err}");
+                        return ExitCode::UsageOrTransport;
+                    },
+                },
+                None => None,
+            };
+            let body = mas_contracts::api_key::CreateApiKeyRequest {
+                name: name.clone(),
+                scopes: scopes.clone(),
+                expires_at,
+            };
+            let outcome: Outcome<serde_json::Value> = client.post("api-keys", &body, None).await;
+            outcome_print_ref(&outcome, global)
+        },
+        ApiKeyCmd::Revoke { id, reason } => {
+            if let Err(msg) = scoped_ok(global) {
+                eprintln!("error: {msg}");
+                return ExitCode::UsageOrTransport;
+            }
+            let body = mas_contracts::api_key::RevokeApiKeyRequest {
+                reason: reason.clone(),
+            };
+            let outcome: Outcome<serde_json::Value> = client
+                .post(&format!("api-keys/{id}/revoke"), &body, None)
+                .await;
+            outcome_print_ref(&outcome, global)
+        },
+        ApiKeyCmd::Rotate { id, grace_seconds } => {
+            if let Err(msg) = scoped_ok(global) {
+                eprintln!("error: {msg}");
+                return ExitCode::UsageOrTransport;
+            }
+            // The API requires the JSON body even when there is no grace
+            // window; `grace_seconds: null` means "cut over immediately".
+            let body = mas_contracts::api_key::RotateApiKeyRequest {
+                grace_seconds: *grace_seconds,
+            };
+            let outcome: Outcome<serde_json::Value> = client
+                .post(&format!("api-keys/{id}/rotate"), &body, None)
+                .await;
+            outcome_print_ref(&outcome, global)
+        },
+    }
+}
+
+async fn admin(client: &MasApiClient, global: &GlobalOpts, cmd: &AdminCmd) -> ExitCode {
+    match cmd {
+        AdminCmd::Plan(plan) => admin_plan(client, global, plan).await,
+        AdminCmd::Subscription(sub) => admin_subscription(client, global, sub).await,
+        AdminCmd::Bootstrap { capability } => admin_bootstrap(global, capability),
+    }
+}
+
+/// Local capability + scope check. No network: a denied capability never
+/// leaves this process, and the bearer token is never printed.
+fn admin_bootstrap(global: &GlobalOpts, capability: &str) -> ExitCode {
+    const REQUIRED: &str = "control_plane.bootstrap";
+    if capability != REQUIRED {
+        eprintln!("error: capability denied");
+        return ExitCode::UsageOrTransport;
+    }
+    if let Err(msg) = scoped_ok(global) {
+        eprintln!("error: {msg}");
+        return ExitCode::UsageOrTransport;
+    }
+    println!("bootstrap: ok");
+    ExitCode::Ok
+}
+
+async fn admin_plan(client: &MasApiClient, global: &GlobalOpts, cmd: &AdminPlanCmd) -> ExitCode {
+    if let Err(msg) = scoped_ok(global) {
+        eprintln!("error: {msg}");
+        return ExitCode::UsageOrTransport;
+    }
+    match cmd {
+        AdminPlanCmd::Create {
+            code,
+            name,
+            description,
+        } => {
+            let body = serde_json::json!({
+                "code": code,
+                "name": name,
+                "description": description,
+            });
+            let outcome: Outcome<serde_json::Value> = client.post("admin/plans", &body, None).await;
+            outcome_print_ref(&outcome, global)
+        },
+        AdminPlanCmd::Feature {
+            code,
+            feature,
+            limit,
+        } => {
+            let body = serde_json::json!({ "feature": feature, "limit": limit });
+            let outcome: Outcome<serde_json::Value> = client
+                .put(&format!("admin/plans/{code}/features"), &body)
+                .await;
+            outcome_print_ref(&outcome, global)
+        },
+    }
+}
+
+async fn admin_subscription(
+    client: &MasApiClient,
+    global: &GlobalOpts,
+    cmd: &AdminSubscriptionCmd,
+) -> ExitCode {
+    if let Err(msg) = scoped_ok(global) {
+        eprintln!("error: {msg}");
+        return ExitCode::UsageOrTransport;
+    }
+    match cmd {
+        AdminSubscriptionCmd::Create {
+            tenant_id,
+            plan_code,
+            state,
+        } => {
+            let body = serde_json::json!({ "plan_code": plan_code, "state": state });
+            let outcome: Outcome<serde_json::Value> = client
+                .post(
+                    &format!("admin/tenants/{tenant_id}/subscription"),
+                    &body,
+                    None,
+                )
+                .await;
+            outcome_print_ref(&outcome, global)
+        },
+        AdminSubscriptionCmd::Transition {
+            tenant_id,
+            state,
+            reason,
+            external_event_id,
+            expected_version,
+        } => {
+            let body = serde_json::json!({
+                "state": state,
+                "reason": reason,
+                "external_event_id": external_event_id,
+                "expected_version": expected_version,
+            });
+            let outcome: Outcome<serde_json::Value> = client
+                .post(
+                    &format!("admin/tenants/{tenant_id}/subscription/transitions"),
+                    &body,
+                    None,
+                )
+                .await;
+            outcome_print_ref(&outcome, global)
         },
     }
 }

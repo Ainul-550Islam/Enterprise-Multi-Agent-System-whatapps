@@ -48,6 +48,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from mas_orchestrator.config.enums import (
+    DataSourceKind,
     Environment,
     GuardrailFailureMode,
     MemoryBackend,
@@ -57,6 +58,7 @@ from mas_orchestrator.config.enums import (
     VectorBackend,
 )
 from mas_orchestrator.config.settings import (
+    DataHubSettings,
     MemorySettings,
     ProviderSettings,
     RagSettings,
@@ -224,6 +226,32 @@ def _check_providers(settings: Settings) -> list[ConfigViolation]:
                     message=f"provider '{name}' is test-only and cannot be enabled here",
                     remediation=(
                         "remove the fake provider or switch to a development/test environment"
+                    ),
+                )
+            )
+
+    from mas_orchestrator.config.enums import classify_provider_kind
+
+    for name in providers.enabled_providers:
+        normalised = name.strip().lower()
+        if normalised in TEST_ONLY_PROVIDERS:
+            # wire-less fakes have no provider family; the fake-provider rules
+            # above govern them
+            continue
+        try:
+            classify_provider_kind(name)
+        except ValueError:
+            violations.append(
+                ConfigViolation(
+                    field="providers.enabled_providers",
+                    message=(
+                        f"provider '{name}' has no known kind "
+                        "(expected openai/anthropic/compatible/gemini/azure/"
+                        "azure_openai/ollama/vllm/groq/openrouter)"
+                    ),
+                    remediation=(
+                        "rename the provider id so it starts with a known family "
+                        "prefix, or remove it from providers.enabled_providers"
                     ),
                 )
             )
@@ -401,6 +429,85 @@ def _check_backends(settings: Settings) -> list[ConfigViolation]:
     return violations
 
 
+def _check_data_hub(settings: Settings) -> list[ConfigViolation]:
+    """Validates Data Hub source egress and least-privilege storage wiring."""
+    violations: list[ConfigViolation] = []
+    data_hub: DataHubSettings = settings.data_hub
+    enabled = set(data_hub.allowed_source_kinds)
+
+    if DataSourceKind.WEB in enabled and not data_hub.crawl_egress_allowlist:
+        violations.append(
+            ConfigViolation(
+                field="data_hub.crawl_egress_allowlist",
+                message="web crawling is enabled without an egress host allow-list",
+                remediation=(
+                    "set data_hub.crawl_egress_allowlist to explicit public DNS hostnames; "
+                    "private addresses remain blocked"
+                ),
+            )
+        )
+
+    if DataSourceKind.OBJECT_STORAGE in enabled and not data_hub.object_storage_egress_allowlist:
+        violations.append(
+            ConfigViolation(
+                field="data_hub.object_storage_egress_allowlist",
+                message="object storage is enabled without an egress host allow-list",
+                remediation=(
+                    "set data_hub.object_storage_egress_allowlist to the approved storage hosts"
+                ),
+            )
+        )
+
+    if settings.rag.vector_backend is VectorBackend.PGVECTOR:
+        if not data_hub.database_role or data_hub.database_role.strip() != "mas_rag":
+            violations.append(
+                ConfigViolation(
+                    field="data_hub.database_role",
+                    message=(
+                        "pgvector requires the dedicated least-privilege RAG-plane role "
+                        "mas_rag, not the Rust runtime/database role"
+                    ),
+                    remediation="set data_hub.database_role='mas_rag' and provision migration 0028",
+                )
+            )
+        if not data_hub.database_url_secret_ref:
+            violations.append(
+                ConfigViolation(
+                    field="data_hub.database_url_secret_ref",
+                    message="pgvector requires a secret reference for the RAG-plane database URL",
+                    remediation=(
+                        "set data_hub.database_url_secret_ref to a mounted secret reference; "
+                        "never put the URL in TOML"
+                    ),
+                )
+            )
+
+    if (
+        settings.rag.vector_backend is VectorBackend.PGVECTOR
+        and settings.rag.embedding_dimensions != 1536
+    ):
+        violations.append(
+            ConfigViolation(
+                field="rag.embedding_dimensions",
+                message="the current pgvector migration stores 1536-dimensional embeddings",
+                remediation=(
+                    "configure a 1536-dimensional embedding model or apply a reviewed "
+                    "schema migration"
+                ),
+            )
+        )
+
+    if settings.rag.vector_backend is VectorBackend.PGVECTOR and not settings.rag.enabled:
+        violations.append(
+            ConfigViolation(
+                field="rag.enabled",
+                message="pgvector was selected while the RAG pipeline is disabled",
+                remediation="set rag.enabled=true or rag.vector_backend='disabled'",
+            )
+        )
+    return violations
+
+
 def _check_security(settings: Settings) -> list[ConfigViolation]:
     """Validates authentication, tenancy, and redaction invariants."""
     violations: list[ConfigViolation] = []
@@ -454,6 +561,21 @@ def _check_security(settings: Settings) -> list[ConfigViolation]:
                 remediation=(
                     "set security.internal_service_secret_ref to a resolvable "
                     "secret name shared with the Rust worker"
+                ),
+            )
+        )
+
+    if settings.is_production and not settings.security.internal_replay_database_url_secret_ref:
+        violations.append(
+            ConfigViolation(
+                field="security.internal_replay_database_url_secret_ref",
+                message=(
+                    "production internal authentication requires a durable shared "
+                    "replay receipt store"
+                ),
+                remediation=(
+                    "set security.internal_replay_database_url_secret_ref to a "
+                    "PostgreSQL DSN secret"
                 ),
             )
         )
@@ -539,6 +661,7 @@ def validate_settings(settings: Settings) -> tuple[ConfigViolation, ...]:
     violations.extend(_check_providers(settings))
     violations.extend(_check_tools(settings))
     violations.extend(_check_backends(settings))
+    violations.extend(_check_data_hub(settings))
     violations.extend(_check_security(settings))
     violations.extend(_check_guardrails(settings))
     violations.extend(_check_tool_output_trust(settings))
@@ -602,6 +725,7 @@ def production_ready_settings(environment: Environment = Environment.PRODUCTION)
             # message that was sent now from one that was captured earlier,
             # so production validation refuses to boot.
             internal_service_secret_ref="rust_internal_signing_secret",  # noqa: S106
+            internal_replay_database_url_secret_ref="orchestrator_replay_database_url",  # noqa: S106
         ),
     )
     return validate_settings_or_raise(settings)

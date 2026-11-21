@@ -302,7 +302,7 @@ class TestSafetySuite:
             assert_safe(SafetySuiteResult((failure,)))
 
     def test_assert_safe_passes_a_clean_suite(self) -> None:
-        assert_safe(SafetySuiteResult(()))
+        assert assert_safe(SafetySuiteResult(())) is None
 
     def test_describe_reports_only_pass_counts(self) -> None:
         passed = SafetyVerdict("a", True, SafetyCheck.NO_SECRET)

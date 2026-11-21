@@ -1,0 +1,53 @@
+# PURPOSE: Demo overlay for `docker-compose.yml` — the demo plane additions on top
+# of the production-shaped core (IdP + web dashboard + local mailbox).
+#
+# Usage:
+#   docker compose -f deploy/compose/docker-compose.yml \
+#                  -f deploy/compose/docker-compose.demo.yml up
+#
+# It must NOT replace core services: every file in this overlay only *adds*
+# services, networks or volumes. The core compose file stays authoritative.
+
+services:
+  idp:
+    image: quay.io/keycloak/keycloak:26.0
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${MAS_IDP_ADMIN_USER:-admin}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${MAS_IDP_ADMIN_PASSWORD:-admin}
+      KC_HEALTH_ENABLED: "true"
+    volumes:
+      - ./idp/realm-export.json:/opt/keycloak/data/import/realm-export.json:ro
+    ports:
+      - "8081:8080"
+    networks:
+      - mas
+      - demo
+
+  web:
+    image: enterprise-mas/web:local
+    build:
+      context: ../../web
+      dockerfile: ../deploy/docker/web.Dockerfile
+    environment:
+      MAS_API_BASE_URL: http://api:8080
+      MAS_IDP_ISSUER: http://idp:8080/realms/enterprise-mas
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+      - idp
+    networks:
+      - mas
+      - demo
+
+  mailpit:
+    image: axllent/mailpit:v1.20
+    ports:
+      - "8025:8025"
+    networks:
+      - demo
+
+networks:
+  demo:
+    driver: bridge

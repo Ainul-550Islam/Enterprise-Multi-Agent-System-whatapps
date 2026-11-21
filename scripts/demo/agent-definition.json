@@ -1,0 +1,18 @@
+{
+  "kind": "AgentDefinition",
+  "apiVersion": "mas/v1",
+  "metadata": {
+    "name": "Demo Support Agent",
+    "slug": "demo-support-agent",
+    "labels": { "demo": "true", "channel": "whatsapp" }
+  },
+  "spec": {
+    "kind": "standard",
+    "description": "Demo agent for the agents API: classifies support intents and drafts replies.",
+    "model_hint": "gpt-4.1-mini",
+    "system_prompt": "You are a concise support triage agent. Never invent account facts.",
+    "allowed_tools": ["search"],
+    "limits": { "max_steps": 4, "max_tool_calls": 2, "max_delegation_depth": 0 },
+    "tags": ["demo", "support"]
+  }
+}

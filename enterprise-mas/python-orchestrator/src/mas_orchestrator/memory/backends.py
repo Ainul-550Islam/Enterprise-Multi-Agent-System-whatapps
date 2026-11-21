@@ -2,16 +2,18 @@
 
 The production store is a database owned by Rust. Python must not write
 Rust-owned tables (spec §5), so the only backend that ships here is an
-in-process one, and it refuses to be selected in production.
+**in-process** one, and it refuses to be selected in production.
+
 That is not a stub waiting to be replaced — it is a deliberate boundary. The
 alternative would be a "temporary" SQL implementation in Python that quietly
 becomes the system of record, at which point two services own the same data and
-neither can enforce the other's invariants."""
+neither can enforce the other's invariants.
+"""
 
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Any, Final, Protocol, runtime_checkable
 
 from mas_orchestrator.config.enums import Environment
 from mas_orchestrator.contracts.errors import ConfigurationError
@@ -23,6 +25,35 @@ if TYPE_CHECKING:
 _LOGGER: Final[logging.Logger] = logging.getLogger(__name__)
 
 MAX_RECORDS_PER_TENANT: Final[int] = 10_000
+
+
+@runtime_checkable
+class MemoryStore(Protocol):
+    """What a memory backend must do."""
+
+    async def put(self, record: MemoryRecord) -> None:
+        """Stores a record, overwriting any record with the same id."""
+        ...
+
+    async def get(
+        self,
+        tenant_id: str,
+        record_id: str,
+    ) -> MemoryRecord | None:
+        """Returns a record, or ``None``. Never another tenant's record."""
+        ...
+
+    async def query(self, query: MemoryQuery) -> list[MemoryHit]:
+        """Searches within one tenant only."""
+        ...
+
+    async def delete(self, tenant_id: str, record_id: str) -> bool:
+        """Deletes a record. Returns whether it existed."""
+        ...
+
+    async def purge_tenant(self, tenant_id: str) -> int:
+        """Deletes every record for a tenant. Returns the count."""
+        ...
 
 
 class InProcessMemoryStore:
@@ -47,7 +78,7 @@ class InProcessMemoryStore:
         self._records: dict[tuple[str, str], MemoryRecord] = {}
 
     async def put(self, record: MemoryRecord) -> None:
-        """Stores a record, overwriting any record with the same id."""
+        """Stores a record."""
         key = (record.tenant_id, record.record_id)
         if len(self._records) >= MAX_RECORDS_PER_TENANT and key not in self._records:
             raise ConfigurationError(
@@ -61,7 +92,7 @@ class InProcessMemoryStore:
         return self._records.get((tenant_id, record_id))
 
     async def query(self, query: MemoryQuery) -> list[MemoryHit]:
-        """Search records for one tenant.
+        """Searches records for one tenant.
 
         Matching is a plain case-insensitive substring test. That is honest
         for a development store; semantic retrieval belongs to the RAG layer,
@@ -79,7 +110,7 @@ class InProcessMemoryStore:
                 continue
             if query.execution_id is not None and record.execution_id != query.execution_id:
                 continue
-            if query.include_sensitive and record.needs_redaction():
+            if not query.include_sensitive and record.needs_redaction():
                 # Skipped rather than returned unredacted: leaking an
                 # unredacted sensitive record is worse than omitting it.
                 continue
@@ -97,7 +128,7 @@ class InProcessMemoryStore:
         return self._records.pop((tenant_id, record_id), None) is not None
 
     async def purge_tenant(self, tenant_id: str) -> int:
-        """Deletes every record for a tenant."""
+        """Deletes all records for a tenant."""
         doomed = [key for key in self._records if key[0] == tenant_id]
         for key in doomed:
             del self._records[key]
@@ -163,100 +194,28 @@ def assert_tenant_scoped(records: Sequence[MemoryRecord], tenant_id: str) -> Non
         )
 
 
-class PostgresMemoryStore:
-    """Postgres-backed memory store with pgvector and RLS.
+def build_memory_store(backend: str, *, pool: Any = None) -> MemoryStore:
+    """Constructs the configured memory backend.
 
-    Requires PostgreSQL with the pgvector extension installed.
-    Tenant isolation is enforced at the database level via Row Level Security.
-    The ``mas_memory" role is confined to this table only.
+    ``backend="postgres"`` hands durability to
+    :class:`~mas_orchestrator.memory.postgres_store.PostgresMemoryStore`
+    (Rust-owned tables, spec §5) and needs an already-open pool;
+    ``backend="in-process"`` (or ``""``) is :class:`InProcessMemoryStore`.
+    Unknown names fail closed. The import is function-local so that
+    ``postgres_store`` can depend on this module without a cycle.
     """
-
-    def __init__(self, *, connection_dsn: str, environment: Environment = Environment.DEVELOPMENT) -> None:
-        self._connection_dsn = connection_dsn
-        self._environment = environment
-
-        if environment is Environment.PRODUCTION:
+    if backend == "postgres":
+        if pool is None:
             raise ConfigurationError(
-                "PostgresMemoryStore must not be constructed directly in production; "
-                "use the factory or the Rust-owned durable store",
-                details={"environment": environment.value},
+                "postgres memory backend requires an open pool",
+                details={"backend": backend},
             )
+        from mas_orchestrator.memory.postgres_store import PostgresMemoryStore
 
-    async def put(self, record: MemoryRecord) -> None:
-        """Stores a record."""
-        raise NotImplementedError("PostgresMemoryStore put not implemented in this layer")
-
-    async def get(self, tenant_id: str, record_id: str) -> MemoryRecord | None:
-        """Get a single record by ID, scoped to tenant."""
-        raise NotImplementedError("PostgresMemoryStore get not implemented in this layer")
-
-    async def query(self, query: MemoryQuery) -> list[MemoryHit]:
-        """Search memories for one tenant with scope filtering."""
-        raise NotImplementedError("PostgresMemoryStore query not implemented in this layer")
-
-    async def delete(self, tenant_id: str, record_id: str) -> bool:
-        """Delete a record by tenant and ID."""
-        raise NotImplementedError("PostgresMemoryStore delete not implemented in this layer")
-
-    async def purge_tenant(self, tenant_id: str) -> int:
-        """Delete all records for a tenant."""
-        raise NotImplementedError("PostgresMemoryStore purge_tenant not implemented in this layer")
-
-    async def count(self, tenant_id: str | None = None) -> int:
-        """Count records, optionally scoped to tenant."""
-        raise NotImplementedError("PostgresMemoryStore count not implemented in this layer")
-
-
-def memory_store_factory(
-    *,
-    backend: str = "in_process",
-    connection_dsn: str | None = None,
-    environment: Environment = Environment.DEVELOPMENT,
-) -> MemoryStore:
-    """Factory function to create a memory store instance.
-
-    Args:
-        backend: Which backend to use. ``in_process`` is the default for
-            development; ``postgres`` requires a connection_dsn.
-        connection_dsn: PostgreSQL DSN for the ``postgres`` backend.
-        environment: Current deployment environment.
-
-    Returns:
-        An initialized MemoryStore instance.
-
-    Raises:
-        ConfigurationError: If an unknown backend is requested, or if ``postgres"
-            is selected without a connection_dsn, or if ``postgres" is selected
-            in production (the production store is owned by Rust).
-    """
-    from mas_orchestrator.memory.postgres_store import PostgresMemoryStore
-    from mas_orchestrator.memory.short_term import ShortTermMemoryStore
-
-    if backend == "in_process":
-        return InProcessMemoryStore(environment=environment)
-    elif backend == "postgres":
-        if environment is Environment.PRODUCTION:
-            raise ConfigurationError(
-                "postgres memory backend must not be selected in production; "
-                "the durable store is owned by Rust",
-                details={"environment": environment.value},
-            )
-        if connection_dsn is None:
-            raise ConfigurationError(
-                "postgres memory backend requires a connection_dsn",
-                details={"field": "connection_dsn"},
-            )
-        return PostgresMemoryStore(
-            connection_dsn=connection_dsn, environment=environment
-        )
-    else:
-        raise ConfigurationError(
-            f"unknown memory backend: {backend}",
-            details={"backend": backend, "supported": ["in_process", "postgres"]},
-        )
-
-
-
-# Legacy alias for backward compatibility
-memory_store_factory.InProcessMemoryStore = InProcessMemoryStore
-memory_store_factory.PostgresMemoryStore = PostgresMemoryStore
+        return PostgresMemoryStore(pool)
+    if backend in ("", "in-process"):
+        return InProcessMemoryStore()
+    raise ConfigurationError(
+        "unknown memory backend",
+        details={"backend": backend, "supported": ["postgres", "in-process"]},
+    )

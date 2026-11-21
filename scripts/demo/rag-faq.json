@@ -1,0 +1,6 @@
+{
+  "name": "Demo RAG FAQ",
+  "slug": "rag-faq",
+  "kind": "standard",
+  "description": "Answers only from retrieved documents. Empty retrieval is an honest miss, not a fabricated FAQ."
+}

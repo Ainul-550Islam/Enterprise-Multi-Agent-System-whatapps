@@ -25,10 +25,21 @@ spec:
                 name: {{ include "enterprise-mas.fullname" . }}-api
                 port:
                   number: 8080
+    - host: {{ .Values.web.host | default "app.mas.example.com" }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "enterprise-mas.fullname" . }}-web
+                port:
+                  number: 3000
   {{- if .Values.ingress.tls.enabled }}
   tls:
     - hosts:
         - api.mas.example.com
+        - {{ .Values.web.host | default "app.mas.example.com" }}
       secretName: {{ include "enterprise-mas.fullname" . }}-tls
   {{- end }}
 {{- end }}

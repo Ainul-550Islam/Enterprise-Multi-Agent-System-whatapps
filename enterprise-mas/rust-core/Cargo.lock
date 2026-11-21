@@ -1408,7 +1408,7 @@ checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
 
 [[package]]
 name = "mas-ai-bridge"
-version = "0.1.0"
+version = "1.1.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1430,7 +1430,7 @@ dependencies = [
 
 [[package]]
 name = "mas-api"
-version = "0.1.0"
+version = "1.1.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -1470,13 +1470,15 @@ dependencies = [
 
 [[package]]
 name = "mas-application"
-version = "0.1.0"
+version = "1.1.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
  "chrono",
  "criterion",
  "hex",
+ "hmac",
+ "mas-billing-stripe",
  "mas-common",
  "mas-contracts",
  "mas-domain",
@@ -1497,8 +1499,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "mas-billing-stripe"
+version = "1.1.0"
+dependencies = [
+ "hex",
+ "hmac",
+ "mas-common",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "mas-channel-whatsapp"
+version = "1.1.0"
+dependencies = [
+ "hex",
+ "hmac",
+ "mas-common",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "mas-cli"
-version = "0.1.0"
+version = "1.1.0"
 dependencies = [
  "axum",
  "clap",
@@ -1515,7 +1541,7 @@ dependencies = [
 
 [[package]]
 name = "mas-common"
-version = "0.1.0"
+version = "1.1.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -1531,7 +1557,7 @@ dependencies = [
 
 [[package]]
 name = "mas-contracts"
-version = "0.1.0"
+version = "1.1.0"
 dependencies = [
  "chrono",
  "mas-common",
@@ -1542,7 +1568,7 @@ dependencies = [
 
 [[package]]
 name = "mas-domain"
-version = "0.1.0"
+version = "1.1.0"
 dependencies = [
  "chrono",
  "cron",
@@ -1557,7 +1583,7 @@ dependencies = [
 
 [[package]]
 name = "mas-events"
-version = "0.1.0"
+version = "1.1.0"
 dependencies = [
  "async-trait",
  "mas-common",
@@ -1571,7 +1597,7 @@ dependencies = [
 
 [[package]]
 name = "mas-execution"
-version = "0.1.0"
+version = "1.1.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1590,7 +1616,7 @@ dependencies = [
 
 [[package]]
 name = "mas-integrations"
-version = "0.1.0"
+version = "1.1.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1613,7 +1639,7 @@ dependencies = [
 
 [[package]]
 name = "mas-messaging"
-version = "0.1.0"
+version = "1.1.0"
 dependencies = [
  "async-nats",
  "async-trait",
@@ -1630,7 +1656,7 @@ dependencies = [
 
 [[package]]
 name = "mas-observability"
-version = "0.1.0"
+version = "1.1.0"
 dependencies = [
  "async-trait",
  "hex",
@@ -1645,7 +1671,7 @@ dependencies = [
 
 [[package]]
 name = "mas-orchestration"
-version = "0.1.0"
+version = "1.1.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1666,7 +1692,7 @@ dependencies = [
 
 [[package]]
 name = "mas-persistence"
-version = "0.1.0"
+version = "1.1.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1697,7 +1723,7 @@ dependencies = [
 
 [[package]]
 name = "mas-policy"
-version = "0.1.0"
+version = "1.1.0"
 dependencies = [
  "async-trait",
  "hex",
@@ -1713,7 +1739,7 @@ dependencies = [
 
 [[package]]
 name = "mas-quota"
-version = "0.1.0"
+version = "1.1.0"
 dependencies = [
  "async-trait",
  "mas-common",
@@ -1725,7 +1751,7 @@ dependencies = [
 
 [[package]]
 name = "mas-scheduler-service"
-version = "0.1.0"
+version = "1.1.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -1753,7 +1779,7 @@ dependencies = [
 
 [[package]]
 name = "mas-scheduling"
-version = "0.1.0"
+version = "1.1.0"
 dependencies = [
  "async-trait",
  "mas-common",
@@ -1766,7 +1792,7 @@ dependencies = [
 
 [[package]]
 name = "mas-security"
-version = "0.1.0"
+version = "1.1.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1787,7 +1813,7 @@ dependencies = [
 
 [[package]]
 name = "mas-tenancy"
-version = "0.1.0"
+version = "1.1.0"
 dependencies = [
  "async-trait",
  "mas-common",
@@ -1801,7 +1827,7 @@ dependencies = [
 
 [[package]]
 name = "mas-worker"
-version = "0.1.0"
+version = "1.1.0"
 dependencies = [
  "async-trait",
  "criterion",
@@ -1820,7 +1846,7 @@ dependencies = [
 
 [[package]]
 name = "mas-worker-service"
-version = "0.1.0"
+version = "1.1.0"
 dependencies = [
  "async-trait",
  "mas-ai-bridge",

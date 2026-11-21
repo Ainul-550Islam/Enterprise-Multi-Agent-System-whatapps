@@ -7,7 +7,7 @@
 
 [package]
 name = "mas-ai-bridge"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 rust-version = "1.85"
 description = "gRPC adapter implementing mas-execution's AgentBridge port against the Python AI Orchestrator."

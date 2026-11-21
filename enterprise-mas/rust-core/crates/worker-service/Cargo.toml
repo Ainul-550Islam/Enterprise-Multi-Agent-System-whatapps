@@ -7,7 +7,7 @@
 
 [package]
 name = "mas-worker-service"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 license = "MIT"
 description = "Host binary for the mas-worker durable consumer (mirrors mas-scheduler-service)."

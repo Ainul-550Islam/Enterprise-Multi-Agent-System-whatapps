@@ -1,42 +1,65 @@
--- 0058_plan_prices up.sql
--- plan_prices table: maps internal plan_code → Stripe price_id + metadata
+-- PURPOSE: Migration 0058 — the plan ↔ billing-provider price mapping.
+--
+-- A checkout needs to know which provider price (`price_…`) to charge for a
+-- platform plan on a given provider and billing interval. Before this table
+-- that mapping was a constant compiled into the process; it is data now.
+--
+-- Uniqueness, two guarantees:
+--   • `UNIQUE (tenant_id, provider, plan_id, billing_interval)` — one price
+--     per plan/interval/provider within a tenant's catalogue;
+--   • `UNIQUE (provider, provider_price_id)` — a provider price id maps to
+--     exactly one row, so a webhook that names a price can never be applied
+--     against two mappings.
+--
+-- Data ownership: Rust-owned platform state. Provider price ids are opaque
+-- handles; amounts are integer minor units (cents), never floats. No provider
+-- secret or key is stored here.
+--
+-- It must NOT:
+--   • float the amount — money is integer minor units with an explicit
+--     currency;
+--   • let one provider price id map to two plans;
+--   • be readable cross-tenant (FORCE RLS below is the control).
 
--- Table: plan_prices
--- Holds Stripe price metadata for checkout/portal session creation.
--- One row per (plan_code, provider), ensured unique by plan_code.
-CREATE TABLE IF NOT EXISTS plan_prices (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    plan_code TEXT NOT NULL,           -- internal plan identifier (e.g. "free", "pro", "business")
-    provider TEXT NOT NULL DEFAULT 'stripe',
-    price_id TEXT NOT NULL UNIQUE,     -- Stripe price ID (e.g. "price_123456789")
-    interval TEXT NOT NULL,            -- "monthly" or "yearly"
-    currency TEXT NOT NULL,            -- ISO 4217 currency code (e.g. "usd", "eur")
-    amount INTEGER NOT NULL,           -- amount in smallest currency unit (cents for USD)
-    stripe_secret_ref TEXT NOT NULL,   -- reference to secret store key
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now,
-
-    -- One price per (plan_code, provider)
-    CONSTRAINT uq_plan_code_provider UNIQUE (plan_code, provider),
-
-    -- Row-level security: tenants can only read their own prices
-    CONSTRAINT tenant_plan_prices_check CHECK (tenant_id IS NULL OR tenant_id = current_setting('app.tenant_id')::uuid),
-
-    -- Indexes
-    INDEX idx_plan_prices_code ON plan_prices (plan_code),
-    INDEX idx_plan_prices_currency ON plan_prices (currency),
-    INDEX idx_plan_prices_interval ON plan_prices (interval)
+CREATE TABLE plan_prices (
+    id                uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id         uuid NOT NULL REFERENCES tenants (id) ON DELETE CASCADE,
+    plan_id           uuid NOT NULL REFERENCES plans (id) ON DELETE CASCADE,
+    provider          text NOT NULL CHECK (char_length(provider) BETWEEN 1 AND 32),
+    -- Opaque provider handle (`price_…`). Globally unique: a webhook naming
+    -- this price must resolve to exactly one mapping.
+    provider_price_id text NOT NULL CHECK (char_length(provider_price_id) BETWEEN 1 AND 128),
+    currency          text NOT NULL DEFAULT 'usd'
+                      CHECK (currency ~ '^[a-z]{3}$'),
+    -- Integer minor units (cents). NULL when the provider does not expose an
+    -- amount to the platform; never fabricated as zero.
+    unit_amount       bigint NULL CHECK (unit_amount IS NULL OR unit_amount >= 0),
+    billing_interval  text NOT NULL
+                      CHECK (billing_interval IN ('month', 'year', 'one_time')),
+    active            boolean NOT NULL DEFAULT true,
+    created_at        timestamptz NOT NULL DEFAULT now(),
+    updated_at        timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (tenant_id, provider, plan_id, billing_interval)
 );
 
--- Audit trigger
-CREATE OR REPLACE FUNCTION plan_prices_audit()
-RETURNS TRIGGER AS $$
-BEGIN
-    NEW.updated_at = now();
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
+CREATE UNIQUE INDEX plan_prices_provider_price_key
+    ON plan_prices (provider, provider_price_id);
+CREATE INDEX plan_prices_tenant_plan_idx
+    ON plan_prices (tenant_id, plan_id, active);
 
-CREATE TRIGGER plan_prices_updated_at_trigger
-    BEFORE UPDATE ON plan_prices
-    FOR EACH ROW EXECUTE FUNCTION plan_prices_audit();
+CREATE TRIGGER plan_prices_updated_at BEFORE UPDATE ON plan_prices
+    FOR EACH ROW EXECUTE FUNCTION mas_set_updated_at();
+
+ALTER TABLE plan_prices ENABLE ROW LEVEL SECURITY;
+ALTER TABLE plan_prices FORCE ROW LEVEL SECURITY;
+CREATE POLICY plan_prices_tenant_isolation ON plan_prices
+    USING (
+        tenant_id = nullif(current_setting('app.current_tenant', true), '')::uuid
+    )
+    WITH CHECK (
+        tenant_id = nullif(current_setting('app.current_tenant', true), '')::uuid
+    );
+
+COMMENT ON TABLE plan_prices IS
+    'Tenant-scoped plan ↔ provider price catalogue. Amounts are integer minor '
+    'units; provider price ids are opaque handles, globally unique.';

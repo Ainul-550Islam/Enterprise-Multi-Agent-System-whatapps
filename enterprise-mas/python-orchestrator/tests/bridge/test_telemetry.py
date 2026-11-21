@@ -344,9 +344,9 @@ class TestNoopTelemetry:
     async def test_the_noop_sink_accepts_every_call(self) -> None:
         """Every method is a no-op, so no call site needs a guard."""
         telemetry = NoopTelemetry()
-        telemetry.tenant_mismatch(correlation_id="c", reason="r")
-        telemetry.model_latency(provider="p", elapsed_ms=1.0)
-        telemetry.tool_latency(tool_kind="k", elapsed_ms=1.0)
+        assert telemetry.tenant_mismatch(correlation_id="c", reason="r") is None
+        assert telemetry.model_latency(provider="p", elapsed_ms=1.0) is None
+        assert telemetry.tool_latency(tool_kind="k", elapsed_ms=1.0) is None
 
     async def test_a_span_measures_a_block(self, recorder: MetricsRecorder) -> None:
         """The span helper returns a usable duration."""

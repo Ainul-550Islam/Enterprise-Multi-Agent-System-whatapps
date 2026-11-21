@@ -1,0 +1,6 @@
+{
+  "name": "Demo Support Bot",
+  "slug": "support-bot",
+  "kind": "standard",
+  "description": "Classifies support intents and drafts replies. Never invents account facts."
+}

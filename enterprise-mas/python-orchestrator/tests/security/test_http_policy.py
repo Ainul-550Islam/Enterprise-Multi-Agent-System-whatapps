@@ -169,7 +169,7 @@ class TestBlockedAddressRanges:
             _policy().validate_resolved_address("127.0.0.1")
 
     def test_policy_allows_public_resolution(self) -> None:
-        _policy().validate_resolved_address("93.184.216.34")
+        assert _policy().validate_resolved_address("93.184.216.34") is None
 
     def test_private_network_bypass_is_refused_at_policy_construction(self) -> None:
         """Development fixtures must inject a fake transport, never weaken egress."""

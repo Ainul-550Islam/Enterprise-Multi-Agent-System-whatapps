@@ -20,6 +20,7 @@ rather than run a degraded, silently-unsafe AI runtime.
 from __future__ import annotations
 
 from mas_orchestrator.config.enums import (
+    DataSourceKind,
     Environment,
     GuardrailFailureMode,
     LogFormat,
@@ -35,6 +36,7 @@ from mas_orchestrator.config.settings import (
     DEFAULT_MAX_TOOL_RESULT_BYTES,
     ENV_PREFIX,
     AgentRuntimeSettings,
+    DataHubSettings,
     GuardrailSettings,
     MemorySettings,
     ObservabilitySettings,
@@ -64,6 +66,8 @@ __all__ = [
     "AgentRuntimeSettings",
     "ConfigViolation",
     "ConfigurationError",
+    "DataHubSettings",
+    "DataSourceKind",
     "Environment",
     "GuardrailFailureMode",
     "GuardrailSettings",

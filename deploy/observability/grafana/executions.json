@@ -1,0 +1,70 @@
+{
+  "title": "MAS Executions",
+  "uid": "mas-executions",
+  "tags": ["mas", "executions"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Submissions vs terminal outcomes",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        { "expr": "sum(rate(mas_execution_submissions_total[5m]))", "legendFormat": "submissions" },
+        { "expr": "sum(rate(mas_execution_succeeded_total[5m]))", "legendFormat": "succeeded" },
+        { "expr": "sum(rate(mas_execution_failed_total[5m]))", "legendFormat": "failed" },
+        { "expr": "sum(rate(mas_execution_cancelled_total[5m]))", "legendFormat": "cancelled" }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Duration p50/p95/p99 (ms)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(mas_execution_duration_ms_bucket[5m])) by (le))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(mas_execution_duration_ms_bucket[5m])) by (le))",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(mas_execution_duration_ms_bucket[5m])) by (le))",
+          "legendFormat": "p99"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Claim latency, retries, stale rejections",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 8 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(mas_task_claim_latency_ms_bucket[5m])) by (le))",
+          "legendFormat": "claim p95 ms"
+        },
+        { "expr": "sum(rate(mas_task_retries_total[5m]))", "legendFormat": "retries" },
+        { "expr": "sum(rate(mas_stale_worker_rejections_total[5m]))", "legendFormat": "stale worker" },
+        { "expr": "sum(mas_active_attempts)", "legendFormat": "active attempts" }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Idempotency + tasks created",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 16 },
+      "targets": [
+        { "expr": "sum(rate(mas_task_created_total[5m]))", "legendFormat": "tasks created" },
+        { "expr": "sum(rate(mas_idempotency_duplicate_requests_total[5m]))", "legendFormat": "idempotent replay" },
+        { "expr": "sum(rate(mas_idempotency_conflicts_total[5m]))", "legendFormat": "idempotency conflict" },
+        { "expr": "sum(rate(mas_broker_redeliveries_total[5m]))", "legendFormat": "broker redeliveries" }
+      ]
+    }
+  ]
+}

@@ -18,8 +18,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from contextlib import suppress
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any, Final, cast
 
 from mas_orchestrator.agents.base import (
     AgentKind,
@@ -32,6 +33,7 @@ from mas_orchestrator.agents.base import (
 from mas_orchestrator.agents.router import AgentRoutingRequest
 from mas_orchestrator.contracts.errors import (
     AgentNotFoundError,
+    CancellationRequestedError,
     ConfigurationError,
     ExecutionTimeoutError,
 )
@@ -146,6 +148,7 @@ class AgentRuntime:
         state: AgentState | None = None,
         cancel_event: asyncio.Event | None = None,
         agent_id: str | None = None,
+        agent_spec: AgentSpec | None = None,
     ) -> ExecutionResult:
         """Runs one execution end to end.
 
@@ -158,6 +161,9 @@ class AgentRuntime:
             cancel_event: Optional cancellation signal.
             agent_id: Run a specific agent instead of selecting one. The
                 agent must still satisfy the routing policy.
+            agent_spec: Optional immutable Rust-resolved definition. When
+                present, the process-local registry is not consulted for the
+                root agent.
 
         Returns:
             An :class:`ExecutionResult`.
@@ -169,7 +175,7 @@ class AgentRuntime:
         started = time.monotonic()
         ledger = CostLedger(self._pricing) if self._pricing is not None else None
 
-        spec = self._select_agent(context.tenant_id, routing, agent_id)
+        spec = self._select_agent(context.tenant_id, routing, agent_id, agent_spec=agent_spec)
         agent = self._factory.build(spec, ledger=ledger)
 
         initial = state or _seed(spec, request)
@@ -177,13 +183,12 @@ class AgentRuntime:
 
         try:
             outcome = await self._run_bounded(agent, initial, context, cancel_event)
-        except asyncio.CancelledError as error:
-            outcome = AgentOutcome(
-                agent_id=spec.agent_id,
-                termination=Termination.CANCELLED,
-                error=error,
-                duration_ms=int((time.monotonic() - started) * 1000),
-            )
+        except asyncio.CancelledError:
+            # Preserve structured-concurrency cancellation.  Converting it into
+            # a result lets upstream workers believe cancellation settled while
+            # nested provider/tool work may still be unwinding.
+            cancel_event.set()
+            raise
 
         duration_ms = int((time.monotonic() - started) * 1000)
         _LOGGER.info(
@@ -212,8 +217,35 @@ class AgentRuntime:
         tenant_id: str,
         routing: AgentRoutingRequest | None,
         agent_id: str | None,
+        *,
+        agent_spec: AgentSpec | None = None,
     ) -> AgentSpec:
-        """Selects the agent, honouring both the policy and an explicit choice."""
+        """Selects an agent, preferring a validated per-run Rust snapshot."""
+        if agent_spec is not None:
+            selected_id = agent_id or agent_spec.agent_id
+            if (
+                agent_spec.tenant_id != tenant_id
+                or agent_spec.agent_id != selected_id
+                or not agent_spec.is_runnable
+            ):
+                raise AgentNotFoundError(
+                    "the Rust-resolved agent snapshot is unavailable in this tenant",
+                    details={"agent_id": selected_id, "tenant_id": tenant_id},
+                )
+            if agent_spec.kind is AgentKind.SUPERVISOR:
+                # A root-only snapshot cannot authorize delegated agents. Do
+                # not let AgentFactory's process-local registry fill that gap.
+                raise ConfigurationError(
+                    "supervisor execution requires pinned delegated-agent snapshots",
+                    details={"agent_id": agent_spec.agent_id},
+                )
+            if self._router.evaluate(agent_spec, routing or AgentRoutingRequest()) is not None:
+                raise AgentNotFoundError(
+                    "the requested agent does not satisfy the routing policy",
+                    details={"agent_id": selected_id, "tenant_id": tenant_id},
+                )
+            return agent_spec
+
         if agent_id is not None:
             spec = self._registry.spec(tenant_id, agent_id)
             if self._router.evaluate(spec, routing or AgentRoutingRequest()) is not None:
@@ -246,16 +278,39 @@ class AgentRuntime:
             else self._config.default_timeout_seconds
         )
 
+        run_task = asyncio.create_task(agent.run(state, context, cancel_event=cancel_event))
+        cancellation_wait = asyncio.create_task(cancel_event.wait())
         try:
-            return await asyncio.wait_for(
-                agent.run(state, context, cancel_event=cancel_event),
+            done, _pending = await asyncio.wait(
+                {run_task, cancellation_wait},
                 timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED,
             )
-        except TimeoutError as error:
+            if run_task in done:
+                return cast("AgentOutcome", await run_task)
+            if cancellation_wait in done:
+                # A provider/tool may be blocked in an await and therefore not
+                # observe the cooperative event itself.  Cancel its task and
+                # wait for cleanup before reporting a cancellation outcome.
+                run_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await run_task
+                raise CancellationRequestedError("execution cancellation was requested")
+            run_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await run_task
             raise ExecutionTimeoutError(
                 "execution exceeded the runtime deadline",
                 details={"timeout_seconds": timeout},
-            ) from error
+            )
+        finally:
+            cancellation_wait.cancel()
+            with suppress(asyncio.CancelledError):
+                await cancellation_wait
+            if not run_task.done():
+                run_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await run_task
 
     async def execute_parallel(
         self,

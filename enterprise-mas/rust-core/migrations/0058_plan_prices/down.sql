@@ -1,10 +1,15 @@
--- 0058_plan_prices down.sql
+-- Reverses 0058_plan_prices only after an explicit data-loss opt-in.
+-- Set `mas.allow_data_loss = 'true'` in the migration session to drop stored
+-- price mappings.
 
-DROP TRIGGER IF EXISTS plan_prices_updated_at_trigger ON plan_prices;
-DROP FUNCTION IF EXISTS plan_prices_audit() ON plan_prices;
+DO $$
+BEGIN
+    IF current_setting('mas.allow_data_loss', true) IS DISTINCT FROM 'true'
+       AND EXISTS (SELECT 1 FROM plan_prices LIMIT 1) THEN
+        RAISE EXCEPTION
+            '0058 down migration would delete plan prices; set mas.allow_data_loss=true explicitly';
+    END IF;
+END
+$$;
 
-DROP INDEX IF EXISTS idx_plan_prices_interval;
-DROP INDEX IF EXISTS idx_plan_prices_currency;
-DROP INDEX IF EXISTS idx_plan_prices_code;
-
-DROP TABLE IF EXISTS plan_prices CASCADE;
+DROP TABLE IF EXISTS plan_prices;

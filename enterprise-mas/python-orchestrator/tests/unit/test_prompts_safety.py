@@ -128,7 +128,7 @@ class TestAssembly:
             assert_assembly("x" * 200, max_chars=100)
 
     def test_assert_accepts_a_good_prompt(self) -> None:
-        assert_assembly("You are a helpful assistant.")
+        assert assert_assembly("You are a helpful assistant.") is None
 
     def test_default_ceiling_is_generous_but_finite(self) -> None:
         assert 0 < MAX_PROMPT_CHARS < 10_000_000

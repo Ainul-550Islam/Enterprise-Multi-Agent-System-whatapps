@@ -79,6 +79,13 @@ from mas_orchestrator.memory.models import (
     Sensitivity,
     new_record_id,
 )
+from mas_orchestrator.memory.postgres_store import (
+    REQUIRED_ROLE as MEMORY_PLANE_ROLE,
+)
+from mas_orchestrator.memory.postgres_store import (
+    PostgresMemoryStore,
+    PostgresMemoryStoreConfig,
+)
 from mas_orchestrator.memory.retention import (
     RetentionPolicy,
     describe_retention,
@@ -106,6 +113,7 @@ __all__ = [
     "MAX_MEMORY_METADATA_KEYS",
     "MAX_RECORDS_PER_TENANT",
     "MAX_TASK_RECORDS_PER_EXECUTION",
+    "MEMORY_PLANE_ROLE",
     "PERSISTENCE_RISK_CEILING",
     "CompactionResult",
     "InProcessMemoryStore",
@@ -117,6 +125,8 @@ __all__ = [
     "MemoryScope",
     "MemoryStore",
     "NoRedaction",
+    "PostgresMemoryStore",
+    "PostgresMemoryStoreConfig",
     "RedactionHook",
     "Retention",
     "RetentionPolicy",

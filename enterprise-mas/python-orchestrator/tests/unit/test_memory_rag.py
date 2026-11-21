@@ -782,17 +782,19 @@ class TestCitations:
 
     def test_assert_supported_passes_when_valid(self) -> None:
         checks = validate_citations([self._citation("hello")], {"c1": "hello world"})
-        assert_supported(checks)
+        assert len(checks) == 1
+        assert assert_supported(checks) is None
 
     def test_tolerates_some_bad_citations(self) -> None:
         checks = [
             validate_citation(self._citation("hello"), "hello world"),
             validate_citation(self._citation("nonsense"), "hello world"),
         ]
-        assert_supported(checks, require_all=False)
+        assert len(checks) == 2
+        assert assert_supported(checks, require_all=False) is None
 
     def test_empty_checks_pass(self) -> None:
-        assert_supported([])
+        assert assert_supported([]) is None
 
     def test_context_numbers_passages(self) -> None:
         context = construct_context([self._hit("a", "1"), self._hit("b", "2")])

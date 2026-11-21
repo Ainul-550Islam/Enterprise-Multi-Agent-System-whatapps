@@ -111,6 +111,18 @@ impl ConnectorDisablePort for crate::stores::InMemoryServices {
     }
 }
 
+/// Shared-handle delegation for composition slots that take boxed ports.
+#[async_trait::async_trait]
+impl ConnectorDisablePort for std::sync::Arc<crate::stores::InMemoryServices> {
+    async fn disable_and_revoke(
+        &self,
+        tenant: mas_common::ids::TenantId,
+        id: ConnectorId,
+    ) -> Result<Connector> {
+        ConnectorDisablePort::disable_and_revoke(self.as_ref(), tenant, id).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

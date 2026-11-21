@@ -1,0 +1,61 @@
+# Prometheus alerting/recording rules for the Enterprise MAS platform.
+# Metric names here are the families exported by
+# `mas_application::pipeline_metrics::ALL_METRICS` plus
+# `mas_metrics_cardinality_dropped_total`. Names that are not in that
+# list are not alerted on.
+groups:
+  - name: mas-execution-pipeline
+    interval: 30s
+    rules:
+      - record: job:mas_execution_duration_ms:p95
+        expr: histogram_quantile(0.95, sum(rate(mas_execution_duration_ms_bucket[5m])) by (job, le))
+      - alert: MasExecutionBacklog
+        expr: sum(mas_outbox_backlog) > 200
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "Outbox backlog above 200"
+          description: "mas_outbox_backlog is the pipeline's durable publish queue depth."
+      - alert: MasDeadLetterGrowing
+        expr: increase(mas_dead_lettered_total[15m]) > 0
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Work was dead-lettered"
+          description: "mas_dead_lettered_total counts executions that exhausted their attempt budget."
+      - alert: MasPublishFailures
+        expr: sum(rate(mas_outbox_publish_failures_total[5m])) > 0.1
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: "Outbox publish failures"
+      - alert: MasStaleWorkerSpike
+        expr: sum(rate(mas_stale_worker_rejections_total[10m])) > 1
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Stale worker settlements are being refused"
+
+  - name: mas-idempotency
+    interval: 30s
+    rules:
+      - alert: MasIdempotencyConflictSpike
+        expr: sum(rate(mas_idempotency_conflicts_total[10m])) > 0.5
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Idempotency key reused with a different payload"
+
+  - name: mas-registry
+    interval: 60s
+    rules:
+      - alert: MasMetricsCardinalityDropped
+        expr: increase(mas_metrics_cardinality_dropped_total[15m]) > 0
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Metric series dropped by the cardinality fuse"

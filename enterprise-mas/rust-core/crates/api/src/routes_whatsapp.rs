@@ -1,117 +1,69 @@
-/// Protected WhatsApp routes (mounted under /v1/whatsapp/*).
-use warp::Filter;
+//! PURPOSE: The WhatsApp + billing route tables, split by authentication
+//! envelope.
+//!
+//! Owning layer: `mas-api`.
+//!
+//! Security boundary: `public_routes` carries only provider-facing webhook
+//! paths (authenticated by body signature); `protected_routes` carries only
+//! tenant paths (authenticated by the bearer layer). A route registered on
+//! the wrong table is a hole, not a bug.
 
-use crate::api::handlers::whatsapp::{
-    protected_inbound, protected_send_text, protected_send_template,
-    protected_handle_status, protected_handle_stop, protected_human_handoff,
-    protected_rotate_credentials, protected_submit_execution,
-    register_account, list_accounts,
-};
+use axum::routing::{get, post, put};
+use axum::Router;
 
-/// Protected WhatsApp routes — require authentication + tenant authorization.
-pub fn protected_routes() -> impl Filter<Extract = impl warp::Reply, Rejection = warp::Rejection> + Clone {
-    // Protected routes (authenticated layer)
-    let register = warp::post()
-        .and(warp::path("whatsapp"))
-        .and(warp::path("account"))
-        .and(warp::body::json())
-        .and_with(register_account);
+use crate::handlers::{billing_checkout, billing_public, whatsapp, whatsapp_public};
+use crate::state::AppState;
 
-    let list = warp::get()
-        .and(warp::path("whatsapp"))
-        .and(warp::path("accounts"))
-        .and(warp::query())
-        .and_with(list_accounts);
-
-    let inbound = warp::post()
-        .and(warp::path("whatsapp"))
-        .and(warp::path("inbound"))
-        .and(warp::body::json())
-        .and(warp::any().map(|_| warp::http::Method::POST))
-        .and_with(protected_inbound);
-
-    let send_text = warp::post()
-        .and(warp::path("whatsapp"))
-        .and(warp::path("send"))
-        .and(warp::path("text"))
-        .and(warp::query())
-        .and(warp::body::json())
-        .and_with(protected_send_text);
-
-    let send_template = warp::post()
-        .and(warp::path("whatsapp"))
-        .and(warp::path("send"))
-        .and(warp::path("template"))
-        .and(warp::query())
-        .and(warp::body::json())
-        .and_with(protected_send_template);
-
-    let handle_status = warp::post()
-        .and(warp::path("whatsapp"))
-        .and(warp::path("status"))
-        .and(warp::query())
-        .and(warp::body::json())
-        .and_with(protected_handle_status);
-
-    let handle_stop = warp::post()
-        .and(warp::path("whatsapp"))
-        .and(warp::path("stop"))
-        .and(warp::query())
-        .and_with(protected_handle_stop);
-
-    let human_handoff = warp::post()
-        .and(warp::path("whatsapp"))
-        .and(warp::path("handoff"))
-        .and(warp::query())
-        .and(warp::body::json())
-        .and_with(human_handoff);
-
-    let rotate_creds = warp::post()
-        .and(warp::path("whatsapp"))
-        .and(warp::path("rotate-credentials"))
-        .and(warp::body::json())
-        .and_with(rotate_credentials);
-
-    let submit_exec = warp::post()
-        .and(warp::path("whatsapp"))
-        .and(warp::path("execution"))
-        .and(warp::query())
-        .and(warp::body::json())
-        .and_with(submit_exec);
-
-    // Combine all protected routes
-    register
-        .or(list)
-        .or(inbound)
-        .or(send_text)
-        .or(send_template)
-        .or(handle_status)
-        .or(handle_stop)
-        .or(human_handoff)
-        .or(rotate_creds)
-        .or(submit_exec)
+/// Provider-facing webhook paths. Public by necessity; authenticated by the
+/// signature over the raw body.
+pub fn public_routes() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/webhooks/whatsapp",
+            get(whatsapp_public::verify).post(whatsapp_public::inbound),
+        )
+        .route(
+            "/v1/public/whatsapp/webhook/{route_id}",
+            get(whatsapp_public::verify).post(whatsapp_public::inbound),
+        )
+        .route(
+            "/webhooks/billing/stripe",
+            post(billing_public::stripe_inbound),
+        )
 }
 
-// Public Whatsapp webhook routes — no authentication required (hub challenge + signed POST)
-pub fn public_routes() -> impl Filter<Extract = impl warp::Reply, Rejection = warp::Rejection> + Clone {
-    // Public GET challenge
-    let public_get = warp::get()
-        .and(warp::path("public"))
-        .and(warp::path("whatsapp"))
-        .and(warp::path("webhook"))
-        .and(warp::path::param())
-        .and(warp::query())
-        .and_with(public_webhook_get);
-
-    // Public POST signed webhook
-    let public_post = warp::post()
-        .and(warp::path("public"))
-        .and(warp::path("whatsapp"))
-        .and(warp::path("webhook"))
-        .and(warp::path::param())
-        .and(warp::header("X-Hub-Signature-256"))
-        .and(warp::body::exact())
-        .and_with(public_webhook_post);
-
-    public_get.or(public_post)
+/// Tenant-facing WhatsApp + billing paths. Behind the authenticated layer.
+pub fn protected_routes() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/v1/whatsapp/channels",
+            post(whatsapp::register_channel).get(whatsapp::list_channels),
+        )
+        .route(
+            "/v1/whatsapp/channels/{channel_id}/messages",
+            post(whatsapp::send_text).get(whatsapp::list_messages),
+        )
+        .route("/v1/whatsapp/conversations", get(whatsapp::conversation))
+        .route(
+            "/v1/whatsapp/conversations/{conversation_id}/messages",
+            get(whatsapp::conversation_messages).post(whatsapp::human_reply),
+        )
+        .route(
+            "/v1/whatsapp/messages/{wamid}/status",
+            put(whatsapp::update_status),
+        )
+        .route(
+            "/v1/whatsapp/templates",
+            get(whatsapp::list_templates).post(whatsapp::sync_templates),
+        )
+        .route("/v1/whatsapp/stats", get(whatsapp::stats))
+        .route("/v1/billing/checkout", post(billing_checkout::create))
+        .route(
+            "/v1/billing/checkout-session",
+            post(billing_checkout::create),
+        )
+        .route(
+            "/v1/billing/portal-session",
+            post(billing_checkout::create_portal),
+        )
 }

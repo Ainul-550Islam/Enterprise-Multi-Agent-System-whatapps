@@ -1,85 +1,81 @@
-/// Stripe billing routes tests.
-///
-/// Tests cover: signed/unsigned webhooks, idempotent event application,
-/// out-of-order event handling, cross-tenant isolation, and role denial.
-use crate::api::router::router;
-use crate::billing_stripe::{
-    signature::{parse_stripe_signature, StripeSignature},
-    models::StripeEvent, EventType,
+//! Stripe webhook route contract: unsigned deliveries are refused, the
+//! public lane is signature-authenticated (not bearer), and the in-memory
+//! test composition answers a deterministic 503 when billing is unwired.
+
+use axum::{
+    body::Body,
+    http::{Request, StatusCode},
 };
-use serde_json::json;
-use warp::test::request::RequestExt;
+use http_body_util::BodyExt;
+use mas_api::{router::router, state::test_support::inmemory_state};
+use serde_json::Value;
+use tower::ServiceExt;
 
-#[test]
-fn test_stripe_webhook_signed() {
-    // A valid signed webhook should be processable
-    let body = r#"{"id": "evt_123", "type": "invoice.paid"}"#;
-    let sig = "t=1698765432,v1=placeholder";
-    let req = warp::test::method::POST
-        .and(warp::path("/v1/public/billing/stripe/webhook"))
-        .and(warp::body::bytes())
-        .and(warp::header("x-stripe-signature", sig));
-    // Just verify the route exists and returns a result
-    let result = router().oneshot(req);
-    // The route should be registered (will return 404 or handle the request)
-    assert!(result.status() != 404 || true); // route registration is the key test
+async fn call(
+    app: &axum::Router,
+    method: &str,
+    uri: &str,
+    headers: &[(&str, &str)],
+    body: Body,
+) -> (StatusCode, Value) {
+    let mut builder = Request::builder().method(method).uri(uri);
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    let response = app
+        .clone()
+        .oneshot(builder.body(body).expect("request"))
+        .await
+        .expect("response");
+    let status = response.status();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    let value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, value)
 }
 
-#[test]
-fn test_stripe_webhook_unsigned_rejected() {
-    // An unsigned webhook should be rejected
-    let body = r#"{"id": "evt_123", "type": "invoice.paid"}"#;
-    let req = warp::test::method::POST
-        .and(warp::path("/v1/public/billing/stripe/webhook"))
-        .and(warp::body::bytes())
-        .and(warp::header("x-stripe-signature", ""));
-    let result = router().oneshot(req);
-    // Should not crash; signature verification will fail
-    assert!(result.status() != 500); // shouldn't crash
-}
-
-#[test]
-fn test_same_event_idempotent() {
-    // Verify that the same event_id doesn't create duplicate state
-    let event_id = "evt_001";
-    // In a full implementation, we'd check the receipt/store for duplicates
-    // For now, just verify the concept: calling with the same event_id should
-    // be idempotent
-    let first = format!("processed_{}", event_id);
-    let second = format!("processed_{}", event_id);
-    assert_eq!(first, second); // same event_id -> same processing key
-}
-
-#[test]
-fn test_out_of_order_events() {
-    // Events should be processable in any order; the state machine handles this
-    // by tracking the current state and only allowing legal transitions.
-    let event_types = vec![
-        "customer.subscription.created",
-        "customer.subscription.updated",
-        "customer.subscription.deleted",
-    ];
-    // Verify all event types are recognised
-    for et in &event_types {
-        let etype = EventType::from_stripe_str(et);
-        assert!(etype.requires_transition() || etype == EventType::Unknown);
+#[tokio::test]
+async fn billing_checkout_rejects_unauthenticated_requests() {
+    let app = router(inmemory_state());
+    for path in [
+        "/v1/billing/checkout",
+        "/v1/billing/checkout-session",
+        "/v1/billing/portal-session",
+    ] {
+        let (status, _) = call(&app, "POST", path, &[], Body::empty()).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}");
     }
 }
 
-#[test]
-fn test_cross_tenant_isolation() {
-    // In a full implementation, webhook handlers would check tenant isolation
-    // via the request context. For now, verify the concept: the route handlers
-    // should be designed so that tenant_id from the request context determines
-    // which data is accessible.
-    let _tenant_check = true; // placeholder - full impl in application layer
+#[tokio::test]
+async fn stripe_webhook_without_a_wired_service_is_unavailable() {
+    let app = router(inmemory_state());
+    let (status, _) = call(
+        &app,
+        "POST",
+        "/webhooks/billing/stripe",
+        &[("stripe-signature", "t=1,v1=00")],
+        Body::from("{}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 }
 
-#[test]
-fn test_role_denial() {
-    // Protected routes should enforce role requirements
-    // (billing-admin role for checkout, etc.)
-    let _role_check = true; // placeholder - full impl in auth layer
+#[tokio::test]
+async fn stripe_webhook_is_not_a_bearer_route() {
+    let app = router(inmemory_state());
+    let (status, _) = call(
+        &app,
+        "POST",
+        "/webhooks/billing/stripe",
+        &[("authorization", "Bearer dev-token")],
+        Body::from("{}"),
+    )
+    .await;
+    // Unwired → 503; a bearer token must not turn this into 401/200.
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 }
-PYEOF
-cat /home/user/Enterprise-Multi-Agent-System-whatapps/enterprise-mas/rust-core/crates/api/tests/billing_stripe_routes.rs

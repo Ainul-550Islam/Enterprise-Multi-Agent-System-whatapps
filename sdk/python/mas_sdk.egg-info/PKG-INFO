@@ -1,0 +1,7 @@
+Metadata-Version: 2.4
+Name: mas-sdk
+Version: 1.1.0
+Summary: Python SDK for the Enterprise MAS API (executions, schedules, events).
+Requires-Python: >=3.11
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0; extra == "dev"

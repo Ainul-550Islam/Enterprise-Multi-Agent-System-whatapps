@@ -36,7 +36,17 @@ impl ApiKeyApplicationService {
     ) -> Result<CreatedApiKeyDto> {
         let tenant = ctx.require_tenant()?;
         let organization = ctx.require_organization()?;
-        let role: MembershipRole = ctx.require_resolved_role()?;
+        // Role under which the new key is minted. A human or api-key actor
+        // carries a resolved membership role; a machine actor (platform
+        // break-glass bootstrap, service callers) carries none, and its keys
+        // are stamped with the service-account role rather than refused —
+        // minting machine keys is exactly what machine actors are for.
+        let role: MembershipRole = match ctx.actor.kind {
+            mas_domain::AuditActorKind::User | mas_domain::AuditActorKind::ApiKey => {
+                ctx.require_resolved_role()?
+            },
+            _ => MembershipRole::ServiceAccount,
+        };
         let scopes = ScopeSet::new(scopes.iter().cloned())?;
         let user_id = (ctx.actor.kind == mas_domain::AuditActorKind::User)
             .then(|| mas_common::ids::UserId::parse_str(&ctx.actor.id).ok())
@@ -110,5 +120,36 @@ fn metadata_dto(metadata: mas_domain::ApiKeyMetadataView) -> ApiKeyMetadataDto {
         last_used_at: metadata.last_used_at,
         revoked: metadata.revoked,
         created_at: metadata.created_at,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mas_common::ids::{OrganizationId, TenantId};
+    use mas_common::timestamps::Timestamp;
+
+    #[tokio::test]
+    async fn system_actor_mints_service_account_stamped_keys() {
+        let store = std::sync::Arc::new(mas_security::InMemoryApiKeyStore::new());
+        let audit = std::sync::Arc::new(crate::audit::InMemoryAuditSink::new());
+        let security = std::sync::Arc::new(mas_security::ApiKeyService::new(
+            store.clone(),
+            audit.clone(),
+        ));
+        let service = ApiKeyApplicationService::new(security, store);
+
+        let now = Timestamp::now();
+        // Platform break-glass: a machine actor with a tenant/org scope and no
+        // membership must mint a service-account key — not be refused.
+        let ctx = ServiceContext::system("bootstrap-test", &now)
+            .expect("ctx")
+            .with_scope(TenantId::new(), OrganizationId::new());
+        let created = service
+            .create(&ctx, "machine-key", &["agents:read".to_owned()], None)
+            .await
+            .expect("system actor can mint machine keys");
+        assert!(!created.key.is_empty(), "raw secret returned exactly once");
+        assert_eq!(created.metadata.name, "machine-key");
     }
 }

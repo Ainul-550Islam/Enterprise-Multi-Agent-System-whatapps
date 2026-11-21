@@ -1,66 +1,54 @@
 # Changelog
 
-All notable changes to enterprise-mas are documented in this file. Format follows
-Keep a Changelog (https://keepachangelog.com/en/1.0.0/).
+All notable changes to this project are documented in this file.
 
-## [1.0.0] — 2026-10-30
-
-Derived from migrations 0001–0053 and the implemented crates/modules in
-`enterprise-mas/rust-core` plus `enterprise-mas/python-orchestrator`.
+## [1.1.0] — 2026-11-15
 
 ### Added
-- Rust core workspace: 22 crates (common, domain, contracts, orchestration,
-  execution, policy, security, tenancy, events, messaging, persistence,
-  scheduling, quota, integrations, observability, application, api, worker,
-  scheduler-service, worker-service, cli, ai-bridge)
-- HTTP v1 API surface in `crates/api` with stable `ApiEnvelope` response
-  contract and `StableApiError` error contract
-- Tenancy: organizations, tenants, projects, users, memberships (register + list)
-- Agent lifecycle: register, get, list, versions, publish, rollback
-- Workflows: create, get, graph update, publish, disable, versions, rollback
-- Executions: submit (idempotent), list, get, steps, start/pause/resume/cancel
-- Schedules: register, get, pause, resume, disable
-- API keys: create, list, revoke, rotate (metadata only; raw material once)
-- Policies: CRUD, publish, rollback, dry-run evaluate
-- Quotas & usage summary (tenant-scoped, read-only)
-- Analytics overview / performance / tasks-by-agent / usage-cost / insights
-- Audit events (keyset-paginated, redacted)
-- Connectors: register, list, get, probe, disable; connector manifests
-- Webhooks: register, list, get, enable/disable, deliveries, replay
-- OAuth authorization callback + connector-bound authorize
-- Inbound webhook endpoints (public HMAC-verified ingestion)
-- Tools: register, get, list, update, agent tool-permissions
-- SSE stream (`/v1/stream`) with per-tenant/per-principal connection caps
-- Governance: `/v1/auth/me`, `/v1/audit-events`, `/v1/policies`, `/v1/quotas`,
-  `/v1/usage/summary`
-- Persistence: SQLx pool, RLS context, 53 migrations (0001–0053), migration
-  runner with FNV-1a checksum ledger and advisory-lock apply
-- Worker: lease-fenced consumer, retry with full jitter, delivery-ceiling DLQ,
-  graceful shutdown
-- Scheduler-service: due-schedule scanner, lease-based exactly-once run ledger
-- gRPC: `mas.api.v1` services (tenancy, agents, workflows, executions, schedules)
-- Python AI orchestrator: agent runtime, providers, tools, memory, RAG plane,
-  guardrails, gRPC AgentBridge server
-- Cross-language Rust <-> Python AgentBridge end-to-end tests (12)
-- CI workflows: `ci.yml` (rust, bridge-e2e, python, openapi-parity,
-  docker-build, compose-smoke) and `security.yml` (deny, audit, pip-audit,
-  gitleaks, trivy)
-- Deployment: Dockerfiles (api, worker, scheduler, migrate, orchestrator),
-  compose (postgres/pgvector + nats + migrate + api + worker + scheduler +
-  orchestrator), Helm chart
-- Release artifacts: LICENSE (proprietary template), SECURITY.md, THIRD_PARTY_NOTICES.md,
-  CHANGELOG.md, README.md, repo-cleanup.sh, gen-third-party-notices.sh
+- WhatsApp plane end to end: `mas-channel-whatsapp` Rust channel crate with
+  AWS Nitro Enclaves attestation for webhook signing keys, 13-type inbound
+  normalisation pipeline, wamid-idempotent message storage, and the signed
+  `/webhooks/whatsapp` receive + `/v1/whatsapp/...` tenant APIs.
+- Billing plane: `mas-billing-stripe` (Stripe client, webhook signature
+  verification, plan price snapshot + proration) and the persistence-backed
+  billing API with live-PG round trip tests.
+- `sandbox-runner/` with hard resource limits (memory/cpu/output) and a
+  default-deny seccomp profile, plus limit/security tests.
+- SDKs: `sdk/typescript` (`MasClient`, SSE `openEventStream`) and
+  `sdk/python` (`MasClient`, scope guard, event parsing) with unit tests.
+- Next.js dashboard (`web/`) — 19 routes, typed API client generated from
+  `openapi.json`, SSE subscriptions, quota/usage/WhatsApp inbox views, and
+  unit + Playwright e2e coverage.
+- Observability pack: Grafana dashboards (overview/executions/quota),
+  Prometheus alert rules, and demo walkthrough/troubleshooting docs.
+- Completeness gate (`completeness` job) cross-checking manifest
+  `scripts/dev/manifest.txt` in CI.
 
-### Not included
-- Frontend / dashboard UI (not in code)
-- WhatsApp channel (not in code)
-- Stripe checkout (not in code)
+### Changed
+- Product version is `1.1.0` across `enterprise-mas/rust-core` workspace.package,
+  `enterprise-mas/python-orchestrator`, `web/package.json`, and both SDKs.
+- `config.enums.ProviderKind` now classifies gemini and azure as first-class
+  provider kinds with validation enforcement.
+- WhatsApp audio intake validates size/mime and raises an explicit
+  `UnsupportedTranscriptionError` when no transcriber is installed.
 
-### Test results (from ci-evidence logs)
-- `cargo fmt --all -- --check`: PASS
-- `cargo clippy --workspace --all-targets --locked -- -D warnings`: PASS
-- `cargo test --workspace --locked`: 1148 passed, 0 failed
-- `cargo test --workspace --locked --features nats`: 1148 passed, 0 failed
-- `cargo test -p mas-ai-bridge --test e2e_python --locked -- --ignored`: 12 passed, 0 failed
-- `cargo deny check`: PASS
-- `python-orchestrator/scripts/check.sh`: 2003 passed, 2 skipped, 0 failed
+### Fixed
+- Deep-review remediation (`docs/REVIEW_RESOLUTION.md`): the C-01…C-12
+  critical set and the W-01…W-08 warning set are resolved — durable broker
+  protocol and delivery receipts, output-preserving settlement, lease-loss
+  and shutdown cancellation wiring, quota idempotency, HMAC v2 + one-time
+  nonce replay receipts on both sides of the bridge, SSRF-safe egress,
+  authoritative execution state reader + durable terminal-state reporter
+  (RLS-scoped `RustStateTransitionReporter`), cooperative cancellation
+  propagation, corrupt-task containment, resumable Data Hub sync with
+  pre-download admission, and isolated document parsing.
+- Web crawler link farms can no longer exceed the frontier, the scheduled
+  set or the URL-length limit (`data_hub/sources.py`: 2048-char cap before
+  `urljoin`/queueing, per-page fanout cap, hostile links dropped
+  individually).
+
+## [1.0.0] — 2026-11-15
+
+### Added
+- Initial release of the Enterprise Multi-Agent System core
+  (`enterprise-mas`).

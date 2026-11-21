@@ -1,180 +1,87 @@
-/// Channel-specific errors for the WhatsApp integration.
-///
-/// These errors are mapped to `StableApiError` in the API layer so that
-/// the HTTP response body is consistent across all crates.
-#[derive(Clone, Debug, PartialEq, thiserror::Error)]
-pub enum ChannelError {
-    #[error("invalid config: {0}")]
-    InvalidConfig(String),
+//! Meta Graph API error codes that the WhatsApp channel maps onto
+//! [`AppError`]. The numeric codes are Meta's; the mapping is ours.
+//!
+//! StableApiError compatibility: every mapped error uses an `AppError`
+//! variant whose `error_code()` is a platform-stable string (`RATE_LIMITED`,
+//! `UNAUTHENTICATED`, `FAILED_PRECONDITION`, `UNAVAILABLE`). Handlers convert
+//! `AppError` through the existing envelope — this module must not invent a
+//! parallel error type.
 
-    #[error("missing or invalid webhook token")]
-    InvalidWebhookToken { route_id: String },
+use mas_common::error::AppError;
 
-    #[error("missing signature header")]
-    MissingSignature,
+/// Meta error 131047 — the 24-hour customer-care window has closed; a
+/// free-form reply is refused until the customer messages again or a
+/// template is used.
+pub const CODE_REENGAGEMENT_WINDOW: i64 = 131047;
 
-    #[error("invalid signature: expected sha256=<hex>, got malformed header")]
-    InvalidSignature,
+/// Meta error 131026 — the message was undeliverable (invalid recipient,
+/// user blocked the business, etc.).
+pub const CODE_UNDELIVERABLE: i64 = 131026;
 
-    #[error("body too large: {received} bytes (max {max})")]
-    BodyTooLarge { received: usize, max: usize },
+/// Meta error 130429 — Graph throughput / pair-rate limit.
+pub const CODE_RATE_LIMITED: i64 = 130429;
 
-    #[error("unsupported message type: {0}")]
-    UnsupportedMessageType(String),
+/// Meta error 190 — access token expired or revoked.
+pub const CODE_ACCESS_TOKEN: i64 = 190;
 
-    #[error("malformed payload: {0}")]
-    MalformedPayload(String),
-
-    #[error("invalid MIME type: {0}, allowed: {allowed}")]
-    InvalidMimeType { mime: String, allowed: String },
-
-    #[error("no allowed host for egress")]
-    NoAllowedHost,
-
-    #[error("Graph API request failed: status {status}, body: {body}")]
-    GraphResponse { status: u16, body: String },
-
-    #[error("Graph request I/O error: {0}")]
-    IoError { source: std::io::Error },
-
-    #[error("JSON parse error: {0}")]
-    JsonParse { source: serde_json::Error },
-
-    #[error("client setup error: {0}")]
-    ClientSetup { source: reqwest::Error },
-
-    #[error("crypto error")]
-    CryptoError,
-
-    #[error("secret ref not resolved: {0}")]
-    SecretNotResolved(String),
-
-    #[error("rate limit exceeded, backoff {0}ms")]
-    RateLimitExceeded(u64),
-
-    #[error("window closed, only approved templates allowed")]
-    WindowClosed,
-
-    #[error("template not approved: {0}")]
-    TemplateNotApproved(String),
-
-    #[error("template validation error: {0}")]
-    TemplateValidation(String),
-
-    #[error(" unknown error: {0}")]
-    Unknown(String),
+/// One error object from a status update or Graph error envelope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphError {
+    /// Meta numeric code.
+    pub code: i64,
+    /// Meta title or message, when present.
+    pub title: String,
 }
 
-impl ChannelError {
-    /// Map this error to a `StableApiError` suitable for the HTTP API response.
-    /// The mapping is many-to-one: several channel errors map to the same
-    /// HTTP status/code combination.
-    pub fn to_stable_api_error(&self) -> crate::api::response::StableApiError {
-        use crate::api::response::StableApiError;
-        match self {
-            ChannelError::InvalidConfig(_) => StableApiError::BadRequest(
-                "invalid configuration".into(),
-            ),
-            ChannelError::InvalidWebhookToken { .. } => {
-                StableApiError::Unauthorized("invalid webhook token".into())
-            }
-            ChannelError::MissingSignature => {
-                StableApiError::BadRequest("missing X-Hub-Signature-256".into())
-            }
-            ChannelError::InvalidSignature => {
-                StableApiError::Unauthorized("invalid signature".into())
-            }
-            ChannelError::BodyTooLarge { .. } => {
-                StableApiError::PayloadTooLarge(
-                    "message body exceeds size limit".into(),
-                )
-            }
-            ChannelError::UnsupportedMessageType(_) => {
-                StableApiError::BadRequest(
-                    "unsupported message type".into(),
-                )
-            }
-            ChannelError::MalformedPayload(_) => {
-                StableApiError::BadRequest(
-                    "malformed webhook payload".into(),
-                )
-            }
-            ChannelError::InvalidMimeType { .. } => {
-                StableApiError::BadRequest(
-                    "invalid MIME type".into(),
-                )
-            }
-            ChannelError::NoAllowedHost => {
-                StableApiError::ServiceUnavailable(
-                    "egress host not allowed".into(),
-                )
-            }
-            ChannelError::GraphResponse { status, body } => {
-                // Map common Meta statuses to appropriate HTTP codes
-                let code = match status {
-                    429 => 429, // rate limited
-                    401 | 403 => 401,
-                    500 | 502 | 503 => 502,
-                    _ => 400,
-                };
-                StableApiError::ExternalServiceError {
-                    service: "graph.facebook.com".into(),
-                    code: *status,
-                    message: body.clone().into(),
-                }
-            }
-            ChannelError::IoError { .. } => {
-                StableApiError::ServiceUnavailable(
-                    "graph I/O error".into(),
-                )
-            }
-            ChannelError::JsonParse { .. } => {
-                StableApiError::BadRequest(
-                    "failed to parse Graph response".into(),
-                )
-            }
-            ChannelError::ClientSetup { .. } => {
-                StableApiError::InternalError(
-                    "HTTP client setup failure".into(),
-                )
-            }
-            ChannelError::CryptoError => {
-                StableApiError::InternalError(
-                    "cryptographic failure".into(),
-                )
-            }
-            ChannelError::SecretNotResolved(_) => {
-                StableApiError::InternalError(
-                    "secret not resolved from key store".into(),
-                )
-            }
-            ChannelError::RateLimitExceeded(_) => {
-                StableApiError::TooManyRequests(
-                    "rate limit exceeded, see 130429".into(),
-                )
-            }
-            ChannelError::WindowClosed => {
-                StableApiError::BadRequest(
-                    "window closed, use approved template".into(),
-                )
-            }
-            ChannelError::TemplateNotApproved(msg) => {
-                StableApiError::BadRequest(
-                    format!("template not approved: {}", msg).into(),
-                )
-            }
-            ChannelError::TemplateValidation(msg) => {
-                StableApiError::BadRequest(
-                    format!("template validation error: {}", msg).into(),
-                )
-            }
-            ChannelError::Unknown(msg) => {
-                StableApiError::InternalError(
-                    msg.into(),
-                )
-            }
-        }
+impl GraphError {
+    /// Builds from a JSON object with `code` and optional `title`/`message`.
+    #[must_use]
+    pub fn from_value(value: &serde_json::Value) -> Option<Self> {
+        let code = value.get("code")?.as_i64()?;
+        let title = value
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| value.get("message").and_then(serde_json::Value::as_str))
+            .unwrap_or("")
+            .to_owned();
+        Some(Self { code, title })
     }
+}
+
+/// Maps a Meta Graph error code onto a platform [`AppError`].
+///
+/// Unknown codes become [`AppError::ExternalService`] so a new Meta code
+/// surfaces as a provider failure, never as success.
+#[must_use]
+pub fn map_graph_error(code: i64, message: &str) -> AppError {
+    match code {
+        CODE_REENGAGEMENT_WINDOW => AppError::conflict(format!(
+            "whatsapp 24h re-engagement window closed ({CODE_REENGAGEMENT_WINDOW}): {message}"
+        )),
+        CODE_UNDELIVERABLE => AppError::conflict(format!(
+            "whatsapp message undeliverable ({CODE_UNDELIVERABLE}): {message}"
+        )),
+        CODE_RATE_LIMITED => AppError::rate_limited(format!(
+            "whatsapp graph rate limited ({CODE_RATE_LIMITED}): {message}"
+        )),
+        CODE_ACCESS_TOKEN => AppError::unauthorized(format!(
+            "whatsapp access token rejected ({CODE_ACCESS_TOKEN}): {message}"
+        )),
+        other => AppError::external_service("whatsapp", format!("graph error {other}: {message}")),
+    }
+}
+
+/// Parses a Graph error envelope (`{"error":{"code":…,"message":…}}`).
+#[must_use]
+pub fn error_from_graph_body(body: &str) -> Option<AppError> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let error = value.get("error")?;
+    let code = error.get("code")?.as_i64()?;
+    let message = error
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    Some(map_graph_error(code, message))
 }
 
 #[cfg(test)]
@@ -182,38 +89,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_invalid_config() {
-        let err = ChannelError::InvalidConfig("waba_id required".into());
-        let stable = err.to_stable_api_error();
-        match stable {
-            crate::api::response::StableApiError::BadRequest(msg) => {
-                assert!(msg.contains("invalid configuration"));
-            }
-            _ => panic!("expected BadRequest, got {:?}", stable),
-        }
+    fn maps_the_documented_codes() {
+        assert_eq!(
+            map_graph_error(CODE_REENGAGEMENT_WINDOW, "window").error_code(),
+            "CONFLICT"
+        );
+        assert_eq!(
+            map_graph_error(CODE_UNDELIVERABLE, "gone").error_code(),
+            "CONFLICT"
+        );
+        assert_eq!(
+            map_graph_error(CODE_RATE_LIMITED, "slow").error_code(),
+            "RATE_LIMITED"
+        );
+        assert_eq!(
+            map_graph_error(CODE_ACCESS_TOKEN, "expired").error_code(),
+            "UNAUTHENTICATED"
+        );
+        assert_eq!(
+            map_graph_error(1, "other").error_code(),
+            "EXTERNAL_SERVICE_ERROR"
+        );
     }
 
     #[test]
-    fn test_rate_limit_exceeded() {
-        let err = ChannelError::RateLimitExceeded(30_000);
-        let stable = err.to_stable_api_error();
-        match stable {
-            crate::api::response::StableApiError::TooManyRequests(msg) => {
-                assert!(msg.contains("130429"));
-            }
-            _ => panic!("expected TooManyRequests, got {:?}", stable),
-        }
-    }
-
-    #[test]
-    fn test_window_closed() {
-        let err = ChannelError::WindowClosed;
-        let stable = err.to_stable_api_error();
-        match stable {
-            crate::api::response::StableApiError::BadRequest(msg) => {
-                assert!(msg.contains("window closed"));
-            }
-            _ => panic!("expected BadRequest, got {:?}", stable),
-        }
+    fn parses_a_graph_envelope() {
+        let body = r#"{"error":{"code":130429,"message":"too many"}}"#;
+        let err = error_from_graph_body(body).expect("parses");
+        assert_eq!(err.error_code(), "RATE_LIMITED");
     }
 }

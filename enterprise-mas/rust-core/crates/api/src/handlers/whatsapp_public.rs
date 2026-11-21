@@ -1,100 +1,135 @@
-/// PUBLIC WhatsApp webhook endpoints.
-///
-/// These are deliberately unauthenticated (anyone who knows the URL can POST
-/// the hub challenge). They are fronted by a rate cap and body size limit.
-///
-/// Routes:
-///   - GET  /v1/public/whatsapp/webhook/{route_id}  challenge verification
-///   - POST /v1/public/whatsapp/webhook/{route_id}  signed inbound delivery
-use crate::errors::ChannelError;
-use crate::webhook_verify::{verify_hub_challenge, verify_post_signature};
-use crate::config::WhatsAppAccountConfig;
-use serde_json::Value;
-use tracing::instrument;
+//! PURPOSE: The public WhatsApp webhook handler (verification handshake and
+//! inbound message deliveries).
+//!
+//! Owning layer: `mas-api` process edge.
+//!
+//! Production role: answer the provider's subscription check and process
+//! inbound deliveries in the two phases the WhatsApp service defines --
+//! verify the signature over the raw body and resolve the tenant pre-scope,
+//! then record inside the resolved tenant's authoritative scope.
+//!
+//! Security boundary: this route is public because the provider calls it;
+//! it is authenticated by the `X-Hub-Signature-256` over the raw body, and
+//! the verify token is compared in constant time. The tenant is resolved
+//! from the channel's phone-number handle through platform truth, never
+//! from the body.
+//!
+//! Data ownership: the WhatsApp service owns the message log.
+//!
+//! Prohibited responsibilities: parsing decisions, SQL, secret logging.
 
-/// GET  /v1/public/whatsapp/webhook/{route_id}
-/// Query params: `hub.challenge` and `hub.verify_token`
-/// Returns the challenge echo if verification passes, else 400.
-#[instrument(skip(query))]
-pub async fn public_webhook_get(
-    path: web::Path<String>,
-    query: web::Query<serde_json::Value>,
-) -> Result<impl warp::Reply, warp::reject::Rejection> {
-    let route_id = path.into_inner();
-    let challenge = query.get("hub.challenge")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| warp::reject::reject::custom(warp::reject::custom::missing("hub.challenge")))?;
+use axum::body::Bytes;
+use axum::extract::{Query, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use serde::Deserialize;
+use serde_json::json;
 
-    let verify_token = query.get("hub.verify_token")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| warp::reject::reject::custom(warp::reject::custom::missing("hub.verify_token")))?;
+use crate::handlers::Ctx;
+use crate::state::AppState;
 
-    // Resolve the account associated with this route_id
-    // (in a full implementation, look up from DB; for now we just validate)
-    let _config = WhatsAppAccountConfig {
-        waba_id: uuid::Uuid::nil(),
-        phone_number_id: uuid::Uuid::nil(),
-        graph_version: "v20.0".into(),
-        app_secret_ref: "ref".into(),
-        access_token_ref: "ref".into(),
-        verify_token_ref: verify_token.into(),
+/// `GET /webhooks/whatsapp` query (the provider's handshake).
+#[derive(Debug, Deserialize)]
+pub struct VerifyQuery {
+    /// `hub.mode` -- must be `subscribe`.
+    #[serde(rename = "hub.mode")]
+    pub hub_mode: Option<String>,
+    /// `hub.verify_token` -- compared in constant time.
+    #[serde(rename = "hub.verify_token")]
+    pub hub_verify_token: Option<String>,
+    /// `hub.challenge` -- echoed back on success.
+    #[serde(rename = "hub.challenge")]
+    pub hub_challenge: Option<String>,
+}
+
+/// `GET /webhooks/whatsapp`.
+pub async fn verify(
+    State(state): State<AppState>,
+    Ctx(ctx): Ctx,
+    Query(query): Query<VerifyQuery>,
+) -> Response {
+    let Some(service) = state.whatsapp.clone() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "whatsapp not configured").into_response();
     };
-
-    // Verify the hub challenge
-    match verify_hub_challenge(&_config, challenge, verify_token) {
-        Ok(echo) => Ok(warp::reply::with_status(
-            warp::reply::json(&serde_json::json!({ "entry": [{ "id": route_id, "changes": [] }]})),
-            warp::http::StatusCode::OK,
-        )),
-        Err(e) => {
-            // Log and return 401
-            Err(warp::reject::reject::custom(warp::reject::custom::custom(format!(
-                "webhook verification failed: {:?}", e
-            ))))
-        }
+    match service.verify_subscription(
+        query.hub_mode.as_deref(),
+        query.hub_verify_token.as_deref(),
+        query.hub_challenge.as_deref(),
+    ) {
+        Ok(challenge) => (StatusCode::OK, challenge).into_response(),
+        Err(error) => crate::response::ApiError::new(error, &ctx).into_response(),
     }
 }
 
-/// POST /v1/public/whatsapp/webhook/{route_id}
-/// Body: signed WhatsApp payload. Verification via X-Hub-Signature-256.
-/// On success, return 200. On bad signature, return 401 + record the event.
-#[instrument(skip(body), signature))]
-pub async fn public_webhook_post(
-    path: web::Path<String>,
-    body: web::Body,
-    signature: web::Header<String>,
-) -> Result<impl warp::Reply, warp::reject::Rejection> {
-    let route_id = path.into_inner();
-    let sig_value = signature.into_inner();
-
-    // Read the raw body
-    let raw_bytes = body.into_bytes().await.unwrap_or_default();
-
-    // Resolve config (placeholder - in production, look up by route_id)
-    let _config = WhatsAppAccountConfig {
-        waba_id: uuid::Uuid::nil(),
-        phone_number_id: uuid::Uuid::nil(),
-        graph_version: "v20.0".into(),
-        app_secret_ref: "ref".into(),
-        access_token_ref: "ref".into(),
-        verify_token_ref: "".into(),
+/// `POST /webhooks/whatsapp`.
+pub async fn inbound(
+    State(state): State<AppState>,
+    Ctx(ctx): Ctx,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let signature = headers
+        .get("x-hub-signature-256")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    let Some(service) = state.whatsapp.clone() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "whatsapp not configured").into_response();
     };
 
-    // Verify the signature
-    match verify_post_signature(&_config, &raw_bytes, &sig_value) {
-        Ok(()) => {
-            // Process the inbound message (delegated to the protected layer)
-            // For now, just accept and return 200
-            Ok(warp::reply::with_status(
-                warp::reply::json(&serde_json::json!({ "status": "accepted" })),
-                warp::http::StatusCode::OK,
-            ))
-        }
-        Err(e) => {
-            // Log the bad signature (audit)
-            Err(warp::reject::reject::custom(warp::reject::custom::custom(format!(
-                "invalid webhook signature: {:?}", e
-            ))))
-        }
+    let delivery = match service.receive_inbound(&body, &signature).await {
+        Ok(delivery) => delivery,
+        Err(error) => {
+            return crate::response::ApiError::new(error, &ctx).into_response();
+        },
+    };
+
+    use mas_application::whatsapp_service::WhatsAppDelivery;
+    match delivery {
+        WhatsAppDelivery::Rejected { reason } => {
+            // A delivery that does not verify, or names no channel this
+            // platform owns, is refused. An unverifiable delivery must not
+            // be acknowledged at all.
+            if reason.contains("signature") {
+                return (
+                    StatusCode::FORBIDDEN,
+                    axum::Json(json!({ "status": "rejected", "reason": reason })),
+                )
+                    .into_response();
+            }
+            (
+                StatusCode::OK,
+                axum::Json(json!({ "status": "ignored", "reason": reason })),
+            )
+                .into_response()
+        },
+        WhatsAppDelivery::Resolved(resolved) => {
+            let Some(pool) = state.runtime_pool.as_ref() else {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "whatsapp scope not configured",
+                )
+                    .into_response();
+            };
+            let scope = mas_security::scope::AuthoritativeScope::resolved(
+                resolved.owner.0,
+                resolved.owner.1,
+                "webhook:whatsapp",
+            );
+            let outcome = mas_persistence::scoped_request::with_authoritative_scope(
+                pool,
+                scope,
+                move || async move { service.apply_inbound(&resolved).await },
+            )
+            .await;
+            match outcome {
+                Ok(recorded) => (
+                    StatusCode::OK,
+                    axum::Json(json!({ "status": "applied", "messages": recorded.len() })),
+                )
+                    .into_response(),
+                Err(error) => crate::response::ApiError::new(error, &ctx).into_response(),
+            }
+        },
     }
 }

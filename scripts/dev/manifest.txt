@@ -1,0 +1,266 @@
+# manifest.txt — deliverable inventory (tier full: 260 entries; tier min: 143 entries)
+# columns: path<TAB>KIND<TAB>TIER<TAB>MARKER
+# KIND  : code | test | config | doc | asset
+# TIER  : min (core) | full (core + depth)   — every min entry also counts at full
+# MARKER: a real semantic name that must literally occur in the file (class,
+#         function, route, heading). Never a planted marker comment.
+README.md	doc	min	enterprise-mas — Enterprise Multi-Agent System
+CHANGELOG.md	doc	min	## [1.1.0]
+SECURITY.md	doc	min	Security Policy
+THIRD_PARTY_NOTICES.md	doc	min	Third-Party Notices
+LICENSE	doc	min	TEMPLATE — have a lawyer review before sale. This is a propr
+.github/workflows/ci.yml	config	min	completeness
+.github/workflows/security.yml	config	min	security
+scripts/gen-third-party-notices.sh	code	min	#!/usr/bin/env bash
+scripts/dev/verify_manifest.py	code	min	entries:
+scripts/dev/manifest.txt	config	min	KIND
+docs/REVIEW_RESOLUTION.md	doc	min	Review Resolution — C-01…C-12, W-01…W-08
+enterprise-mas/README.md	doc	min	Enterprise MAS — Deliverable Index
+enterprise-mas/docs/ARCHITECTURE.md	doc	full	Architecture (verified against code)
+enterprise-mas/docs/DEPLOYMENT.md	doc	full	Deployment
+enterprise-mas/docs/QUICKSTART.md	doc	min	Quickstart (steps executed and verified)
+enterprise-mas/docs/SECURITY_MODEL.md	doc	full	Security Model (English whitepaper)
+enterprise-mas/docs/STRIPE_SETUP.md	doc	full	Stripe billing setup
+enterprise-mas/docs/WHATSAPP_SETUP.md	doc	full	WhatsApp channel setup
+enterprise-mas/docs/review_worktrack.md	doc	full	Review worktrack — live repair log
+deploy/compose/docker-compose.yml	config	min	docker-compose.yml — enterprise-mas local development stack
+deploy/compose/docker-compose.demo.yml	config	full	demo plane additions
+deploy/compose/idp/realm-export.json	config	full	enterprise-mas
+deploy/compose/nats.conf	config	full	nats.conf — NATS configuration matching crates/messaging sub
+deploy/compose/.env.example	config	min	.env.example — every variable the services actually read.
+deploy/docker/api.Dockerfile	config	min	Dockerfile — mas-api (multi-stage, hardened)
+deploy/docker/web.Dockerfile	config	min	web
+deploy/docker/worker.Dockerfile	config	full	Dockerfile — mas-worker (multi-stage, hardened)
+deploy/docker/scheduler.Dockerfile	config	full	Dockerfile — mas-scheduler-service (multi-stage, hardened)
+deploy/docker/orchestrator.Dockerfile	config	full	Dockerfile — mas-orchestrator (Python, multi-stage, hardened
+deploy/docker/migrate.Dockerfile	config	full	Dockerfile — mas-migrate (one-shot migration runner)
+deploy/helm/enterprise-mas/Chart.yaml	config	full	apiVersion: v2
+deploy/helm/enterprise-mas/values.yaml	config	full	values.yaml — enterprise-mas Helm chart
+deploy/helm/enterprise-mas/templates/web-deployment.yaml	config	min	web
+deploy/observability/grafana/overview.json	asset	full	overview
+deploy/observability/grafana/executions.json	asset	full	executions
+deploy/observability/grafana/quota.json	asset	full	quota
+deploy/observability/prometheus-rules.yaml	asset	full	groups
+enterprise-mas/rust-core/Cargo.toml	config	min	PURPOSE: The `rust-core` workspace manifest — the single pla
+enterprise-mas/rust-core/Cargo.lock	config	full	mas-common
+enterprise-mas/rust-core/deny.toml	config	min	PURPOSE: cargo-deny policy for the rust-core workspace.
+enterprise-mas/rust-core/.cargo/config.toml	config	min	Cargo-level configuration for reproducible compilation of ru
+enterprise-mas/rust-core/scripts/check.sh	code	min	#!/usr/bin/env bash
+enterprise-mas/rust-core/scripts/bootstrap-toolchain.sh	code	full	#!/usr/bin/env bash
+enterprise-mas/rust-core/scripts/provision-plane-roles.sh	code	min	#!/usr/bin/env bash
+enterprise-mas/rust-core/scripts/verify-routes.sh	code	min	#!/usr/bin/env bash
+enterprise-mas/rust-core/scripts/verify-inventory.sh	code	min	with_audit_query
+enterprise-mas/rust-core/scripts/verify-static.sh	code	min	#!/usr/bin/env bash
+enterprise-mas/rust-core/scripts/openapi_to_json.py	code	full	#!/usr/bin/env python3
+enterprise-mas/rust-core/docs/openapi.yaml	config	min	openapi: 3.1.0
+enterprise-mas/rust-core/docs/openapi.json	config	min	openapi
+enterprise-mas/rust-core/README.md	doc	full	rust-core
+enterprise-mas/rust-core/migrations/0054_memory_plane_role/up.sql	config	full	ROW LEVEL SECURITY
+enterprise-mas/rust-core/migrations/0055_whatsapp_channels/up.sql	config	full	ROW LEVEL SECURITY
+enterprise-mas/rust-core/migrations/0056_whatsapp_messages/up.sql	config	min	ROW LEVEL SECURITY
+enterprise-mas/rust-core/migrations/0057_billing_customers/up.sql	config	min	ROW LEVEL SECURITY
+enterprise-mas/rust-core/migrations/0058_plan_prices/up.sql	config	min	plan_prices
+enterprise-mas/rust-core/migrations/0059_billing_checkout_sessions/up.sql	config	min	ROW LEVEL SECURITY
+enterprise-mas/rust-core/migrations/0060_billing_event_applications/up.sql	config	min	ROW LEVEL SECURITY
+enterprise-mas/rust-core/migrations/0061_cross_tenant_guard/up.sql	config	min	mas_forbid_tenant_reassignment
+enterprise-mas/rust-core/crates/contracts/src/execution.rs	code	min	StartExecutionRequest
+enterprise-mas/rust-core/crates/contracts/src/policy.rs	code	min	CreatePolicyRequest
+enterprise-mas/rust-core/crates/policy/src/engine.rs	code	min	RuleRef
+enterprise-mas/rust-core/crates/channel-whatsapp/Cargo.toml	config	min	channel-whatsapp
+enterprise-mas/rust-core/crates/channel-whatsapp/src/lib.rs	code	min	verify_inbound_signature
+enterprise-mas/rust-core/crates/channel-whatsapp/src/client.rs	code	min	ChannelClient
+enterprise-mas/rust-core/crates/channel-whatsapp/src/inbound.rs	code	min	InboundMessage
+enterprise-mas/rust-core/crates/channel-whatsapp/src/outbound.rs	code	min	OutboundPayload
+enterprise-mas/rust-core/crates/channel-whatsapp/tests/webhook_verify.rs	test	min	rejects_mismatched_signatures
+enterprise-mas/rust-core/crates/channel-whatsapp/tests/inbound_fixtures.rs	test	min	parses_all_inbound_fixtures
+enterprise-mas/rust-core/crates/channel-whatsapp/tests/outbound_payloads.rs	test	min	builds_templated_payload
+enterprise-mas/rust-core/crates/channel-whatsapp/tests/client_mock.rs	test	full	mock_graph_client
+enterprise-mas/rust-core/crates/channel-whatsapp/tests/fixtures/inbound_text.json	test	full	messages
+enterprise-mas/rust-core/crates/channel-whatsapp/tests/fixtures/inbound_media.json	test	full	audio
+enterprise-mas/rust-core/crates/channel-whatsapp/tests/fixtures/inbound_button.json	test	full	button_reply
+enterprise-mas/rust-core/crates/channel-whatsapp/tests/fixtures/status_delivered.json	test	full	status
+enterprise-mas/rust-core/crates/billing-stripe/Cargo.toml	config	min	[package]
+enterprise-mas/rust-core/crates/billing-stripe/src/lib.rs	code	min	//! # mas-billing-stripe -- the Stripe provider boundary
+enterprise-mas/rust-core/crates/billing-stripe/src/signature.rs	code	min	ParsedHeader
+enterprise-mas/rust-core/crates/billing-stripe/src/event.rs	code	min	StripeEventType
+enterprise-mas/rust-core/crates/billing-stripe/tests/signature.rs	test	min	rejects_replayed_timestamps
+enterprise-mas/rust-core/crates/billing-stripe/tests/events_fixtures.rs	test	full	parses_all_event_fixtures
+enterprise-mas/rust-core/crates/billing-stripe/tests/client_mock.rs	test	full	mock_stripe_client
+enterprise-mas/rust-core/crates/billing-stripe/tests/mapping.rs	test	min	maps_checkout_completed
+enterprise-mas/rust-core/crates/billing-stripe/tests/fixtures/checkout_completed.json	test	full	checkout.session
+enterprise-mas/rust-core/crates/billing-stripe/tests/fixtures/subscription_updated.json	test	full	customer.subscription
+enterprise-mas/rust-core/crates/billing-stripe/tests/fixtures/invoice_paid.json	test	full	invoice.paid
+enterprise-mas/rust-core/crates/application/src/lib.rs	code	min	//! PURPOSE: The use-case layer: the services `api`, `worker
+enterprise-mas/rust-core/crates/application/src/whatsapp_service.rs	code	min	WhatsAppStorePort
+enterprise-mas/rust-core/crates/application/src/billing_service.rs	code	min	ReceiptOutcome
+enterprise-mas/rust-core/crates/application/src/stores.rs	code	min	OrganizationStorePort
+enterprise-mas/rust-core/crates/application/src/audit.rs	code	full	AuditSinkPort
+enterprise-mas/rust-core/crates/application/src/audit_query_service.rs	code	full	AuditReadFilter
+enterprise-mas/rust-core/crates/application/src/usage_service.rs	code	full	UsageReadPort
+enterprise-mas/rust-core/crates/application/src/api_key_service.rs	code	full	ApiKeyApplicationService
+enterprise-mas/rust-core/crates/application/src/webhook_service.rs	code	full	DeliveryCursor
+enterprise-mas/rust-core/crates/application/src/connector_service.rs	code	full	ConnectorDisablePort
+enterprise-mas/rust-core/crates/application/src/tenancy_service.rs	code	full	TenancyService
+enterprise-mas/rust-core/crates/domain/src/billing.rs	code	min	BillingCustomer
+enterprise-mas/rust-core/crates/domain/src/whatsapp.rs	code	min	WhatsAppChannel
+enterprise-mas/rust-core/crates/persistence/src/lib.rs	code	min	//! PURPOSE: The PostgreSQL persistence layer: every byte th
+enterprise-mas/rust-core/crates/persistence/src/migrations.rs	code	min	Migration
+enterprise-mas/rust-core/crates/persistence/src/repositories/whatsapp.rs	code	min	PostgresWhatsAppStore
+enterprise-mas/rust-core/crates/persistence/src/repositories/billing_customers.rs	code	min	PostgresBillingCustomerStore
+enterprise-mas/rust-core/crates/persistence/src/repositories/plan_prices.rs	code	min	PostgresPlanPriceStore
+enterprise-mas/rust-core/crates/persistence/src/repositories/billing_checkout.rs	code	full	PostgresCheckoutSessionStore
+enterprise-mas/rust-core/crates/persistence/src/repositories/services.rs	code	full	PgServices
+enterprise-mas/rust-core/crates/persistence/src/repositories/usage.rs	code	full	UsageCursor
+enterprise-mas/rust-core/crates/persistence/src/repositories/mod.rs	code	full	//! PURPOSE: The concrete PostgreSQL repositories, and the s
+enterprise-mas/rust-core/crates/persistence/tests/whatsapp_live_pg.rs	test	full	cross_tenant
+enterprise-mas/rust-core/crates/persistence/tests/cross_tenant_isolation_pg.rs	test	full	seed_scope
+enterprise-mas/rust-core/crates/integrations/src/manifest.rs	code	min	ProviderManifest
+enterprise-mas/rust-core/crates/integrations/src/provider_adapters.rs	code	min	ProviderAuthorization
+enterprise-mas/rust-core/crates/integrations/src/provider_ports.rs	code	min	ProviderCustomer
+enterprise-mas/rust-core/crates/integrations/src/providers.rs	code	min	StripeCheckoutProvider
+enterprise-mas/rust-core/crates/integrations/src/connectors.rs	code	full	validate_category_config
+enterprise-mas/rust-core/crates/integrations/src/durable_webhooks.rs	code	full	ClaimedWebhookDelivery
+enterprise-mas/rust-core/crates/api/Cargo.toml	config	min	PURPOSE: The `mas-api` crate manifest — the tenant-facing HT
+enterprise-mas/rust-core/crates/api/src/main.rs	code	min	//! PURPOSE: `mas-api` process bootstrap: HTTP + gRPC server
+enterprise-mas/rust-core/crates/api/src/lib.rs	code	min	//! HTTP + gRPC **api processes**: thin transports over `mas
+enterprise-mas/rust-core/crates/api/src/router.rs	code	min	router
+enterprise-mas/rust-core/crates/api/src/state.rs	code	min	AppState
+enterprise-mas/rust-core/crates/api/src/routes_whatsapp.rs	code	min	public_routes
+enterprise-mas/rust-core/crates/api/src/routes_tooling.rs	code	full	routes
+enterprise-mas/rust-core/crates/api/src/routes_governance.rs	code	full	routes
+enterprise-mas/rust-core/crates/api/src/openapi_bundle.rs	code	min	//! PURPOSE: The bundled OpenAPI document, served at `GET /v
+enterprise-mas/rust-core/crates/api/src/handlers/mod.rs	code	min	Ctx
+enterprise-mas/rust-core/crates/api/src/handlers/whatsapp.rs	code	min	RegisterChannelRequest
+enterprise-mas/rust-core/crates/api/src/handlers/whatsapp_public.rs	code	min	VerifyQuery
+enterprise-mas/rust-core/crates/api/src/handlers/billing_checkout.rs	code	min	CreateCheckoutRequest
+enterprise-mas/rust-core/crates/api/src/handlers/billing_public.rs	code	min	//! PURPOSE: The public billing provider webhook (Stripe) ha
+enterprise-mas/rust-core/crates/api/src/handlers/inbound_webhooks.rs	code	min	//! PURPOSE: Authenticated endpoint-management and public si
+enterprise-mas/rust-core/crates/api/src/handlers/control_plane.rs	code	min	page_size
+enterprise-mas/rust-core/crates/api/src/handlers/discovery.rs	code	full	ModelCatalog
+enterprise-mas/rust-core/crates/api/src/handlers/executions.rs	code	min	//! Execution routes. Submission lives under the project (`P
+enterprise-mas/rust-core/crates/api/src/handlers/tenancy.rs	code	min	RegisterOrganizationBody
+enterprise-mas/rust-core/crates/api/tests/openapi_parity.rs	test	min	//! PURPOSE: OpenAPI <-> router parity.
+enterprise-mas/rust-core/crates/api/tests/whatsapp_routes.rs	test	min	channel_roundtrip_requires_scope
+enterprise-mas/rust-core/crates/api/tests/security_matrix.rs	test	full	//! PURPOSE: Cargo anchor for the workspace-root security ma
+enterprise-mas/rust-core/crates/api/tests/root_contract.rs	test	full	//! Cargo anchor for the workspace-root contract suite (see
+enterprise-mas/rust-core/crates/api/tests/control_plane_admin.rs	test	full	Should not exist
+enterprise-mas/rust-core/crates/api/tests/tooling_routes.rs	test	full	//! PURPOSE: Route and authorization contract tests for the 
+enterprise-mas/rust-core/crates/api/tests/governance_routes.rs	test	full	//! PURPOSE: Route and service security contract tests for t
+enterprise-mas/rust-core/crates/worker/src/consumer.rs	code	min	ConsumerConfig
+enterprise-mas/rust-core/crates/worker-service/src/agent_execution.rs	code	min	AgentBridgeSettings
+enterprise-mas/rust-core/crates/cli/src/main.rs	code	min	//! `mas` — operator CLI binary. All behavior lives in [`mas
+enterprise-mas/rust-core/crates/cli/src/args.rs	code	min	GlobalOpts
+enterprise-mas/rust-core/crates/cli/src/commands.rs	code	min	ExitCode
+enterprise-mas/rust-core/crates/cli/tests/e2e.rs	test	full	//! Fake-server integration: a local axum app answering with
+enterprise-mas/rust-core/crates/cli/tests/bootstrap.rs	test	min	bootstrap_masks_secret_material
+enterprise-mas/python-orchestrator/pyproject.toml	config	min	PURPOSE:
+enterprise-mas/python-orchestrator/scripts/check.sh	code	min	#!/usr/bin/env bash
+enterprise-mas/python-orchestrator/scripts/bootstrap.sh	code	min	#!/usr/bin/env sh
+enterprise-mas/python-orchestrator/src/mas_orchestrator/main.py	code	min	PURPOSE:
+enterprise-mas/python-orchestrator/src/mas_orchestrator/version.py	code	min	1.1.0
+enterprise-mas/python-orchestrator/src/mas_orchestrator/config/enums.py	code	min	"""Stable configuration enumerations.
+enterprise-mas/python-orchestrator/src/mas_orchestrator/config/validation.py	code	min	PURPOSE:
+enterprise-mas/python-orchestrator/src/mas_orchestrator/config/settings.py	code	min	PURPOSE:
+enterprise-mas/python-orchestrator/src/mas_orchestrator/providers/factory.py	code	min	"""Provider adapter construction from validated configuratio
+enterprise-mas/python-orchestrator/src/mas_orchestrator/providers/azure.py	code	min	AzureOpenAIProvider
+enterprise-mas/python-orchestrator/src/mas_orchestrator/providers/gemini.py	code	min	GeminiProvider
+enterprise-mas/python-orchestrator/src/mas_orchestrator/channels/__init__.py	code	full	channels
+enterprise-mas/python-orchestrator/src/mas_orchestrator/channels/whatsapp_media.py	code	min	split_by_limit
+enterprise-mas/python-orchestrator/src/mas_orchestrator/agents/builtin/whatsapp_support_agent.py	code	min	WhatsappSupportAgent
+enterprise-mas/python-orchestrator/src/mas_orchestrator/agents/builtin/__init__.py	code	full	Platform Assistant
+enterprise-mas/python-orchestrator/src/mas_orchestrator/tools/builtins/__init__.py	code	full	"""Built-in tools.
+enterprise-mas/python-orchestrator/src/mas_orchestrator/tools/builtins/code.py	code	min	"""Code-execution tool.
+enterprise-mas/python-orchestrator/src/mas_orchestrator/tools/builtins/database.py	code	min	"""Read-only database tool.
+enterprise-mas/python-orchestrator/src/mas_orchestrator/tools/builtins/email.py	code	min	"""Email tool.
+enterprise-mas/python-orchestrator/src/mas_orchestrator/tools/builtins/search.py	code	min	"""Search tool.
+enterprise-mas/python-orchestrator/src/mas_orchestrator/tools/backends/email.py	code	min	"""Email delivery backends: SMTP and SendGrid.
+enterprise-mas/python-orchestrator/src/mas_orchestrator/tools/backends/search.py	code	min	"""Web search backends: Brave, Tavily, and SearXNG.
+enterprise-mas/python-orchestrator/src/mas_orchestrator/tools/backends/sandbox.py	code	min	"""Remote sandbox backend for the code tool.
+enterprise-mas/python-orchestrator/src/mas_orchestrator/tools/backends/database.py	code	min	"""Read-only PostgreSQL backend for the database tool.
+enterprise-mas/python-orchestrator/src/mas_orchestrator/memory/backends.py	code	min	"""Memory storage backends.
+enterprise-mas/python-orchestrator/src/mas_orchestrator/memory/postgres_store.py	code	min	"""Durable memory store on PostgreSQL — the ``mas_memory`` p
+enterprise-mas/python-orchestrator/src/mas_orchestrator/services/composition.py	code	min	PURPOSE:
+enterprise-mas/python-orchestrator/src/mas_orchestrator/services/execution_service.py	code	full	"""The canonical execution service.
+enterprise-mas/python-orchestrator/src/mas_orchestrator/services/execution_state.py	code	full	"""Authoritative execution state, read from Rust's durable s
+enterprise-mas/python-orchestrator/tests/unit/test_whatsapp_format.py	test	min	test_split_by_limit_respects_paragraphs
+enterprise-mas/python-orchestrator/tests/unit/test_backends.py	test	min	a
+enterprise-mas/python-orchestrator/tests/unit/test_provider_gemini_azure.py	test	min	lookup
+enterprise-mas/python-orchestrator/tests/unit/test_memory_postgres_store.py	test	min	"""Unit tests for the PostgreSQL memory-plane store that nee
+enterprise-mas/python-orchestrator/tests/unit/test_whatsapp_agent.py	test	min	WhatsappSupportAgent
+enterprise-mas/python-orchestrator/tests/unit/test_secrets_lifecycle.py	test	min	test_value_is_reachable
+enterprise-mas/python-orchestrator/src/mas_orchestrator/models/types.py	code	full	class ToolSpec
+enterprise-mas/python-orchestrator/src/mas_orchestrator/tools/builtins/webhook.py	code	full	class WebhookTarget
+enterprise-mas/python-orchestrator/tests/unit/test_config.py	test	full	"""Unit tests for the configuration subsystem.
+enterprise-mas/python-orchestrator/tests/unit/test_builtins.py	test	full	"""Tests for the five built-in tools.
+enterprise-mas/python-orchestrator/tests/unit/test_data_hub_sources.py	test	full	"""Resource-bound and checkpoint regressions for Data Hub so
+enterprise-mas/python-orchestrator/tests/integration/test_memory_plane_store.py	test	full	"""Live PostgreSQL regression tests for the memory-plane sto
+enterprise-mas/python-orchestrator/src/mas_orchestrator/grpc/server.py	code	full	PURPOSE:
+enterprise-mas/python-orchestrator/src/mas_orchestrator/security/internal_service.py	code	full	"""Versioned, body-bound internal service authentication.
+enterprise-mas/python-orchestrator/src/mas_orchestrator/prompts/registry.py	code	full	"""Versioned prompt registry.
+sandbox-runner/runner.py	code	min	enforce_limits
+sandbox-runner/seccomp.json	config	min	SCMP_ACT_ERRNO
+sandbox-runner/tests/test_runner_limits.py	test	min	test_memory_limit
+sandbox-runner/tests/test_runner_security.py	test	full	test_seccomp_default_deny
+sdk/typescript/package.json	config	min	mas-sdk
+sdk/typescript/src/index.ts	code	min	export class MasClient
+sdk/typescript/src/sse.ts	code	min	export function openEventStream
+sdk/typescript/tests/client.test.ts	test	full	submits executions
+sdk/typescript/tests/sse.test.ts	test	full	parses event frames
+sdk/python/pyproject.toml	config	min	mas-sdk
+sdk/python/mas_sdk/__init__.py	code	min	MasClient
+sdk/python/mas_sdk/client.py	code	min	class MasClient
+sdk/python/tests/test_client.py	test	full	test_submit_execution
+sdk/python/tests/test_auth.py	test	full	test_scope_guard
+sdk/python/tests/test_events.py	test	full	test_event_parsing
+examples/01_hello_agent.py	code	full	mas_sdk
+examples/02_run_workflow.py	code	full	mas_sdk
+examples/03_stream_events.py	code	full	mas_sdk
+examples/04_quota_and_usage.py	code	full	mas_sdk
+examples/05_whatsapp_bot.md	doc	full	whatsapp
+scripts/e2e-smoke.sh	code	min	#!/usr/bin/env bash
+scripts/e2e-whatsapp.sh	code	min	webhooks/whatsapp
+scripts/e2e-full.sh	code	full	e2e
+scripts/demo/docs/demo-walkthrough.md	doc	full	demo
+scripts/demo/docs/demo-troubleshooting.md	doc	full	demo
+scripts/demo/agent-definition.json	asset	full	agents
+scripts/demo/workflow-definition.json	asset	full	workflows
+web/package.json	config	min	enterprise-mas-web
+web/next.config.mjs	config	full	next
+web/tsconfig.json	config	full	typescript
+web/.env.example	config	full	MAS_API
+web/scripts/gen-api-client.sh	code	min	openapi
+web/src/app/layout.tsx	code	min	RootLayout
+web/src/app/page.tsx	code	min	DashboardPage
+web/src/app/(dashboard)/layout.tsx	code	min	AppShell
+web/src/app/(dashboard)/agents/page.tsx	code	min	AgentsPage
+web/src/app/(dashboard)/agents/[id]/page.tsx	code	full	AgentDetailPage
+web/src/app/(dashboard)/executions/page.tsx	code	min	ExecutionsPage
+web/src/app/(dashboard)/executions/[id]/page.tsx	code	full	ExecutionDetailPage
+web/src/app/(dashboard)/api-keys/page.tsx	code	min	ApiKeysPage
+web/src/app/(dashboard)/workflows/page.tsx	code	full	WorkflowsPage
+web/src/app/(dashboard)/approvals/page.tsx	code	full	ApprovalsPage
+web/src/app/(dashboard)/tools/page.tsx	code	full	ToolsPage
+web/src/app/(dashboard)/connectors/page.tsx	code	full	ConnectorsPage
+web/src/app/(dashboard)/webhooks/page.tsx	code	full	WebhooksPage
+web/src/app/(dashboard)/billing/page.tsx	code	full	BillingPage
+web/src/app/(dashboard)/policies/page.tsx	code	full	PoliciesPage
+web/src/app/(dashboard)/audit/page.tsx	code	full	AuditPage
+web/src/app/(dashboard)/usage/page.tsx	code	full	UsagePage
+web/src/app/(dashboard)/settings/page.tsx	code	full	SettingsPage
+web/src/app/(dashboard)/whatsapp/page.tsx	code	full	WhatsappPage
+web/src/app/(dashboard)/whatsapp/inbox/page.tsx	code	full	WhatsappInboxPage
+web/src/lib/api.ts	code	min	ApiClient
+web/src/lib/auth/apikey.ts	code	min	resolveApiKey
+web/src/lib/sse.ts	code	full	subscribeStream
+web/src/components/ui/button.tsx	code	full	Button
+web/src/components/ui/card.tsx	code	full	Card
+web/src/components/ui/table.tsx	code	full	DataTable
+web/src/components/ui/badge.tsx	code	full	Badge
+web/src/components/ui/input.tsx	code	full	Input
+web/src/components/ui/dialog.tsx	code	full	Dialog
+web/src/components/charts/throughput-chart.tsx	code	full	ThroughputChart
+web/src/service-worker.ts	code	full	SHELL_CACHE
+web/tests/unit/table.test.tsx	test	full	renders rows
+web/tests/unit/badge.test.tsx	test	full	renders tone
+web/tests/unit/apikey.test.ts	test	min	rejects missing key
+web/tests/e2e/dashboard.spec.ts	test	min	loads the dashboard

@@ -14,6 +14,10 @@ from mas_orchestrator.agents.builtin.platform_assistant import (
     PlatformAssistantAgent,
     PlatformAssistantResponse,
 )
+from mas_orchestrator.agents.builtin.whatsapp_support_agent import (
+    WHATSAPP_SUPPORT_AGENT_ID,
+    WhatsappSupportAgent,
+)
 from mas_orchestrator.prompts.builtin_assistant import register_builtin_assistant_prompt
 from mas_orchestrator.prompts.registry import PromptRegistry
 
@@ -29,6 +33,7 @@ __all__ = [
     "AssistantQuickAction",
     "PlatformAssistantAgent",
     "PlatformAssistantResponse",
+    "WhatsappSupportAgent",
     "register_builtin_agents",
 ]
 
@@ -47,6 +52,26 @@ PLATFORM_ASSISTANT_TEMPLATE: Final[Mapping[str, object]] = MappingProxyType(
         "allowed_tools": (),
         "limits": AgentLimits(max_steps=4, max_tool_calls=0, max_delegation_depth=0),
         "tags": ("builtin", "read-only", "prompt:platform_assistant.system:v1"),
+        "read_only": True,
+    }
+)
+
+
+WHATSAPP_SUPPORT_TEMPLATE: Final[Mapping[str, object]] = MappingProxyType(
+    {
+        "agent_id": WHATSAPP_SUPPORT_AGENT_ID,
+        "agent_version_id": "1",
+        "name": "WhatsApp Support",
+        "slug": "whatsapp-support",
+        "kind": AgentKind.STANDARD,
+        "description": (
+            "Product-owned WhatsApp support triage: intent classification, "
+            "reply drafting and WhatsApp-sized segmentation. No data tools."
+        ),
+        "system_prompt": "",
+        "allowed_tools": (),
+        "limits": AgentLimits(max_steps=1, max_tool_calls=0, max_delegation_depth=0),
+        "tags": ("builtin", "read-only", "channel:whatsapp"),
         "read_only": True,
     }
 )
@@ -74,4 +99,5 @@ def register_builtin_agents(
         f"prompt_fingerprint:{prompt.fingerprint}",
     )
     registry.register_builtin(template)
+    registry.register_builtin(dict(WHATSAPP_SUPPORT_TEMPLATE))
     return registry

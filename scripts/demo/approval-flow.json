@@ -1,0 +1,19 @@
+{
+  "name": "Demo Approval Flow",
+  "slug": "approval-flow",
+  "graph": {
+    "nodes": [
+      {
+        "id": "draft",
+        "type": "agent_step",
+        "config": { "agent_slug": "support-bot" }
+      },
+      {
+        "id": "approve",
+        "type": "human_approval",
+        "config": { "sla_minutes": 30 }
+      }
+    ],
+    "edges": [{ "from": "draft", "to": "approve" }]
+  }
+}

@@ -44,9 +44,9 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Any, Final
 
-from mas_orchestrator.config.enums import ProviderMode
+from mas_orchestrator.config.enums import DataSourceKind, ProviderMode, VectorBackend
 from mas_orchestrator.contracts.errors import ConfigurationError
 
 if TYPE_CHECKING:
@@ -55,9 +55,13 @@ if TYPE_CHECKING:
     from mas_orchestrator.agents.runtime import AgentRuntime
     from mas_orchestrator.agents.tenant_registry import TenantScopedAgentRegistry
     from mas_orchestrator.config.settings import Settings
+    from mas_orchestrator.data_hub.service import DataHubService
     from mas_orchestrator.models.cost import PricingTable
     from mas_orchestrator.models.registry import ModelRegistry
+    from mas_orchestrator.prompts.registry import PromptRegistry
     from mas_orchestrator.providers.factory import ProviderBundle, ProviderSpec
+    from mas_orchestrator.rag.embeddings import Embedder
+    from mas_orchestrator.rag.index import VectorIndex
     from mas_orchestrator.security.identity import ServiceIdentityResolver
     from mas_orchestrator.services.execution_service import ExecutionService
 
@@ -79,6 +83,8 @@ DEFAULT_AGENT_ID: Final[str] = "platform.default"
 _PROVIDER_SECRET_REFS: Final[dict[str, str]] = {
     "openai": "env:MAS_OPENAI_API_KEY",
     "anthropic": "env:MAS_ANTHROPIC_API_KEY",
+    "gemini": "env:MAS_GEMINI_API_KEY",
+    "azure": "env:MAS_AZURE_OPENAI_API_KEY",
 }
 
 
@@ -93,6 +99,8 @@ class RuntimeBundle:
         providers: The constructed provider bundle, kept so the composition
             root can close every adapter on shutdown.
         agent_registry: The tenant-scoped registry, exposed for diagnostics.
+        prompt_registry: Immutable, versioned prompt templates used by built-in agents.
+        data_hub_service: Rust-authorized Data Hub ingestion and RAG-plane service.
     """
 
     execution_service: ExecutionService
@@ -100,10 +108,19 @@ class RuntimeBundle:
     identity_resolver: ServiceIdentityResolver
     providers: ProviderBundle
     agent_registry: TenantScopedAgentRegistry
+    prompt_registry: PromptRegistry
+    data_hub_service: DataHubService
 
     async def aclose(self) -> None:
-        """Closes every provider transport owned by the bundle."""
-        await self.providers.aclose()
+        """Closes provider, source-adapter, embedding and vector-store resources."""
+        errors: list[Exception] = []
+        for close in (self.data_hub_service.aclose, self.providers.aclose):
+            try:
+                await close()
+            except Exception as error:
+                errors.append(error)
+        if errors:
+            raise ExceptionGroup("runtime resource cleanup failed", errors)
 
     def describe(self) -> dict[str, object]:
         """A log-safe summary of what was composed.
@@ -122,6 +139,15 @@ class RuntimeBundle:
             "skipped_providers": list(self.providers.skipped),
             "agent_catalog": sorted(self.agent_registry.catalog_ids),
             "default_agent_id": self.agent_registry.default_agent_id,
+            "prompts": [
+                {
+                    "name": name,
+                    "version": self.prompt_registry.get(name).version,
+                    "fingerprint": self.prompt_registry.get(name).fingerprint,
+                }
+                for name in self.prompt_registry.names()
+            ],
+            "data_hub_enabled": self.data_hub_service.enabled,
         }
 
 
@@ -225,6 +251,9 @@ def build_identity_resolver(settings: Settings) -> ServiceIdentityResolver:
                 ServiceScope.EXECUTE_AGENT,
                 ServiceScope.INVOKE_API,
                 ServiceScope.READ_HEALTH,
+                ServiceScope.DATA_HUB_SYNC,
+                ServiceScope.DATA_HUB_INGEST,
+                ServiceScope.DATA_HUB_PURGE,
             }
         ),
     )
@@ -256,6 +285,7 @@ def build_runtime_bundle(settings: Settings) -> RuntimeBundle:
     from mas_orchestrator.models.registry import ModelRegistry
     from mas_orchestrator.models.router import ModelRouter
     from mas_orchestrator.models.router import build_policy as build_model_policy
+    from mas_orchestrator.prompts.registry import PromptRegistry
     from mas_orchestrator.providers.factory import build_providers
     from mas_orchestrator.services.execution_service import build_execution_service
 
@@ -292,12 +322,17 @@ def build_runtime_bundle(settings: Settings) -> RuntimeBundle:
         catalog=DEFAULT_AGENT_CATALOG,
         default_agent_id=_default_agent_id(settings),
     )
+    from mas_orchestrator.agents.builtin import register_builtin_agents
+
+    prompt_registry = PromptRegistry(environment=settings.environment)
+    register_builtin_agents(agent_registry, prompts=prompt_registry)
     agent_factory = AgentFactory(
         router=model_router,
         provider_for=registry.resolve,  # type: ignore[arg-type]
         tool_executor=None,
         tool_registry=None,
         agent_registry=agent_registry,  # type: ignore[arg-type]
+        prompt_registry=prompt_registry,
     )
     agent_registry.bind_factory(agent_factory)
 
@@ -319,7 +354,38 @@ def build_runtime_bundle(settings: Settings) -> RuntimeBundle:
             max_parallel_agents=1,
         ),
     )
-    execution_service = build_execution_service(runtime)
+    # Stage-2 idempotency is only as authoritative as its state reader. When
+    # the platform database is configured, wire the real Rust-backed reader;
+    # without one every duplicate delivery proceeds (documented gap, logged).
+    state_reader: Any = None
+    state_reporter: Any = None
+    if settings.data_hub.database_url_secret_ref:
+        from mas_orchestrator.security.credentials import resolve_secret
+        from mas_orchestrator.services.execution_state import (
+            RustExecutionStateReader,
+            RustStateTransitionReporter,
+        )
+
+        pool = RustExecutionStateReader.builder(
+            resolve_secret(settings.data_hub.database_url_secret_ref).reveal()
+        )
+        state_reader = RustExecutionStateReader(pool)
+        state_reporter = RustStateTransitionReporter(pool)
+    else:
+        _LOGGER.warning(
+            "no platform database configured; duplicate deliveries cannot consult "
+            "authoritative execution state and will proceed",
+            extra={"event": "startup.state_reader_unwired"},
+        )
+        _LOGGER.warning(
+            "no platform database configured; terminal state transitions are "
+            "logged, not written back to Rust",
+            extra={"event": "startup.state_reporter_unwired"},
+        )
+    execution_service = build_execution_service(
+        runtime, state_reader=state_reader, reporter=state_reporter
+    )
+    data_hub_service = build_data_hub_service(settings)
 
     bundle = RuntimeBundle(
         execution_service=execution_service,
@@ -327,6 +393,8 @@ def build_runtime_bundle(settings: Settings) -> RuntimeBundle:
         identity_resolver=build_identity_resolver(settings),
         providers=providers,
         agent_registry=agent_registry,
+        prompt_registry=prompt_registry,
+        data_hub_service=data_hub_service,
     )
 
     _LOGGER.info(
@@ -334,6 +402,153 @@ def build_runtime_bundle(settings: Settings) -> RuntimeBundle:
         extra={"event": "startup.runtime", **bundle.describe()},
     )
     return bundle
+
+
+def build_data_hub_service(settings: Settings) -> DataHubService:
+    """Constructs configured source adapters and the RAG ingestion plane.
+
+    A disabled RAG plane is represented by a service that refuses ingestion;
+    it is never backed by an accidental in-memory fallback. When durable RAG is
+    enabled, PostgreSQL connectivity is opened and health-checked by gRPC server
+    startup before the listener is bound.
+    """
+    from mas_orchestrator.data_hub.service import DataHubService
+    from mas_orchestrator.data_hub.sources import S3CompatibleAdapter, WebCrawlAdapter
+    from mas_orchestrator.rag.chunking import ChunkingConfig
+    from mas_orchestrator.rag.embeddings import HashingEmbedder, OpenAIEmbedder
+    from mas_orchestrator.rag.index import InMemoryVectorIndex
+    from mas_orchestrator.rag.ingestion import IngestConfig, IngestionPipeline
+    from mas_orchestrator.security.credentials import resolve_secret
+
+    adapters: dict[DataSourceKind, object] = {}
+    data_settings = settings.data_hub
+    if DataSourceKind.WEB in data_settings.allowed_source_kinds:
+        if not data_settings.crawl_egress_allowlist:
+            raise ConfigurationError(
+                "web source is enabled without an egress allow-list",
+                details={"field": "data_hub.crawl_egress_allowlist"},
+            )
+        web = WebCrawlAdapter(
+            allowed_hosts=data_settings.crawl_egress_allowlist,
+            max_depth=data_settings.max_crawl_depth,
+            max_pages=min(data_settings.max_crawl_pages, data_settings.max_pages_per_sync),
+            max_document_bytes=data_settings.max_document_bytes,
+            max_sync_bytes=data_settings.max_sync_bytes,
+        )
+        adapters[DataSourceKind.WEB] = web.sync
+
+    if DataSourceKind.OBJECT_STORAGE in data_settings.allowed_source_kinds:
+        if not data_settings.object_storage_egress_allowlist:
+            raise ConfigurationError(
+                "object storage is enabled without an egress allow-list",
+                details={"field": "data_hub.object_storage_egress_allowlist"},
+            )
+        object_storage = S3CompatibleAdapter(
+            allowed_hosts=data_settings.object_storage_egress_allowlist,
+            max_pages=min(data_settings.max_pages_per_sync, 10_000),
+            max_document_bytes=data_settings.max_document_bytes,
+            max_sync_bytes=data_settings.max_sync_bytes,
+        )
+        adapters[DataSourceKind.OBJECT_STORAGE] = object_storage.sync
+
+    if not settings.rag.enabled:
+        return DataHubService(
+            settings=settings,
+            pipeline=None,
+            index=None,
+            embedder=None,
+            adapters=adapters,  # type: ignore[arg-type]
+        )
+
+    if settings.rag.hybrid_enabled:
+        raise ConfigurationError(
+            "hybrid retrieval was requested but no persistent lexical index is configured",
+            details={"field": "rag.hybrid_enabled"},
+        )
+    if settings.rag.embedding_dimensions != 1536:
+        raise ConfigurationError(
+            "the configured Data Hub vector plane requires 1536-dimensional embeddings",
+            details={"field": "rag.embedding_dimensions"},
+        )
+
+    index: VectorIndex
+    embedder: Embedder
+    if settings.rag.vector_backend is VectorBackend.PGVECTOR:
+        if data_settings.database_role != "mas_rag":
+            raise ConfigurationError(
+                "pgvector requires data_hub.database_role='mas_rag'",
+                details={"field": "data_hub.database_role"},
+            )
+        if not data_settings.database_url_secret_ref:
+            raise ConfigurationError(
+                "pgvector requires a secret reference for the RAG database URL",
+                details={"field": "data_hub.database_url_secret_ref"},
+            )
+        if settings.rag.embedding_provider != "openai":
+            raise ConfigurationError(
+                "only the fixed-host OpenAI embedding adapter is configured",
+                details={"field": "rag.embedding_provider"},
+            )
+        if not settings.rag.embedding_api_key_secret_ref:
+            raise ConfigurationError(
+                "a real embedding provider secret reference is required",
+                details={"field": "rag.embedding_api_key_secret_ref"},
+            )
+        from mas_orchestrator.rag.pgvector_index import PgVectorIndex
+
+        index = PgVectorIndex.deferred(
+            resolve_secret(data_settings.database_url_secret_ref).reveal(),
+            dimensions=settings.rag.embedding_dimensions,
+            database_role=data_settings.database_role,
+        )
+        embedder = OpenAIEmbedder(
+            api_key=resolve_secret(settings.rag.embedding_api_key_secret_ref),
+            model=settings.rag.embedding_model,
+            dimensions=settings.rag.embedding_dimensions,
+            request_timeout_seconds=settings.providers.request_timeout_seconds,
+        )
+    elif settings.rag.vector_backend is VectorBackend.IN_MEMORY:
+        if settings.is_production:
+            raise ConfigurationError(
+                "in-memory vector storage is refused in production",
+                details={"field": "rag.vector_backend"},
+            )
+        index = InMemoryVectorIndex(environment=settings.environment)
+        embedder = HashingEmbedder(
+            dimensions=settings.rag.embedding_dimensions,
+            environment=settings.environment,
+        )
+    else:
+        raise ConfigurationError(
+            "RAG is enabled without a usable vector backend",
+            details={"field": "rag.vector_backend"},
+        )
+
+    target = settings.rag.chunk_size_chars
+    chunking = ChunkingConfig(
+        target_chars=target,
+        max_chars=max(target, min(target * 2, 8_000)),
+        overlap_chars=settings.rag.chunk_overlap_chars,
+    )
+    pipeline = IngestionPipeline(
+        embedder=embedder,
+        index=index,
+        config=IngestConfig(
+            batch_size=64,
+            chunking=chunking,
+            index_lexically=False,
+            parser_workers=data_settings.parser_workers,
+            parser_timeout_seconds=data_settings.parser_timeout_seconds,
+            parser_memory_bytes=data_settings.parser_memory_bytes,
+        ),
+    )
+    return DataHubService(
+        settings=settings,
+        pipeline=pipeline,
+        index=index,
+        embedder=embedder,
+        adapters=adapters,  # type: ignore[arg-type]
+    )
 
 
 def _pricing_table(settings: Settings) -> PricingTable:
@@ -375,7 +590,11 @@ def _allowlist_for(settings: Settings, registry: ModelRegistry) -> tuple[str, ..
     if not settings.providers.allowed_models:
         return tuple(registry.models())
 
-    unknown = [key for key in settings.providers.allowed_models if key not in registry]
+    # Membership must compare *keys*: ``key in registry`` asks the registry
+    # for object membership (it looks up ``model.key``), so a plain string key
+    # is never found and every non-empty allowlist would refuse to boot.
+    known_keys = frozenset(registry.models())
+    unknown = [key for key in settings.providers.allowed_models if key not in known_keys]
     if unknown:
         raise ConfigurationError(
             "allowlisted models are not offered by any enabled provider",

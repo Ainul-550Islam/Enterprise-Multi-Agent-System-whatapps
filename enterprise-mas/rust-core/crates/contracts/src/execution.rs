@@ -25,6 +25,28 @@ pub struct StartExecutionRequest {
     pub idempotency_key: Option<String>,
 }
 
+/// Lifecycle signal for `POST /v1/executions/{execution_id}/signal` — a
+/// route-alias body carrying the transition verb for callers that dispatch
+/// through one endpoint instead of the dedicated lifecycle routes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignalExecutionRequest {
+    /// One of `start`, `pause`, `resume`, `cancel`.
+    pub signal: String,
+}
+
+impl SignalExecutionRequest {
+    pub fn validate(&self) -> Result<()> {
+        match self.signal.as_str() {
+            "start" | "pause" | "resume" | "cancel" => Ok(()),
+            _ => Err(mas_common::error::AppError::invalid_field(
+                "signal",
+                "invalid_enum_value",
+                "signal must be one of: start, pause, resume, cancel",
+            )),
+        }
+    }
+}
+
 impl StartExecutionRequest {
     pub fn validate(&self) -> Result<()> {
         if self.workflow_id.is_none() == self.agent_id.is_none() {

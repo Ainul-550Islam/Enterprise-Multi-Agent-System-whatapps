@@ -74,6 +74,7 @@ use crate::attempts::{AttemptCoordinator, ClaimOneOutcome};
 use crate::backoff::RetryPolicy;
 use crate::classify::{classify, FailureClass};
 use crate::consumer::{ConsumerConfig, ConsumerOutcome, TaskConsumer};
+use crate::delivery_receipts::InMemoryDeliveryReceiptStore;
 use crate::handler::{canned::CannedHandler, OperationDispatcher};
 
 // ---------------------------------------------------------------------------
@@ -294,6 +295,7 @@ fn submission_intent(key: &str) -> SubmissionIntent {
         project_id: project(),
         workflow_id: Some(workflow()),
         agent_id: None,
+        agent_version_id: None,
         input: payload(key),
         idempotency_key: Some(key.to_owned()),
         fingerprint: fingerprint(key),
@@ -339,6 +341,10 @@ fn queue_message(task: &mas_domain::Task) -> TaskQueueMessage {
         "corr-matrix",
     )
     .expect("message");
+    let message = match task.agent_version_id {
+        Some(version_id) => message.with_agent_version_id(version_id),
+        None => message,
+    };
     match task.request_id {
         Some(request_id) => message.with_request_id(request_id),
         None => message,
@@ -415,6 +421,7 @@ async fn run_consumer_on(
         rig.broker.clone(),
         attempts,
         Arc::new(dispatcher),
+        Arc::new(InMemoryDeliveryReceiptStore::default()),
         config(worker),
     );
     let (handle, watch) = crate::grace::channel();
@@ -736,7 +743,7 @@ async fn case_05_worker_crash_before_attempt_creation_leaves_the_task_claimable(
     assert_eq!(rig.durable.attempts().len(), 1);
 
     let receipt = healthy
-        .succeed(&reclaimed, usage(), true, &at(3))
+        .succeed(&reclaimed, serde_json::Value::Null, usage(), true, &at(3))
         .await
         .expect("settle");
     assert_eq!(receipt.task.status, TaskStatus::Completed);
@@ -789,7 +796,7 @@ async fn case_06_worker_crash_after_attempt_creation_is_reclaimable_after_the_le
 
     // And it can still finish: not permanently unrecoverable.
     let receipt = recovered
-        .succeed(&reclaimed, usage(), true, &at(32))
+        .succeed(&reclaimed, serde_json::Value::Null, usage(), true, &at(32))
         .await
         .expect("settle");
     assert_eq!(receipt.task.status, TaskStatus::Completed);
@@ -836,7 +843,7 @@ async fn case_07_worker_crash_after_the_runtime_result_is_not_lost_and_reruns() 
     let healthy = coordinator(rig.durable.clone(), "w-healthy", 30);
     let reclaimed = claim_owned(&healthy, &task, at(31)).await;
     let receipt = healthy
-        .succeed(&reclaimed, usage(), true, &at(32))
+        .succeed(&reclaimed, serde_json::Value::Null, usage(), true, &at(32))
         .await
         .expect("settle");
 
@@ -870,7 +877,7 @@ async fn case_08_failure_to_commit_the_terminal_state_is_reported_and_retryable(
     faulted.arm("settle", "statement timeout").await;
     let failing = coordinator(faulted.clone(), "w-1", 30);
     let error = failing
-        .succeed(&claim, usage(), true, &at(1))
+        .succeed(&claim, serde_json::Value::Null, usage(), true, &at(1))
         .await
         .expect_err("the terminal write fails");
     assert!(
@@ -893,7 +900,7 @@ async fn case_08_failure_to_commit_the_terminal_state_is_reported_and_retryable(
     // Recovery: the same worker settles again once the database is healthy.
     let before = metered(&rig);
     let receipt = coord
-        .succeed(&claim, usage(), true, &at(2))
+        .succeed(&claim, serde_json::Value::Null, usage(), true, &at(2))
         .await
         .expect("retry the settle");
     assert_eq!(receipt.task.status, TaskStatus::Completed);
@@ -1019,7 +1026,9 @@ async fn case_11_a_stale_worker_completion_is_rejected() {
     );
 
     // A completes late.
-    let late = a.succeed(&claim_a, usage(), true, &at(32)).await;
+    let late = a
+        .succeed(&claim_a, serde_json::Value::Null, usage(), true, &at(32))
+        .await;
     assert!(
         matches!(late, Err(AppError::Conflict(_))),
         "a stale worker must not be able to write: {late:?}"
@@ -1027,7 +1036,7 @@ async fn case_11_a_stale_worker_completion_is_rejected() {
 
     // B's write is the one that counts, and the state reflects B's outcome.
     let receipt = b
-        .succeed(&claim_b, usage(), true, &at(33))
+        .succeed(&claim_b, serde_json::Value::Null, usage(), true, &at(33))
         .await
         .expect("B settles");
     assert_eq!(receipt.task.status, TaskStatus::Completed);
@@ -1258,7 +1267,9 @@ async fn case_14_cancellation_during_execution_is_durable_and_idempotent() {
     // The worker that was running it arrives late with a result. Both a
     // success and a failure are refused: the version fence is what makes
     // cancellation final.
-    let late_success = coord.succeed(&claim, usage(), true, &at(4)).await;
+    let late_success = coord
+        .succeed(&claim, serde_json::Value::Null, usage(), true, &at(4))
+        .await;
     assert!(
         matches!(late_success, Err(AppError::Conflict(_))),
         "a late success must not reopen a cancelled run: {late_success:?}"
@@ -1326,7 +1337,7 @@ async fn case_15_process_restart_recovers_from_durable_state_alone() {
     // And the restarted process settles it: no permanent wedge.
     let before = metered(&rig);
     let receipt = after
-        .succeed(&claim, usage(), true, &at(3))
+        .succeed(&claim, serde_json::Value::Null, usage(), true, &at(3))
         .await
         .expect("settle after restart");
     assert_eq!(receipt.task.status, TaskStatus::Completed);

@@ -57,6 +57,10 @@ pub trait UserStorePort: std::fmt::Debug + Send + Sync {
     async fn save(&self, user: &User) -> Result<()>;
     async fn get(&self, id: UserId) -> Result<Option<User>>;
     async fn get_by_email(&self, email: &str) -> Result<Option<User>>;
+    /// Known users of the deployment. The platform-facing `GET /v1/users`
+    /// lists this catalogue, so the read belongs on the port rather than
+    /// inside one lane's handler.
+    async fn list(&self) -> Result<Vec<User>>;
 }
 
 #[async_trait]
@@ -533,6 +537,92 @@ impl UserStorePort for InMemoryServices {
             .values()
             .find(|u| u.email.to_string() == email)
             .cloned())
+    }
+
+    async fn list(&self) -> Result<Vec<User>> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .users
+            .values()
+            .cloned()
+            .collect())
+    }
+}
+
+#[async_trait]
+impl crate::usage_service::UsageReadPort for InMemoryServices {
+    async fn records(
+        &self,
+        tenant: TenantId,
+        from: Timestamp,
+        to: Timestamp,
+        limit: u16,
+    ) -> Result<Vec<mas_domain::usage::UsageRecord>> {
+        let mut records: Vec<_> = self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .usage_records
+            .values()
+            .filter(|record| record.tenant_id == tenant)
+            .filter(|record| {
+                !record.occurred_at.is_before(&from) && record.occurred_at.is_before(&to)
+            })
+            .cloned()
+            .collect();
+        records.sort_by(|a, b| {
+            b.occurred_at
+                .cmp(&a.occurred_at)
+                .then_with(|| b.id.cmp(&a.id))
+        });
+        records.truncate(usize::from(limit));
+        Ok(records)
+    }
+
+    async fn totals(
+        &self,
+        tenant: TenantId,
+        project: Option<ProjectId>,
+        from: Timestamp,
+        to: Timestamp,
+        dimension: Option<&str>,
+    ) -> Result<Vec<(String, u64)>> {
+        let mut totals: std::collections::BTreeMap<String, u64> = Default::default();
+        for record in self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .usage_records
+            .values()
+        {
+            if record.tenant_id != tenant
+                || project.is_some_and(|p| record.project_id != Some(p))
+                || record.occurred_at.is_before(&from)
+                || !record.occurred_at.is_before(&to)
+            {
+                continue;
+            }
+            let name = record.dimension.as_str().to_owned();
+            if dimension.is_some_and(|d| d != name) {
+                continue;
+            }
+            *totals.entry(name).or_default() += record.quantity;
+        }
+        Ok(totals.into_iter().collect())
+    }
+
+    async fn quota_snapshots(
+        &self,
+        _tenant: TenantId,
+    ) -> Result<Vec<(mas_domain::quota::Quota, u64)>> {
+        // The in-memory lane provisions no quota definitions — quotas are
+        // tenant provisioning data owned by the Postgres lane's
+        // `quota_definitions`. An empty list is the honest answer here, and
+        // the quota endpoints then report an empty catalogue rather than
+        // fabricated limits.
+        Ok(Vec::new())
     }
 }
 
@@ -1858,6 +1948,18 @@ arc_delegate!(UserStorePort => InMemoryServices {
     fn save(user: &User) -> Result<()>;
     fn get(id: UserId) -> Result<Option<User>>;
     fn get_by_email(email: &str) -> Result<Option<User>>;
+    fn list() -> Result<Vec<User>>;
+});
+use crate::usage_service::UsageReadPort;
+arc_delegate!(UsageReadPort => InMemoryServices {
+    fn records(tenant: TenantId, from: Timestamp, to: Timestamp, limit: u16) -> Result<Vec<mas_domain::usage::UsageRecord>>;
+    fn totals(tenant: TenantId, project: Option<ProjectId>, from: Timestamp, to: Timestamp, dimension: Option<&str>) -> Result<Vec<(String, u64)>>;
+    fn quota_snapshots(tenant: TenantId) -> Result<Vec<(mas_domain::quota::Quota, u64)>>;
+});
+use crate::webhook_service::{DeliveryCursor, DeliveryRecord, WebhookAdminPort};
+arc_delegate!(WebhookAdminPort => InMemoryServices {
+    fn list_deliveries(tenant: TenantId, endpoint: WebhookId, after: Option<DeliveryCursor>, limit: u16) -> Result<Vec<DeliveryRecord>>;
+    fn replay_dead_letter(tenant: TenantId, endpoint: WebhookId, delivery: uuid::Uuid, actor: Option<UserId>) -> Result<DeliveryRecord>;
 });
 arc_delegate!(MembershipStorePort => InMemoryServices {
     fn save(membership: &Membership) -> Result<()>;

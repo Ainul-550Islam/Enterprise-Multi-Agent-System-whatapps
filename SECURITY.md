@@ -4,9 +4,12 @@
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 1.0.x   | :white_check_mark: (current development line) |
+| 1.1.x   | :white_check_mark: (current release — see `CHANGELOG.md` [1.1.0]) |
+| 1.0.x   | :white_check_mark: (security fixes only) |
 
-Earlier releases are not supported.
+Product release `1.1.0` is the version in `enterprise-mas/rust-core/Cargo.toml`
+`[workspace.package]`, `enterprise-mas/python-orchestrator/pyproject.toml`, and
+`web/package.json`. Earlier releases are not supported.
 
 ## Reporting a Vulnerability
 
@@ -40,4 +43,4 @@ source rather than taken on faith. Anything not listed here is **not** enforced.
 | Python production composition fail-closed | `enterprise-mas/python-orchestrator/src/mas_orchestrator/main.py` (`build_bridge_server`, `require_internal_signature`) |
 | Key rotation entry points | `enterprise-mas/rust-core/crates/api/src/handlers/api_keys.rs` (`/v1/api-keys/{id}/rotate`), `crates/security/src/jwks.rs` |
 
-Not implemented (stated plainly, not implied): SOC2/ISO certification, a frontend/dashboard, a WhatsApp channel, Stripe checkout.
+Not implemented (stated plainly, not implied): SOC2/ISO certification.

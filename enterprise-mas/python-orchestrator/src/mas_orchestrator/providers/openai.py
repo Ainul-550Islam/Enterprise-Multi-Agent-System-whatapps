@@ -32,7 +32,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any, ClassVar, Final
 
 from mas_orchestrator.contracts.errors import (
     CancellationRequestedError,
@@ -157,7 +157,9 @@ class OpenAIProvider:
             permitted by the policy.
     """
 
-    provider_id: Final[str] = "openai"
+    #: Provider identity. A ``ClassVar`` rather than ``Final`` because the
+    #: Azure OpenAI adapter subclasses this codec and must override it.
+    provider_id: ClassVar[str] = "openai"
 
     def __init__(
         self,

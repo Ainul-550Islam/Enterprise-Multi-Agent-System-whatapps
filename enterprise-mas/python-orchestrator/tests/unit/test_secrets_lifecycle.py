@@ -229,7 +229,7 @@ class TestDiagnostics:
             assert_no_committed_credentials("key: sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ123456")
 
     def test_clean_text_passes(self) -> None:
-        assert_no_committed_credentials("host: localhost")
+        assert assert_no_committed_credentials("host: localhost") is None
 
     def test_redact_in_text(self) -> None:
         result = redact_in_text("key: sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ123456")

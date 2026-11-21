@@ -91,6 +91,13 @@ pub struct AppState {
     /// `None` means an embedding explicitly omitted the notification plane;
     /// handlers fail loudly rather than returning a plausible empty inbox.
     pub notifications: Option<Arc<NotificationService>>,
+    /// Billing use cases (checkout + provider webhook application).
+    pub billing: Option<Arc<mas_application::billing_service::BillingService>>,
+    /// WhatsApp use cases (channels, sends, inbound webhook).
+    pub whatsapp: Option<Arc<mas_application::whatsapp_service::WhatsAppService>>,
+    /// AI model provider availability of this deployment (composition-time
+    /// catalogue; every lane sets it — it reports config state, not secrets).
+    pub model_catalog: Option<Arc<crate::handlers::discovery::ModelCatalog>>,
     /// Authorized tenant configuration service for canonical public inbound
     /// webhook endpoints. Omitted compositions fail loudly in its handlers.
     pub inbound_webhook_endpoints: Option<Arc<InboundWebhookEndpointService>>,
@@ -294,6 +301,62 @@ impl AppState {
         self
     }
 
+    /// Wires the billing service (composition root only).
+    #[must_use]
+    pub fn with_billing(
+        mut self,
+        billing: Arc<mas_application::billing_service::BillingService>,
+    ) -> Self {
+        self.billing = Some(billing);
+        self
+    }
+
+    /// Wires the WhatsApp service (composition root only).
+    #[must_use]
+    pub fn with_whatsapp(
+        mut self,
+        whatsapp: Arc<mas_application::whatsapp_service::WhatsAppService>,
+    ) -> Self {
+        self.whatsapp = Some(whatsapp);
+        self
+    }
+
+    /// The billing service, or a configuration envelope error.
+    pub fn billing_service(
+        &self,
+        ctx: &crate::context::RequestContext,
+    ) -> std::result::Result<
+        Arc<mas_application::billing_service::BillingService>,
+        crate::response::ApiError,
+    > {
+        self.billing.clone().ok_or_else(|| {
+            crate::response::ApiError::new(
+                mas_common::error::AppError::internal(
+                    "billing service is not configured for this API deployment",
+                ),
+                ctx,
+            )
+        })
+    }
+
+    /// The WhatsApp service, or a configuration envelope error.
+    pub fn whatsapp_service(
+        &self,
+        ctx: &crate::context::RequestContext,
+    ) -> std::result::Result<
+        Arc<mas_application::whatsapp_service::WhatsAppService>,
+        crate::response::ApiError,
+    > {
+        self.whatsapp.clone().ok_or_else(|| {
+            crate::response::ApiError::new(
+                mas_common::error::AppError::internal(
+                    "whatsapp service is not configured for this API deployment",
+                ),
+                ctx,
+            )
+        })
+    }
+
     /// Returns notification lifecycle composition or a deterministic error.
     pub fn notification_service(
         &self,
@@ -370,7 +433,7 @@ impl AppState {
     ) -> std::result::Result<Arc<IntegrationService>, crate::response::ApiError> {
         self.integrations.clone().ok_or_else(|| {
             crate::response::ApiError::new(
-                mas_common::error::AppError::internal(
+                mas_common::error::AppError::unavailable(
                     "integration service is not configured for this API deployment",
                 ),
                 ctx,
@@ -516,6 +579,32 @@ impl AppState {
         })
     }
 
+    /// Installs the composition-time AI model provider catalogue.
+    #[must_use]
+    pub fn with_model_catalog(
+        mut self,
+        catalog: Arc<crate::handlers::discovery::ModelCatalog>,
+    ) -> Self {
+        self.model_catalog = Some(catalog);
+        self
+    }
+
+    /// Returns the model catalogue or a typed `503` composition error.
+    pub fn model_catalog(
+        &self,
+        ctx: &crate::context::RequestContext,
+    ) -> std::result::Result<Arc<crate::handlers::discovery::ModelCatalog>, crate::response::ApiError>
+    {
+        self.model_catalog.clone().ok_or_else(|| {
+            crate::response::ApiError::new(
+                mas_common::error::AppError::unavailable(
+                    "the model catalogue is not configured for this API deployment",
+                ),
+                ctx,
+            )
+        })
+    }
+
     /// Installs the tool catalogue service over the production tool store
     /// and the canonical policy engine.
     #[must_use]
@@ -650,7 +739,7 @@ impl AppState {
         Arc<mas_persistence::repositories::control_plane::ControlPlaneStores>,
     > {
         self.control_plane_stores.clone().ok_or_else(|| {
-            mas_common::error::AppError::internal(
+            mas_common::error::AppError::unavailable(
                 "control-plane data requires the database lane; this deployment has none",
             )
         })
@@ -693,6 +782,9 @@ impl AppState {
             data_hub: None,
             search: None,
             notifications: None,
+            billing: None,
+            whatsapp: None,
+            model_catalog: None,
             inbound_webhook_endpoints: None,
             inbound_webhook_ingress: None,
             integrations: None,

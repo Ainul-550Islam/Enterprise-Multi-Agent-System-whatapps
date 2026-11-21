@@ -139,10 +139,13 @@ class TestReconcileTenantScope:
     """The critical tenancy cross-check."""
 
     def test_matching_headers_are_accepted(self) -> None:
-        reconcile_tenant_scope(
-            body_tenant_id="tenant-1",
-            body_organization_id="org-1",
-            metadata=_metadata(),
+        assert (
+            reconcile_tenant_scope(
+                body_tenant_id="tenant-1",
+                body_organization_id="org-1",
+                metadata=_metadata(),
+            )
+            is None
         )
 
     def test_mismatched_tenant_is_refused(self) -> None:
@@ -165,10 +168,13 @@ class TestReconcileTenantScope:
 
     def test_absent_headers_are_tolerated(self) -> None:
         """Some Rust call paths legitimately omit the headers."""
-        reconcile_tenant_scope(
-            body_tenant_id="tenant-1",
-            body_organization_id="org-1",
-            metadata=RustCallMetadata(),
+        assert (
+            reconcile_tenant_scope(
+                body_tenant_id="tenant-1",
+                body_organization_id="org-1",
+                metadata=RustCallMetadata(),
+            )
+            is None
         )
 
     def test_error_never_echoes_the_values(self) -> None:

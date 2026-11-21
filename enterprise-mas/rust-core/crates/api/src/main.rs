@@ -138,8 +138,9 @@ async fn run() -> Result<i32, String> {
         runtime_pool,
         internal_secret,
         health,
+        dev_integration,
     ) = if dev_inmemory {
-        compose_inmemory(&merger)?
+        compose_inmemory(&merger).await?
     } else {
         compose_production(&merger).await?
     };
@@ -151,6 +152,8 @@ async fn run() -> Result<i32, String> {
         enforce_production_guardrails(&merger.string("MAS_DEV_TOKENS", "server.dev_tokens", ""))?;
     }
 
+    let runtime_pool_for_billing = runtime_pool.clone();
+    let control_plane_for_billing = control_plane.clone();
     let state = AppState::new(
         "mas-api",
         env!("CARGO_PKG_VERSION"),
@@ -178,7 +181,20 @@ async fn run() -> Result<i32, String> {
     .with_api_keys(api_keys)
     .with_approvals(approvals)
     .with_data_hub(data_hub)
-    .with_search(search);
+    .with_search(search)
+    .with_model_catalog(Arc::new(
+        mas_api::handlers::discovery::ModelCatalog::from_merger(&merger),
+    ));
+
+    // Billing + WhatsApp planes: composed from the runtime pool and
+    // config-sourced secrets. A deployment that provides no secrets gets
+    // honest 503s on these routes -- never a half-wired service.
+    let state = wire_billing_and_whatsapp(
+        state,
+        &merger,
+        runtime_pool_for_billing.as_ref(),
+        control_plane_for_billing.as_ref(),
+    );
     let state = install_governance_services(state, audit_query, policies, usage);
     let state = install_tooling_services(
         state,
@@ -187,6 +203,7 @@ async fn run() -> Result<i32, String> {
         webhook_admin,
         stream_hub,
         assistant,
+        dev_integration,
     );
     let state = match (inbound_webhook_endpoints, inbound_webhook_ingress) {
         (Some(endpoints), Some(ingress)) => state.with_inbound_webhooks(endpoints, ingress),
@@ -353,6 +370,10 @@ type ServiceSet = (
     // every internal route refuses; see `handlers::internal`).
     Option<mas_security::SecretString>,
     Arc<HealthRegistry>,
+    // Worker-less integration plane for lanes composed without durable
+    // delivery workers (the dev in-memory lane). Production installs its
+    // integration service through the full `IntegrationComposition` above.
+    Option<Arc<mas_application::integration_service::IntegrationService>>,
 );
 
 /// Reads the shared secret used to authenticate internal service calls.
@@ -447,6 +468,7 @@ fn install_tooling_services(
     webhook_admin: Option<Arc<mas_application::webhook_service::WebhookService>>,
     stream_hub: Option<Arc<mas_api::handlers::stream::StreamHub>>,
     assistant: Option<Arc<mas_application::assistant_service::AssistantService>>,
+    integration_service: Option<Arc<mas_application::integration_service::IntegrationService>>,
 ) -> AppState {
     let state = match tools {
         Some(service) => state.with_tools(service),
@@ -464,8 +486,14 @@ fn install_tooling_services(
         Some(hub) => state.with_stream_hub(hub),
         None => state,
     };
-    match assistant {
+    let state = match assistant {
         Some(service) => state.with_assistant(service),
+        None => state,
+    };
+    // A worker-less integration plane (dev lane); production installs the
+    // same service through its durable `IntegrationComposition` instead.
+    match integration_service {
+        Some(service) => state.with_integrations(service),
         None => state,
     }
 }
@@ -821,7 +849,7 @@ fn spawn_oauth_materialization_reconciler(
     Ok(())
 }
 
-fn compose_inmemory(merger: &mas_common::config::Merger<'_>) -> Result<ServiceSet, String> {
+async fn compose_inmemory(merger: &mas_common::config::Merger<'_>) -> Result<ServiceSet, String> {
     let store = Arc::new(InMemoryServices::new());
     let audit = Arc::new(InMemoryAuditSink::new());
     // The control plane is built first and shared: tenant provisioning writes
@@ -916,16 +944,123 @@ fn compose_inmemory(merger: &mas_common::config::Merger<'_>) -> Result<ServiceSe
         Box::new(store.clone()),
     ));
     let verifier: Arc<dyn mas_api::auth::TokenVerifierPort> = Arc::new(dev_verifier()?);
-    // The in-memory lane still resolves scope from identity — over an
-    // in-memory directory rather than PostgreSQL. Resolving from a header here
+    // The in-memory lane still resolves scope from identity — over a
+    // tenancy directory backed by the SAME store as the services above
+    // (`crate::inmemory_directory` is the bridge the tests use too). A
+    // second, disjoint directory would make the resolver unable to see
+    // tenants `register_tenant` just created. Resolving from a header here
     // would make the development lane behave differently from production in
     // exactly the way that hides bugs until deploy.
     let scope_resolver = Some(mas_api::scope_resolution::RequestScopeResolver::new(
         mas_tenancy::TenantResolver::new(
-            Arc::new(mas_tenancy::InMemoryDirectory::new()),
-            Arc::new(mas_tenancy::InMemoryMemberships::new()),
+            Arc::new(mas_api::inmemory_directory::InMemoryTenantDirectory::new(
+                store.clone(),
+            )),
+            Arc::new(mas_api::inmemory_directory::InMemoryMembershipDirectory::new(store.clone())),
         ),
     ));
+    // ── Governance + tooling surface: in-memory, real data ────────────
+    //
+    // These services read the SAME shared store, control plane, and audit
+    // sink as the rest of the lane: audit queries return the events this
+    // deployment recorded, policy administration edits the very engine the
+    // execution gate evaluates against, usage reads the same in-memory
+    // ledger the quota port aggregates, and the tooling catalogues list
+    // what tenants actually registered. Pieces that genuinely have no
+    // in-memory source (connection probes, delivery workers) keep answering
+    // with their own honest errors — this wiring adds no fake rows.
+    let policy_service = Arc::new(mas_application::policy_service::PolicyService::new(
+        Arc::clone(control_plane.policy().store()),
+        Arc::clone(control_plane.policy()),
+        audit.clone() as Arc<dyn mas_application::audit::AuditSinkPort>,
+    ));
+    let usage_service = Arc::new(mas_application::usage_service::UsageService::new(Box::new(
+        store.clone(),
+    )));
+    // Filtered audit cursors are HMAC-signed; prefer the dedicated key or the
+    // internal secret exactly as production does. Without either, the dev
+    // lane mints a boot-scoped ephemeral key: the in-memory audit history
+    // dies with the process, so a cursor can never outlive the data behind it.
+    let audit_cursor_key: Vec<u8> = {
+        let dedicated = merger.string("MAS_AUDIT_CURSOR_KEY", "audit.cursor_key", "");
+        let fallback = load_internal_secret(merger)?.map(|secret| secret.expose().to_owned());
+        if dedicated.len() >= 32 {
+            dedicated.into_bytes()
+        } else if fallback.as_deref().is_some_and(|value| value.len() >= 32) {
+            fallback.expect("length checked above").into_bytes()
+        } else {
+            let mut key = Vec::with_capacity(32);
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            key.extend_from_slice(&nanos.to_le_bytes());
+            key.extend_from_slice(&std::process::id().to_le_bytes());
+            key.resize(32, 0x5A);
+            key
+        }
+    };
+    let audit_query = match mas_application::audit_query_service::AuditQueryService::new(
+        Box::new(audit.clone()),
+        audit_cursor_key,
+    ) {
+        Ok(service) => Some(Arc::new(service)),
+        Err(error) => {
+            eprintln!("mas-api: audit query composition failed: {error}");
+            None
+        },
+    };
+    let tool_service = Arc::new(mas_application::tool_service::ToolService::new(
+        Box::new(store.clone()),
+        Box::new(store.clone()),
+        Arc::clone(control_plane.policy()),
+        Box::new(audit.clone()) as Box<dyn mas_application::audit::AuditSinkPort>,
+    ));
+    // The integration plane over the in-memory registries and the SHARED
+    // webhook store, so connector/webhook admin writes and integration-plane
+    // reads observe the same rows. Probes and fan-out are the honest
+    // dev-lane implementations (probe = no network plane; fan-out = recorded
+    // events, zero durable deliveries).
+    let integration_service = Arc::new(
+        mas_application::integration_service::IntegrationService::new(
+            Box::new(mas_integrations::registry::InMemoryProviderRegistry::with_builtin()),
+            Box::new(mas_integrations::registry::InMemoryConnectorRegistry::new()),
+            Box::new(mas_integrations::connectors::InMemoryConnectionProbe),
+            Box::new(store.clone()),
+            Box::new(mas_integrations::secrets::InMemorySecretReferenceLookup::new()),
+            Box::new(mas_integrations::durable_webhooks::InMemoryOutboundFanout::new()),
+            Box::new(audit.clone()) as Box<dyn mas_application::audit::AuditSinkPort>,
+        ),
+    );
+    let connector_admin = Arc::new(mas_application::connector_service::ConnectorService::new(
+        Box::new(mas_integrations::registry::InMemoryProviderRegistry::with_builtin()),
+        Arc::clone(&integration_service),
+        Box::new(store.clone())
+            as Box<dyn mas_application::connector_service::ConnectorDisablePort>,
+        Box::new(audit.clone()) as Box<dyn mas_application::audit::AuditSinkPort>,
+    ));
+    let webhook_admin = Arc::new(mas_application::webhook_service::WebhookService::new(
+        Box::new(store.clone()),
+        Box::new(audit.clone()) as Box<dyn mas_application::audit::AuditSinkPort>,
+    ));
+    let assistant = Arc::new(mas_application::assistant_service::AssistantService::new(
+        Box::new(store.clone()),
+        Box::new(store.clone()),
+        Box::new(store.clone()),
+        Arc::clone(&executions),
+        Box::new(audit.clone()) as Box<dyn mas_application::audit::AuditSinkPort>,
+    ));
+    // The SSE hub over an in-process event bus: real connect/subscribe/publish
+    // semantics inside the lane (delivery is empty until something publishes).
+    let stream_hub = {
+        let config = stream_config(merger)?;
+        let hub = mas_api::handlers::stream::StreamHub::new(config)
+            .map_err(|error| format!("stream hub configuration: {error}"))?;
+        hub.attach(Arc::new(mas_events::bus::InMemoryEventBus::new()))
+            .await
+            .map_err(|error| format!("stream hub attach: {error}"))?;
+        Arc::new(hub)
+    };
     Ok((
         tenancy,
         agents,
@@ -947,18 +1082,16 @@ fn compose_inmemory(merger: &mas_common::config::Merger<'_>) -> Result<ServiceSe
         approvals,
         data_hub,
         search,
-        // The in-memory lane has no database plane for governance reads; the
-        // routes answer a typed 503 rather than a plausible empty result.
-        None,
-        None,
-        None,
-        // Likewise the tooling plane: no durable catalogue, deliveries, or
-        // event transport in the dev lane — typed 503, never fake data.
-        None,
-        None,
-        None,
-        None,
-        None,
+        // In-memory governance reads over the shared store/sink above.
+        audit_query,
+        Some(policy_service),
+        Some(usage_service),
+        // In-memory tooling catalogues over the shared store above.
+        Some(tool_service),
+        Some(connector_admin),
+        Some(webhook_admin),
+        Some(stream_hub),
+        Some(assistant),
         // The ExecutionService owns one handle; this is a second handle to
         // the same control plane, not a second control plane.
         control_plane,
@@ -969,6 +1102,8 @@ fn compose_inmemory(merger: &mas_common::config::Merger<'_>) -> Result<ServiceSe
         None,
         load_internal_secret(merger)?,
         Arc::new(HealthRegistry::new()),
+        // Worker-less integration plane for the dev lane.
+        Some(integration_service),
     ))
 }
 
@@ -1478,6 +1613,9 @@ async fn compose_production(merger: &mas_common::config::Merger<'_>) -> Result<S
         Some(pool.clone()),
         load_internal_secret(merger)?,
         health,
+        // Production composes its integration service via the durable
+        // `IntegrationComposition` slot, not this worker-less channel.
+        None,
     ))
 }
 
@@ -1834,15 +1972,13 @@ fn dev_verifier() -> Result<StaticTokenVerifier, String> {
 
     let layered = mas_common::config::load_layered().map_err(|err| format!("config: {err}"))?;
     let merger = mas_common::config::Merger::new(&layered);
-    let mut verifier = StaticTokenVerifier::new().with_token(
-        "dev-token",
-        SecurityPrincipal::new(
-            uuid::Uuid::now_v7().to_string(),
-            PrincipalKind::User,
-            None,
-            ScopeSet::all(),
-        ),
-    );
+    // No built-in credentials (review M-6): a dev lane must not silently
+    // carry a known token, because `--dev-inmemory` is one flag away from a
+    // staging deployment that anyone can enter. Every dev token is declared
+    // explicitly through MAS_DEV_TOKENS / server.dev_tokens (scripts/dev-up.sh
+    // declares one for local bring-up); an empty table means the dev lane
+    // authenticates nobody.
+    let mut verifier = StaticTokenVerifier::new();
     let table = merger.string("MAS_DEV_TOKENS", "server.dev_tokens", "");
     if !table.is_empty() {
         for entry in table.split(',').filter(|e| !e.trim().is_empty()) {
@@ -1858,6 +1994,12 @@ fn dev_verifier() -> Result<StaticTokenVerifier, String> {
                 "user" => PrincipalKind::User,
                 "service" => PrincipalKind::ServiceAccount,
                 "api_key" => PrincipalKind::ApiKey,
+                // The audited break-glass lane (`is_platform_identity`): the
+                // only identity the authorization service lets operate
+                // without a membership. Declaring it here is deliberate and
+                // explicit — the production guardrails above refuse the whole
+                // table outside `--dev-inmemory`.
+                "system" => PrincipalKind::System,
                 other => return Err(format!("unknown principal kind '{other}'")),
             };
             verifier = verifier.with_token(
@@ -1867,6 +2009,110 @@ fn dev_verifier() -> Result<StaticTokenVerifier, String> {
         }
     }
     Ok(verifier)
+}
+
+/// Wires the billing and WhatsApp application services when the deployment
+/// provides their secrets, and leaves the state unprovisioned (503 on those
+/// routes) when it does not.
+fn wire_billing_and_whatsapp(
+    state: AppState,
+    merger: &mas_common::config::Merger<'_>,
+    pool: Option<&sqlx::PgPool>,
+    control_plane: &mas_application::control_plane::ControlPlane,
+) -> AppState {
+    use mas_application::billing_service::BillingService;
+    use mas_application::whatsapp_service::WhatsAppService;
+    use mas_integrations::http_guard::GuardedHttpClient;
+    use mas_integrations::providers::{StripeCheckoutProvider, WhatsAppGraphGateway};
+    use mas_integrations::reqwest_egress::ReqwestEgress;
+    use std::sync::Arc;
+
+    let Some(pool) = pool else {
+        eprintln!("mas-api: no runtime pool; billing/whatsapp routes stay unprovisioned");
+        return state;
+    };
+
+    let stripe_secret = merger.string("MAS_STRIPE_SECRET_KEY", "billing.stripe_secret_key", "");
+    let stripe_webhook = merger.string(
+        "MAS_STRIPE_WEBHOOK_SECRET",
+        "billing.stripe_webhook_secret",
+        "",
+    );
+    let state = if !stripe_secret.is_empty() && !stripe_webhook.is_empty() {
+        let receipts = Arc::new(
+            mas_persistence::repositories::control_plane::billing::PostgresBillingWebhookStore::new(
+                pool.clone(),
+            ),
+        );
+        let customers = Arc::new(
+            mas_persistence::repositories::billing_customers::PostgresBillingCustomerStore::new(
+                pool.clone(),
+            ),
+        );
+        let prices = Arc::new(
+            mas_persistence::repositories::plan_prices::PostgresPlanPriceStore::new(pool.clone()),
+        );
+        let checkouts = Arc::new(
+            mas_persistence::repositories::billing_checkout::PostgresCheckoutSessionStore::new(
+                pool.clone(),
+            ),
+        );
+        let claims = Arc::new(
+            mas_persistence::repositories::billing_checkout::PostgresEventApplicationStore::new(
+                pool.clone(),
+            ),
+        );
+        let policy = StripeCheckoutProvider::<ReqwestEgress>::egress_policy();
+        let provider = Arc::new(StripeCheckoutProvider::new(
+            GuardedHttpClient::new(ReqwestEgress::new(policy.clone()), policy),
+            "https://api.stripe.com".to_owned(),
+            mas_security::SecretString::new(stripe_secret),
+        ));
+        state.with_billing(Arc::new(BillingService::new(
+            receipts,
+            customers,
+            prices,
+            checkouts,
+            claims,
+            control_plane.entitlement_store(),
+            provider,
+            vec![mas_security::SecretString::new(stripe_webhook)],
+            300,
+        )))
+    } else {
+        eprintln!(
+            "mas-api: MAS_STRIPE_SECRET_KEY/MAS_STRIPE_WEBHOOK_SECRET not set -- \
+             /v1/billing/checkout and /webhooks/billing/stripe answer 503"
+        );
+        state
+    };
+
+    let wa_access = merger.string("MAS_WHATSAPP_ACCESS_TOKEN", "whatsapp.access_token", "");
+    let wa_app_secret = merger.string("MAS_WHATSAPP_APP_SECRET", "whatsapp.app_secret", "");
+    let wa_verify = merger.string("MAS_WHATSAPP_VERIFY_TOKEN", "whatsapp.verify_token", "");
+    if !wa_access.is_empty() && !wa_app_secret.is_empty() && !wa_verify.is_empty() {
+        let store = Arc::new(
+            mas_persistence::repositories::whatsapp::PostgresWhatsAppStore::new(pool.clone()),
+        );
+        let policy = WhatsAppGraphGateway::<ReqwestEgress>::egress_policy();
+        let gateway = Arc::new(WhatsAppGraphGateway::new(
+            GuardedHttpClient::new(ReqwestEgress::new(policy.clone()), policy),
+            "https://graph.facebook.com".to_owned(),
+            mas_security::SecretString::new(wa_access),
+        ));
+        state.with_whatsapp(Arc::new(WhatsAppService::new(
+            store,
+            gateway,
+            mas_security::SecretString::new(wa_app_secret),
+            mas_security::SecretString::new(wa_verify),
+        )))
+    } else {
+        eprintln!(
+            "mas-api: MAS_WHATSAPP_ACCESS_TOKEN/APP_SECRET/VERIFY_TOKEN not set -- \
+             whatsapp routes answer 503"
+        );
+        state
+    }
 }
 
 #[cfg(test)]

@@ -60,6 +60,8 @@ pub mod oauth_providers;
 pub mod oauth_refresh;
 /// Real guarded HTTP probes for supported provider adapters.
 pub mod provider_adapters;
+pub mod provider_ports;
+pub mod providers;
 pub mod registry;
 /// Canonical concrete Reqwest adapter used beneath the guarded egress port.
 pub mod reqwest_egress;

@@ -1,0 +1,64 @@
+{
+  "title": "MAS Platform Overview",
+  "uid": "mas-overview",
+  "tags": ["mas", "overview"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Execution submissions by outcome",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "expr": "sum(rate(mas_execution_submissions_total[5m])) by (outcome)",
+          "legendFormat": "{{outcome}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Terminal outcomes",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        { "expr": "sum(rate(mas_execution_succeeded_total[5m]))", "legendFormat": "succeeded" },
+        { "expr": "sum(rate(mas_execution_failed_total[5m]))", "legendFormat": "failed" },
+        { "expr": "sum(rate(mas_execution_cancelled_total[5m]))", "legendFormat": "cancelled" }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Active attempts",
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 8 },
+      "targets": [{ "expr": "sum(mas_active_attempts)", "legendFormat": "active" }]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "p95 execution duration (ms)",
+      "gridPos": { "h": 6, "w": 6, "x": 6, "y": 8 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(mas_execution_duration_ms_bucket[5m])) by (le))",
+          "legendFormat": "p95"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Outbox backlog + dead letters",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "targets": [
+        { "expr": "sum(mas_outbox_backlog)", "legendFormat": "outbox backlog" },
+        { "expr": "sum(rate(mas_outbox_publish_failures_total[5m]))", "legendFormat": "publish failures" },
+        { "expr": "sum(rate(mas_dead_lettered_total[5m]))", "legendFormat": "dead lettered" }
+      ]
+    }
+  ]
+}

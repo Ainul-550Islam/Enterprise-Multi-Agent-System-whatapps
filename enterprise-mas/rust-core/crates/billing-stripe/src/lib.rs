@@ -1,38 +1,42 @@
-/// mas-billing-stripe — protocol-only crate
-///
-/// No database dependencies. All types, models, and pure functions live here.
-/// Integration into the control plane happens via:
-///   • `crates/persistence` — repository implementations (billing customers, plan prices)
-///   • `crates/application` — service layer that owns receipt lifecycle + audit
-///   • `crates/api` — HTTP handlers + webhook ingress
-///
-/// Stripe protocol contract:
-///   - POST /v1/billing/checkout-session   (protected, billing-admin role)
-///   - POST /v1/billing/portal-session     (protected, billing-admin role)
-///   - PUBLIC POST /v1/public/billing/stripe/webhook  (raw body + Stripe signature verify)
-///   - GET  /v1/billing/subscription/{id}  (protected)
-///
-/// All secret values (api_key, webhook secrets) are referenced via `secret_ref`,
-/// never inline.  Outbound egress is guarded by `crates/integrations::http_guard`
-/// (pinned hosts, SSRF protection, DNS pinning).
-///
-/// Crate policy: zero DB, zero runtime deps beyond workspace deps + standard libs.
-/// Any DB/state interaction lives in the application crate; this crate purely
-/// defines the protocol shapes, verifiers, and client adapters.
-mod config;
-mod errors;
-mod mapping;
-mod models;
-mod signature;
-mod client;
-mod events;
+//! # mas-billing-stripe -- the Stripe provider boundary
+//!
+//! Everything that knows Stripe's wire format lives here and nowhere else:
+//!
+//! * [`signature`] -- `Stripe-Signature` verification over the **raw request
+//!   body**: HMAC-SHA256 over `"{timestamp}.{payload}"`, a bounded timestamp
+//!   tolerance, constant-time tag comparison, and signing-key rotation (any
+//!   configured secret may match any `v1` tag).
+//! * [`event`] -- the webhook event envelope and the small typed object
+//!   projections (`checkout.session.completed`, subscription lifecycle) that
+//!   `mas-application` services consume. Unknown fields are ignored; unknown
+//!   event types are reported, never guessed at.
+//!
+//! Security boundary: this crate performs **no I/O and holds no secret**. It
+//! verifies bytes a caller already has and returns typed errors. The webhook
+//! receipt log and the durable claim of an event id belong to
+//! `mas-persistence`; applying an event to platform state belongs to
+//! `mas-application`. Signature verification always happens **before** any
+//! receipt is written or any state changes.
+//!
+//! It must NOT:
+//!   * trust a field of an event that has not been signature-verified;
+//!   * compare HMAC tags with `==` (timing side channel) -- verification goes
+//!     through [`hmac::Mac::verify_slice`], which is constant-time;
+//!   * accept a timestamp unbounded by tolerance, or a future timestamp;
+//!   * read the environment, configuration, or any secret store.
 
-pub use config::StripeConfig;
-pub use errors::StripeError;
-pub use models::{StripeCustomer, StripeCheckoutSession, StripePortalSession, StripeSubscription, StripeSubscriptionItem, StripeEvent, StripeEventData, StripeTrialSettings};
-pub use mapping::{stripe_status_to_subscription_state, price_id_to_plan, map_stripe_event, LocalSubscriptionState};
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
+pub mod client;
+pub mod event;
+pub mod mapping;
+pub mod signature;
+
+pub use client::{HttpStripeClient, StripeClient};
+pub use event::{CheckoutSession, StripeEvent, StripeEventType, SubscriptionObject};
+pub use mapping::resolve_subscription;
 pub use signature::{
-    verify_stripe_signature, parse_stripe_signature, StripeSignature, StripeSignatureVersion,
+    compute_v1_signature, parse_header, verify_signature, ParsedHeader, DEFAULT_TOLERANCE_SECS,
+    MAX_SIGNATURES_PER_HEADER, STRIPE_SIGNATURE_HEADER,
 };
-pub use events::{StripeEvent, stripe_event_from_raw, EventType};
-pub use client::StripeClient;

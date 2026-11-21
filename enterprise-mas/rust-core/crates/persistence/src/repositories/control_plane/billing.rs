@@ -289,6 +289,88 @@ impl PostgresBillingWebhookStore {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Application-service ports. The application layer declares what the billing
+// use cases need from storage; this crate provides it. Pre-scope operations
+// (claim, resolve_owner) run through the pooled executor; scoped operations
+// run inside the request's authoritative scope and are RLS-enforced.
+// ---------------------------------------------------------------------------
+
+use mas_application::billing_service::{BillingReceiptPort, ReceiptClaim, ReceiptOutcome};
+
+fn receipt_state_from_outcome(outcome: ReceiptOutcome) -> ReceiptState {
+    match outcome {
+        ReceiptOutcome::Received => ReceiptState::Received,
+        ReceiptOutcome::Applied => ReceiptState::Applied,
+        ReceiptOutcome::Ignored => ReceiptState::Ignored,
+        ReceiptOutcome::Rejected => ReceiptState::Rejected,
+    }
+}
+
+fn receipt_row_to_claim(row: BillingReceiptRow) -> Result<ReceiptClaim> {
+    let state = match row.state.as_str() {
+        "received" => ReceiptOutcome::Received,
+        "applied" => ReceiptOutcome::Applied,
+        "ignored" => ReceiptOutcome::Ignored,
+        "rejected" => ReceiptOutcome::Rejected,
+        other => {
+            return Err(AppError::database(format!(
+                "billing receipt state drifted from the enum: {other}"
+            )))
+        },
+    };
+    Ok(ReceiptClaim {
+        id: mas_common::ids::BillingReceiptId::from_uuid(row.id),
+        event_id: row.event_id,
+        state,
+        tenant_id: row.tenant_id.map(TenantId::from_uuid),
+    })
+}
+
+#[async_trait::async_trait]
+impl BillingReceiptPort for PostgresBillingWebhookStore {
+    async fn claim(
+        &self,
+        provider: &str,
+        event_id: &str,
+        event_type: &str,
+        payload_hash: &str,
+        signature_valid: bool,
+    ) -> Result<ReceiptClaim> {
+        let row = PostgresBillingWebhookStore::claim(
+            self,
+            provider,
+            event_id,
+            event_type,
+            payload_hash,
+            signature_valid,
+            None,
+        )
+        .await?
+        .ok_or_else(|| AppError::database("receipt claim produced no row"))?;
+        receipt_row_to_claim(row)
+    }
+
+    async fn finish(
+        &self,
+        receipt_id: mas_common::ids::BillingReceiptId,
+        outcome: ReceiptOutcome,
+        reason: Option<&str>,
+        tenant: Option<TenantId>,
+    ) -> Result<ReceiptClaim> {
+        let row = PostgresBillingWebhookStore::finish(
+            self,
+            receipt_id,
+            receipt_state_from_outcome(outcome),
+            reason,
+            tenant,
+            &Timestamp::now(),
+        )
+        .await?;
+        receipt_row_to_claim(row)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

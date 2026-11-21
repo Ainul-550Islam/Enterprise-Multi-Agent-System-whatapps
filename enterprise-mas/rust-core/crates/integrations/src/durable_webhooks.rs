@@ -536,3 +536,60 @@ mod tests {
         assert!(!is_retryable_status(404));
     }
 }
+
+/// One fan-out event recorded by the in-memory fan-out.
+#[derive(Debug, Clone)]
+pub struct RecordedOutboundEvent {
+    pub tenant_id: mas_common::ids::TenantId,
+    pub event_id: mas_common::ids::EventId,
+    pub event_type: String,
+    pub body: Vec<u8>,
+}
+
+/// In-memory fan-out recorder for lanes without a delivery worker (dev
+/// bring-up, tests). Every enqueued event is kept for observability, and the
+/// returned count is honestly `0`: this lane has no durable delivery
+/// transport, and inventing delivery rows would be a lie.
+#[derive(Debug, Default)]
+pub struct InMemoryOutboundFanout {
+    events: std::sync::Mutex<Vec<RecordedOutboundEvent>>,
+}
+
+impl InMemoryOutboundFanout {
+    /// Empty recorder.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Everything recorded so far, oldest first.
+    #[must_use]
+    pub fn recorded(&self) -> Vec<RecordedOutboundEvent> {
+        self.events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+}
+
+#[async_trait]
+impl OutboundWebhookEnqueuePort for InMemoryOutboundFanout {
+    async fn enqueue_event(
+        &self,
+        tenant_id: mas_common::ids::TenantId,
+        event_id: mas_common::ids::EventId,
+        event_type: &str,
+        body: &[u8],
+    ) -> Result<u64> {
+        self.events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(RecordedOutboundEvent {
+                tenant_id,
+                event_id,
+                event_type: event_type.to_owned(),
+                body: body.to_vec(),
+            });
+        Ok(0)
+    }
+}

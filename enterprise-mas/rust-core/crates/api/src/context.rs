@@ -145,6 +145,33 @@ impl RequestContext {
         self.build_service_context(principal, None, None, None)
     }
 
+    /// Builds an organization-bound context for platform-administered
+    /// bootstrap operations that name their organization explicitly.
+    ///
+    /// Creating or listing an organization's tenants cannot go through the
+    /// tenant resolver — the tenant being created does not exist to resolve
+    /// yet, so every such request used to fail with "x-tenant-id required".
+    /// This lane mirrors [`Self::platform_service_context`] (explicit
+    /// `platform:admin` capability, no tenant scope invented) but binds the
+    /// claimed organization, which is exactly what the application layer's
+    /// `require_organization()` gate asks for.
+    pub(crate) fn organization_service_context(&self) -> Result<ServiceContext> {
+        let principal = self.authenticated_principal()?;
+        if !principal.scopes.permits("platform:admin") {
+            return Err(AppError::forbidden(
+                "insufficient scope for a platform operation",
+            ));
+        }
+        let organization_id = self.claimed_organization.ok_or_else(|| {
+            AppError::invalid_field(
+                ORGANIZATION_HEADER,
+                "required",
+                "name the organization being administered",
+            )
+        })?;
+        self.build_service_context(principal, None, Some(organization_id), None)
+    }
+
     fn authenticated_principal(&self) -> Result<&SecurityPrincipal> {
         let principal = self
             .principal
@@ -318,6 +345,48 @@ mod tests {
                 mas_security::ScopeSet::denied(),
             ));
         assert!(denied.platform_service_context().is_err());
+    }
+
+    /// Regression: the tenant-creation bootstrap lane must not depend on a
+    /// resolved *tenant* scope — the very tenant being created cannot be
+    /// resolved yet. The lane is capability-gated and organization-bound.
+    #[test]
+    fn organization_context_binds_the_claim_and_needs_no_tenant_scope() {
+        let organization = OrganizationId::new();
+        let context = RequestContext::with_claims(
+            ScopeClaims {
+                tenant: None,
+                organization: Some(organization),
+                project: None,
+            },
+            "corr".to_owned(),
+        )
+        .with_authenticated(SecurityPrincipal::system());
+        let bound = context
+            .organization_service_context()
+            .expect("platform admin names the organization");
+        assert_eq!(bound.organization_id, Some(organization));
+        assert_eq!(bound.tenant_id, None);
+
+        let without_claim = RequestContext::with_claims(ScopeClaims::default(), "corr".to_owned())
+            .with_authenticated(SecurityPrincipal::system());
+        assert!(without_claim.organization_service_context().is_err());
+
+        let denied = RequestContext::with_claims(
+            ScopeClaims {
+                tenant: None,
+                organization: Some(organization),
+                project: None,
+            },
+            "corr".to_owned(),
+        )
+        .with_authenticated(SecurityPrincipal::new(
+            "ordinary-user",
+            PrincipalKind::User,
+            None,
+            mas_security::ScopeSet::denied(),
+        ));
+        assert!(denied.organization_service_context().is_err());
     }
 
     #[test]

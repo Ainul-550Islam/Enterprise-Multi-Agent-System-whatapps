@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from mas_orchestrator.models.cost import CostLedger
     from mas_orchestrator.models.router import ModelRouter
     from mas_orchestrator.models.types import ModelRef
+    from mas_orchestrator.prompts.registry import PromptRegistry
     from mas_orchestrator.tools.executor import ToolExecutor
     from mas_orchestrator.tools.registry import ToolRegistry
 
@@ -46,12 +47,14 @@ class AgentFactory:
         tool_executor: ToolExecutor | None = None,
         tool_registry: ToolRegistry | None = None,
         agent_registry: AgentRegistry | None = None,
+        prompt_registry: PromptRegistry | None = None,
     ) -> None:
         self._router = router
         self._provider_for = provider_for
         self._tool_executor = tool_executor
         self._tool_registry = tool_registry
         self._agent_registry = agent_registry
+        self._prompt_registry = prompt_registry
 
     def build(
         self,
@@ -76,6 +79,25 @@ class AgentFactory:
             ConfigurationError: If the spec's kind needs a collaborator that
                 was not supplied.
         """
+        if spec.agent_id == "platform_assistant":
+            from mas_orchestrator.agents.builtin.platform_assistant import PlatformAssistantAgent
+
+            if spec.kind is not AgentKind.STANDARD or spec.allowed_tools or not spec.read_only:
+                raise ConfigurationError(
+                    "platform assistant must remain a read-only standard agent with no tools",
+                    details={"agent_id": spec.agent_id},
+                )
+            executor = AgentExecutor(
+                spec,
+                router=self._router,
+                provider_for=self._provider_for,
+                tool_executor=None,
+                tool_registry=None,
+                ledger=ledger,
+                config=config,
+            )
+            return PlatformAssistantAgent(spec, executor, prompts=self._prompt_registry)
+
         if spec.kind is AgentKind.SUPERVISOR:
             if self._agent_registry is None:
                 raise ConfigurationError(

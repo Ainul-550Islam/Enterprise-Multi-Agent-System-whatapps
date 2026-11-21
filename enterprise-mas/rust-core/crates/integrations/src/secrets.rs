@@ -224,7 +224,7 @@ where
             ConnectorAuthMode::OAuth2 => Ok(ProviderAuthorization::Bearer(material)),
             ConnectorAuthMode::ApiKey => match connector.provider.as_str() {
                 // These vendors use API keys as bearer credentials.
-                "slack" | "sendgrid" | "salesforce" | "jira" => {
+                "slack" | "sendgrid" | "salesforce" | "jira" | "whatsapp" => {
                     Ok(ProviderAuthorization::Bearer(material))
                 },
                 // Generic HTTP connectors deliberately use a named API key
@@ -1695,5 +1695,42 @@ mod tests {
             .as_str()
             .contains("version=7"));
         let _ = Timestamp::now();
+    }
+}
+
+/// In-memory secret-reference registry: a truthful, empty-by-default source.
+/// `get` answers with a reference only when one was actually registered —
+/// lanes without a secret store compose this and see honest `None`s rather
+/// than fabricated metadata.
+#[derive(Debug, Default)]
+pub struct InMemorySecretReferenceLookup {
+    records: std::sync::Mutex<std::collections::BTreeMap<SecretReferenceId, SecretReferenceRecord>>,
+}
+
+impl InMemorySecretReferenceLookup {
+    /// Empty registry.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Registers (or replaces) a reference record under its id.
+    pub fn insert(&self, id: SecretReferenceId, record: SecretReferenceRecord) {
+        self.records
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, record);
+    }
+}
+
+#[async_trait]
+impl SecretReferenceLookupPort for InMemorySecretReferenceLookup {
+    async fn get(&self, id: SecretReferenceId) -> Result<Option<SecretReferenceRecord>> {
+        Ok(self
+            .records
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&id)
+            .cloned())
     }
 }

@@ -32,9 +32,12 @@ from mas_orchestrator.config.settings import (
 )
 from mas_orchestrator.contracts.errors import ConfigurationError
 from mas_orchestrator.grpc.server import GrpcServer, GrpcServerConfig
+from mas_orchestrator.models.registry import ModelRegistry
+from mas_orchestrator.providers.factory import build_providers
 from mas_orchestrator.services.composition import (
     DEFAULT_AGENT_CATALOG,
     DEFAULT_AGENT_ID,
+    _allowlist_for,
     build_identity_resolver,
     build_provider_specs,
     build_runtime_bundle,
@@ -482,3 +485,43 @@ class TestBridgeServerComposition:
         assert recorded_server.insecure_binding is None
         assert server_options["maximum_concurrent_rpcs"] == 64
         await server.stop()
+
+
+class TestAllowlistMatchesRegistryKeys:
+    """Regression: allowlist entries are ``provider/model`` *string keys*.
+
+    ``key in registry`` asks the registry for object membership — it looks up
+    ``model.key`` on the operand — so every plain string was reported unknown
+    and any non-empty allowlist refused to boot (live mode requires one). The
+    check must compare against the registry's key set.
+    """
+
+    async def test_registry_keys_are_accepted_and_unknown_keys_refused(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("MAS_OPENAI_API_KEY", "sk-test-fixture")
+        settings = _settings(
+            providers=ProviderSettings(
+                mode=ProviderMode.LIVE,
+                enabled_providers=("openai",),
+                allowed_models=("openai/gpt-4o-mini",),
+            )
+        )
+        registry = ModelRegistry()
+        build_providers(
+            build_provider_specs(settings),
+            environment=settings.environment,
+            registry=registry,
+        )
+
+        assert _allowlist_for(settings, registry) == ("openai/gpt-4o-mini",)
+
+        refused = _settings(
+            providers=ProviderSettings(
+                mode=ProviderMode.LIVE,
+                enabled_providers=("openai",),
+                allowed_models=("openai/no-such-model",),
+            )
+        )
+        with pytest.raises(ConfigurationError, match="allowlisted models"):
+            _allowlist_for(refused, registry)

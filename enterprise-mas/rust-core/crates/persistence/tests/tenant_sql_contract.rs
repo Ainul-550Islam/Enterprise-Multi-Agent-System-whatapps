@@ -7,7 +7,7 @@
 // *today*. They cannot prove that the next statement someone adds is scoped.
 // This file closes that gap: it reads the repository source, extracts every SQL
 // statement, and asserts that any statement touching a tenant-owned table
-// carries a tenant predicate — or is named here, with the reason it is safe.
+// carries a tenant predicate -- or is named here, with the reason it is safe.
 //
 // It is deliberately a *contract* test rather than a live query test, so it
 // runs on every `cargo test` with no database at all. The live query half of
@@ -23,12 +23,12 @@
 //   3. no migration in the set is destructive.
 //
 // It must NOT:
-//   • become a place where violations are parked. Every entry in
+//   * become a place where violations are parked. Every entry in
 //     [`ALLOWED_UNSCOPED`] states *why* the statement is safe, and the reason
 //     must be a property of the statement (it runs under a tenant-scoped row
 //     lock, it is keyed by an ownership fence, it is a global counter by
 //     design), never "it is hard to fix";
-//   • connect to a database. It is a source-level test.
+//   * connect to a database. It is a source-level test.
 
 use std::path::{Path, PathBuf};
 
@@ -38,13 +38,25 @@ use std::path::{Path, PathBuf};
 
 /// Tables that hold one tenant's data and must never be read or written
 /// without a tenant predicate.
-const TENANT_OWNED_TABLES: [&str; 6] = [
+const TENANT_OWNED_TABLES: [&str; 14] = [
     "executions",
     "tasks",
     "task_attempts",
     "outbox_events",
     "usage_records",
     "audit_events",
+    // 0055-0060: the WhatsApp and billing boundary tables. The webhook path
+    // resolves these tenants through SECURITY DEFINER functions before any
+    // scope exists (see migrations 0055/0057); inside the scope, every
+    // statement must carry the tenant predicate like any other tenant table.
+    "whatsapp_channels",
+    "whatsapp_messages",
+    "whatsapp_conversations",
+    "whatsapp_templates",
+    "billing_customers",
+    "plan_prices",
+    "billing_checkout_sessions",
+    "billing_event_applications",
 ];
 
 /// A statement that names a tenant-owned table without a tenant predicate,
@@ -53,13 +65,13 @@ const TENANT_OWNED_TABLES: [&str; 6] = [
 /// Adding an entry here is a design decision and must be justified in the
 /// `why` string. Three reasons recur, and they are the only ones in use:
 ///
-/// * **row-locked** — the statement runs inside the same transaction as a
+/// * **row-locked** -- the statement runs inside the same transaction as a
 ///   `SELECT ... FOR UPDATE WHERE id = $1 AND tenant_id = $2` on the same row,
 ///   so the tenant was checked while the row was locked and cannot change
 ///   between the check and the write;
-/// * **ownership-fenced** — the statement is keyed by `worker_id`/`locked_by`,
+/// * **ownership-fenced** -- the statement is keyed by `worker_id`/`locked_by`,
 ///   and holding the fence is itself proof of a prior tenant-scoped claim;
-/// * **global-by-design** — a counter or gauge that is intentionally summed
+/// * **global-by-design** -- a counter or gauge that is intentionally summed
 ///   across all tenants (backlog, capacity, claimable work).
 struct Allowed {
     /// A distinctive substring identifying the statement.
@@ -203,7 +215,7 @@ fn statements(source: &str) -> Vec<Statement> {
 }
 
 // ---------------------------------------------------------------------------
-// 1. Every tenant-owned statement is scoped — or is named, with a reason
+// 1. Every tenant-owned statement is scoped -- or is named, with a reason
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -236,6 +248,47 @@ fn every_statement_naming_a_tenant_owned_table_is_tenant_scoped_or_allowlisted()
             owned = statement.owned,
             sql = statement.sql
         );
+    }
+}
+
+#[test]
+fn billing_and_whatsapp_statements_are_tenant_scoped_or_allowlisted() {
+    // The same contract over the 0055-0060 boundary repositories. The only
+    // unscoped reads of these tables live inside the SECURITY DEFINER
+    // functions (migrations 0055/0057), which call them by name and never
+    // name the table from repository source -- so every statement below must
+    // carry the tenant predicate.
+    for file in [
+        "src/repositories/billing_customers.rs",
+        "src/repositories/plan_prices.rs",
+        "src/repositories/billing_checkout.rs",
+        "src/repositories/whatsapp.rs",
+    ] {
+        let source =
+            std::fs::read_to_string(workspace_file(file)).unwrap_or_else(|_| panic!("read {file}"));
+        let statements = statements(&source);
+        assert!(
+            !statements.is_empty(),
+            "the extractor should find {file}'s statements, found none"
+        );
+        for statement in &statements {
+            if statement.sql.to_ascii_lowercase().contains("tenant_id") {
+                continue;
+            }
+            let allowed = ALLOWED_UNSCOPED
+                .iter()
+                .any(|entry| statement.sql.contains(entry.matches))
+                || ALLOWED_GLOBAL
+                    .iter()
+                    .any(|entry| statement.sql.contains(entry));
+            assert!(
+                allowed,
+                "{file}: statement names tenant-owned table(s) {owned:?} with no tenant \
+                 predicate and is not allowlisted.\n\n    {sql}",
+                owned = statement.owned,
+                sql = statement.sql
+            );
+        }
     }
 }
 

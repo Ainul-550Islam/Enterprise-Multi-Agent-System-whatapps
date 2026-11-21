@@ -9,7 +9,7 @@
 
 use mas_common::enums::Environment;
 use mas_common::error::AppError;
-use mas_common::ids::{TenantId, UserId};
+use mas_common::ids::{MembershipId, TenantId, UserId};
 use mas_common::result::Result;
 use mas_domain::value_objects::{Email, Slug};
 use mas_domain::{IsolationMode, Membership, MembershipRole, Organization, Project, Tenant, User};
@@ -301,6 +301,38 @@ impl TenancyService {
         Ok(membership)
     }
 
+    /// Accepts a membership invitation (invited → active) in the caller's
+    /// tenant.
+    ///
+    /// The same `ManageMembers` zone that admits the invite admits the
+    /// acceptance: the inviting side may confirm an outstanding invitation.
+    /// A membership that belongs to another tenant reads as "does not exist".
+    pub async fn accept_membership(
+        &self,
+        ctx: &ServiceContext,
+        membership_id: MembershipId,
+    ) -> Result<Membership> {
+        let tenant_id = ctx.require_tenant()?;
+        let mut membership = self
+            .memberships
+            .get(membership_id)
+            .await?
+            .filter(|m| m.tenant_id == Some(tenant_id))
+            .ok_or_else(|| AppError::not_found("membership", membership_id.to_string()))?;
+        membership.accept_invitation()?;
+        self.memberships.save(&membership).await?;
+        audit::record_mutation(
+            ctx,
+            self.audit.as_ref(),
+            "membership.accept",
+            "membership",
+            Some(membership.id.to_string()),
+            mas_domain::AuditOutcome::Success,
+        )
+        .await?;
+        Ok(membership)
+    }
+
     /// Lists memberships of a tenant (tenant-scoped operator view).
     pub async fn tenant_memberships(&self, ctx: &ServiceContext) -> Result<Vec<Membership>> {
         let tenant_id = ctx.require_tenant()?;
@@ -310,6 +342,11 @@ impl TenancyService {
     /// Lists organizations (system-level catalog view).
     pub async fn list_organizations(&self, _ctx: &ServiceContext) -> Result<Vec<Organization>> {
         self.organizations.list().await
+    }
+
+    /// Lists the deployment's user catalogue (`GET /v1/users`).
+    pub async fn list_users(&self, _ctx: &ServiceContext) -> Result<Vec<User>> {
+        self.users.list().await
     }
 
     /// Lists tenants of the context's organization.

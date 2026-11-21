@@ -118,6 +118,18 @@ impl AgentBridgeSettings {
     /// [`AgentBridgeSettings::require_token`]) so the two failures read
     /// differently: "not configured" vs "configured without a credential".
     pub fn from_merger(merger: &mas_common::config::Merger<'_>) -> Result<Self> {
+        let environment = merger.string("MAS_ENV", "environment", "development");
+        Self::from_merger_with_environment(merger, &environment)
+    }
+
+    /// The same composition with the environment named explicitly. Tests use
+    /// this so an ambient `MAS_ENV` (which `scripts/check.sh` exports) cannot
+    /// leak into a fixture — mutating the process environment inside a test
+    /// would race every other test in the binary.
+    pub fn from_merger_with_environment(
+        merger: &mas_common::config::Merger<'_>,
+        environment: &str,
+    ) -> Result<Self> {
         let endpoint = merger.string(ENV_ENDPOINT, PATH_ENDPOINT, "");
         if endpoint.trim().is_empty() {
             return Err(mas_common::error::AppError::validation(format!(
@@ -126,8 +138,7 @@ impl AgentBridgeSettings {
             )));
         }
 
-        let environment = merger.string("MAS_ENV", "environment", "development");
-        let requires_production_security = match environment.as_str() {
+        let requires_production_security = match environment {
             "development" | "test" => false,
             "production" => true,
             other => {
@@ -402,7 +413,7 @@ impl AgentRunHandler {
             )
         })?;
 
-        let context = self.runtime_context(message, execution_id);
+        let context = self.runtime_context(message, execution_id)?;
 
         Ok(AgentRunDispatch {
             execution_id,
@@ -428,7 +439,7 @@ impl AgentRunHandler {
         &self,
         message: &TaskQueueMessage,
         execution_id: ExecutionId,
-    ) -> RuntimeContext {
+    ) -> Result<RuntimeContext> {
         let mut context = RuntimeContext::new(
             message.tenant_id,
             message.organization_id,
@@ -436,16 +447,24 @@ impl AgentRunHandler {
             "mas-worker",
             mas_common::enums::Environment::Production,
         )
-        .unwrap_or_else(|error| {
+        .map_err(|error| {
             // A nil identifier here means the task row itself is corrupt. The
-            // context cannot be built, so the run cannot be scoped; this is the
-            // one place a panic is preferable to executing unscoped AI work.
-            panic!("execution.run task carries an invalid scope: {error}")
-        });
+            // context cannot be built, so the run cannot be scoped and must
+            // never execute. A typed error keeps that promise without killing
+            // the worker: the consumer classifies a validation failure as
+            // terminal work, so the corrupt row is dead-lettered once instead
+            // of panicking one worker process per bad row.
+            mas_common::error::AppError::validation(format!(
+                "execution.run task carries an invalid scope: {error}"
+            ))
+        })?;
 
         context = context.with_correlation_id(message.correlation_id.clone());
         if let Some(request_id) = message.request_id {
             context = context.with_request_id(request_id);
+        }
+        if let Some(version_id) = message.agent_version_id {
+            context = context.with_agent_version_id(version_id);
         }
         context = context.for_execution(execution_id, None);
         // The run is cancelled by the worker's shutdown path, so a graceful
@@ -461,7 +480,7 @@ impl AgentRunHandler {
             }
         }
 
-        context
+        Ok(context)
     }
 }
 
@@ -623,6 +642,7 @@ mod tests {
             "corr-1",
         )
         .expect("message")
+        .with_agent_version_id(mas_common::ids::AgentVersionId::new())
         .with_request_id(uuid::Uuid::from_u128(901))
     }
 
@@ -751,6 +771,39 @@ mod tests {
         assert_eq!(dispatch.context.correlation_id(), "corr-1");
         assert_eq!(dispatch.context.request_id(), message.request_id);
         assert_eq!(dispatch.context.execution_id(), message.execution_id);
+        let version_id = message.agent_version_id.expect("test message is pinned");
+        assert_eq!(dispatch.context.agent_version_id(), Some(version_id));
+        let restored = RuntimeContext::from_snapshot(dispatch.context.snapshot())
+            .expect("restore pinned context");
+        assert_eq!(restored.agent_version_id(), Some(version_id));
+
+        let bridge_request = mas_execution::agent_bridge::AgentRunRequest::from_context(
+            &dispatch.context,
+            dispatch.agent_id,
+            dispatch.input.clone(),
+            mas_domain::ResourceLimits::default(),
+            &mas_domain::TokenBudget::unlimited(),
+        )
+        .expect("build bridge request from durable context");
+        let expected_version = version_id.to_string();
+        assert_eq!(
+            bridge_request.agent_version.as_deref(),
+            Some(expected_version.as_str())
+        );
+    }
+
+    #[test]
+    fn build_dispatch_refuses_a_corrupt_scope_instead_of_panicking() {
+        let handler = handler();
+        let mut message = message();
+        // A nil identifier is the corrupt-row case the old code panicked on:
+        // one such task must cost a dead letter, not a worker process.
+        message.tenant_id = TenantId::nil();
+
+        let error = handler
+            .build_dispatch(&message)
+            .expect_err("a task with a nil scope identifier must be refused");
+        assert!(matches!(error, AppError::Validation { .. }));
     }
 
     #[test]
@@ -926,7 +979,7 @@ mod tests {
         use mas_common::config::Merger;
         let layered = toml::Value::Table(toml::Table::new());
         let merger = Merger::new(&layered);
-        let error = AgentBridgeSettings::from_merger(&merger)
+        let error = AgentBridgeSettings::from_merger_with_environment(&merger, "development")
             .expect_err("a missing endpoint must fail the boot");
         let rendered = format!("{error}");
         assert!(
@@ -957,7 +1010,8 @@ mod tests {
         let layered = toml::Value::Table(table);
         let merger = Merger::new(&layered);
 
-        let settings = AgentBridgeSettings::from_merger(&merger).expect("settings");
+        let settings = AgentBridgeSettings::from_merger_with_environment(&merger, "development")
+            .expect("settings");
         assert_eq!(settings.endpoint(), "http://127.0.0.1:9100");
 
         let error = settings
@@ -989,7 +1043,7 @@ mod tests {
         let layered = toml::Value::Table(table);
         let merger = Merger::new(&layered);
 
-        let error = AgentBridgeSettings::from_merger(&merger)
+        let error = AgentBridgeSettings::from_merger_with_environment(&merger, "production")
             .expect_err("production must not connect over plaintext gRPC");
 
         assert!(format!("{error}").contains("https"));
@@ -1017,7 +1071,7 @@ mod tests {
         let layered = toml::Value::Table(table);
         let merger = Merger::new(&layered);
 
-        let error = AgentBridgeSettings::from_merger(&merger)
+        let error = AgentBridgeSettings::from_merger_with_environment(&merger, "production")
             .expect_err("production must sign every request body");
         let rendered = format!("{error}");
 

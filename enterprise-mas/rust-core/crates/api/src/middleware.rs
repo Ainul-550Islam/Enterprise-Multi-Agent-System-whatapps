@@ -149,12 +149,16 @@ pub async fn authenticated_layer(
     // Global operations are an explicit platform-admin lane, not a fallback
     // for ordinary callers without a tenant. Keep it untenanted: every
     // tenant-owned handler still requires a resolved scope before use.
-    if claims.tenant.is_none()
-        && claims.organization.is_none()
-        && claims.project.is_none()
-        && principal.is_usable()
-        && principal.scopes.permits("platform:admin")
-    {
+    //
+    // The lane also covers an organization-only claim from a platform
+    // administrator: creating or listing an organization's tenants must not
+    // be gated by the tenant resolver, because the tenant being created does
+    // not exist to resolve yet. Handlers that consume this lane bind the
+    // organization themselves (`RequestContext::organization_service_context`);
+    // any request carrying a tenant or project claim still goes through the
+    // resolver below.
+    let platform_capable = principal.is_usable() && principal.scopes.permits("platform:admin");
+    if platform_capable && claims.tenant.is_none() && claims.project.is_none() {
         request
             .extensions_mut()
             .insert(existing.with_authenticated(principal));

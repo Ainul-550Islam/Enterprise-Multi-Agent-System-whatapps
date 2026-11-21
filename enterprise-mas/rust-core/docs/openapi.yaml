@@ -31,11 +31,18 @@ tags:
   - name: billing
   - name: admin
   - name: governance
-  - name: whatsapp
   - name: tooling
   - name: public
 paths:
   # ── health (public) ──────────────────────────────────────────────
+  /health:
+    get:
+      tags: [health]
+      summary: Liveness probe (root alias)
+      description: Convenience alias of GET /v1/health/live for probes that expect a root health path.
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
   /v1/health/live:
     get:
       tags: [health]
@@ -50,6 +57,18 @@ paths:
       responses:
         '200':
           $ref: '#/components/responses/Ok'
+  /v1/openapi.json:
+    get:
+      tags: [health]
+      summary: OpenAPI document
+      description: The OpenAPI 3.1 document for this API, served as plain JSON (not enveloped) for spec tooling; kept in parity with this file and the router by tests.
+      responses:
+        '200':
+          description: The OpenAPI document.
+          content:
+            application/json:
+              schema:
+                type: object
 
   # ── public callbacks ─────────────────────────────────────────────
   /v1/public/inbound-webhooks/{route_id}:
@@ -76,6 +95,50 @@ paths:
           description: Redirect to callback target
         '400':
           $ref: '#/components/responses/Error'
+
+  # ── deployment surface discovery ─────────────────────────────────
+  /v1/models/status:
+    get:
+      tags: [discovery]
+      summary: AI model provider status
+      description: Which AI providers this deployment is configured for (booleans only — never credentials).
+      security: [{bearerAuth: []}]
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+  /v1/models/status/{provider}:
+    get:
+      tags: [discovery]
+      summary: One AI model provider's status
+      security: [{bearerAuth: []}]
+      parameters:
+        - name: provider
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+        '404':
+          $ref: '#/components/responses/Error'
+  /v1/platforms:
+    get:
+      tags: [discovery]
+      summary: Messaging platforms and provisioning state
+      description: Reports which messaging platforms this deployment actually composed (provisioning state, not fabricated capability).
+      security: [{bearerAuth: []}]
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+  /v1/platforms/whatsapp/health:
+    get:
+      tags: [discovery]
+      summary: WhatsApp platform status report
+      description: A status report of the WhatsApp plane's composed state; the check itself always succeeds and describes reality.
+      security: [{bearerAuth: []}]
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
 
   # ── tenancy ──────────────────────────────────────────────────────
   /v1/organizations:
@@ -116,6 +179,20 @@ paths:
       responses:
         '201':
           $ref: '#/components/responses/Created'
+  /v1/tenants/{tenant_id}/activate:
+    post:
+      tags: [tenancy]
+      summary: Activate tenant
+      description: Moves a tenant from provisioning to active.
+      security: [{bearerAuth: []}]
+      parameters:
+        - name: tenant_id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        '201':
+          $ref: '#/components/responses/Created'
   /v1/projects:
     post:
       tags: [tenancy]
@@ -136,6 +213,14 @@ paths:
       responses:
         '201':
           $ref: '#/components/responses/Created'
+    get:
+      tags: [tenancy]
+      summary: List users
+      description: The deployment's user catalogue (the read twin of POST /v1/users); platform-admin scoped.
+      security: [{bearerAuth: []}]
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
   /v1/memberships:
     post:
       tags: [tenancy]
@@ -143,6 +228,20 @@ paths:
       security: [{bearerAuth: []}]
       requestBody:
         $ref: '#/components/requestBodies/Membership'
+      responses:
+        '201':
+          $ref: '#/components/responses/Created'
+  /v1/memberships/{membership_id}/accept:
+    post:
+      tags: [tenancy]
+      summary: Accept membership invitation
+      description: Moves a membership from invited to active.
+      security: [{bearerAuth: []}]
+      parameters:
+        - name: membership_id
+          in: path
+          required: true
+          schema: {type: string}
       responses:
         '201':
           $ref: '#/components/responses/Created'
@@ -674,6 +773,33 @@ paths:
       responses:
         '200':
           $ref: '#/components/responses/Ok'
+  /v1/executions/{execution_id}/signal:
+    post:
+      tags: [executions]
+      summary: Dispatch a lifecycle signal
+      description: >-
+        Route alias carrying the transition verb in the body (start, pause,
+        resume, cancel); the same service transitions and per-transition
+        authorization as the dedicated lifecycle routes. Cancellation is
+        durable — the response flags cancellation_requested and the runner
+        stops at the next safe point.
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/ExecutionId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [signal]
+              properties:
+                signal:
+                  type: string
+                  enum: [start, pause, resume, cancel]
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
 
   # ── schedules ────────────────────────────────────────────────────
   /v1/schedules:
@@ -937,23 +1063,7 @@ paths:
       responses:
         '200':
           $ref: '#/components/responses/OkList'
-  /v1/billing/receipts/{provider}/{event_id}
-  /v1/whatsapp/account:
-    get:
-      tags: [whatsapp]
-      summary: List WhatsApp accounts
-  /v1/whatsapp/inbound:
-    post:
-      tags: [whatsapp]
-      summary: Handle inbound WhatsApp webhook
-  /v1/whatsapp/send/text:
-    post:
-      tags: [whatsapp]
-      summary: Send text message
-  /v1/whatsapp/send/template:
-    post:
-      tags: [whatsapp]
-      summary: Send template message/v1/billing/receipts/{provider}/{event_id}:
+  /v1/billing/receipts/{provider}/{event_id}:
     get:
       tags: [billing]
       summary: Get receipt
@@ -1233,6 +1343,291 @@ paths:
               schema:
                 type: string
 
+  /webhooks/whatsapp:
+    get:
+      tags: [whatsapp]
+      summary: Webhook subscription verification handshake
+      description: >
+        Provider-facing handshake. Echoes hub.challenge only when hub.mode is
+        subscribe and hub.verify_token matches in constant time.
+      responses:
+        '200':
+          description: The challenge echoed back
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags: [whatsapp]
+      summary: Inbound WhatsApp message delivery
+      description: >
+        Authenticated by X-Hub-Signature-256 over the raw body. The tenant is
+        resolved from the channel's phone_number_id through platform truth.
+      responses:
+        '200':
+          description: Delivery applied or deliberately ignored
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /v1/public/whatsapp/webhook/{route_id}:
+    get:
+      tags: [whatsapp]
+      summary: Public WhatsApp webhook handshake (per route)
+      parameters:
+        - name: route_id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        '200':
+          description: The challenge echoed back
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags: [whatsapp]
+      summary: Public WhatsApp inbound delivery (per route)
+      parameters:
+        - name: route_id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        '200':
+          description: Delivery applied or deliberately ignored
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /webhooks/billing/stripe:
+    post:
+      tags: [billing]
+      summary: Stripe billing webhook
+      description: >
+        Authenticated by Stripe-Signature over the raw body. Processed in two
+        phases: verify/claim/resolve pre-scope, then apply inside the resolved
+        tenant's authoritative scope. Exactly one effect per event per tenant.
+      responses:
+        '200':
+          description: Applied, already applied, or deliberately ignored
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /v1/whatsapp/channels:
+    get:
+      tags: [whatsapp]
+      summary: List WhatsApp channels
+      security: [{bearerAuth: []}]
+      responses:
+        '200':
+          $ref: '#/components/responses/OkList'
+    post:
+      tags: [whatsapp]
+      summary: Register a WhatsApp channel
+      security: [{bearerAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [display_name, phone_number_id, api_version, verify_token_ref]
+              properties:
+                display_name: {type: string}
+                phone_number_id: {type: string}
+                waba_id: {type: string, nullable: true}
+                api_version: {type: string}
+                verify_token_ref: {type: string}
+      responses:
+        '201':
+          $ref: '#/components/responses/Ok'
+  /v1/whatsapp/channels/{channel_id}/messages:
+    get:
+      tags: [whatsapp]
+      summary: List a channel's messages
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/ChannelId'
+      responses:
+        '200':
+          $ref: '#/components/responses/OkList'
+    post:
+      tags: [whatsapp]
+      summary: Send a text message
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/ChannelId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [to, body]
+              properties:
+                to: {type: string}
+                body: {type: string}
+      responses:
+        '201':
+          $ref: '#/components/responses/Ok'
+  /v1/whatsapp/conversations:
+    get:
+      tags: [whatsapp]
+      summary: One contact conversation on one channel
+      security: [{bearerAuth: []}]
+      responses:
+        '200':
+          $ref: '#/components/responses/OkList'
+  /v1/whatsapp/conversations/{conversation_id}/messages:
+    get:
+      tags: [whatsapp]
+      summary: Messages on one conversation
+      security: [{bearerAuth: []}]
+      parameters:
+        - name: conversation_id
+          in: path
+          required: true
+          schema: {type: string, format: uuid}
+      responses:
+        '200':
+          $ref: '#/components/responses/OkList'
+    post:
+      tags: [whatsapp]
+      summary: Human reply on a conversation
+      security: [{bearerAuth: []}]
+      parameters:
+        - name: conversation_id
+          in: path
+          required: true
+          schema: {type: string, format: uuid}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                body: {type: string, nullable: true}
+                template_name: {type: string, nullable: true}
+                template_language: {type: string, nullable: true}
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+  /v1/whatsapp/templates:
+    get:
+      tags: [whatsapp]
+      summary: List message templates for a channel
+      security: [{bearerAuth: []}]
+      parameters:
+        - name: channel_id
+          in: query
+          required: true
+          schema: {type: string, format: uuid}
+      responses:
+        '200':
+          $ref: '#/components/responses/OkList'
+    post:
+      tags: [whatsapp]
+      summary: Sync message templates from the provider
+      security: [{bearerAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [channel_id]
+              properties:
+                channel_id: {type: string, format: uuid}
+      responses:
+        '200':
+          $ref: '#/components/responses/OkList'
+  /v1/whatsapp/stats:
+    get:
+      tags: [whatsapp]
+      summary: WhatsApp inbox counters
+      security: [{bearerAuth: []}]
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+  /v1/whatsapp/messages/{wamid}/status:
+    put:
+      tags: [whatsapp]
+      summary: Record a delivery status update
+      security: [{bearerAuth: []}]
+      parameters:
+        - name: wamid
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status: {type: string, enum: [received, sent, delivered, read, failed]}
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+  /v1/billing/checkout:
+    post:
+      tags: [billing]
+      summary: Open a checkout (idempotent per key)
+      security: [{bearerAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [plan_id, interval, success_url, cancel_url, idempotency_key]
+              properties:
+                plan_id: {type: string, format: uuid}
+                interval: {type: string, enum: [one_time, subscription]}
+                success_url: {type: string}
+                cancel_url: {type: string}
+                idempotency_key: {type: string}
+                email: {type: string, nullable: true}
+      responses:
+        '201':
+          $ref: '#/components/responses/Ok'
+  /v1/billing/checkout-session:
+    post:
+      tags: [billing]
+      summary: Open a checkout session (alias of /v1/billing/checkout)
+      security: [{bearerAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [plan_id, interval, success_url, cancel_url, idempotency_key]
+              properties:
+                plan_id: {type: string, format: uuid}
+                interval: {type: string, enum: [one_time, subscription]}
+                success_url: {type: string}
+                cancel_url: {type: string}
+                idempotency_key: {type: string}
+                email: {type: string, nullable: true}
+      responses:
+        '201':
+          $ref: '#/components/responses/Ok'
+  /v1/billing/portal-session:
+    post:
+      tags: [billing]
+      summary: Open a Stripe billing portal session
+      security: [{bearerAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [return_url, idempotency_key]
+              properties:
+                return_url: {type: string}
+                idempotency_key: {type: string}
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+
 components:
   securitySchemes:
     bearerAuth:
@@ -1242,6 +1637,11 @@ components:
       description: Bearer API key or JWT.
 
   parameters:
+    ChannelId:
+      name: channel_id
+      in: path
+      required: true
+      schema: {type: string, format: uuid}
     RouteId:
       name: route_id
       in: path
@@ -1393,12 +1793,6 @@ components:
         type: string
     Feature:
       name: feature
-      in: path
-      required: true
-      schema:
-        type: string
-    Provider:
-      name: provider
       in: path
       required: true
       schema:

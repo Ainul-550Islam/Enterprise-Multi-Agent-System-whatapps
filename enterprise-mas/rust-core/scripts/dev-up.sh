@@ -35,7 +35,7 @@ if [ "${1:-}" = "--fg" ]; then
 fi
 
 start mas-api \
-    bash -c "exec target/debug/mas-api --dev-inmemory >> .dev-logs/mas-api.log 2>&1"
+    bash -c "exec MAS_DEV_TOKENS=\${MAS_DEV_TOKENS:-dev-token:dev-user:user} target/debug/mas-api --dev-inmemory >> .dev-logs/mas-api.log 2>&1"
 start mas-scheduler \
     bash -c "exec MAS_SCHEDULER_INTERVAL_MS=\${MAS_SCHEDULER_INTERVAL_MS:-1000} target/debug/mas-scheduler --dev-inmemory >> .dev-logs/mas-scheduler.log 2>&1"
 start mas-worker \

@@ -42,6 +42,7 @@ class StateTransitionReporter(Protocol):
         termination: str,
         duration_ms: int,
         error_code: str | None = None,
+        tenant_id: str | None = None,
     ) -> None: ...
 
 
@@ -108,6 +109,7 @@ class FinalResultHandler:
             termination=termination,
             duration_ms=duration,
             error_code=str(error_code) if error_code else None,
+            tenant_id=envelope.tenant_id or None,
         )
 
 

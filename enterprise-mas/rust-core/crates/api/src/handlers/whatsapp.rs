@@ -1,215 +1,435 @@
-/// PROTECTED WhatsApp API handlers.
-///
-/// These routes require authentication + tenant authorization. They are
-/// mounted behind the `/v1/whatsapp/*` prefix and the authenticated layer.
-use crate::errors::ChannelError;
-use crate::whatsapp_service::{handle_inbound, send_text, send_template, handle_status, handle_stop, human_handoff, rotate_credentials, submit_execution};
-use crate::config::WhatsAppAccountConfig;
-use serde_json::Value;
-use tracing::instrument;
+//! PURPOSE: Authenticated tenant-facing WhatsApp channel handlers.
+//!
+//! Owning layer: `mas-api` process edge.
+//!
+//! Production role: register channels, send text, and read the tenant's
+//! conversation log over the canonical WhatsApp service.
+//!
+//! Security boundary: behind resolved-scope authentication; the tenant
+//! comes from the resolved scope, never from the body. Access tokens are
+//! referenced, never returned.
+//!
+//! Data ownership: the WhatsApp service/PostgreSQL own channel rows and the
+//! message log. Handlers own only DTO conversion.
+//!
+//! Prohibited responsibilities: provider calls, SQL, secret handling.
 
-/// Register a new WhatsApp account (WABA + phone number) for a tenant.
-/// Body: WhatsAppAccountConfig (with secret_refs, never inline secrets).
-#[instrument(skip(body))]
-pub async fn register_account(_body: web::Json<WhatsAppAccountConfig>) -> Result<Value, warp::reject::Rejection> {
-    // In a full implementation, validate the secret refs via the secret gate,
-    // persist the account, and return the account ID.
-    let _account = _body.0;
-    Ok(serde_json::json!({ "status": "account_registration_pending", "message": "account requires Meta onboarding flow" }))
+use axum::extract::{Path, Query, State};
+use serde::{Deserialize, Serialize};
+
+use crate::handlers::Ctx;
+use crate::response::{ok, ApiError, ApiResult};
+use crate::state::AppState;
+
+/// `POST /v1/whatsapp/channels` body.
+#[derive(Debug, Deserialize)]
+pub struct RegisterChannelRequest {
+    /// Operator-facing name.
+    pub display_name: String,
+    /// Provider phone-number handle.
+    pub phone_number_id: String,
+    /// WhatsApp Business Account handle, when known.
+    #[serde(default)]
+    pub waba_id: Option<String>,
+    /// Graph API version, e.g. `v21.0`.
+    pub api_version: String,
+    /// Secret *reference* for the webhook verify token.
+    pub verify_token_ref: String,
 }
 
-/// List all WhatsApp accounts for the authenticated tenant.
-pub async fn list_accounts() -> Result<Value, warp::reject::Rejection> {
-    // Return empty for now; full impl queries whatsapp_accounts RLS-filtered.
-    Ok(serde_json::json!({ "accounts": [] }))
+/// One channel over the wire.
+#[derive(Debug, Serialize)]
+pub struct ChannelDto {
+    /// Row id.
+    pub id: uuid::Uuid,
+    /// Operator-facing name.
+    pub display_name: String,
+    /// Provider phone-number handle.
+    pub phone_number_id: String,
+    /// WhatsApp Business Account handle.
+    pub waba_id: Option<String>,
+    /// Graph API version.
+    pub api_version: String,
+    /// Lifecycle status.
+    pub status: String,
 }
 
-/// Handle an inbound WhatsApp webhook POST (signed, authenticated).
-/// This is the protected version of the public webhook — only reachable
-/// after authZ. The body has already been verified by the middleware.
-#[instrument(skip(body))]
-pub async fn protected_inbound(
-    body: web::Json<Value>,
-) -> Result<Value, warp::reject::Rejection> {
-    // The body is already verified by middleware; just normalise and delegate.
-    let raw = body.0;
-    // route_id comes from the request context/middleware
-    let route_id = "default-route".into();
-    let _account = WhatsAppAccountConfig {
-        waba_id: uuid::Uuid::nil(),
-        phone_number_id: uuid::Uuid::nil(),
-        graph_version: "v20.0".into(),
-        app_secret_ref: "ref".into(),
-        access_token_ref: "ref".into(),
-        verify_token_ref: "ref".into(),
+fn channel_dto(channel: &mas_domain::whatsapp::WhatsAppChannel) -> ChannelDto {
+    ChannelDto {
+        id: channel.id.into_uuid(),
+        display_name: channel.display_name.clone(),
+        phone_number_id: channel.phone_number_id.clone(),
+        waba_id: channel.waba_id.clone(),
+        api_version: channel.api_version.clone(),
+        status: channel.status.as_str().to_owned(),
+    }
+}
+
+/// One message over the wire.
+#[derive(Debug, Serialize)]
+pub struct MessageDto {
+    /// Row id.
+    pub id: uuid::Uuid,
+    /// Provider message id.
+    pub wamid: Option<String>,
+    /// Which side the message is on.
+    pub direction: String,
+    /// Sender address.
+    pub from: Option<String>,
+    /// Receiver address.
+    pub to: Option<String>,
+    /// Declared content type.
+    pub message_type: String,
+    /// Text body, when present.
+    pub body: Option<String>,
+    /// Delivery lifecycle.
+    pub status: String,
+    /// When the provider says it happened.
+    pub occurred_at: String,
+}
+
+fn message_dto(message: &mas_domain::whatsapp::WhatsAppMessage) -> MessageDto {
+    MessageDto {
+        id: message.id.into_uuid(),
+        wamid: message.wamid.clone(),
+        direction: message.direction.as_str().to_owned(),
+        from: message.from_addr.clone(),
+        to: message.to_addr.clone(),
+        message_type: message.message_type.as_str().to_owned(),
+        body: message.body_text.clone(),
+        status: message.status.as_str().to_owned(),
+        occurred_at: message.occurred_at.to_rfc3339_millis(),
+    }
+}
+
+/// `POST /v1/whatsapp/channels`.
+pub async fn register_channel(
+    State(state): State<AppState>,
+    Ctx(ctx): Ctx,
+    axum::Json(request): axum::Json<RegisterChannelRequest>,
+) -> ApiResult<ChannelDto> {
+    let scope = crate::handlers::resolved_scope(&ctx)?;
+    let channel = mas_domain::whatsapp::WhatsAppChannel {
+        id: mas_common::ids::WhatsAppChannelId::new(),
+        tenant_id: scope.tenant_id(),
+        display_name: request.display_name,
+        phone_number_id: request.phone_number_id,
+        waba_id: request.waba_id,
+        api_version: request.api_version,
+        status: mas_domain::whatsapp::WhatsAppChannelStatus::Active,
+        verify_token_ref: request.verify_token_ref,
+        created_at: mas_common::timestamps::Timestamp::now(),
+        updated_at: mas_common::timestamps::Timestamp::now(),
     };
+    let registered = state
+        .whatsapp_service(&ctx)?
+        .register_channel(&channel)
+        .await
+        .map_err(|error| ApiError::new(error, &ctx))?;
+    Ok(ok(&ctx, channel_dto(&registered)))
+}
 
-    match handle_inbound(&raw, &route_id, &_account) {
-        Ok(msg) => Ok(serde_json::json!({ "status": "processed", "wamid": msg.wamid })),
-        Err(e) => {
-            let stable = e.to_stable_api_error();
-            Err(warp::reject::reject::custom(warp::reject::custom::custom(format!(
-                "inbound handling error: {:?}", stable
-            ))))
-        }
+/// `GET /v1/whatsapp/channels`.
+pub async fn list_channels(
+    State(state): State<AppState>,
+    Ctx(ctx): Ctx,
+) -> ApiResult<Vec<ChannelDto>> {
+    let scope = crate::handlers::resolved_scope(&ctx)?;
+    let channels = state
+        .whatsapp_service(&ctx)?
+        .list_channels(scope.tenant_id())
+        .await
+        .map_err(|error| ApiError::new(error, &ctx))?;
+    Ok(ok(&ctx, channels.iter().map(channel_dto).collect()))
+}
+
+/// `POST /v1/whatsapp/channels/{channel_id}/messages` body.
+#[derive(Debug, Deserialize)]
+pub struct SendTextRequest {
+    /// Recipient phone number (E.164).
+    pub to: String,
+    /// The text to send.
+    pub body: String,
+}
+
+/// `POST /v1/whatsapp/channels/{channel_id}/messages`.
+pub async fn send_text(
+    State(state): State<AppState>,
+    Ctx(ctx): Ctx,
+    Path(channel_id): Path<uuid::Uuid>,
+    axum::Json(request): axum::Json<SendTextRequest>,
+) -> ApiResult<MessageDto> {
+    let scope = crate::handlers::resolved_scope(&ctx)?;
+    let message = state
+        .whatsapp_service(&ctx)?
+        .send_text(
+            scope.tenant_id(),
+            mas_common::ids::WhatsAppChannelId::from_uuid(channel_id),
+            &request.to,
+            &request.body,
+        )
+        .await
+        .map_err(|error| ApiError::new(error, &ctx))?;
+    Ok(ok(&ctx, message_dto(&message)))
+}
+
+/// `GET /v1/whatsapp/channels/{channel_id}/messages` query.
+#[derive(Debug, Deserialize)]
+pub struct ListMessagesQuery {
+    /// Page size (1..=200).
+    #[serde(default = "default_limit")]
+    pub limit: i64,
+}
+
+const fn default_limit() -> i64 {
+    50
+}
+
+/// `GET /v1/whatsapp/channels/{channel_id}/messages`.
+pub async fn list_messages(
+    State(state): State<AppState>,
+    Ctx(ctx): Ctx,
+    Path(channel_id): Path<uuid::Uuid>,
+    Query(query): Query<ListMessagesQuery>,
+) -> ApiResult<Vec<MessageDto>> {
+    let scope = crate::handlers::resolved_scope(&ctx)?;
+    let limit = query.limit.clamp(1, 200);
+    let messages = state
+        .whatsapp_service(&ctx)?
+        .list_messages(
+            scope.tenant_id(),
+            mas_common::ids::WhatsAppChannelId::from_uuid(channel_id),
+            limit,
+        )
+        .await
+        .map_err(|error| ApiError::new(error, &ctx))?;
+    Ok(ok(&ctx, messages.iter().map(message_dto).collect()))
+}
+
+/// `GET /v1/whatsapp/conversations` query.
+#[derive(Debug, Deserialize)]
+pub struct ConversationQuery {
+    /// The channel.
+    pub channel_id: uuid::Uuid,
+    /// The contact's phone number.
+    pub contact: String,
+}
+
+/// `GET /v1/whatsapp/conversations`.
+pub async fn conversation(
+    State(state): State<AppState>,
+    Ctx(ctx): Ctx,
+    Query(query): Query<ConversationQuery>,
+) -> ApiResult<Vec<MessageDto>> {
+    let scope = crate::handlers::resolved_scope(&ctx)?;
+    let messages = state
+        .whatsapp_service(&ctx)?
+        .get_conversation(
+            scope.tenant_id(),
+            mas_common::ids::WhatsAppChannelId::from_uuid(query.channel_id),
+            &query.contact,
+        )
+        .await
+        .map_err(|error| ApiError::new(error, &ctx))?;
+    Ok(ok(&ctx, messages.iter().map(message_dto).collect()))
+}
+
+/// `PUT /v1/whatsapp/messages/{wamid}/status` body.
+#[derive(Debug, Deserialize)]
+pub struct UpdateStatusRequest {
+    /// The new delivery status.
+    pub status: String,
+}
+
+/// `PUT /v1/whatsapp/messages/{wamid}/status`.
+pub async fn update_status(
+    State(state): State<AppState>,
+    Ctx(ctx): Ctx,
+    Path(wamid): Path<String>,
+    axum::Json(request): axum::Json<UpdateStatusRequest>,
+) -> ApiResult<MessageDto> {
+    let scope = crate::handlers::resolved_scope(&ctx)?;
+    let status: mas_domain::whatsapp::WhatsAppMessageStatus = request
+        .status
+        .parse()
+        .map_err(|error| ApiError::new(error, &ctx))?;
+    let message = state
+        .whatsapp_service(&ctx)?
+        .update_message_status(scope.tenant_id(), &wamid, status)
+        .await
+        .map_err(|error| ApiError::new(error, &ctx))?
+        .ok_or_else(|| {
+            ApiError::new(
+                mas_common::error::AppError::not_found("whatsapp message", wamid),
+                &ctx,
+            )
+        })?;
+    Ok(ok(&ctx, message_dto(&message)))
+}
+
+/// One template over the wire.
+#[derive(Debug, Serialize)]
+pub struct TemplateDto {
+    /// Row id.
+    pub id: uuid::Uuid,
+    /// Channel id.
+    pub channel_id: uuid::Uuid,
+    /// Provider template name.
+    pub name: String,
+    /// Language.
+    pub language: String,
+    /// Lifecycle status.
+    pub status: String,
+    /// Body preview, when known.
+    pub body: Option<String>,
+}
+
+fn template_dto(template: &mas_domain::whatsapp::WhatsAppTemplate) -> TemplateDto {
+    TemplateDto {
+        id: template.id.into_uuid(),
+        channel_id: template.channel_id.into_uuid(),
+        name: template.name.clone(),
+        language: template.language.clone(),
+        status: template.status.clone(),
+        body: template.body.clone(),
     }
 }
 
-/// Send a text message from the bot to a WhatsApp number.
-pub async fn protected_send_text(
-    account: WhatsAppAccountConfig,
-    to: web::Query<String>,
-    body: web::Query<String>,
-) -> Result<Value, warp::reject::Rejection> {
-    let text_body = body.into_inner();
-    let result = send_text(&_account, &to.into_inner(), &text_body, None).await;
-    match result {
-        Ok(()) => Ok(serde_json::json!({ "status": "sent" })),
-        Err(e) => {
-            let stable = e.to_stable_api_error();
-            Err(warp::reject::reject::custom(warp::reject::custom::custom(format!(
-                "send text error: {:?}", stable
-            ))))
-        }
-    }
+/// `GET /v1/whatsapp/templates` query.
+#[derive(Debug, Deserialize)]
+pub struct ListTemplatesQuery {
+    /// The channel whose templates to list.
+    pub channel_id: uuid::Uuid,
 }
 
-/// Send a template message.
-pub async fn protected_send_template(
-    account: WhatsAppAccountConfig,
-    to: web::Query<String>,
-    template_name: web::Query<String>,
-    language_code: web::Query<String>,
-    variables: web::Query<serde_json::Value>,
-) -> Result<Value, warp::reject::Rejection> {
-    let vars = variables.into_inner();
-    let result = send_template(&_account, &to.into_inner(), &template_name.into_inner(),
-        &language_code.into_inner(), vars.as_array().map(|a| a.iter().map(|v| (v["key"].as_str().unwrap_or(""), v["value"].as_str().unwrap_or("")).collect::<Vec<(&str, &str)>>).unwrap_or_default(), &TemplateModel {
-        name: "template".into(),
-        language: "en".into(),
-        category: crate::template::TemplateCategory::Text,
-        status: crate::template::TemplateStatus::Approved,
-        variables: vec![],
-    }, None).await;
-    match result {
-        Ok(()) => Ok(serde_json::json!({ "status": "sent" })),
-        Err(e) => {
-            let stable = e.to_stable_api_error();
-            Err(warp::reject::reject::custom(warp::reject::custom::custom(format!(
-                "send template error: {:?}", stable
-            ))))
-        }
-    }
+/// `GET /v1/whatsapp/templates`.
+pub async fn list_templates(
+    State(state): State<AppState>,
+    Ctx(ctx): Ctx,
+    Query(query): Query<ListTemplatesQuery>,
+) -> ApiResult<Vec<TemplateDto>> {
+    let scope = crate::handlers::resolved_scope(&ctx)?;
+    let templates = state
+        .whatsapp_service(&ctx)?
+        .list_templates(
+            scope.tenant_id(),
+            mas_common::ids::WhatsAppChannelId::from_uuid(query.channel_id),
+        )
+        .await
+        .map_err(|error| ApiError::new(error, &ctx))?;
+    Ok(ok(&ctx, templates.iter().map(template_dto).collect()))
 }
 
-/// Handle status update (delivery/read receipt)
-pub async fn protected_handle_status(
-    wamid: web::Query<String>,
-    status: web::Query<String>,
-) -> Result<Value, warp::reject::Rejection> {
-    let result = handle_status(&wamid.into_inner(), &status.into_inner()).await;
-    match result {
-        Ok(()) => Ok(serde_json::json!({ "status": "acknowledged" })),
-        Err(e) => {
-            let stable = e.to_stable_api_error();
-            Err(warp::reject::reject::custom(warp::reject::custom::custom(format!(
-                "handle status error: {:?}", stable
-            ))))
-        }
-    }
+/// `POST /v1/whatsapp/templates` body (sync).
+#[derive(Debug, Deserialize)]
+pub struct SyncTemplatesRequest {
+    /// The channel whose WABA to pull from.
+    pub channel_id: uuid::Uuid,
 }
 
-/// Handle STOP/opt-out from user
-pub async fn protected_handle_stop(
-    wamid: web::Query<String>,
-) -> Result<Value, warp::reject::Rejection> {
-    let result = handle_stop(&wamid.into_inner()).await;
-    match result {
-        Ok(()) => Ok(serde_json::json!({ "status": "opted_out" })),
-        Err(e) => {
-            let stable = e.to_stable_api_error();
-            Err(warp::reject::reject::custom(warp::reject::custom::custom(format!(
-                "handle stop error: {:?}", stable
-            ))))
-        }
-    }
+/// `POST /v1/whatsapp/templates`.
+pub async fn sync_templates(
+    State(state): State<AppState>,
+    Ctx(ctx): Ctx,
+    axum::Json(request): axum::Json<SyncTemplatesRequest>,
+) -> ApiResult<Vec<TemplateDto>> {
+    let scope = crate::handlers::resolved_scope(&ctx)?;
+    let templates = state
+        .whatsapp_service(&ctx)?
+        .sync_templates(
+            scope.tenant_id(),
+            mas_common::ids::WhatsAppChannelId::from_uuid(request.channel_id),
+        )
+        .await
+        .map_err(|error| ApiError::new(error, &ctx))?;
+    Ok(ok(&ctx, templates.iter().map(template_dto).collect()))
 }
 
-/// Human handoff: bot → human agent
-pub async fn protected_human_handoff(
-    conversation_id: web::Query<String>,
-    new_agent_id: web::Query<String>,
-) -> Result<Value, warp::reject::Rejection> {
-    let result = human_handoff(&conversation_id.into_inner(), &new_agent_id.into_inner()).await;
-    match result {
-        Ok(()) => Ok(serde_json::json!({ "status": "handoff_initiated" })),
-        Err(e) => {
-            let stable = e.to_stable_api_error();
-            Err(warp::reject::reject::custom(warp::reject::custom::custom(format!(
-                "human handoff error: {:?}", stable
-            ))))
-        }
-    }
+/// `GET /v1/whatsapp/conversations/{conversation_id}/messages`.
+pub async fn conversation_messages(
+    State(state): State<AppState>,
+    Ctx(ctx): Ctx,
+    Path(conversation_id): Path<uuid::Uuid>,
+) -> ApiResult<Vec<MessageDto>> {
+    let scope = crate::handlers::resolved_scope(&ctx)?;
+    let messages = state
+        .whatsapp_service(&ctx)?
+        .conversation_messages(
+            scope.tenant_id(),
+            mas_common::ids::WhatsAppConversationId::from_uuid(conversation_id),
+        )
+        .await
+        .map_err(|error| ApiError::new(error, &ctx))?;
+    Ok(ok(&ctx, messages.iter().map(message_dto).collect()))
 }
 
-/// Rotate credentials for a WhatsApp account
-pub async fn protected_rotate_credentials(
-    new_app_secret_ref: web::Query<String>,
-    new_access_token_ref: web::Query<String>,
-) -> Result<Value, warp::reject::Rejection> {
-    let result = rotate_credentials(&new_app_secret_ref.into_inner(), &new_access_token_ref.into_inner()).await;
-    match result {
-        Ok(()) => Ok(serde_json::json!({ "status": "credentials_rotated" })),
-        Err(e) => {
-            let stable = e.to_stable_api_error();
-            Err(warp::reject::reject::custom(warp::reject::custom::custom(format!(
-                "rotate credentials error: {:?}", stable
-            ))))
-        }
-    }
+/// `POST /v1/whatsapp/conversations/{conversation_id}/messages` body.
+#[derive(Debug, Deserialize)]
+pub struct HumanReplyRequest {
+    /// Free-form text, required inside the 24h window.
+    #[serde(default)]
+    pub body: Option<String>,
+    /// Template name, required after the window.
+    #[serde(default)]
+    pub template_name: Option<String>,
+    /// Template language, default `en`.
+    #[serde(default)]
+    pub template_language: Option<String>,
 }
 
-/// Submit execution with idempotency key
-pub async fn protected_submit_execution(
-    wamid: web::Query<String>,
-    account: WhatsAppAccountConfig,
-) -> Result<Value, warp::reject::Rejection> {
-    let result = submit_execution(&wamid.into_inner(), &account).await;
-    match result {
-        Ok(()) => Ok(serde_json::json!({ "status": "execution_submitted" })),
-        Err(e) => {
-            let stable = e.to_stable_api_error();
-            Err(warp::reject::reject::custom(warp::reject::custom::custom(format!(
-                "submit execution error: {:?}", stable
-            ))))
-        }
-    }
+/// `POST /v1/whatsapp/conversations/{conversation_id}/messages`.
+pub async fn human_reply(
+    State(state): State<AppState>,
+    Ctx(ctx): Ctx,
+    Path(conversation_id): Path<uuid::Uuid>,
+    axum::Json(request): axum::Json<HumanReplyRequest>,
+) -> ApiResult<MessageDto> {
+    let scope = crate::handlers::resolved_scope(&ctx)?;
+    let message = state
+        .whatsapp_service(&ctx)?
+        .human_reply(
+            scope.tenant_id(),
+            mas_common::ids::WhatsAppConversationId::from_uuid(conversation_id),
+            request.body.as_deref(),
+            request.template_name.as_deref(),
+            request.template_language.as_deref(),
+        )
+        .await
+        .map_err(|error| ApiError::new(error, &ctx))?;
+    Ok(ok(&ctx, message_dto(&message)))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::WhatsAppAccountConfig;
-    use uuid::Uuid;
+/// Inbox counters over the wire.
+#[derive(Debug, Serialize)]
+pub struct StatsDto {
+    /// Connected channels.
+    pub channels: i64,
+    /// Open conversations.
+    pub conversations: i64,
+    /// Inbound messages.
+    pub inbound: i64,
+    /// Outbound messages.
+    pub outbound: i64,
+    /// Failed outbound messages.
+    pub failed: i64,
+}
 
-    #[test]
-    fn test_register_account() {
-        let account = WhatsAppAccountConfig {
-            waba_id: Uuid::new_v4(),
-            phone_number_id: Uuid::new_v4(),
-            graph_version: "v20.0".into(),
-            app_secret_ref: "ref".into(),
-            access_token_ref: "ref".into(),
-            verify_token_ref: "ref".into(),
-        };
-        let result = register_account(serde_json::json(account));
-        // Just verify it compiles and returns a JSON response
-    }
-
-    #[test]
-    fn test_protected_inbound_structure() {
-        let raw = serde_json::json!({ "object": "page" });
-        let result = protected_inbound(serde_json::json(raw));
-        // Should return an error or result; just verify it doesn't panic
-    }
+/// `GET /v1/whatsapp/stats`.
+pub async fn stats(State(state): State<AppState>, Ctx(ctx): Ctx) -> ApiResult<StatsDto> {
+    let scope = crate::handlers::resolved_scope(&ctx)?;
+    let stats = state
+        .whatsapp_service(&ctx)?
+        .stats(scope.tenant_id())
+        .await
+        .map_err(|error| ApiError::new(error, &ctx))?;
+    Ok(ok(
+        &ctx,
+        StatsDto {
+            channels: stats.channels,
+            conversations: stats.conversations,
+            inbound: stats.inbound,
+            outbound: stats.outbound,
+            failed: stats.failed,
+        },
+    ))
 }

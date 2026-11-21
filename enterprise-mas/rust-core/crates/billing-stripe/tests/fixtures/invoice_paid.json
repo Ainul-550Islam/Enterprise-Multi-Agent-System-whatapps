@@ -1,0 +1,19 @@
+{
+  "id": "evt_1PABCinvoice0003",
+  "object": "event",
+  "api_version": "2024-06-20",
+  "created": 1763400600,
+  "livemode": false,
+  "type": "invoice.paid",
+  "data": {
+    "object": {
+      "id": "in_TEST0003",
+      "object": "invoice",
+      "customer": "cus_TEST0003",
+      "subscription": "sub_TEST0003",
+      "status": "paid",
+      "amount_paid": 2900,
+      "currency": "usd"
+    }
+  }
+}

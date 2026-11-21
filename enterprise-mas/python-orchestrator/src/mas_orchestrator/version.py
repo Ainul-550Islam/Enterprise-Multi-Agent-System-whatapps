@@ -15,7 +15,7 @@ from __future__ import annotations
 from importlib import metadata
 
 #: Semantic version of the Python AI Orchestrator.
-__version__: str = "0.1.0"
+__version__: str = "1.1.0"
 
 #: Logical service name reported to Rust Core, logs, and metrics.
 SERVICE_NAME: str = "mas-orchestrator"

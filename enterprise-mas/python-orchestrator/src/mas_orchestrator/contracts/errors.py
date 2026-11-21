@@ -409,18 +409,23 @@ class ModelRateLimitedError(OrchestratorError):
         message: str,
         *,
         retry_after_seconds: float | None = None,
+        status_code: int | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(message, **kwargs)
         #: Provider-supplied retry hint; honoured by the retry layer when the
         #: configuration enables it. ``None`` means "no hint supplied".
         self.retry_after_seconds: float | None = retry_after_seconds
+        #: HTTP status when the failure originated from an HTTP provider.
+        self.status_code: int | None = status_code
 
     def to_payload(self) -> dict[str, Any]:
         """Includes the retry hint so callers can back off accurately."""
         payload = super().to_payload()
         if self.retry_after_seconds is not None:
             payload["retry_after_seconds"] = self.retry_after_seconds
+        if self.status_code is not None:
+            payload["status_code"] = self.status_code
         return payload
 
 

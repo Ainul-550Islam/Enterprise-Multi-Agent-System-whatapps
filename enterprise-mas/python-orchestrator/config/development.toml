@@ -1,0 +1,27 @@
+# Development overlay — loaded when MAS_ENV=development
+# (config/default.toml + config/{MAS_ENV}.toml + MAS_ORCH_* env স্তরের অংশ)।
+#
+# এই ফাইলে কোনো সিক্রেট মান থাকে না — শুধু *রেফারেন্স*। লোকাল রানের আগে:
+#   export MAS_OPENAI_API_KEY=sk-...            # প্রকৃত (বা ডামি) মডেল কী
+#   export MAS_DEV_BRIDGE_TOKEN=...              # Rust-এর inbound bridge bearer
+#   export MAS_DEV_INTERNAL_SECRET=...           # অভ্যন্তরীণ সিগনেচার সিক্রেট
+# ছাড়াই `python -m mas_orchestrator.main` ইচ্ছাকৃতভাবে boot করবে না
+# (fail-closed: টোকেন/প্রোভাইডার ছাড়া ব্রিজ = খোলা প্রক্সি)।
+
+[rust_core]
+# লোকাল dev-inmemory mas-api-এর সাথে সরাসরি (gRPC :50051)।
+transport = "insecure"
+endpoint = "127.0.0.1:50051"
+
+[providers]
+# ব্রিজ চালু থাকতে অন্তত একটি লাইভ প্রোভাইডার লাগে (fail-closed)।
+mode = "live"
+enabled_providers = ["openai"]
+allowed_models = ["openai/gpt-4o-mini"]
+default_model = "openai/gpt-4o-mini"
+
+[security]
+# env:NAME স্কিম = সরাসরি সেই env ভ্যারিয়েবল থেকে মান নেওয়া হয় (কোনো MAS_ORCH_
+# কলিশন ছাড়া)।
+service_token_ref = "env:MAS_DEV_BRIDGE_TOKEN"
+internal_service_secret_ref = "env:MAS_DEV_INTERNAL_SECRET"

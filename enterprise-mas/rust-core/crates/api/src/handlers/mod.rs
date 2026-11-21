@@ -28,9 +28,12 @@ pub mod approvals;
 pub mod assistant;
 pub mod audit;
 pub mod auth;
+pub mod billing_checkout;
+pub mod billing_public;
 pub mod connectors;
 pub mod control_plane;
 pub mod data_hub;
+pub mod discovery;
 pub mod executions;
 pub mod health;
 pub mod inbound_webhooks;
@@ -48,6 +51,8 @@ pub mod tenancy;
 pub mod tools;
 pub mod usage;
 pub mod webhooks;
+pub mod whatsapp;
+pub mod whatsapp_public;
 pub mod workflows;
 
 use axum::extract::FromRequestParts;
@@ -95,6 +100,20 @@ pub(crate) fn authorized_service_context(
 /// layer always runs first; this trips only on misconfigured routers).
 #[derive(Debug)]
 pub struct Ctx(pub RequestContext);
+
+/// The request's resolved authoritative scope, or a 401 envelope error.
+/// Tenant-facing handlers take their tenant from here -- never from the
+/// body.
+pub fn resolved_scope(
+    ctx: &crate::context::RequestContext,
+) -> std::result::Result<mas_security::scope::AuthoritativeScope, crate::response::ApiError> {
+    ctx.scope.clone().ok_or_else(|| {
+        crate::response::ApiError::new(
+            mas_common::error::AppError::unauthorized("resolved scope required"),
+            ctx,
+        )
+    })
+}
 
 impl<S> FromRequestParts<S> for Ctx
 where

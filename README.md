@@ -1,12 +1,12 @@
 # enterprise-mas — Enterprise Multi-Agent System
 
+[![CI](https://img.shields.io/badge/CI-GitHub_Actions-2088FF?logo=githubactions&logoColor=white)](.github/workflows/ci.yml)
+
 Enterprise-grade multi-agent platform: a Rust core (`enterprise-mas/rust-core`)
 that owns identity, tenancy, authorization, policy, quota, execution state,
 audit, and persistence, plus a Python AI orchestrator
 (`enterprise-mas/python-orchestrator`) that owns AI execution only, reached
 through a versioned gRPC `AgentBridgeApi` contract.
-
-[![CI](https://github.com/Ainul-550Islam/Enterprise-Multi-Agent-System-whatapps/workflows/CI/badge.svg)](https://github.com/Ainul-550Islam/Enterprise-Multi-Agent-System-whatapps/actions)
 
 > This is **source code**, not a SaaS. Shipped under a proprietary commercial
 > source license (see `LICENSE` — TEMPLATE, have a lawyer review before sale).
@@ -17,21 +17,21 @@ through a versioned gRPC `AgentBridgeApi` contract.
 
 ```mermaid
 graph TD
-    subgraph RC [\"rust-core (Rust)\"]
+    subgraph RC ["rust-core (Rust)"]
         API[mas-api: HTTP v1 + gRPC edge]
         APP[application: use cases]
         SEC[security: auth, JWKS, API keys, RLS]
         TEN[tenancy: org/tenant/project]
-        PERS[persistence: Postgres/pgvector, RLS, migrations 0001-0053]
+        PERS[persistence: Postgres/pgvector, RLS, migrations 0001-0061]
         MSG[messaging: NATS/JetStream or PG lane]
         WKR[worker: lease-fenced consumer]
         SCH[scheduler-service: due-schedule scanner]
     end
-    subgraph PY [\"python-orchestrator\"]
+    subgraph PY ["python-orchestrator"]
         BRIDGE[gRPC AgentBridge server]
         RT[agent runtime, providers, tools, memory, RAG, guardrails]
     end
-    subgraph INFRA [\"Infra\"]
+    subgraph INFRA ["Infra"]
         PG[(PostgreSQL + pgvector)]
         NATS[(NATS + JetStream)]
     end
@@ -80,7 +80,7 @@ graph TD
 * SSE stream (`/v1/stream`), per-tenant/per-principal caps
 * Governance: `/v1/auth/me`, `/v1/audit-events`, `/v1/policies`, `/v1/quotas`,
   `/v1/usage/summary`
-* 53 additive migrations (0001–0053), migration runner with FNV-1a checksum
+* 61 additive migrations (0001–0061), migration runner with FNV-1a checksum
   ledger + advisory lock
 * gRPC `mas.api.v1` services; health probes; graceful shutdown
 * CI (`ci.yml`, `security.yml`), Docker images (hardened, non-root),
@@ -88,26 +88,125 @@ graph TD
 
 ## Not included (not in this codebase)
 
-* Frontend / dashboard UI
-* WhatsApp channel
-* Stripe checkout
+* SOC2/ISO certification (nothing here is certified)
+* SaaS hosting — this is source code, not a service
 
-## Quickstart (10-minute demo)
+## 10-minute demo
 
 ```bash
-# 1. Copy example env and fill operator secrets (never commit .env)
+# 1. Copy operator secrets (never commit .env)
 cp deploy/compose/.env.example .env
 
-# 2. Start compose (Postgres/pgvector + NATS + migrate + api + worker + scheduler + orchestrator)
+# 2. Core stack + demo overlay (IdP + dashboard + mailbox)
+docker compose -f deploy/compose/docker-compose.yml \
+               -f deploy/compose/docker-compose.demo.yml up -d
+
+# 3. Scope for the seed script (values come from the running API / IdP)
+export MAS_API_URL=http://127.0.0.1:8080
+export MAS_API_TOKEN=dev-token
+export MAS_TENANT_ID=<uuid>
+export MAS_ORGANIZATION_ID=<uuid>
+
+# 4. Register the five demo agents/workflow
+bash scripts/seed-demo.sh
+
+# 5. Optional WhatsApp webhook handshake
+bash scripts/e2e-whatsapp.sh
+```
+
+## Quickstart
+
+```bash
+# 1. Compose (Postgres/pgvector + NATS + migrate + api + worker + scheduler + orchestrator)
+cp deploy/compose/.env.example .env   # fill operator secrets; never commit .env
 docker compose -f deploy/compose/docker-compose.yml up -d
 
-# 3. Health check
+# 2. Verify
 curl -s http://127.0.0.1:8080/v1/health/live
 curl -s -H "Authorization: Bearer dev-token" http://127.0.0.1:8080/v1/auth/me
 
-# 4. Quick checks
-cargo fmt --all -- --check        # 10s
-cargo clippy --workspace --all-targets --locked -- -D warnings  # 30s
-cargo test --workspace --locked   # 1148 passed, 0 failed
-bash scripts/check.sh             # 2003 passed, 2 skipped, 0 failed
+# 3. Rust checks (from enterprise-mas/rust-core)
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked        # 1250 passed, 0 failed, 13 ignored
+cargo deny check
+
+# 4. Python checks (from enterprise-mas/python-orchestrator)
+bash scripts/bootstrap.sh
+bash scripts/check.sh                  # 2173 passed, 6 skipped, 0 failed
 ```
+
+## Repo map
+
+```
+.
+├── LICENSE                      # proprietary commercial source (TEMPLATE)
+├── README.md                    # this file
+├── SECURITY.md                  # vulnerability reporting + enforced properties
+├── CHANGELOG.md                 # keep-a-changelog; 1.0.0–1.1.0 from migrations 0001–0061
+├── THIRD_PARTY_NOTICES.md       # generated from real dependency metadata
+├── .gitignore
+├── scripts/
+│   ├── repo-cleanup.sh          # idempotent, dry-run by default
+│   └── gen-third-party-notices.sh
+├── .github/workflows/
+│   ├── ci.yml                   # rust, bridge-e2e, completeness, python, openapi-parity, docker-build, compose-smoke, web
+│   └── security.yml             # deny, audit, pip-audit, gitleaks, trivy
+├── deploy/
+│   ├── docker/*.Dockerfile      # api, worker, scheduler, migrate, orchestrator (hardened)
+│   ├── compose/                 # docker-compose.yml, .env.example, nats.conf
+│   └── helm/enterprise-mas/     # Chart, values, templates (default-deny network policy, hardened)
+├── enterprise-mas/
+│   ├── ci-evidence/             # raw logs: fmt, clippy, test, nats, bridge-e2e, deny, python check
+│   ├── scripts/
+│   │   ├── e2e-smoke.sh
+│   │   └── gen-postman.py
+│   ├── docs/
+│   │   ├── ARCHITECTURE.md
+│   │   ├── QUICKSTART.md
+│   │   ├── DEPLOYMENT.md
+│   │   ├── SECURITY_MODEL.md
+│   │   └── postman/mas.postman_collection.json
+│   ├── python-orchestrator/     # Python AI orchestrator (with its own README)
+│   └── rust-core/               # Rust workspace (with its own README)
+├── sdk/
+│   ├── python/                  # Python SDK (tenant-scoped client)
+│   └── typescript/              # TypeScript SDK (tenant-scoped client)
+├── sandbox-runner/              # code-execution sandbox runner (tests exercise it)
+├── web/                         # operations dashboard (Next.js)
+├── docs/                        # review resolution and working notes
+└── examples/                    # runnable examples
+```
+
+## Included (in this codebase)
+
+* `enterprise-mas/python-orchestrator` — Python AI orchestrator
+* `enterprise-mas/rust-core` — Rust workspace (api, worker, scheduler, security, persistence, …)
+* `sdk/python` — Python SDK
+* `sdk/typescript` — TypeScript SDK
+* `sandbox-runner` — sandbox runner used by code execution
+* `web` — operations dashboard
+* `docs` — review resolution and working notes
+
+## Verified test counts (from ci-evidence logs)
+
+| Command | Result |
+|---------|--------|
+| `cargo fmt --all -- --check` | PASS |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | PASS |
+| `cargo test --workspace --locked` | 1250 passed, 0 failed, 13 ignored |
+| `cargo test --workspace --locked --features nats` | NOT_RUN this turn (not in `scripts/check.sh`) |
+| `cargo test -p mas-ai-bridge --test e2e_python -- --ignored` | NOT_RUN this turn (needs live Python bridge) |
+| `cargo deny check` | NOT_RUN this turn |
+| `python-orchestrator/scripts/check.sh` | 2173 passed, 6 skipped, 0 failed |
+
+Live-PostgreSQL / NATS-dependent suites and the compose smoke test could not
+run in this environment (no postgres/pgvector, nats-server, or docker daemon;
+no root to install them) and are listed under `ci-evidence/NOT_RUN.txt` with
+the real error text.
+
+## Releases
+
+Tagged releases cut from `main`. Each release includes the committed
+`Cargo.lock` (`--locked` builds in CI) and the generated
+`THIRD_PARTY_NOTICES.md`.

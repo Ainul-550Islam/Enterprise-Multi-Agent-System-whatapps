@@ -558,3 +558,20 @@ mod tests {
         assert!(reactivated.last_error.is_none());
     }
 }
+
+/// Dev-lane connection probe. The in-memory lane composes no outbound
+/// network plane, so a probe honestly reports the provider as unreachable
+/// instead of fabricating a green check — the port exists so production can
+/// compose a real prober (with `http_guard`) where one belongs.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct InMemoryConnectionProbe;
+
+#[async_trait]
+impl ConnectionProbePort for InMemoryConnectionProbe {
+    async fn probe(&self, _connector: &Connector) -> Result<()> {
+        Err(AppError::external_service(
+            "provider",
+            "connection probes require the outbound network plane, which this deployment has not composed",
+        ))
+    }
+}

@@ -655,6 +655,30 @@
           }
         },
         {
+          "name": "POST /v1/assistant/messages",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/assistant/messages",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "assistant",
+                "messages"
+              ]
+            }
+          }
+        },
+        {
           "name": "GET /v1/audit-events",
           "request": {
             "method": "GET",
@@ -702,6 +726,54 @@
           }
         },
         {
+          "name": "POST /v1/billing/checkout",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/billing/checkout",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "billing",
+                "checkout"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/billing/checkout-session",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/billing/checkout-session",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "billing",
+                "checkout-session"
+              ]
+            }
+          }
+        },
+        {
           "name": "GET /v1/billing/entitlements",
           "request": {
             "method": "GET",
@@ -721,6 +793,30 @@
                 "v1",
                 "billing",
                 "entitlements"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/billing/portal-session",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/billing/portal-session",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "billing",
+                "portal-session"
               ]
             }
           }
@@ -1331,6 +1427,31 @@
           }
         },
         {
+          "name": "POST /v1/executions/{execution_id}/signal",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/executions/{execution_id}/signal",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "executions",
+                "execution_id",
+                "signal"
+              ]
+            }
+          }
+        },
+        {
           "name": "POST /v1/executions/{execution_id}/start",
           "request": {
             "method": "POST",
@@ -1572,6 +1693,80 @@
           }
         },
         {
+          "name": "POST /v1/memberships/{membership_id}/accept",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/memberships/{membership_id}/accept",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "memberships",
+                "membership_id",
+                "accept"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/models/status",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/models/status",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "models",
+                "status"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/models/status/{provider}",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/models/status/{provider}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "models",
+                "status",
+                "provider"
+              ]
+            }
+          }
+        },
+        {
           "name": "GET /v1/notifications/recipients/{recipient_id}",
           "request": {
             "method": "GET",
@@ -1651,6 +1846,29 @@
           }
         },
         {
+          "name": "GET /v1/openapi.json",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/openapi.json",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "openapi.json"
+              ]
+            }
+          }
+        },
+        {
           "name": "GET /v1/organizations",
           "request": {
             "method": "GET",
@@ -1692,6 +1910,54 @@
               "path": [
                 "v1",
                 "organizations"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/platforms",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/platforms",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "platforms"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/platforms/whatsapp/health",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/platforms/whatsapp/health",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "platforms",
+                "whatsapp",
+                "health"
               ]
             }
           }
@@ -1965,6 +2231,84 @@
           }
         },
         {
+          "name": "GET /v1/public/whatsapp/webhook/{route_id}",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/public/whatsapp/webhook/{route_id}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "public",
+                "whatsapp",
+                "webhook",
+                "route_id"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/public/whatsapp/webhook/{route_id}",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/public/whatsapp/webhook/{route_id}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "public",
+                "whatsapp",
+                "webhook",
+                "route_id"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/public/whatsapp/webhook/{route_id}",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/public/whatsapp/webhook/{route_id}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "public",
+                "whatsapp",
+                "webhook",
+                "route_id"
+              ]
+            }
+          }
+        },
+        {
           "name": "GET /v1/quotas",
           "request": {
             "method": "GET",
@@ -2202,6 +2546,52 @@
           }
         },
         {
+          "name": "GET /v1/stream",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/stream",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "stream"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/stream",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/stream",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "stream"
+              ]
+            }
+          }
+        },
+        {
           "name": "GET /v1/tenants",
           "request": {
             "method": "GET",
@@ -2243,6 +2633,31 @@
               "path": [
                 "v1",
                 "tenants"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/tenants/{tenant_id}/activate",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/tenants/{tenant_id}/activate",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "tenants",
+                "tenant_id",
+                "activate"
               ]
             }
           }
@@ -2412,6 +2827,29 @@
           }
         },
         {
+          "name": "GET /v1/users",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/users",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "users"
+              ]
+            }
+          }
+        },
+        {
           "name": "GET /v1/webhooks",
           "request": {
             "method": "GET",
@@ -2555,6 +2993,280 @@
                 "webhooks",
                 "webhook_id",
                 "enable"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/whatsapp/channels",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/whatsapp/channels",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "whatsapp",
+                "channels"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/whatsapp/channels",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/whatsapp/channels",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "whatsapp",
+                "channels"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/whatsapp/channels/{channel_id}/messages",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/whatsapp/channels/{channel_id}/messages",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "whatsapp",
+                "channels",
+                "channel_id",
+                "messages"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/whatsapp/channels/{channel_id}/messages",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/whatsapp/channels/{channel_id}/messages",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "whatsapp",
+                "channels",
+                "channel_id",
+                "messages"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/whatsapp/conversations",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/whatsapp/conversations",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "whatsapp",
+                "conversations"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/whatsapp/conversations/{conversation_id}/messages",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/whatsapp/conversations/{conversation_id}/messages",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "whatsapp",
+                "conversations",
+                "conversation_id",
+                "messages"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/whatsapp/conversations/{conversation_id}/messages",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/whatsapp/conversations/{conversation_id}/messages",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "whatsapp",
+                "conversations",
+                "conversation_id",
+                "messages"
+              ]
+            }
+          }
+        },
+        {
+          "name": "PUT /v1/whatsapp/messages/{wamid}/status",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/whatsapp/messages/{wamid}/status",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "whatsapp",
+                "messages",
+                "wamid",
+                "status"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/whatsapp/stats",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/whatsapp/stats",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "whatsapp",
+                "stats"
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/whatsapp/templates",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/whatsapp/templates",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "whatsapp",
+                "templates"
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/whatsapp/templates",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{api_token}}",
+                "description": "Bearer API key or JWT"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/whatsapp/templates",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "whatsapp",
+                "templates"
               ]
             }
           }

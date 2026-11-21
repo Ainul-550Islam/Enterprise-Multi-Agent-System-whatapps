@@ -271,3 +271,19 @@ define_id!(/// Identifies one append-only `SubscriptionEvent` (lifecycle history
 SubscriptionEventId);
 define_id!(/// Identifies a receipt for one provider billing-webhook event.
 BillingReceiptId);
+define_id!(/// Identifies a tenant ↔ billing-provider customer mapping row.
+BillingCustomerId);
+define_id!(/// Identifies one plan ↔ provider price mapping row.
+PlanPriceId);
+define_id!(/// Identifies one durable billing checkout session record.
+CheckoutSessionId);
+define_id!(/// Identifies one durable per-tenant billing event application claim.
+EventApplicationId);
+define_id!(/// Identifies one connected WhatsApp Business channel.
+WhatsAppChannelId);
+define_id!(/// Identifies one WhatsApp message log row.
+WhatsAppMessageId);
+define_id!(/// Identifies one WhatsApp inbox conversation (contact × channel).
+WhatsAppConversationId);
+define_id!(/// Identifies one WhatsApp message template row.
+WhatsAppTemplateId);

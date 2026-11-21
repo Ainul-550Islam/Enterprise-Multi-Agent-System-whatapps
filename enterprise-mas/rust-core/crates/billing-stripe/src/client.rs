@@ -1,331 +1,137 @@
-/// Stripe Guarded Egress Client
-///
-/// All outbound calls to Stripe API pass through this client which enforces:
-///   - Pinned hosts: only `api.stripe.com` and `connect.stripe.com` allowed
-///   - MIME type validation (application/x-www-form-urlencoded)
-///   - Size limits per API endpoint
-///   - SSRF guard: no arbitrary hostname resolve
-///   - Deadline-aware timeout
-///   - Idempotency-Key support (recommended for create operations)
-///   - 429 backoff with jitter
-use reqwest::Client;
-use serde::{Deserialize, Serialize};
-use serde_urlencoded::serde;
-use std::time::Duration;
+//! The Stripe API client seam.
+//!
+//! The billing flow only needs one read: re-fetching an event by id (for
+//! durable receipt reconciliation after a crash). Everything else arrives
+//! through the webhook. Two rules:
+//!
+//! * **Fixed host.** Requests go to `api.stripe.com` only; there is no config
+//!   key that can point the client elsewhere.
+//! * **Reference secrets.** The API key is injected and redacted from
+//!   `Debug`; tests drive [`HttpTransport`] mocks, production binds `reqwest`
+//!   at the composition root.
 
-/// Configuration for the Stripe API client.
-#[derive(Clone, Debug)]
-pub struct StripeClientConfig {
-    /// Request timeout (seconds)
-    pub timeout: u64,
-    /// Maximum request body size (bytes)
-    pub max_body_size: usize,
-    /// Allowed hosts for egress (pinned)
-    pub allowed_hosts: Vec<String>,
+use mas_common::error::AppError;
+use mas_common::result::Result;
+
+use crate::event::{StripeEvent, SubscriptionObject};
+
+/// Fixed Stripe API host.
+pub const STRIPE_API_HOST: &str = "api.stripe.com";
+
+/// The transport seam: GET plus optional form POST.
+pub trait HttpTransport: Send + Sync {
+    /// GETs `url` with `authorization` (already `Bearer …`).
+    fn get(&self, url: &str, authorization: &str) -> Result<TransportResponse>;
+
+    /// POSTs `body` to `url`. `idempotency_key` is sent as `Idempotency-Key`
+    /// when present. Default: not supported.
+    fn post(
+        &self,
+        url: &str,
+        authorization: &str,
+        body: &str,
+        idempotency_key: Option<&str>,
+    ) -> Result<TransportResponse> {
+        let _ = (url, authorization, body, idempotency_key);
+        Err(AppError::internal("transport does not support POST"))
+    }
 }
 
-impl Default for StripeClientConfig {
-    fn default() -> Self {
-        StripeClientConfig {
-            timeout: 30,
-            max_body_size: 1 * 1024 * 1024, // 1 MB
-            allowed_hosts: vec!["api.stripe.com".into(), "connect.stripe.com".into()],
-        }
+/// A raw transport response.
+#[derive(Debug, Clone)]
+pub struct TransportResponse {
+    /// HTTP status.
+    pub status: u16,
+    /// Response body.
+    pub body: String,
+}
+
+/// The read-only Stripe boundary the billing service depends on.
+pub trait StripeClient: Send + Sync {
+    /// Fetches one event by id (`evt_…`).
+    fn fetch_event(&self, event_id: &str) -> Result<StripeEvent>;
+
+    /// Fetches the current subscription object (`sub_…`). Used when a webhook
+    /// arrived out of order and the event payload may be stale.
+    fn retrieve_subscription(&self, subscription_id: &str) -> Result<SubscriptionObject>;
+}
+
+/// Production client over the fixed Stripe host.
+pub struct HttpStripeClient {
+    transport: Box<dyn HttpTransport>,
+    api_key: String,
+}
+
+impl std::fmt::Debug for HttpStripeClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpStripeClient")
+            .field("host", &STRIPE_API_HOST)
+            .field("api_key", &"[redacted]")
+            .finish()
     }
 }
 
-/// The Stripe API client.
-pub struct StripeClient {
-    inner: Client,
-    config: StripeClientConfig,
+impl HttpStripeClient {
+    /// Builds a client over the given transport with the given API key.
+    pub fn new(transport: Box<dyn HttpTransport>, api_key: impl Into<String>) -> Self {
+        Self {
+            transport,
+            api_key: api_key.into(),
+        }
+    }
+
+    /// The URL for an event fetch (fixed host).
+    pub fn event_url(event_id: &str) -> String {
+        format!("https://{STRIPE_API_HOST}/v1/events/{event_id}")
+    }
+
+    /// The URL for a subscription fetch (fixed host).
+    pub fn subscription_url(subscription_id: &str) -> String {
+        format!("https://{STRIPE_API_HOST}/v1/subscriptions/{subscription_id}")
+    }
 }
 
-impl StripeClient {
-    /// Create a new Stripe client with the given configuration.
-    pub fn new(config: StripeClientConfig) -> Result<Self, crate::billing_stripe::errors::StripeError> {
-        let timeout = Duration::from_secs(config.timeout);
-        let client = Client::builder()
-            .connect_timeout(timeout)
-            .timeout(timeout)
-            .build()
-            .map_err(|e| crate::billing_stripe::errors::StripeError::ClientSetup {
-                source: anyhow::anyhow!(e),
-            })?;
-
-        Ok(StripeClient { inner: client, config })
+impl StripeClient for HttpStripeClient {
+    fn fetch_event(&self, event_id: &str) -> Result<StripeEvent> {
+        if !event_id.starts_with("evt_") {
+            return Err(AppError::validation("stripe event id must start with evt_"));
+        }
+        let auth = format!("Bearer {}", self.api_key);
+        let response = self.transport.get(&Self::event_url(event_id), &auth)?;
+        if !(200..300).contains(&response.status) {
+            return Err(AppError::external_service(
+                "stripe",
+                format!("event fetch rejected with status {}", response.status),
+            ));
+        }
+        StripeEvent::parse(response.body.as_bytes())
     }
 
-    /// Create a Stripe Customer.
-    /// Returns the customer ID on success.
-    pub async fn create_customer(
-        &self,
-        email: &str,
-        name: Option<&str>,
-    ) -> Result<crate::billing_stripe::models::StripeCustomer, crate::billing_stripe::errors::StripeError> {
-        let url = format!("https://{}/v1/customers", 
-            self.config.allowed_hosts.first().ok_or_else(|| {
-                crate::billing_stripe::errors::StripeError::NoAllowedHost
-            })?);
-
-        let mut params = serde_urlencoded::Serializer::new()
-            .serialize_str("email=", email)?;
-
-        if let Some(n) = name {
-            params = params.finish_with("&name=", n);
-        } else {
-            params = params.finish()?;
+    fn retrieve_subscription(&self, subscription_id: &str) -> Result<SubscriptionObject> {
+        if !subscription_id.starts_with("sub_") {
+            return Err(AppError::validation(
+                "stripe subscription id must start with sub_",
+            ));
         }
-
-        let body = params.to_string();
-
-        // Size check
-        if body.len() > self.config.max_body_size {
-            return Err(crate::billing_stripe::errors::StripeError::BodyTooLarge {
-                received: body.len(),
-                max: self.config.max_body_size,
-            });
-        }
-
+        let auth = format!("Bearer {}", self.api_key);
         let response = self
-            .inner
-            .post(&url)
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .timeout(Duration::from_secs(self.config.timeout))
-            .body(body)
-            .send()
-            .await
-            .map_err(|e| crate::billing_stripe::errors::StripeError::ClientSetup {
-                source: anyhow::anyhow!(e),
-            })?;
-
-        let status = response.status();
-        let body_text = response.text().await.unwrap_or_default();
-
-        if !status.is_success() {
-            return Err(crate::billing_stripe::errors::StripeError::ApiError {
-                status: status.as_u16(),
-                body: body_text,
-            });
+            .transport
+            .get(&Self::subscription_url(subscription_id), &auth)?;
+        if !(200..300).contains(&response.status) {
+            return Err(map_stripe_status(response.status, &response.body));
         }
-
-        // Parse the response
-        let json: serde_json::Value = serde_json::from_str(&body_text)
-            .map_err(|e| crate::billing_stripe::errors::StripeError::JsonParse { source: e })?;
-
-        // Extract customer ID
-        let customer_id = json.get("id")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| crate::billing_stripe::errors::StripeError::MissingField { field: "id".into() })?
-            .to_string();
-
-        Ok(crate::billing_stripe::models::StripeCustomer {
-            id: customer_id,
-            email: json.get("email").and_then(|v| v.as_str()).map(|s| s.to_string()),
-            object: json.get("object").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-        })
-    }
-
-    /// Create a Checkout Session for a subscription.
-    pub async fn create_checkout_session(
-        &self,
-        customer_id: &str,
-        price_id: &str,
-        success_url: &str,
-        cancel_url: &str,
-    ) -> Result<crate::billing_stripe::models::StripeCheckoutSession, crate::billing_stripe::errors::StripeError> {
-        let url = format!("https://{}/v1/checkout/sessions", 
-            self.config.allowed_hosts.first().ok_or_else(|| {
-                crate::billing_stripe::errors::StripeError::NoAllowedHost
-            })?);
-
-        let params = serde_urlencoded::ser::SerializeMap::new()
-            .append("customer", customer_id)
-            .append("line_items[0][price]", price_id)
-            .append("mode", "subscription")
-            .append("success_url", success_url)
-            .append("cancel_url", cancel_url)
-            .finish();
-
-        let body = params.to_string();
-
-        if body.len() > self.config.max_body_size {
-            return Err(crate::billing_stripe::errors::StripeError::BodyTooLarge {
-                received: body.len(),
-                max: self.config.max_body_size,
-            });
-        }
-
-        let response = self
-            .inner
-            .post(&url)
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .timeout(Duration::from_secs(self.config.timeout))
-            .body(body)
-            .send()
-            .await
-            .map_err(|e| crate::billing_stripe::errors::StripeError::ClientSetup {
-                source: anyhow::anyhow!(e),
-            })?;
-
-        let status = response.status();
-        let body_text = response.text().await.unwrap_or_default();
-
-        if !status.is_success() {
-            return Err(crate::billing_stripe::errors::StripeError::ApiError {
-                status: status.as_u16(),
-                body: body_text,
-            });
-        }
-
-        let json: serde_json::Value = serde_json::from_str(&body_text)
-            .map_err(|e| crate::billing_stripe::errors::StripeError::JsonParse { source: e })?;
-
-        Ok(crate::billing_stripe::models::StripeCheckoutSession {
-            id: json.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            url: json.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            session_url: json.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            customer: json.get("customer").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            mode: json.get("mode").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            status: json.get("status").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            expires_at: json.get("expires_at").and_then(|v| v.as_i64()),
-            price_id: json.get("line_items", serde_json::Value::Array)
-                .and_then(|arr| arr.first())
-                .and_then(|first| first.get("price"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-        })
-    }
-
-    /// Create a Customer Portal Session.
-    pub async fn create_portal_session(
-        &self,
-        customer_id: &str,
-        return_url: &str,
-    ) -> Result<crate::billing_stripe::models::StripePortalSession, crate::billing_stripe::errors::StripeError> {
-        let url = format!("https://{}/v1/billing_portal/sessions", 
-            self.config.allowed_hosts.first().ok_or_else(|| {
-                crate::billing_stripe::errors::StripeError::NoAllowedHost
-            })?);
-
-        let params = serde_urlencoded::ser::SerializeMap::new()
-            .append("customer", customer_id)
-            .append("return_url", return_url)
-            .finish();
-
-        let body = params.to_string();
-
-        if body.len() > self.config.max_body_size {
-            return Err(crate::billing_stripe::errors::StripeError::BodyTooLarge {
-                received: body.len(),
-                max: self.config.max_body_size,
-            });
-        }
-
-        let response = self
-            .inner
-            .post(&url)
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .timeout(Duration::from_secs(self.config.timeout))
-            .body(body)
-            .send()
-            .await
-            .map_err(|e| crate::billing_stripe::errors::StripeError::ClientSetup {
-                source: anyhow::anyhow!(e),
-            })?;
-
-        let status = response.status();
-        let body_text = response.text().await.unwrap_or_default();
-
-        if !status.is_success() {
-            return Err(crate::billing_stripe::errors::StripeError::ApiError {
-                status: status.as_u16(),
-                body: body_text,
-            });
-        }
-
-        let json: serde_json::Value = serde_json::from_str(&body_text)
-            .map_err(|e| crate::billing_stripe::errors::StripeError::JsonParse { source: e })?;
-
-        Ok(crate::billing_stripe::models::StripePortalSession {
-            id: json.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            url: json.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        })
-    }
-
-    /// Retrieve an existing Subscription.
-    pub async fn retrieve_subscription(
-        &self,
-        subscription_id: &str,
-    ) -> Result<crate::billing_stripe::models::StripeSubscription, crate::billing_stripe::errors::StripeError> {
-        let url = format!("https://{}/v1/subscriptions/{}", 
-            self.config.allowed_hosts.first().ok_or_else(|| {
-                crate::billing_stripe::errors::StripeError::NoAllowedHost
-            })?);
-
-        let response = self
-            .inner
-            .get(&url)
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .timeout(Duration::from_secs(self.config.timeout))
-            .send()
-            .await
-            .map_err(|e| crate::billing_stripe::errors::StripeError::ClientSetup {
-                source: anyhow::anyhow!(e),
-            })?;
-
-        let status = response.status();
-        let body_text = response.text().await.unwrap_or_default();
-
-        if !status.is_success() {
-            return Err(match status.as_u16() {
-                404 => crate::billing_stripe::errors::StripeError::NotFound {
-                    what: format!("subscription {}", subscription_id),
-                },
-                402 => crate::billing_stripe::errors::StripeError::PaymentRequired,
-                _ => crate::billing_stripe::errors::StripeError::ApiError {
-                    status: status.as_u16(),
-                    body: body_text,
-                },
-            });
-        }
-
-        let json: serde_json::Value = serde_json::from_str(&body_text)
-            .map_err(|e| crate::billing_stripe::errors::StripeError::JsonParse { source: e })?;
-
-        Ok(crate::billing_stripe::models::StripeSubscription {
-            id: json.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            customer: json.get("customer").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            status: json.get("status").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            current_period_start: json.get("current_period_start").and_then(|v| v.as_i64()),
-            current_period_end: json.get("current_period_end").and_then(|v| v.as_i64()),
-            cancel_at: json.get("cancel_at").and_then(|v| v.as_i64()),
-            cancel_at_period_end: json.get("cancel_at_period_end").and_then(|v| v.as_bool()).unwrap_or(false),
-            items: json.get("items").and_then(|v| v.as_array()).cloned().unwrap_or_default(),
+        let value: serde_json::Value = serde_json::from_str(&response.body)
+            .map_err(|_| AppError::external_service("stripe", "subscription body is not JSON"))?;
+        SubscriptionObject::from_value(&value).ok_or_else(|| {
+            AppError::external_service("stripe", "subscription body is not a subscription object")
         })
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    fn test_default_config() {
-        let config = StripeClientConfig::default();
-        let client = StripeClient::new(config);
-        // Just verify it compiles; actual API calls need network
-        assert!(client.is_ok());
-    }
-
-    #[tokio::test]
-    fn test_client_creates_with_custom_config() {
-        let config = StripeClientConfig {
-            timeout: 60,
-            max_body_size: 2 * 1024 * 1024,
-            allowed_hosts: vec!["api.stripe.com".into()],
-        };
-        let client = StripeClient::new(config);
-        assert!(client.is_ok());
+fn map_stripe_status(status: u16, body: &str) -> AppError {
+    match status {
+        402 => AppError::conflict(format!("stripe payment required: {body}")),
+        429 => AppError::rate_limited(format!("stripe rate limited: {body}")),
+        other => AppError::external_service("stripe", format!("rejected with status {other}")),
     }
 }

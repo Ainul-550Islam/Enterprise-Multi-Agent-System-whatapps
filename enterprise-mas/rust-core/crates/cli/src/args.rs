@@ -6,7 +6,11 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use uuid::Uuid;
 
 /// Global connection + scope flags (apply to every subcommand).
-#[derive(Debug, Clone, Args)]
+///
+/// `Debug` is implemented by hand: the derived version would print
+/// `token` verbatim, and any `{:?}` log line would leak the bearer
+/// credential. The masked form keeps every non-secret field visible.
+#[derive(Clone, Args)]
 pub struct GlobalOpts {
     /// API base URL (scheme + host, optional :port; no path).
     #[arg(long, env = "MAS_API_URL", default_value = "http://127.0.0.1:8080")]
@@ -33,6 +37,19 @@ pub struct GlobalOpts {
     /// Output format.
     #[arg(long, value_enum, default_value = "brief")]
     pub format: Format,
+}
+
+impl std::fmt::Debug for GlobalOpts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GlobalOpts")
+            .field("base_url", &self.base_url)
+            .field("token", &"[redacted]")
+            .field("tenant", &self.tenant)
+            .field("organization", &self.organization)
+            .field("correlation_id", &self.correlation_id)
+            .field("format", &self.format)
+            .finish()
+    }
 }
 
 /// Output styles.
@@ -104,164 +121,196 @@ pub enum Command {
     /// Inspect schedules and flip their lifecycle flags.
     #[command(subcommand)]
     Schedule(ScheduleCmd),
-    /// Admin operations (org→tenant→project→owner→API key→default plan).
-    #[command(subcommand)]
-    Admin(AdminCmd),
     /// Inspect agents.
     #[command(subcommand)]
     Agent(ListGet),
     /// Inspect workflows.
     #[command(subcommand)]
     Workflow(ListGet),
-    /// Manage API keys (create, rotate, revoke).
+    /// Manage API keys.
     #[command(subcommand)]
     ApiKey(ApiKeyCmd),
+    /// Control-plane administration.
+    #[command(subcommand)]
+    Admin(AdminCmd),
 }
 
-/// Admin verbs (org→tenant→project→owner→API key→default plan).
+/// Execution verbs.
 #[derive(Debug, Clone, Subcommand)]
-pub enum AdminCmd {
-    /// Bootstrap a new organization (idempotent: re-runs are no-ops).
-    Bootstrap(BootstrapArgs),
-    /// Create a new agent under an organization.
-    CreateAgent(CreateAgentArgs),
-    /// Publish an agent (make it available in the org).
-    PublishAgent(PublishAgentArgs),
-    /// Create a new workflow under an organization.
-    CreateWorkflow(CreateWorkflowArgs),
-    /// Create a new API key.
-    CreateApiKey(CreateApiKeyArgs),
-    /// Rotate an API key.
-    RotateApiKey(RotateApiKeyArgs),
-    /// Revoke an API key.
-    RevokeApiKey(RevokeApiKeyArgs),
+pub enum ExecutionCmd {
+    /// Submit a new execution (project-scoped, idempotent).
+    Submit(SubmitArgs),
+    /// List executions (scope-filtered by headers).
+    List,
+    /// Show one execution.
+    Get {
+        /// Execution id (UUID).
+        id: Uuid,
+    },
+    /// Transition: `mas execution <start|pause|resume|cancel> <id>`.
+    Start {
+        /// Execution id.
+        id: Uuid,
+    },
+    /// Pause.
+    Pause {
+        /// Execution id.
+        id: Uuid,
+    },
+    /// Resume.
+    Resume {
+        /// Execution id.
+        id: Uuid,
+    },
+    /// Cancel.
+    Cancel {
+        /// Execution id.
+        id: Uuid,
+    },
 }
 
-/// Bootstrap arguments (org→tenant→project→owner→API key→default plan).
-#[derive(Debug, Clone, Args)]
-pub struct BootstrapArgs {
-    /// Organization UUID.
-    #[arg(long)]
-    pub organization: Uuid,
-    /// Tenant UUID under the organization.
-    #[arg(long)]
-    pub tenant: Uuid,
-    /// Project UUID under the tenant.
-    #[arg(long)]
-    pub project: Uuid,
-    /// Owner UUID under the project.
-    #[arg(long)]
-    pub owner: Uuid,
-    /// Default plan ID for the project.
-    #[arg(long)]
-    pub default_plan: Option<String>,
-    /// Idempotency key. Default: `cli-{uuid}` (safe replays on shell retry).
-    #[arg(long)]
-    pub idempotency_key: Option<String>,
-]
+/// Schedule verbs (register/update stay in provisioning tooling).
+#[derive(Debug, Clone, Subcommand)]
+pub enum ScheduleCmd {
+    /// List schedules.
+    List,
+    /// Show one schedule.
+    Get {
+        /// Schedule id.
+        id: Uuid,
+    },
+    /// Pause.
+    Pause {
+        /// Schedule id.
+        id: Uuid,
+    },
+    /// Resume.
+    Resume {
+        /// Schedule id.
+        id: Uuid,
+    },
+    /// Disable (terminal).
+    Disable {
+        /// Schedule id.
+        id: Uuid,
+    },
+}
 
-/// Create agent arguments.
-#[derive(Debug, Clone, Args)]
-pub struct CreateAgentArgs {
-    /// Agent name.
-    #[arg(long)]
-    pub name: String,
-    /// Agent description.
-    #[arg(long)]
-    pub description: Option<String>,
-    /// Agent scope (tenant or organization).
-    #[arg(long)]
-    pub scope: Option<String>,
-    /// Agent capabilities.
-    #[arg(long)]
-    pub capabilities: Option<String>,
-    /// Idempotency key.
-    #[arg(long)]
-    pub idempotency_key: Option<String>,
-]
-
-/// Publish agent arguments.
-#[derive(Debug, Clone, Args)]
-pub struct PublishAgentArgs {
-    /// Agent ID to publish.
-    #[arg(long)]
-    pub agent_id: Uuid,
-    /// New version to publish.
-    #[arg(long)]
-    pub version: Option<String>,
-    /// Target organization.
-    #[arg(long)]
-    pub organization: Option<Uuid>,
-]
-
-/// Create workflow arguments.
-#[derive(Debug, Clone, Args)]
-pub struct CreateWorkflowArgs {
-    /// Workflow name.
-    #[arg(long)]
-    pub name: String,
-    /// Workflow definition (JSON or @path).
-    #[arg(long)]
-    pub definition: Option<String>,
-    /// Scope (tenant or organization).
-    #[arg(long)]
-    pub scope: Option<String>,
-    /// Idempotency key.
-    #[arg(long)]
-    pub idempotency_key: Option<String>,
-]
-
-/// Create API key arguments.
-#[derive(Debug, Clone, Args)]
-pub struct CreateApiKeyArgs {
-    /// Key name/description.
-    #[arg(long)]
-    pub name: String,
-    /// Key permissions/scopes.
-    #[arg(long)]
-    pub permissions: Option<String>,
-    /// Key expires in seconds (0 = never expires).
-    #[arg(long, default_value = "0")]
-    pub expires_in: u64,
-    /// Idempotency key.
-    #[arg(long)]
-    pub idempotency_key: Option<String>,
-]
-
-/// Rotate API key arguments.
-#[derive(Debug, Clone, Args)]
-pub struct RotateApiKeyArgs {
-    /// Key to rotate.
-    #[arg(long)]
-    pub key_id: Uuid,
-    /// New key name.
-    #[arg(long)]
-    pub new_name: Option<String>,
-    /// Idempotency key.
-    #[arg(long)]
-    pub idempotency_key: Option<String>,
-]
-
-/// Revoke API key arguments.
-#[derive(Debug, Clone, Args)]
-pub struct RevokeApiKeyArgs {
-    /// Key to revoke.
-    #[arg(long)]
-    pub key_id: Uuid,
-    /// Reason for revocation.
-    #[arg(long)]
-    pub reason: Option<String>,
-]
-
-/// API key verbs.
+/// API-key management verbs (mirrors `POST|GET /v1/api-keys`,
+/// `POST /v1/api-keys/{id}/revoke`, `POST /v1/api-keys/{id}/rotate`).
 #[derive(Debug, Clone, Subcommand)]
 pub enum ApiKeyCmd {
-    /// Create a new API key.
-    Create(CreateApiKeyArgs),
-    /// Rotate an existing API key.
-    Rotate(RotateApiKeyArgs),
+    /// List the tenant's API keys.
+    List,
+    /// Issue a new API key.
+    Create {
+        /// Human-recognizable key name.
+        #[arg(long)]
+        name: String,
+        /// Requested least-privilege scopes (repeatable).
+        #[arg(long = "scope", required = true)]
+        scopes: Vec<String>,
+        /// Optional expiry as an RFC 3339 timestamp.
+        #[arg(long)]
+        expires_at: Option<String>,
+    },
     /// Revoke an API key.
-    Revoke(RevokeApiKeyArgs),
+    Revoke {
+        /// Key id.
+        id: Uuid,
+        /// Optional operator reason recorded in the audit trail.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Rotate an API key.
+    Rotate {
+        /// Key id.
+        id: Uuid,
+        /// Optional grace interval in seconds (capped at one day by the API).
+        #[arg(long)]
+        grace_seconds: Option<u64>,
+    },
+}
+
+/// Control-plane administration verbs (mirrors `/v1/admin/...`).
+#[derive(Debug, Clone, Subcommand)]
+pub enum AdminCmd {
+    /// Plan administration.
+    #[command(subcommand)]
+    Plan(AdminPlanCmd),
+    /// Tenant subscription administration.
+    #[command(subcommand)]
+    Subscription(AdminSubscriptionCmd),
+    /// Idempotent control-plane bootstrap (plans, first admin). Local
+    /// capability check happens before any network call.
+    Bootstrap {
+        /// Required capability token the operator must hold.
+        #[arg(long)]
+        capability: String,
+    },
+}
+
+/// Plan administration verbs.
+#[derive(Debug, Clone, Subcommand)]
+pub enum AdminPlanCmd {
+    /// Create a plan (`POST /v1/admin/plans`).
+    Create {
+        /// Stable machine code (`free`, `team`, …).
+        #[arg(long)]
+        code: String,
+        /// Human-facing name.
+        #[arg(long)]
+        name: String,
+        /// Optional description.
+        #[arg(long)]
+        description: Option<String>,
+    },
+    /// Grant or update a plan feature entitlement
+    /// (`PUT /v1/admin/plans/{code}/features`).
+    Feature {
+        /// Plan code.
+        code: String,
+        /// Feature key.
+        feature: String,
+        /// Numeric cap, when the feature has one.
+        #[arg(long)]
+        limit: Option<u64>,
+    },
+}
+
+/// Subscription administration verbs.
+#[derive(Debug, Clone, Subcommand)]
+pub enum AdminSubscriptionCmd {
+    /// Create a tenant's subscription (`POST /v1/admin/tenants/{id}/subscription`).
+    Create {
+        /// Tenant id.
+        tenant_id: Uuid,
+        /// Plan code — must already exist in `plans`.
+        #[arg(long)]
+        plan_code: String,
+        /// Optional initial lifecycle state.
+        #[arg(long)]
+        state: Option<String>,
+    },
+    /// Record a subscription lifecycle transition
+    /// (`POST /v1/admin/tenants/{id}/subscription/transitions`).
+    Transition {
+        /// Tenant id.
+        tenant_id: Uuid,
+        /// Target lifecycle state.
+        #[arg(long)]
+        state: String,
+        /// Why — required, because the reason is the only thing that lets
+        /// the next operator understand a change they did not make.
+        #[arg(long)]
+        reason: String,
+        /// Optional provider event id that caused this.
+        #[arg(long)]
+        external_event_id: Option<String>,
+        /// The version the caller observed; a mismatch is a lost update.
+        #[arg(long)]
+        expected_version: i64,
+    },
 }
 
 /// Shared `list|get <id>` shape for read-only resources.
@@ -310,7 +359,7 @@ impl Cli {
 #[cfg(test)]
 mod tests {
     use super::Cli;
-    use super::{Command, ExecutionCmd, AdminCmd, ApiKeyCmd};
+    use super::{Command, ExecutionCmd};
 
     #[test]
     fn parses_submit_with_input_file_and_wait() {
@@ -358,62 +407,95 @@ mod tests {
     }
 
     #[test]
-    fn parses_admin_bootstrap() {
-        let cli = Cli::parse_from_args([
-            "mas",
-            "admin",
-            "bootstrap",
-            "--organization",
-            "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1",
-            "--tenant",
-            "b2b2b2b2-b2b2-b2b2-b2b2-b2b2b2b2b2b2",
-            "--project",
-            "c3c3c3c3-c3c3-c3c3-c3c3-c3c3c3c3c3c3",
-            "--owner",
-            "d4d4d4d4-d4d4-d4d4-d4d4-d4d4d4d4d4d4",
-        ]);
-        matches!(
-            cli.command,
-            Command::Admin(AdminCmd::Bootstrap(_))
-        );
-    }
-
-    #[test]
-    fn parses_admin_create_agent() {
-        let cli = Cli::parse_from_args([
-            "mas",
-            "admin",
-            "create-agent",
-            "--name",
-            "support-bot",
-            "--organization",
-            "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1",
-            "--tenant",
-            "b2b2b2b2-b2b2-b2b2-b2b2-b2b2b2b2b2b2",
-        ]);
-        matches!(
-            cli.command,
-            Command::Admin(AdminCmd::CreateAgent(_))
-        );
-    }
-
-    #[test]
-    fn parses_api_key_create() {
+    fn parses_api_key_verbs() {
         let cli = Cli::parse_from_args([
             "mas",
             "api-key",
             "create",
             "--name",
-            "operator-key",
-            "--permissions",
-            "exec:read;exec:write",
-            "--organization",
-            "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1",
+            "ci-reader",
+            "--scope",
+            "executions:read",
+            "--scope",
+            "memory:read",
+            "--expires-at",
+            "2027-01-01T00:00:00Z",
         ]);
-        matches!(
-            cli.command,
-            Command::ApiKey(ApiKeyCmd::Create(_))
+        let Command::ApiKey(super::ApiKeyCmd::Create {
+            name,
+            scopes,
+            expires_at,
+        }) = &cli.command
+        else {
+            panic!("expected api-key create, got {:?}", cli.command);
+        };
+        assert_eq!(name, "ci-reader");
+        assert_eq!(
+            scopes,
+            &["executions:read".to_owned(), "memory:read".to_owned()]
         );
+        assert_eq!(expires_at.as_deref(), Some("2027-01-01T00:00:00Z"));
+
+        let cli = Cli::parse_from_args([
+            "mas",
+            "api-key",
+            "rotate",
+            "9e9e9e9e-9e9e-9e9e-9e9e-9e9e9e9e9e9e",
+            "--grace-seconds",
+            "900",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Command::ApiKey(super::ApiKeyCmd::Rotate {
+                grace_seconds: Some(900),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn parses_admin_verbs() {
+        let cli = Cli::parse_from_args([
+            "mas",
+            "admin",
+            "plan",
+            "create",
+            "--code",
+            "team",
+            "--name",
+            "Team plan",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Command::Admin(super::AdminCmd::Plan(super::AdminPlanCmd::Create { .. }))
+        ));
+
+        let cli = Cli::parse_from_args([
+            "mas",
+            "admin",
+            "subscription",
+            "transition",
+            "9e9e9e9e-9e9e-9e9e-9e9e-9e9e9e9e9e9e",
+            "--state",
+            "active",
+            "--reason",
+            "operator override after provider outage",
+            "--expected-version",
+            "3",
+        ]);
+        let Command::Admin(super::AdminCmd::Subscription(
+            super::AdminSubscriptionCmd::Transition {
+                state,
+                reason,
+                expected_version,
+                ..
+            },
+        )) = &cli.command
+        else {
+            panic!("expected subscription transition, got {:?}", cli.command);
+        };
+        assert_eq!(state, "active");
+        assert_eq!(reason, "operator override after provider outage");
+        assert_eq!(*expected_version, 3);
     }
 }
-

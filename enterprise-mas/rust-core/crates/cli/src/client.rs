@@ -242,6 +242,16 @@ impl MasApiClient {
     pub async fn post_empty<T: DeserializeOwned>(&self, path: &str) -> Outcome<T> {
         self.post(path, &serde_json::json!({}), None).await
     }
+
+    /// PUT with a JSON body (idempotent replacements).
+    pub async fn put<B: Serialize, T: DeserializeOwned>(&self, path: &str, body: &B) -> Outcome<T> {
+        let request = self.http.put(self.url(path)).json(body);
+        let request = self.config.prepare(request);
+        match request.send().await {
+            Ok(resp) => self.decode(resp).await,
+            Err(err) => transport(err),
+        }
+    }
 }
 
 fn transport<T>(err: reqwest::Error) -> Outcome<T> {

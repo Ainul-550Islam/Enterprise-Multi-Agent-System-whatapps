@@ -7,6 +7,8 @@ because each of them is an escape from a substitution-only template language.
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from mas_orchestrator.contracts.errors import ConfigurationError, PromptRenderError
@@ -66,14 +68,14 @@ class TestUnsupportedConstructs:
             render("{{ x.__class__ }}", {"x": trusted("v")})
 
     def test_plain_placeholder_is_accepted(self) -> None:
-        validate_template("hello {{ name }}")
+        assert validate_template("hello {{ name }}") is None
 
     def test_unbalanced_brace_is_rejected(self) -> None:
         with pytest.raises(PromptRenderError):
             validate_template("hello { name }")
 
     def test_doubled_braces_are_a_literal_escape(self) -> None:
-        validate_template("a JSON object looks like {{ }} {{ }}")
+        assert validate_template("a JSON object looks like {{ }} {{ }}") is None
 
 
 class TestSubstitution:
@@ -235,6 +237,22 @@ class TestRegistry:
         registry = PromptRegistry()
         registry.register(self._template())
         assert registry.get("greeting").version == 1
+
+    def test_registration_log_survives_info_level(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Regression: structured logging must not pass LogRecord-reserved keys.
+
+        The registration log once carried ``extra={"name": ...}``; ``name`` is
+        the LogRecord logger-name attribute, so the moment the INFO level was
+        actually enabled (production logging config) ``makeRecord`` raised
+        KeyError. Test runs missed it because their default level skipped the
+        call before the record was built.
+        """
+        registry = PromptRegistry()
+        with caplog.at_level(logging.INFO, logger="mas_orchestrator.prompts.registry"):
+            registry.register(self._template())
+        events = [r for r in caplog.records if r.event == "prompt.registered"]
+        assert events, "registration must emit a structured event"
+        assert events[0].prompt_name == "greeting"
 
     def test_newest_version_by_default(self) -> None:
         registry = PromptRegistry()

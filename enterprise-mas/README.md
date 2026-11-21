@@ -1,15 +1,27 @@
 # Enterprise MAS — Deliverable Index
 
-Everything produced across the six programme items, in one archive.
+Index of what lives under `enterprise-mas/`. SDK, dashboard, sandbox-runner,
+examples and compose live at the **repository root**, not here.
 
 ```
 enterprise-mas/
 ├── README.md                  ← this file
-├── reports/                   ← one report per item, plus the review and the patch
-├── specs/                     ← the specifications the work was built against
 ├── rust-core/                 ← the Rust workspace (source, migrations, scripts, docs)
-└── python-orchestrator/       ← the Python AI orchestrator (item 2)
+├── python-orchestrator/       ← the Python AI orchestrator
+├── ci-evidence/               ← raw gate logs (fmt, clippy, test, deny, python)
+├── docs/                      ← architecture, quickstart, deployment, security model, Stripe, WhatsApp, API_REFERENCE.html, postman
+├── reports/                   ← programme item reports
+├── scripts/                   ← e2e-smoke, postman generator
+└── specs/                     ← programme specs
 ```
+
+There is no `enterprise-mas/sdk`, `enterprise-mas/web`, `enterprise-mas/deploy`,
+or `enterprise-mas/docs/internal`. Those paths are:
+
+- `sdk/python`, `sdk/typescript` (repo root)
+- `web/` (repo root)
+- `deploy/` (repo root)
+- `docs/REVIEW_RESOLUTION.md` (repo root)
 
 ---
 
@@ -17,12 +29,12 @@ enterprise-mas/
 
 | # | Item | Report | Status |
 |---|---|---|---|
-| 1 | Full codebase review | `CODE_REVIEW.md` | Complete |
-| 2 | Python AI Orchestrator (from `first.md`) | `PYTHON_ORCHESTRATOR_STATUS.md` | Complete — 1,936 tests, 0 failed |
-| 3 | Rust ↔ Python Production AgentBridge | `BRIDGE_INTEGRATION_STATUS.md`, `RUST_PYTHON_BRIDGE_PHASE16_FILES.md` | Complete — 36/36, E2E 12 |
-| 4 | Canonical Durable Execution Pipeline | `CANONICAL_DURABLE_PIPELINE_REPORT.md` | Complete |
-| 5 | Enterprise Security / Authorization / Tenancy / RLS Hardening | `SECURITY_HARDENING_REPORT.md` (1.2 MB), `SECURITY_NARRATIVE_BN.md` (Bangla) | Complete — 66 files, 1,200,577 bytes |
-| 6 | Enterprise Policy + Distributed Quota + Usage + Entitlement-Billing Control Plane | `CONTROL_PLANE_REPORT.md` | Complete — 956 tests, 0 failed |
+| 1 | Full codebase review | `reports/CODE_REVIEW.md` | Complete |
+| 2 | Python AI Orchestrator (from `first.md`) | `reports/PYTHON_ORCHESTRATOR_STATUS.md` | Complete — `scripts/check.sh` this tree: 2220 passed, 6 skipped, 0 failed |
+| 3 | Rust ↔ Python Production AgentBridge | `reports/BRIDGE_INTEGRATION_STATUS.md` | Complete |
+| 4 | Canonical Durable Execution Pipeline | `reports/CANONICAL_DURABLE_PIPELINE_REPORT.md` | Complete |
+| 5 | Enterprise Security / Authorization / Tenancy / RLS Hardening | `reports/SECURITY_HARDENING_REPORT.md`, `reports/SECURITY_NARRATIVE_BN.md` | Complete |
+| 6 | Enterprise Policy + Distributed Quota + Usage + Entitlement-Billing Control Plane | `reports/CONTROL_PLANE_REPORT.md` | Complete |
 
 Item 6 is the most recent. Its report is the one to read first if you are picking the
 work up: §4 covers what was built against the spec, §5 lists the 19 real defects found
@@ -43,21 +55,21 @@ export MAS_ENV=test CARGO_INCREMENTAL=0
 export MAS_TEST_DATABASE_URL="postgres://mas:mas@127.0.0.1:55432/mas_live"
 export MAS_TEST_DATABASE_APP_URL="postgres://mas_app:mas_app_pw@127.0.0.1:55432/mas_live"
 
-cargo test --workspace --locked                  # 956 passed, 0 failed
-cargo test --workspace --locked --features nats  # 956 passed, 0 failed
+cargo test --workspace --locked
+cargo test --workspace --locked --features nats
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt --all -- --check
 cargo doc --no-deps --workspace
 ```
 
 The live-PostgreSQL suites skip loudly without those two URLs rather than passing
-vacuously. Under them the totals are as above; without them the total is lower.
+vacuously.
 
 Python (from `enterprise-mas/python-orchestrator`):
 
 ```bash
-pip install pytest-asyncio grpcio grpcio-tools
-PYTHONPATH="$(pwd)/src:$(pwd)" python3 -m pytest tests -q   # 1,936 passed
+bash scripts/bootstrap.sh
+bash scripts/check.sh
 ```
 
 `pytest-asyncio` ≥ 0.24 is required. Without it collection aborts with
@@ -65,22 +77,23 @@ PYTHONPATH="$(pwd)/src:$(pwd)" python3 -m pytest tests -q   # 1,936 passed
 that is a missing dependency, not a failing test.
 
 The Rust toolchain is pinned by `rust-toolchain.toml` (1.98.1).
+`[workspace.package] version` is `1.1.0`.
 
 ---
 
 ## What is deliberately not in this archive
 
-- `target/` — build output (19 GB). Excluded; `cargo test` regenerates it.
+- `target/` — build output. Excluded; `cargo test` regenerates it.
 - `pg16/`, `pgdata/` — the PostgreSQL build and its data directory. Rebuild with
   `pg_up.sh`'s bootstrap, or point `MAS_TEST_DATABASE_URL` at your own instance.
 - `.git/` — no history was authored by this work.
-- `node_modules/`, `.venv/`, caches — none exist.
+- `node_modules/`, `.venv/`, caches — none belong in the deliverable zip.
 
 ---
 
 ## Orientation for a reader
 
-- **Start with** `CONTROL_PLANE_REPORT.md` §3 (architecture) — the canonical gate is
+- **Start with** `reports/CONTROL_PLANE_REPORT.md` §3 (architecture) — the canonical gate is
   one: `ControlPlane` in `mas-application`, and everything else calls through it.
 - **The chain** is `Plan → Subscription → Entitlement → Feature gate → Policy → Quota →
   Execution → Usage metering → Usage ledger → Billing output`. Limits are enforced

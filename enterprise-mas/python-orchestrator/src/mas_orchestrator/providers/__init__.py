@@ -18,6 +18,12 @@ from mas_orchestrator.providers.anthropic import (
     ANTHROPIC_VERSION,
     AnthropicProvider,
 )
+from mas_orchestrator.providers.azure import (
+    AZURE_DEFAULT_API_VERSION,
+    AzureOpenAIProvider,
+    AzureProviderConfig,
+    build_azure_provider,
+)
 from mas_orchestrator.providers.base_http import (
     BLOCKED_NETWORKS,
     DEFAULT_MAX_RESPONSE_BYTES,
@@ -39,24 +45,34 @@ from mas_orchestrator.providers.factory import (
     ProviderSpec,
     build_providers,
 )
+from mas_orchestrator.providers.gemini import (
+    GEMINI_DEFAULT_HOST,
+    GeminiProvider,
+)
 from mas_orchestrator.providers.openai import OPENAI_DEFAULT_HOST, OpenAIProvider
 
 __all__ = [
     "ANTHROPIC_DEFAULT_HOST",
     "ANTHROPIC_VERSION",
+    "AZURE_DEFAULT_API_VERSION",
     "BLOCKED_NETWORKS",
     "DEFAULT_MAX_RESPONSE_BYTES",
+    "GEMINI_DEFAULT_HOST",
     "OPENAI_DEFAULT_HOST",
     "PROVIDER_IDS",
     "AnthropicProvider",
+    "AzureOpenAIProvider",
+    "AzureProviderConfig",
     "CompatibleProvider",
     "CompatibleProviderConfig",
+    "GeminiProvider",
     "HttpPolicy",
     "HttpTransport",
     "OpenAIProvider",
     "ProviderBundle",
     "ProviderSpec",
     "TransportResponse",
+    "build_azure_provider",
     "build_compatible_provider",
     "build_providers",
     "classify_status",

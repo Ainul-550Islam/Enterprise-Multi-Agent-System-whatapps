@@ -51,6 +51,10 @@ _S3_DATE_FORMAT: Final[str] = "%Y%m%dT%H%M%SZ"
 _CURSOR_VERSION: Final[int] = 2
 _MAX_CURSOR_ENTRIES: Final[int] = 10_000
 _MAX_START_URLS: Final[int] = 25
+#: Longest crawl target that may be scheduled (W-05). Hostile link farms
+#: saturate pages with oversized URLs; they are dropped before ``urljoin``
+#: and before queueing so the frontier stays bounded and predictable.
+_MAX_URL_LENGTH: Final[int] = 2048
 
 
 @dataclass(frozen=True, slots=True)
@@ -255,12 +259,26 @@ def _validate_link(
     root_host: str,
     allowed_hosts: frozenset[str],
 ) -> str | None:
-    """Resolves one crawl target, staying on its configured origin host."""
+    """Resolves one crawl target, staying on its configured origin host.
+
+    Invalid targets are dropped individually — oversized URLs (capped before
+    ``urljoin`` and again before queueing), non-HTTPS schemes, credential
+    tricks, off-list hosts and off-origin links. One hostile link on a crawled
+    page must neither abort the sync nor smuggle an unbounded URL into the
+    frontier.
+    """
     candidate = raw.strip()
     if not candidate or candidate.startswith(("#", "mailto:", "tel:", "javascript:", "data:")):
         return None
+    if len(candidate) > _MAX_URL_LENGTH:
+        return None
     absolute = urljoin(base_url, candidate)
-    canonical = _validate_https_url(absolute, allowed_hosts)
+    if len(absolute) > _MAX_URL_LENGTH:
+        return None
+    try:
+        canonical = _validate_https_url(absolute, allowed_hosts)
+    except (ToolPermissionDeniedError, InvalidRequestError):
+        return None
     if (urlsplit(canonical).hostname or "").lower() != root_host.lower():
         return None
     return canonical
@@ -269,6 +287,8 @@ def _validate_link(
 def _validate_https_url(url: str, allowed_hosts: frozenset[str]) -> str:
     """Rejects URL tricks before the guarded transport performs DNS checks."""
     candidate, _fragment = urldefrag(url.strip())
+    if len(candidate) > _MAX_URL_LENGTH:
+        raise InvalidRequestError("web source URL exceeds the length limit")
     parsed = urlsplit(candidate)
     if parsed.scheme.lower() != "https" or not parsed.hostname:
         raise ToolPermissionDeniedError("web source URL must use HTTPS")

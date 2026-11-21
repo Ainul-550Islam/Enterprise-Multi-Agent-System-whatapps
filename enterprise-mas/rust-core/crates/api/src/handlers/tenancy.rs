@@ -1,9 +1,9 @@
 //! Tenancy/identity routes.
 
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::Json;
 use mas_common::enums::Environment;
-use mas_common::ids::UserId;
+use mas_common::ids::{MembershipId, TenantId, UserId};
 use mas_common::result::Result as MasResult;
 use mas_domain::{IsolationMode, MembershipRole};
 use serde::{Deserialize, Serialize};
@@ -217,6 +217,30 @@ pub async fn list_organizations(
         .into_api(&ctx)
 }
 
+fn user_response(user: &mas_domain::user::User) -> UserResponse {
+    UserResponse {
+        id: user.id.to_string(),
+        email: user.email.to_string(),
+        display_name: user.display_name.clone(),
+        status: user.status.to_string(),
+    }
+}
+
+/// `GET /v1/users` — the deployment's user catalogue, the read twin of
+/// `POST /v1/users`. Platform-admin scoped, like the other catalogue reads.
+pub async fn list_users(
+    State(state): State<AppState>,
+    Ctx(ctx): Ctx,
+) -> ApiResult<Vec<UserResponse>> {
+    let service_ctx = platform_admin_context(&ctx)?;
+    state
+        .tenancy
+        .list_users(&service_ctx)
+        .await
+        .map(|users| users.iter().map(user_response).collect::<Vec<_>>())
+        .into_api(&ctx)
+}
+
 /// `POST /v1/tenants` — requires `X-Organization-Id`.
 pub async fn register_tenant(
     State(state): State<AppState>,
@@ -227,11 +251,7 @@ pub async fn register_tenant(
         .map_err(|e| crate::response::ApiError::new(e, &ctx))?;
     let isolation: IsolationMode = wl_enum("isolation", &body.isolation)
         .map_err(|e| crate::response::ApiError::new(e, &ctx))?;
-    let service_ctx = authorized_tenancy(
-        &ctx,
-        mas_security::ResourceKind::Tenant,
-        mas_security::Action::Administer,
-    )?;
+    let service_ctx = organization_admin_context(&ctx)?;
     state
         .tenancy
         .register_tenant(&service_ctx, &body.name, &body.slug, environment, isolation)
@@ -245,17 +265,33 @@ pub async fn list_tenants(
     State(state): State<AppState>,
     Ctx(ctx): Ctx,
 ) -> ApiResult<Vec<TenantResponse>> {
-    let service_ctx = authorized_tenancy(
-        &ctx,
-        mas_security::ResourceKind::Tenant,
-        mas_security::Action::Read,
-    )?;
+    let service_ctx = organization_admin_context(&ctx)?;
     state
         .tenancy
         .list_tenants(&service_ctx)
         .await
         .map(|tenants| tenants.iter().map(tenant_response).collect::<Vec<_>>())
         .into_api(&ctx)
+}
+
+/// `POST /v1/tenants/{tenant_id}/activate` — provisioning → active.
+///
+/// Organization-scoped platform operation on the tenant bootstrap lane: the
+/// same context that may create an organization's tenants may make one
+/// operational. A tenant of another organization reads as "does not exist",
+/// never as "forbidden".
+pub async fn activate_tenant(
+    State(state): State<AppState>,
+    Ctx(ctx): Ctx,
+    Path(tenant_id): Path<TenantId>,
+) -> ApiResult<TenantResponse> {
+    let service_ctx = organization_admin_context(&ctx)?;
+    state
+        .tenancy
+        .activate_tenant(&service_ctx, tenant_id)
+        .await
+        .map(|tenant| created(&ctx, tenant_response(&tenant)))
+        .map_err(|e| crate::response::ApiError::new(e, &ctx))
 }
 
 /// `POST /v1/projects` — requires both scope headers.
@@ -348,10 +384,58 @@ pub async fn invite_membership(
         .map_err(|e| crate::response::ApiError::new(e, &ctx))
 }
 
+/// `POST /v1/memberships/{membership_id}/accept` — invited → active.
+///
+/// Admitted by the same `ManageMembers` zone as the invite: the inviting side
+/// may confirm an outstanding invitation, and the transition is audited like
+/// every other tenancy mutation. A membership of another tenant reads as
+/// "does not exist".
+pub async fn accept_membership(
+    State(state): State<AppState>,
+    Ctx(ctx): Ctx,
+    Path(membership_id): Path<MembershipId>,
+) -> ApiResult<MembershipResponse> {
+    let service_ctx = authorized_tenancy(
+        &ctx,
+        mas_security::ResourceKind::Membership,
+        mas_security::Action::ManageMembers,
+    )?;
+    state
+        .tenancy
+        .accept_membership(&service_ctx, membership_id)
+        .await
+        .map(|membership| {
+            created(
+                &ctx,
+                MembershipResponse {
+                    id: membership.id.to_string(),
+                    user_id: membership.user_id.to_string(),
+                    tenant_id: membership.tenant_id.map(|t| t.to_string()),
+                    roles: membership.roles.iter().map(|r| r.to_string()).collect(),
+                    status: membership.status.to_string(),
+                },
+            )
+        })
+        .map_err(|e| crate::response::ApiError::new(e, &ctx))
+}
+
 fn platform_admin_context(
     ctx: &RequestContext,
 ) -> std::result::Result<mas_application::context::ServiceContext, crate::response::ApiError> {
     ctx.platform_service_context()
+        .map_err(|error| crate::response::ApiError::new(error, ctx))
+}
+
+/// Organization-bound platform lane for tenant bootstrap operations.
+///
+/// `POST /v1/tenants` cannot resolve a *tenant* scope: the tenant it creates
+/// does not exist yet. The application layer needs only the organization
+/// (`require_organization()`), so this lane binds the claimed organization
+/// under the explicit `platform:admin` capability.
+fn organization_admin_context(
+    ctx: &RequestContext,
+) -> std::result::Result<mas_application::context::ServiceContext, crate::response::ApiError> {
+    ctx.organization_service_context()
         .map_err(|error| crate::response::ApiError::new(error, ctx))
 }
 

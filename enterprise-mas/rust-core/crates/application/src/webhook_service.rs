@@ -77,6 +77,46 @@ pub trait WebhookAdminPort: std::fmt::Debug + Send + Sync {
     ) -> Result<DeliveryRecord>;
 }
 
+/// In-memory admin reads over the shared dev-lane store. Delivery history is
+/// honestly empty — the dev lane has no delivery pipeline — while the
+/// visibility contract still holds: a foreign endpoint id is not-found,
+/// never an empty page.
+#[async_trait::async_trait]
+impl WebhookAdminPort for crate::stores::InMemoryServices {
+    async fn list_deliveries(
+        &self,
+        tenant: TenantId,
+        endpoint: WebhookId,
+        _after: Option<DeliveryCursor>,
+        _limit: u16,
+    ) -> Result<Vec<DeliveryRecord>> {
+        use crate::stores::WebhookStorePort;
+        WebhookStorePort::get(self, endpoint)
+            .await?
+            .filter(|endpoint| endpoint.tenant_id == tenant)
+            .ok_or_else(|| AppError::not_found("webhook", endpoint.to_string()))?;
+        Ok(Vec::new())
+    }
+
+    async fn replay_dead_letter(
+        &self,
+        tenant: TenantId,
+        endpoint: WebhookId,
+        delivery: uuid::Uuid,
+        _actor: Option<UserId>,
+    ) -> Result<DeliveryRecord> {
+        use crate::stores::WebhookStorePort;
+        WebhookStorePort::get(self, endpoint)
+            .await?
+            .filter(|endpoint| endpoint.tenant_id == tenant)
+            .ok_or_else(|| AppError::not_found("webhook", endpoint.to_string()))?;
+        // No delivery pipeline means no dead-letter rows; a replay request
+        // honestly reports the delivery as unknown rather than fabricating a
+        // record.
+        Err(AppError::not_found("delivery", delivery.to_string()))
+    }
+}
+
 /// Webhook delivery administration service.
 #[derive(Debug)]
 pub struct WebhookService {
