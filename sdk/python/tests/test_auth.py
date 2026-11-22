@@ -18,7 +18,7 @@ def test_scope_guard() -> None:
 
     # scoped routes refuse before the transport is invoked
     with pytest.raises(MissingScopeError):
-        client.submit_execution(agent_id="a", input="i")
+        client.submit_execution(project_id="p", agent_id="a", input="i")
     with pytest.raises(MissingScopeError):
         client.get_execution("exec-1")
     with pytest.raises(MissingScopeError):

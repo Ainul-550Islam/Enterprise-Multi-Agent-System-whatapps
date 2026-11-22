@@ -5,6 +5,7 @@ Empty catalogue answers are truthful — this example prints exactly what the
 platform reports and never fabricates numbers.
 
     export MAS_API_URL=... MAS_API_TOKEN=... MAS_TENANT_ID=... MAS_ORGANIZATION_ID=...
+    export MAS_PROJECT_ID=<project-uuid>
     python examples/04_quota_and_usage.py
 """
 
@@ -40,7 +41,7 @@ def main() -> int:
     print(f"billing usage-totals: ok={totals.ok} data={totals.data}")
 
     # a refused over-quota submit is a quota answer, not a crash — show it
-    demo = client.submit_execution(agent_id="hello-agent", input="quota demo")
+    demo = client.submit_execution(project_id=os.environ["MAS_PROJECT_ID"], agent_id="hello-agent", input={"prompt": "quota demo"})
     print(f"demo submit: ok={demo.ok} code={demo.code} status={(demo.data or {}).get('status')}")
     return 0
 

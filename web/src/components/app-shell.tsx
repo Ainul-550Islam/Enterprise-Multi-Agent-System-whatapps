@@ -9,17 +9,24 @@ import { useSession } from "@/lib/auth/SessionProvider";
 import { api } from "@/lib/api/client";
 import { readCsrfCookie } from "@/lib/csrf";
 import { Button } from "@/components/ui/button";
+import { SearchBox } from "@/components/search-box";
 
 const NAV: ReadonlyArray<{ href: string; label: string }> = [
   { href: "/overview", label: "Overview" },
   { href: "/agents", label: "Agents" },
   { href: "/executions", label: "Executions" },
   { href: "/workflows", label: "Workflows" },
+  { href: "/schedules", label: "Schedules" },
   { href: "/approvals", label: "Approvals" },
   { href: "/tools", label: "Tools" },
   { href: "/connectors", label: "Connectors" },
   { href: "/webhooks", label: "Webhooks" },
   { href: "/api-keys", label: "API keys" },
+  { href: "/team", label: "Team" },
+  { href: "/knowledge", label: "Knowledge" },
+  { href: "/notifications", label: "Notifications" },
+  { href: "/assistant", label: "Assistant" },
+  { href: "/onboarding", label: "Onboarding" },
   { href: "/billing", label: "Billing" },
   { href: "/usage", label: "Usage" },
   { href: "/policies", label: "Policies" },
@@ -116,6 +123,7 @@ export function AppShell({ children }: { children: ReactNode }) {
               ))}
             </select>
           </label>
+          <SearchBox />
           <div className="ml-auto flex items-center gap-3">
             <span className="text-sm text-muted">{session.subject ?? "signed in"}</span>
             <Button

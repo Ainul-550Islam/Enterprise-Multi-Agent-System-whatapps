@@ -11,6 +11,12 @@
  *   `ok`, never on message text.
  */
 
+import { isRetryableStatus, waitBeforeRetry, type RetryOptions } from "./retry.js";
+
+export * from "./errors.js";
+export * from "./resources/index.js";
+export { backoffWithJitter, isRetryableStatus } from "./retry.js";
+
 /** Scope headers the API requires together. */
 export interface Scope {
   tenantId: string;
@@ -24,18 +30,21 @@ export interface MasClientConfig {
   scope?: Scope;
   correlationId?: string;
   fetchImpl?: typeof fetch;
+  /** HTTP timeout in milliseconds (default 10000). */
+  timeoutMs?: number;
+  /** Transient-failure retry policy; defaults to three attempts. */
+  retry?: RetryOptions;
+  /** Raise typed errors instead of returning an error result. */
+  raiseOnError?: boolean;
 }
 
 /** A decoded API envelope result. */
 export type MasResult<T> = { ok: true; data: T } | { ok: false; code: string; message: string };
 
-/** Thrown when a scoped call is attempted without a scope. */
-export class MissingScopeError extends Error {
-  constructor() {
-    super("missing scope: pass tenantId and organizationId together (MAS_TENANT_ID / MAS_ORGANIZATION_ID)");
-    this.name = "MissingScopeError";
-  }
-}
+import { MasScopeError } from "./errors.js";
+
+/** Backwards-compatible alias for the original SDK error name. */
+export class MissingScopeError extends MasScopeError {}
 
 function uuid(): string {
   return globalThis.crypto.randomUUID();
@@ -48,6 +57,9 @@ export class MasClient {
   private readonly scope?: Scope;
   private readonly correlationId: string;
   private readonly fetchImpl: typeof fetch;
+  private readonly timeoutMs: number;
+  private readonly retry: RetryOptions;
+  private readonly raiseOnError: boolean;
 
   constructor(config: MasClientConfig) {
     this.baseUrl = config.baseUrl.replace(/\/+$/, "");
@@ -55,6 +67,9 @@ export class MasClient {
     this.scope = config.scope;
     this.correlationId = config.correlationId ?? uuid();
     this.fetchImpl = config.fetchImpl ?? fetch;
+    this.timeoutMs = config.timeoutMs ?? 10_000;
+    this.retry = config.retry ?? {};
+    this.raiseOnError = config.raiseOnError ?? false;
   }
 
   /** Resolves the scope or fails locally, before the network. */
@@ -67,12 +82,25 @@ export class MasClient {
 
   /** Submits an execution and returns its id. */
   async submitExecution(input: {
-    agentId: string;
-    input: string;
+    projectId: string;
+    input: unknown;
+    agentId?: string;
+    workflowId?: string;
     idempotencyKey?: string;
-  }): Promise<MasResult<{ executionId: string; status: string }>> {
+  }): Promise<MasResult<{ id: string; status: string }>> {
     this.requireScope();
-    return this.request("POST", "/v1/executions", input, input.idempotencyKey ?? uuid());
+    if (Boolean(input.agentId) === Boolean(input.workflowId)) {
+      throw new TypeError("provide exactly one of agentId or workflowId");
+    }
+    const body: Record<string, unknown> = { input: input.input };
+    if (input.agentId) body.agent_id = input.agentId;
+    if (input.workflowId) body.workflow_id = input.workflowId;
+    return this.request(
+      "POST",
+      `/v1/projects/${encodeURIComponent(input.projectId)}/executions`,
+      body,
+      input.idempotencyKey ?? uuid(),
+    );
   }
 
   /** Reads one execution. */
@@ -87,7 +115,7 @@ export class MasClient {
     return this.request("POST", `/v1/executions/${encodeURIComponent(executionId)}/signal`, { signal });
   }
 
-  /** Raw request through the envelope decoder. */
+  /** Raw request through the envelope decoder, with bounded transient retries. */
   async request<T>(method: string, path: string, body?: unknown, idempotencyKey?: string): Promise<MasResult<T>> {
     const headers: Record<string, string> = {
       authorization: `Bearer ${this.token}`,
@@ -103,22 +131,54 @@ export class MasClient {
     if (idempotencyKey) {
       headers["x-idempotency-key"] = idempotencyKey;
     }
-    const response = await this.fetchImpl(`${this.baseUrl}${path}`, {
-      method,
-      headers,
-      body: body === undefined ? undefined : JSON.stringify(body),
-    });
-    const envelope = (await response.json()) as {
-      data?: T;
-      error?: { code?: string; message?: string };
-    };
-    if (!response.ok || envelope.error) {
-      return {
-        ok: false,
-        code: envelope.error?.code ?? `HTTP_${response.status}`,
-        message: envelope.error?.message ?? response.statusText,
+
+    const attempts = this.retry.attempts ?? 3;
+    let lastStatus = 0;
+    let lastStatusText = "";
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      const response = await this.fetchImpl(`${this.baseUrl}${path}`, {
+        method,
+        headers,
+        body: body === undefined ? undefined : JSON.stringify(body),
+        signal: AbortSignal.timeout(this.timeoutMs),
+      });
+      lastStatus = response.status;
+      lastStatusText = response.statusText;
+      const envelope = (await response.json()) as {
+        data?: T;
+        error?: { code?: string; message?: string };
+        meta?: { request_id?: string };
+        retry_after?: number;
       };
+      const failed = !response.ok || Boolean(envelope.error);
+      if (!failed || !isRetryableStatus(response.status) || attempt === attempts) {
+        if (failed && this.raiseOnError) {
+          const { MasApiError, MasRateLimited } = await import("./errors.js");
+          if (response.status === 429) {
+            throw new MasRateLimited(envelope.retry_after ?? null, envelope.error?.message ?? lastStatusText);
+          }
+          throw new MasApiError(
+            response.status,
+            envelope.error?.code ?? `HTTP_${response.status}`,
+            envelope.error?.message ?? lastStatusText,
+            envelope.meta?.request_id,
+          );
+        }
+        if (failed) {
+          return {
+            ok: false,
+            code: envelope.error?.code ?? `HTTP_${response.status}`,
+            message: envelope.error?.message ?? lastStatusText,
+          };
+        }
+        return { ok: true, data: envelope.data as T };
+      }
+      const retryAfter = response.headers?.get?.("retry-after");
+      const seconds = retryAfter === null || retryAfter === undefined
+        ? (typeof envelope.retry_after === "number" ? envelope.retry_after : null)
+        : Number(retryAfter);
+      await waitBeforeRetry(attempt, Number.isFinite(seconds) ? seconds : null, this.retry);
     }
-    return { ok: true, data: envelope.data as T };
+    return { ok: false, code: `HTTP_${lastStatus}`, message: lastStatusText };
   }
 }

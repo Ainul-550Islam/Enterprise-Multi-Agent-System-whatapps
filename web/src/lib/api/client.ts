@@ -9,6 +9,8 @@ import { unwrapEnvelope, StableApiError, type ApiEnvelope } from "./types";
 export interface MasRequestInit {
   method?: string;
   body?: unknown;
+  /** Multipart body; browser supplies the matching Content-Type boundary. */
+  formData?: FormData;
   query?: Record<string, string | number | undefined>;
   headers?: Record<string, string>;
   signal?: AbortSignal;
@@ -36,8 +38,15 @@ export async function masFetch<T>(path: string, init: MasRequestInit = {}): Prom
     "x-csrf-token": readCsrfCookie(),
     ...(init.headers ?? {}),
   };
-  let body: string | undefined;
-  if (init.body !== undefined) {
+  let body: BodyInit | undefined;
+  if (init.formData !== undefined) {
+    for (const key of Object.keys(headers)) {
+      if (key.toLowerCase() === "content-type") {
+        delete headers[key];
+      }
+    }
+    body = init.formData;
+  } else if (init.body !== undefined) {
     headers["content-type"] = "application/json";
     body = JSON.stringify(init.body);
   }

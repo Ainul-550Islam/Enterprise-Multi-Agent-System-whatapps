@@ -5,6 +5,7 @@ Run against a dev stack (`scripts/e2e-smoke.sh` first):
 
     export MAS_API_URL=http://localhost:8080 MAS_API_TOKEN=dev-token
     export MAS_TENANT_ID=<uuid> MAS_ORGANIZATION_ID=<uuid>
+    export MAS_PROJECT_ID=<project-uuid>
     python examples/01_hello_agent.py
 """
 
@@ -46,11 +47,11 @@ def main() -> int:
     agent_id = registered.data["id"]
     print(f"registered agent {agent_id}")
 
-    submitted = client.submit_execution(agent_id=agent_id, input="Say hello in one sentence.")
+    submitted = client.submit_execution(project_id=os.environ["MAS_PROJECT_ID"], agent_id=agent_id, input={"prompt": "Say hello in one sentence."})
     if not submitted.ok:
         print(f"submit refused: {submitted.code} {submitted.message}", file=sys.stderr)
         return 1
-    execution_id = submitted.data["execution_id"]
+    execution_id = submitted.data["id"]
     print(f"submitted execution {execution_id} (status={submitted.data['status']})")
 
     result = client.get_execution(execution_id)

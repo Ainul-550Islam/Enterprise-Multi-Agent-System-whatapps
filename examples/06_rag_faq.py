@@ -4,6 +4,7 @@
 Empty retrieval is printed as empty. This example never fabricates hits.
 
     export MAS_API_URL=... MAS_API_TOKEN=... MAS_TENANT_ID=... MAS_ORGANIZATION_ID=...
+    export MAS_PROJECT_ID=<project-uuid>
     python examples/06_rag_faq.py
 """
 
@@ -49,8 +50,9 @@ def main() -> int:
         print(f"agent registration refused: {agent.code} {agent.message}", file=sys.stderr)
         return 1
     submitted = client.submit_execution(
+        project_id=os.environ["MAS_PROJECT_ID"],
         agent_id=agent.data["id"],
-        input="What is the refund policy? Cite documents or say you do not know.",
+        input={"prompt": "What is the refund policy? Cite documents or say you do not know."},
     )
     print(f"submit: ok={submitted.ok} code={submitted.code} data={submitted.data}")
     return 0 if submitted.ok else 1

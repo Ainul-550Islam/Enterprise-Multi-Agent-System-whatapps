@@ -8,6 +8,27 @@ import http from "node:http";
 const port = Number(process.env.MOCK_MAS_PORT ?? 18080);
 const agents = [];
 const executions = [];
+const schedules = [];
+const users = [
+  { id: "user-1", email: "operator@example.test", display_name: "Operator", status: "active" },
+];
+const sources = [
+  {
+    id: "source-1",
+    project_id: "33333333-3333-3333-3333-333333333333",
+    name: "Product docs",
+    kind: "web",
+    status: "active",
+    config: { url: "https://docs.example.test" },
+    has_credential: false,
+    updated_at: "2026-11-21T00:00:00Z",
+  },
+];
+const whatsappChannels = [];
+const webhookExecutions = [];
+const deliveries = [
+  { id: "delivery-1", subject: "Run failed", state: "failed", channel: "email", attempts: 2 },
+];
 
 function envelope(data, status = 200) {
   return {
@@ -16,7 +37,7 @@ function envelope(data, status = 200) {
       data,
       error: null,
       meta: {
-        request_id: "e2e",
+        request_id: "00000000-0000-0000-0000-000000000e2e",
         correlation_id: "e2e",
         api_version: "v1",
         responded_at: new Date().toISOString(),
@@ -32,7 +53,7 @@ function error(status, code, message) {
       data: null,
       error: { code, message },
       meta: {
-        request_id: "e2e",
+        request_id: "00000000-0000-0000-0000-000000000e2e",
         correlation_id: "e2e",
         api_version: "v1",
         responded_at: new Date().toISOString(),
@@ -53,9 +74,9 @@ const server = http.createServer((request, response) => {
   request.on("end", () => {
     let result;
     const json = chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}") : {};
-    if (url.pathname === "/v1/health/live") {
-      result = envelope({ status: "ok" });
-    } else if (!auth.startsWith("Bearer ")) {
+    // Public provider callbacks authenticate by signature, never by bearer.
+    const isPublicWebhook = request.method === "POST" && url.pathname.startsWith("/v1/public/whatsapp/webhook/");
+    if (!isPublicWebhook && !auth.startsWith("Bearer ")) {
       result = error(401, "UNAUTHENTICATED", "authentication required");
     } else if (request.method === "GET" && url.pathname === "/v1/auth/me") {
       result = envelope({
@@ -70,6 +91,40 @@ const server = http.createServer((request, response) => {
       result = envelope([{ id: "22222222-2222-2222-2222-222222222222", name: "Acme" }]);
     } else if (request.method === "GET" && url.pathname === "/v1/tenants") {
       result = envelope([{ id: "11111111-1111-1111-1111-111111111111", name: "Prod" }]);
+    } else if (request.method === "GET" && url.pathname === "/v1/health/live") {
+      result = envelope({ status: "ok" });
+    } else if (request.method === "GET" && url.pathname === "/v1/whatsapp/channels") {
+      result = envelope(whatsappChannels);
+    } else if (request.method === "POST" && url.pathname === "/v1/whatsapp/channels") {
+      whatsappChannels.push(json);
+      result = envelope(json, 201);
+    } else if (request.method === "POST" && url.pathname.startsWith("/v1/public/whatsapp/webhook/")) {
+      if (!request.headers["x-hub-signature-256"]) {
+        result = error(401, "UNAUTHENTICATED", "missing webhook signature");
+      } else {
+        webhookExecutions.push({ id: `exec-webhook-${webhookExecutions.length + 1}`, wamid: "wamid-e2e-001", status: "queued" });
+        result = envelope({ accepted: true }, 202);
+      }
+    } else if (request.method === "GET" && url.pathname === "/v1/executions") {
+      result = envelope([...executions, ...webhookExecutions]);
+    } else if (request.method === "POST" && (url.pathname === "/v1/admin/plans" || url.pathname === "/v1/api-keys")) {
+      result = envelope(json, 201);
+    } else if (request.method === "GET" && url.pathname === "/v1/schedules") {
+      result = envelope(schedules);
+    } else if (request.method === "POST" && url.pathname === "/v1/schedules") {
+      const item = { id: `schedule-${schedules.length + 1}`, name: json.name, status: "active", next_run_at: null };
+      schedules.push(item);
+      result = envelope(item, 201);
+    } else if (request.method === "GET" && url.pathname === "/v1/users") {
+      result = envelope(users);
+    } else if (request.method === "GET" && url.pathname === "/v1/data-sources") {
+      result = envelope(sources);
+    } else if (request.method === "GET" && url.pathname.match(/^\/v1\/data-sources\/[^/]+\/documents$/)) {
+      result = envelope([]);
+    } else if (request.method === "GET" && url.pathname === "/v1/notifications/recipients/user-1") {
+      result = envelope({ items: deliveries, next_cursor: null });
+    } else if (request.method === "GET" && url.pathname === "/v1/policies") {
+      result = envelope([]);
     } else if (request.method === "GET" && url.pathname === "/v1/agents") {
       result = envelope(agents);
     } else if (request.method === "POST" && url.pathname === "/v1/agents") {
@@ -93,8 +148,6 @@ const server = http.createServer((request, response) => {
       };
       executions.push(execution);
       result = envelope(execution, 201);
-    } else if (request.method === "GET" && url.pathname === "/v1/executions") {
-      result = envelope(executions);
     } else if (request.method === "GET" && url.pathname.match(/^\/v1\/executions\/[^/]+$/)) {
       const id = url.pathname.split("/").pop();
       result = envelope(executions.find((item) => item.id === id) ?? { id, status: "running" });

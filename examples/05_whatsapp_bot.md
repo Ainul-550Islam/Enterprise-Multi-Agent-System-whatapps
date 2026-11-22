@@ -1,9 +1,21 @@
 # 05 — WhatsApp support bot (end-to-end walkthrough)
 
 A complete, runnable design for a WhatsApp support bot on the Enterprise MAS
-stack. This example is intentionally documentation-shaped: it composes the
-pieces the codebase already ships (`mas-channel-whatsapp`,
+stack. `examples/05_whatsapp_bot.py` drives the tenant-facing API through the Python
+SDK; this document composes the pieces the codebase already ships (`mas-channel-whatsapp`,
 `WhatsappSupportAgent`, the WhatsApp API surface) into one deployable flow.
+
+## 0. Run the tenant-facing SDK script
+
+```bash
+export MAS_API_URL=... MAS_API_TOKEN=... MAS_TENANT_ID=... MAS_ORGANIZATION_ID=...
+export MAS_WHATSAPP_CHANNEL_ID=... MAS_WHATSAPP_TO=+8801712345678
+python examples/05_whatsapp_bot.py
+```
+
+The script reads the channel list and, when a channel and recipient are
+supplied, sends one real text message through the documented API. It never
+handles provider tokens or webhook secrets.
 
 ## Architecture
 

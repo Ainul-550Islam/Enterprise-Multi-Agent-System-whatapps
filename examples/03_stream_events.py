@@ -2,6 +2,7 @@
 """03 — stream events: follow the SSE stream while an execution runs.
 
     export MAS_API_URL=... MAS_API_TOKEN=... MAS_TENANT_ID=... MAS_ORGANIZATION_ID=...
+    export MAS_PROJECT_ID=<project-uuid>
     python examples/03_stream_events.py
 """
 
@@ -28,11 +29,11 @@ def main() -> int:
     base = os.environ.get("MAS_API_URL", "http://localhost:8080").rstrip("/")
     client = MasClient(base, token, scope=scope)
 
-    submitted = client.submit_execution(agent_id="hello-agent", input="stream me")
+    submitted = client.submit_execution(project_id=os.environ["MAS_PROJECT_ID"], agent_id="hello-agent", input={"prompt": "stream me"})
     if not submitted.ok:
         print(f"submit refused: {submitted.code} {submitted.message}", file=sys.stderr)
         return 1
-    execution_id = submitted.data["execution_id"]
+    execution_id = submitted.data["id"]
     print(f"following execution {execution_id} on /v1/stream")
 
     request = urllib.request.Request(

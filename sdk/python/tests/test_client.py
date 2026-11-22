@@ -18,20 +18,21 @@ def make_client(reply: tuple[int, str]) -> tuple[MasClient, list[dict[str, objec
 
 
 def test_submit_execution() -> None:
-    client, seen = make_client((201, '{"data": {"execution_id": "exec-1", "status": "queued"}}'))
-    result = client.submit_execution(agent_id="agent-1", input="hello")
+    client, seen = make_client((201, '{"data": {"id": "exec-1", "status": "queued"}}'))
+    result = client.submit_execution(project_id="project-1", agent_id="agent-1", input={"prompt": "hello"})
 
     assert result.ok is True
-    assert result.data == {"execution_id": "exec-1", "status": "queued"}
+    assert result.data == {"id": "exec-1", "status": "queued"}
     assert len(seen) == 1
     call = seen[0]
     assert call["method"] == "POST"
-    assert call["url"] == "http://api.test/v1/executions"
+    assert call["url"] == "http://api.test/v1/projects/project-1/executions"
     headers = call["headers"]
     assert headers["x-tenant-id"] == "tenant-1"
     assert headers["x-organization-id"] == "org-1"
     assert len(headers["x-idempotency-key"]) > 8
-    assert b"hello" in call["body"]
+    assert b'"input": {"prompt": "hello"}' in call["body"]
+    assert b'"agent_id": "agent-1"' in call["body"]
 
 
 def test_error_envelopes_become_typed_results() -> None:
