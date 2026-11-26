@@ -38,6 +38,9 @@ allow = [
 ]
 
 [advisories]
+# Chrono is an upstream dependency throughout the date/time model. This warning
+# is tracked pending a deliberate migration to an actively maintained API.
+ignore = ["RUSTSEC-2026-0543"]
 # Vulnerability and unsound advisories are errors by default in cargo-deny;
 # this section exists to record the policy explicitly. Never add an `ignore`
 # entry without a linked security review.

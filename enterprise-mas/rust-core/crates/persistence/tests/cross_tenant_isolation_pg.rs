@@ -427,9 +427,20 @@ async fn checkout_idempotency_is_per_tenant() {
     let b = seed_scope(&pool, "ck-b").await;
     let suffix = &uuid::Uuid::now_v7().to_string().replace('-', "");
     let key = format!("key-{suffix}");
+    let plan_id = PlanId::new();
+    let plan_code = format!("plan_checkout_{suffix}");
+    sqlx::query("INSERT INTO plans (id, code, name) VALUES ($1, $2, $3)")
+        .bind(plan_id.into_uuid())
+        .bind(&plan_code)
+        .bind("Checkout test plan")
+        .execute(&pool)
+        .await
+        .expect("checkout plan fixture");
 
     scoped(pool.clone(), a.tenant.id, a.organization.id, {
-        let row = checkout(a.tenant.id, &key);
+        let mut row = checkout(a.tenant.id, &key);
+        row.plan_id = plan_id;
+        row.plan_code = plan_code.clone();
         move |p| async move {
             let store = PostgresCheckoutSessionStore::new(p);
             let (_, created_first) = store.create_or_get(&row).await.expect("first");
@@ -446,7 +457,9 @@ async fn checkout_idempotency_is_per_tenant() {
 
     // The same key in another tenant is a different checkout.
     scoped(pool.clone(), b.tenant.id, b.organization.id, {
-        let row = checkout(b.tenant.id, &key);
+        let mut row = checkout(b.tenant.id, &key);
+        row.plan_id = plan_id;
+        row.plan_code = plan_code;
         move |p| async move {
             let store = PostgresCheckoutSessionStore::new(p);
             let (_, created) = store.create_or_get(&row).await.expect("tenant B");

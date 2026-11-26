@@ -87,6 +87,23 @@ async fn bridge(port: u16, subject: &str) -> GrpcDataHubBridge {
 
 #[tokio::test]
 async fn signed_rust_ingest_retry_and_purge_cross_python_and_live_postgres() {
+    let prerequisites = [
+        "MAS_E2E_PYTHON",
+        "MAS_TEST_RAG_DATABASE_URL",
+        "MAS_TEST_REPLAY_DATABASE_URL",
+    ];
+    let missing: Vec<_> = prerequisites
+        .iter()
+        .filter(|name| std::env::var_os(name).is_none())
+        .copied()
+        .collect();
+    if !missing.is_empty() {
+        eprintln!(
+            "skipping live Rust/Python/PostgreSQL Data Hub test; missing {}",
+            missing.join(", ")
+        );
+        return;
+    }
     let server = server();
     let bad_subject = bridge(server.1, "mas-api-data-hub").await;
     let bridge = bridge(server.1, "rust-core").await;

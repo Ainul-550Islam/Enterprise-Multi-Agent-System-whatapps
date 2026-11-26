@@ -1,39 +1,22 @@
-# Upgrade Guide
+# Upgrade and migration policy
 
-## Upgrading from 0.x to 0.11 (this release)
+## Before an upgrade
 
-### Breaking Changes
+1. Read the release notes and deployment changes for the target version.
+2. Take and verify a restorable database backup.
+3. Confirm the target application image and migration bundle are from the same release.
+4. Plan a maintenance or rollout window appropriate to the schema changes.
 
-| Change | Migration |
-|--------|-----------|
-| `MAS_API_URL` format changed | Update to include `:port` if non-standard |
-| Provider config format | Move `api_key` to `api_key_secret_ref` |
-| Memory backend default | `in_process` → `postgres` in production |
+## Apply an upgrade
 
-### Migration Steps
+1. Deploy the target release's migration runner with the required database credentials.
+2. Apply registered migrations in order; the runner is forward-only and records checksums.
+3. Confirm the runner completed and inspect `mas_schema_migrations` for the expected registered versions and checksums.
+4. Deploy the matching application services and run documented health checks.
+5. Keep the prior application image and verified database backup available until the upgrade is accepted.
 
-1. Update `.env` file with new variable names
-2. Run: `mas admin bootstrap --reconcile`
-3. Re-configure providers using secret references
-4. Migrate any in-memory data to PostgreSQL if applicable
-5. Run `mas status` to verify
+Do not run an older binary against a database that contains migrations unknown to that binary. The runner intentionally treats that state as an error.
 
-### New Features
+## Repository verification
 
-- **Admin bootstrap**: Idempotent org→tenant→project→owner setup
-- **API key rotation**: `mas api-key rotate --key-id <id>`
-- **SSE events**: Real-time execution updates via SSE
-- **Keyset pagination**: Efficient large-data traversal
-- **Remote sandbox**: ISO-8080 isolated code execution
-
-### Deprecated
-
-- Direct `api_key` in config (use `api_key_secret_ref` instead)
-- In-memory only memory backend for production
-- Legacy execution transition verbs
-
-## Upgrading from 0.11 to 0.12 (next release)
-
-*Coming in the next release cycle.*
-
-Check the changelog for detailed notes.
+The migration registry currently ends at version 0064. The Rust integration test `crates/persistence/tests/migration_registry.rs` checks migration-directory registration, unique numeric prefixes, `up.sql` presence, and the required `down.sql` files for versions 0042 onward. Run `python scripts/dev/verify_manifest.py --tier full` and the Rust migration-registry test after changing migration files. A passing repository check does not replace testing against a production-like database or a verified backup.

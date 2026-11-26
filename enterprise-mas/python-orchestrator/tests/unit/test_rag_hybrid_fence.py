@@ -13,9 +13,8 @@ from mas_orchestrator.rag.retrieval import InMemoryLexicalIndex, RetrievalConfig
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("allow_unowned", [False, True])
 async def test_pgvector_rejects_hybrid_index_that_can_bypass_fences(
-    allow_unowned: bool, monkeypatch: pytest.MonkeyPatch
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     lexical = InMemoryLexicalIndex()
     embedder = HashingEmbedder()
@@ -38,7 +37,7 @@ async def test_pgvector_rejects_hybrid_index_that_can_bypass_fences(
     assert await lexical.search(
         "confidential", context=SecurityContext(tenant_id="tenant"), limit=1
     )
-    index = PgVectorIndex(object(), dimensions=1536, allow_unowned_documents=allow_unowned)
+    index = PgVectorIndex(object(), dimensions=1536)
     with pytest.raises(ConfigurationError, match="does not support a separate lexical index"):
         Retriever(embedder=embedder, index=index, lexical=lexical)
 

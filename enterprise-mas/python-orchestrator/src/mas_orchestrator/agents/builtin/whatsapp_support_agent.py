@@ -14,6 +14,10 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Final
 
+from mas_orchestrator.channels.whatsapp_format import (
+    format_for_whatsapp,
+    reject_tables_and_html,
+)
 from mas_orchestrator.channels.whatsapp_media import WHATSAPP_TEXT_LIMIT, split_by_limit
 
 WHATSAPP_SUPPORT_AGENT_ID: Final[str] = "whatsapp_support"
@@ -97,7 +101,8 @@ class WhatsappSupportAgent:
         """Classifies, drafts and segments one inbound message."""
         intent = self.classify(text)
         reply = self.draft_reply(intent, customer_name=customer_name)
-        segments = tuple(split_by_limit(reply, self._max_segment_chars))
+        safe_reply = format_for_whatsapp(reject_tables_and_html(reply))
+        segments = tuple(split_by_limit(safe_reply, self._max_segment_chars))
         return TriageResult(
             intent=intent,
             reply_segments=segments,

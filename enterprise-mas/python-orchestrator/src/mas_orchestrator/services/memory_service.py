@@ -101,14 +101,15 @@ class MemoryService:
         # The record is built here so its execution binding and retention
         # policy are validated first; the write goes through the manager, which
         # stamps the tenant from the authoritative context.
-        await self._manager.remember(
+        persisted = await self._manager.remember(
             content,
             context,
             scope=MemoryScope.TASK,
             sensitivity=sensitivity,
             retention=record.retention,
+            record_id=record_id,
         )
-        return record
+        return persisted if isinstance(persisted, MemoryRecord) else record
 
     async def remember_fact(
         self,
@@ -132,13 +133,15 @@ class MemoryService:
             agent_id=context.agent_id,
             sensitivity=sensitivity,
         )
-        await self._manager.remember(
+        persisted = await self._manager.remember(
             content,
             context,
             scope=MemoryScope.DURABLE,
             sensitivity=sensitivity,
+            retention=record.retention,
+            record_id=record_id,
         )
-        return record
+        return persisted if isinstance(persisted, MemoryRecord) else record
 
     async def recall(
         self,

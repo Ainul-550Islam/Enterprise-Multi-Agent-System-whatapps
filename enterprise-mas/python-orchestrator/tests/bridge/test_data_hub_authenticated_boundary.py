@@ -95,8 +95,8 @@ async def test_signed_data_hub_scope_body_replay_and_tenant_are_enforced() -> No
             require_scope=ServiceScope.EXECUTE_AGENT,
             internal_service_secret=_SECRET,
             require_internal_signature=True,
+            replay_guard=InMemoryReplayGuard(),
         ),
-        replay_guard=InMemoryReplayGuard(),
     )
     data_hub = DataHubBridgeServicer(service=service, agent_bridge=boundary)  # type: ignore[arg-type]
     server = grpc.aio.server()
@@ -165,9 +165,10 @@ async def test_signed_purge_rejects_invalid_scope_before_index_work() -> None:
             _TOKEN, scopes={ServiceScope.DATA_HUB_PURGE}
         ),
         config=AgentBridgeServicerConfig(
-            internal_service_secret=_SECRET, require_internal_signature=True
+            internal_service_secret=_SECRET,
+            require_internal_signature=True,
+            replay_guard=InMemoryReplayGuard(),
         ),
-        replay_guard=InMemoryReplayGuard(),
     )
     server = grpc.aio.server()
     pbg.add_DataHubBridgeApiServicer_to_server(
@@ -217,9 +218,10 @@ async def test_signed_data_hub_deadline_must_be_valid_and_unexpired() -> None:
             _TOKEN, scopes={ServiceScope.DATA_HUB_SYNC}
         ),
         config=AgentBridgeServicerConfig(
-            internal_service_secret=_SECRET, require_internal_signature=True
+            internal_service_secret=_SECRET,
+            require_internal_signature=True,
+            replay_guard=InMemoryReplayGuard(),
         ),
-        replay_guard=InMemoryReplayGuard(),
     )
     server = grpc.aio.server()
     pbg.add_DataHubBridgeApiServicer_to_server(

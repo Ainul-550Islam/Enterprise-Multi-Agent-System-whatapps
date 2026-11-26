@@ -51,6 +51,14 @@ class TestWhatsappSupportAgent:
         _, triage = result
         assert all(len(segment) <= 20 for segment in triage.reply_segments)
 
+    def test_reply_is_sanitized_and_formatted_for_whatsapp(self) -> None:
+        self.agent.draft_reply = lambda intent, customer_name="there": "<b>**Hello**</b>"
+
+        result = self.agent.handle_message("hello")
+
+        assert result.reply_segments == ("*Hello*",)
+        assert "<b>" not in result.reply_segments[0]
+
     def test_invalid_limits_are_refused(self) -> None:
         with pytest.raises(ValueError):
             WhatsappSupportAgent(max_segment_chars=0)

@@ -73,3 +73,24 @@ class TestTranscriberHook:
         hook = UnsupportedTranscriber()
         with pytest.raises(UnsupportedTranscriptionError):
             await hook.transcribe(b"bytes", mime_type="audio/ogg")
+
+
+class TestWhatsAppFormatting:
+    def test_markdown_is_converted_to_whatsapp_markup(self) -> None:
+        from mas_orchestrator.channels.whatsapp_format import format_for_whatsapp
+
+        assert format_for_whatsapp("## Update\n**Ready** and _safe_.") == (
+            "Update\n*Ready* and _safe_."
+        )
+
+    def test_html_and_table_rows_are_removed_before_sending(self) -> None:
+        from mas_orchestrator.channels.whatsapp_format import (
+            format_for_whatsapp,
+            reject_tables_and_html,
+        )
+
+        raw = "<b>Summary</b>\n| Name | Status |\n|---|---|\n| API | Ready |"
+        safe = format_for_whatsapp(reject_tables_and_html(raw))
+        assert "<b>" not in safe
+        assert "| Name | Status |" not in safe
+        assert "Summary" in safe

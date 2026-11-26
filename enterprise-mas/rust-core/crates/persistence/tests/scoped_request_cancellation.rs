@@ -7,7 +7,9 @@ use mas_common::error::AppError;
 use mas_common::ids::{OrganizationId, TenantId};
 use mas_persistence::scoped_request::{connection, with_authoritative_scope};
 use mas_security::AuthoritativeScope;
-use sqlx::{postgres::PgPoolOptions, PgPool};
+use sqlx::PgPool;
+
+mod support;
 use tokio::sync::oneshot;
 
 fn scope() -> AuthoritativeScope {
@@ -36,13 +38,12 @@ async fn assert_clean(pool: &PgPool, pid: i32, expected_rows: i64) {
 
 #[tokio::test]
 async fn scoped_transaction_does_not_leak_after_cancel_panic_error_or_escaped_guard() {
-    let app_url =
-        std::env::var("MAS_TEST_DATABASE_APP_URL").expect("MAS_TEST_DATABASE_APP_URL required");
-    let pool = PgPoolOptions::new()
-        .max_connections(1)
-        .connect(&app_url)
-        .await
-        .expect("app pool");
+    let Some(_admin) = support::live_pool("scoped-request-cancellation-migrator").await else {
+        return;
+    };
+    let Some(pool) = support::live_app_pool("scoped-request-cancellation-app").await else {
+        return;
+    };
     sqlx::query("CREATE TEMP TABLE scope_cancel_probe (value integer)")
         .execute(&pool)
         .await

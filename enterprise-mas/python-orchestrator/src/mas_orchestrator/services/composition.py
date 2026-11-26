@@ -235,7 +235,10 @@ def build_identity_resolver(settings: Settings) -> ServiceIdentityResolver:
         # ``Secret`` refuses an empty value, so a configured-but-empty token is
         # reported here as a configuration error rather than becoming a
         # resolver that accepts empty credentials.
-        token = resolve_secret(settings.security.service_token_ref).reveal()
+        token_reference = (
+            settings.security.service_token_ref or settings.service.service_token_secret_ref
+        )
+        token = resolve_secret(token_reference).reveal()
     except ConfigurationError as error:
         raise ConfigurationError(
             "the agent bridge requires a configured service token; "

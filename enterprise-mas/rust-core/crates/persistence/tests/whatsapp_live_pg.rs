@@ -235,29 +235,35 @@ async fn channel_owner_resolves_by_phone_number() {
     let scope = seed_scope(&pool, "owner").await;
     let suffix = uuid::Uuid::now_v7().to_string().replace('-', "");
     let phone = format!("pn-owner-{suffix}");
-    scoped(pool.clone(), scope.tenant.id, scope.organization.id, {
+    let tenant_id = scope.tenant.id;
+    let organization_id = scope.organization.id;
+    scoped(pool.clone(), tenant_id, organization_id, {
         let phone = phone.clone();
         move |p| async move {
-            let store = PostgresWhatsAppStore::new(p);
-            store
-                .create_channel(&channel(scope.tenant.id, &phone, "owner line"))
+            PostgresWhatsAppStore::new(p)
+                .create_channel(&channel(tenant_id, &phone, "owner line"))
                 .await
                 .expect("channel");
-            let owner = store
-                .resolve_owner_by_phone_number(&phone)
-                .await
-                .expect("resolve");
-            assert_eq!(
-                owner,
-                Some((scope.tenant.id, scope.organization.id)),
-                "phone handle must resolve to the owning tenant"
-            );
-            let missing = store
-                .resolve_owner_by_phone_number("pn-does-not-exist")
-                .await
-                .expect("resolve missing");
-            assert!(missing.is_none(), "unknown handles resolve to nothing");
         }
     })
     .await;
+
+    // Inbound webhook ownership resolution is deliberately pre-scope, so it
+    // runs after the channel transaction commits and on the separate resolver
+    // connection rather than reading its own uncommitted insert.
+    let resolver = PostgresWhatsAppStore::new(pool);
+    let owner = resolver
+        .resolve_owner_by_phone_number(&phone)
+        .await
+        .expect("resolve");
+    assert_eq!(
+        owner,
+        Some((tenant_id, organization_id)),
+        "phone handle must resolve to the owning tenant"
+    );
+    let missing = resolver
+        .resolve_owner_by_phone_number("pn-does-not-exist")
+        .await
+        .expect("resolve missing");
+    assert!(missing.is_none(), "unknown handles resolve to nothing");
 }

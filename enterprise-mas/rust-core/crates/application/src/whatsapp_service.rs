@@ -25,6 +25,7 @@
 use std::fmt;
 use std::sync::Arc;
 
+use crate::whatsapp_policy::{authorize_outbound, SendDecision, TokenBucket};
 use async_trait::async_trait;
 use mas_common::error::AppError;
 use mas_common::ids::{
@@ -207,6 +208,7 @@ pub struct WhatsAppService {
     app_secret: SecretString,
     /// The configured webhook verify token for subscription checks.
     verify_token: SecretString,
+    outbound_limiter: TokenBucket,
 }
 
 impl fmt::Debug for WhatsAppService {
@@ -233,6 +235,9 @@ impl WhatsAppService {
             gateway,
             app_secret,
             verify_token,
+            // Conservative per-recipient burst/sustained rate shared across this service.
+            outbound_limiter: TokenBucket::new(10, 1.0)
+                .expect("static WhatsApp outbound rate limits are valid"),
         }
     }
 
@@ -415,20 +420,57 @@ impl WhatsAppService {
                     conversation.channel_id.as_uuid().to_string(),
                 )
             })?;
+        let template_send = if let Some(name) = template_name {
+            let language = template_language.unwrap_or("en");
+            let approved = self
+                .store
+                .list_templates(tenant_id, conversation.channel_id)
+                .await?
+                .into_iter()
+                .any(|template| {
+                    template.name == name
+                        && template.language == language
+                        && template.status.eq_ignore_ascii_case("approved")
+                });
+            if !approved {
+                return Err(AppError::validation(
+                    "the requested WhatsApp template is not approved for this channel and language",
+                ));
+            }
+            true
+        } else {
+            false
+        };
+        match authorize_outbound(
+            &self.outbound_limiter,
+            &conversation,
+            channel.id,
+            mas_common::timestamps::Timestamp::now(),
+            template_send,
+        ) {
+            SendDecision::Allow => {},
+            SendDecision::OptedOut => {
+                return Err(AppError::conflict(
+                    "the contact opted out; outbound is refused",
+                ));
+            },
+            SendDecision::TemplateRequired => {
+                return Err(AppError::validation(
+                    "the 24-hour customer-care window has closed; send a template",
+                ));
+            },
+            SendDecision::RateLimited { retry_after_ms } => {
+                return Err(AppError::rate_limited(format!(
+                    "WhatsApp recipient rate limit exceeded; retry after {retry_after_ms} ms"
+                )));
+            },
+        }
         let receipt = if let Some(name) = template_name {
             let language = template_language.unwrap_or("en");
             self.gateway
                 .send_template(&channel, &conversation.contact, name, language)
                 .await?
         } else {
-            let window_open = conversation
-                .window_expires_at
-                .is_some_and(|expires| expires > mas_common::timestamps::Timestamp::now());
-            if !window_open {
-                return Err(AppError::validation(
-                    "the 24-hour customer-care window has closed; send a template",
-                ));
-            }
             let body = body
                 .map(str::trim)
                 .filter(|value| !value.is_empty())

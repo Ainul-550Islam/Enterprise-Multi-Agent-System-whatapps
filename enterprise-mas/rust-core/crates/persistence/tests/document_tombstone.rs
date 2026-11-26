@@ -7,24 +7,18 @@ use mas_domain::{Document, DocumentStatus};
 use mas_persistence::repositories::PostgresDocumentStore;
 use mas_persistence::scoped_request::with_authoritative_scope;
 use mas_security::AuthoritativeScope;
-use sqlx::postgres::PgPoolOptions;
 use uuid::Uuid;
+
+mod support;
 
 #[tokio::test]
 async fn deleted_document_cannot_be_revived_by_a_stale_writer() {
-    let admin_url = std::env::var("MAS_TEST_DATABASE_URL").expect("MAS_TEST_DATABASE_URL required");
-    let app_url =
-        std::env::var("MAS_TEST_DATABASE_APP_URL").expect("MAS_TEST_DATABASE_APP_URL required");
-    let admin = PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&admin_url)
-        .await
-        .expect("admin pool");
-    let app = PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&app_url)
-        .await
-        .expect("app pool");
+    let Some(admin) = support::live_pool("document-tombstone-admin").await else {
+        return;
+    };
+    let Some(app) = support::live_app_pool("document-tombstone-app").await else {
+        return;
+    };
     let tenant = TenantId::new();
     let organization = OrganizationId::new();
     let project = ProjectId::new();
@@ -114,12 +108,9 @@ async fn deleted_document_cannot_be_revived_by_a_stale_writer() {
 
 #[tokio::test]
 async fn database_rejects_cross_project_and_cross_tenant_catalogue_links() {
-    let url = std::env::var("MAS_TEST_DATABASE_URL").expect("MAS_TEST_DATABASE_URL required");
-    let pool = PgPoolOptions::new()
-        .max_connections(1)
-        .connect(&url)
-        .await
-        .expect("admin pool");
+    let Some(pool) = support::live_pool("document-catalogue-constraint").await else {
+        return;
+    };
     let mut tx = pool.begin().await.expect("transaction");
     let org = Uuid::new_v4();
     let tenant_a = Uuid::new_v4();

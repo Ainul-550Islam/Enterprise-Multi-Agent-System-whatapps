@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Final, Protocol, runtime_checkable
 
 from mas_orchestrator.contracts.errors import ConfigurationError, MemoryBackendError
+from mas_orchestrator.memory.backends import MAX_RECORDS_PER_TENANT
 from mas_orchestrator.memory.models import (
     MemoryHit,
     MemoryQuery,
@@ -89,6 +90,7 @@ class MemoryManager:
     ) -> None:
         self._store = store
         self._redaction = redaction or NoRedaction()
+        self._redaction_configured = redaction is not None
         self._config = config or MemoryConfig()
 
     async def remember(
@@ -100,6 +102,7 @@ class MemoryManager:
         sensitivity: Sensitivity = Sensitivity.INTERNAL,
         retention: Retention | None = None,
         metadata: dict[str, object] | None = None,
+        record_id: str | None = None,
     ) -> MemoryRecord:
         """Stores a memory.
 
@@ -119,11 +122,17 @@ class MemoryManager:
 
         applied_redaction = False
         if sensitivity.requires_redaction:
+            if not self._redaction_configured:
+                raise ConfigurationError(
+                    "sensitive memory requires a configured redaction hook",
+                    details={"field": "redaction"},
+                )
             content = self._redaction.redact(content)
             applied_redaction = True
+        content = content.strip()
 
         record = MemoryRecord(
-            record_id=new_record_id(),
+            record_id=record_id or new_record_id(),
             tenant_id=context.tenant_id,
             scope=scope,
             content=content,
@@ -168,17 +177,37 @@ class MemoryManager:
 
         The tenant comes from the context, never from the arguments.
         """
-        query = MemoryQuery(
-            tenant_id=context.tenant_id,
-            scopes=scopes,
-            text=text,
-            agent_id=None,
-            execution_id=None,
-            limit=min(limit or self._config.max_context_records, self._config.max_context_records),
-            include_sensitive=include_sensitive,
+        result_limit = min(
+            limit or self._config.max_context_records, self._config.max_context_records
         )
+        hits: list[MemoryHit] = []
         try:
-            return await self._store.query(query)
+            for scope in scopes:
+                query = MemoryQuery(
+                    tenant_id=context.tenant_id,
+                    scopes=(scope,),
+                    text=text,
+                    agent_id=context.agent_id if scope is MemoryScope.EPISODIC else None,
+                    execution_id=context.execution_id if scope is MemoryScope.TASK else None,
+                    limit=result_limit,
+                    include_sensitive=include_sensitive,
+                )
+                hits.extend(await self._store.query(query))
+            scoped_hits = [
+                hit
+                for hit in hits
+                if hit.record.tenant_id == context.tenant_id
+                and hit.record.scope in scopes
+                and (
+                    hit.record.scope is not MemoryScope.TASK
+                    or hit.record.execution_id == context.execution_id
+                )
+                and (
+                    hit.record.scope is not MemoryScope.EPISODIC
+                    or hit.record.agent_id == context.agent_id
+                )
+            ]
+            return scoped_hits[:result_limit]
         except ConfigurationError as error:
             raise MemoryBackendError(
                 "memory read failed", details={"reason": str(error)}
@@ -190,6 +219,13 @@ class MemoryManager:
         Returns:
             Whether the record existed.
         """
+        record = await self._store.get(context.tenant_id, record_id)
+        if record is None or record.tenant_id != context.tenant_id:
+            return False
+        if record.scope is MemoryScope.TASK and record.execution_id != context.execution_id:
+            return False
+        if record.scope is MemoryScope.EPISODIC and record.agent_id != context.agent_id:
+            return False
         return await self._store.delete(context.tenant_id, record_id)
 
     async def forget_execution(self, context: ExecutionContext) -> int:
@@ -199,11 +235,24 @@ class MemoryManager:
         execution is a leak, and one that is easy to miss because the records
         are individually harmless.
         """
+        close_execution = getattr(self._store, "close_execution", None)
+        if callable(close_execution):
+            try:
+                removed: object = await close_execution(context.tenant_id, context.execution_id)
+                if not isinstance(removed, int) or removed < 0:
+                    raise ConfigurationError("memory execution cleanup returned an invalid count")
+                return removed
+            except ConfigurationError as error:
+                raise MemoryBackendError(
+                    "memory execution cleanup failed",
+                    details={"execution_id": context.execution_id, "reason": str(error)},
+                ) from error
+
         query = MemoryQuery(
             tenant_id=context.tenant_id,
             scopes=(MemoryScope.TASK,),
             execution_id=context.execution_id,
-            limit=MAX_CONTEXT_RECORDS * 32,
+            limit=MAX_RECORDS_PER_TENANT,
             include_sensitive=True,
         )
         hits = await self._store.query(query)

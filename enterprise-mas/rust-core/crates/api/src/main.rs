@@ -73,7 +73,12 @@ async fn main() {
 }
 
 async fn run() -> Result<i32, String> {
-    let dev_inmemory = std::env::args().skip(1).any(|arg| arg == "--dev-inmemory");
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|arg| arg == "--health") {
+        println!("ok");
+        return Ok(0);
+    }
+    let dev_inmemory = args.iter().any(|arg| arg == "--dev-inmemory");
 
     let layered = mas_common::config::load_layered().map_err(|err| format!("config: {err}"))?;
     let merger = mas_common::config::Merger::new(&layered);

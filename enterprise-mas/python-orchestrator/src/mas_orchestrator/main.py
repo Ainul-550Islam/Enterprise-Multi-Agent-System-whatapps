@@ -46,8 +46,10 @@ from collections.abc import Awaitable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final
 
+from mas_orchestrator.config.enums import Environment
 from mas_orchestrator.config.settings import load_settings
 from mas_orchestrator.config.validation import validate_settings_or_raise
+from mas_orchestrator.contracts.errors import ConfigurationError
 from mas_orchestrator.grpc.agent_bridge_servicer import (
     AgentBridgeServicer,
     AgentBridgeServicerConfig,
@@ -199,15 +201,22 @@ def _internal_signing_secret(settings: Settings) -> str | None:
     return resolve_secret(reference).reveal()
 
 
-def _internal_replay_guard(settings: Settings) -> InternalReplayGuard | None:
-    """Builds the shared nonce consumer required by production bridge auth."""
+def _internal_replay_guard(settings: Settings) -> InternalReplayGuard:
+    """Builds durable replay storage outside development, local fallback only in dev."""
     reference = settings.security.internal_replay_database_url_secret_ref
-    if not reference:
-        return None
-    from mas_orchestrator.security.credentials import resolve_secret
-    from mas_orchestrator.security.internal_replay import PostgresReplayGuard
+    if reference:
+        from mas_orchestrator.security.credentials import resolve_secret
+        from mas_orchestrator.security.internal_replay import PostgresReplayGuard
 
-    return PostgresReplayGuard(resolve_secret(reference).reveal())
+        return PostgresReplayGuard(resolve_secret(reference).reveal())
+    if settings.environment is Environment.DEVELOPMENT:
+        from mas_orchestrator.security.internal_replay import InMemoryReplayGuard
+
+        return InMemoryReplayGuard()
+    raise ConfigurationError(
+        "non-development bridge auth requires a durable internal replay database secret",
+        details={"field": "security.internal_replay_database_url_secret_ref"},
+    )
 
 
 def build_bridge_server(

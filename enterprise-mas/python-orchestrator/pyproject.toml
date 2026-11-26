@@ -212,5 +212,5 @@ exclude_lines = [
 # installation deliberately does not install them, so static checking of the
 # base dependency set must not require their third-party stubs.
 [[tool.mypy.overrides]]
-module = ["pypdf", "pgvector", "pgvector.*"]
+module = ["pypdf", "pgvector", "pgvector.*", "docx", "docx.*"]
 ignore_missing_imports = true

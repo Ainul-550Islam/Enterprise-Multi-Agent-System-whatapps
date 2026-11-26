@@ -74,12 +74,13 @@ class InMemoryLexicalIndex:
     """A BM25-flavoured keyword index for development and tests."""
 
     def __init__(self) -> None:
-        self._items: dict[str, EmbeddedChunk] = {}
+        self._items: dict[tuple[str, str, str], EmbeddedChunk] = {}
 
     async def upsert(self, items: Sequence[EmbeddedChunk]) -> None:
         """Adds chunks to the index."""
         for item in items:
-            self._items[item.chunk.chunk_id] = item
+            key = (item.chunk.access.tenant_id, item.chunk.document_id, item.chunk.chunk_id)
+            self._items[key] = item
 
     async def search(
         self,
@@ -159,10 +160,35 @@ class Retriever:
         lexical: LexicalIndex | None = None,
         config: RetrievalConfig | None = None,
     ) -> None:
+        resolved_config = config or RetrievalConfig()
+        if lexical is not None and resolved_config.hybrid:
+            from mas_orchestrator.rag.index import InMemoryVectorIndex
+            from mas_orchestrator.rag.pgvector_index import PgVectorIndex
+
+            current: object = index
+            seen: set[int] = set()
+            wraps_pgvector = False
+            while id(current) not in seen:
+                seen.add(id(current))
+                if isinstance(current, PgVectorIndex):
+                    wraps_pgvector = True
+                    break
+                wrapped = getattr(current, "wrapped", None)
+                if wrapped is None:
+                    break
+                current = wrapped
+            if wraps_pgvector or not (
+                type(index) is InMemoryVectorIndex and type(lexical) is InMemoryLexicalIndex
+            ):
+                raise ConfigurationError(
+                    "this vector index does not support a separate lexical index because it "
+                    "cannot preserve the same ownership and deletion fences"
+                )
+
         self._embedder = embedder
         self._index = index
         self._lexical = lexical
-        self._config = config or RetrievalConfig()
+        self._config = resolved_config
 
     async def retrieve(
         self,
@@ -208,11 +234,17 @@ class Retriever:
         except ConfigurationError as error:
             raise RetrievalError("vector search failed", details={"reason": str(error)}) from error
 
+        vector_hits = [
+            (item, score) for item, score in vector_hits if item.chunk.access.permits(context)
+        ]
         keyword_hits: list[tuple[EmbeddedChunk, float]] = []
         if self._config.hybrid and self._lexical is not None:
             keyword_hits = await self._lexical.search(
                 query, context=context, limit=self._config.candidate_k
             )
+            keyword_hits = [
+                (item, score) for item, score in keyword_hits if item.chunk.access.permits(context)
+            ]
 
         fused = fuse(vector_hits, keyword_hits, limit=limit)
 
@@ -241,20 +273,32 @@ def fuse(
     lists accumulates both contributions, which is how agreement between the
     two signals is expressed without needing their scores to be comparable.
     """
-    scores: dict[str, float] = {}
-    vector_scores: dict[str, float] = {}
-    keyword_scores: dict[str, float] = {}
-    items: dict[str, EmbeddedChunk] = {}
+    scores: dict[tuple[str, str, str], float] = {}
+    vector_scores: dict[tuple[str, str, str], float] = {}
+    keyword_scores: dict[tuple[str, str, str], float] = {}
+    items: dict[tuple[str, str, str], EmbeddedChunk] = {}
+
+    def identity(item: EmbeddedChunk) -> tuple[str, str, str]:
+        return (item.chunk.access.tenant_id, item.chunk.document_id, item.chunk.chunk_id)
+
+    def record(item: EmbeddedChunk, key: tuple[str, str, str]) -> None:
+        existing = items.get(key)
+        if existing is not None and existing != item:
+            raise RetrievalError(
+                "vector and lexical indexes disagree about the same chunk",
+                details={"tenant_id": key[0], "document_id": key[1], "chunk_id": key[2]},
+            )
+        items[key] = item
 
     for rank, (item, score) in enumerate(vector_hits, start=1):
-        key = item.chunk.chunk_id
-        items[key] = item
+        key = identity(item)
+        record(item, key)
         vector_scores[key] = score
         scores[key] = scores.get(key, 0.0) + 1.0 / (RRF_K + rank)
 
     for rank, (item, score) in enumerate(keyword_hits, start=1):
-        key = item.chunk.chunk_id
-        items[key] = item
+        key = identity(item)
+        record(item, key)
         keyword_scores[key] = score
         scores[key] = scores.get(key, 0.0) + 1.0 / (RRF_K + rank)
 

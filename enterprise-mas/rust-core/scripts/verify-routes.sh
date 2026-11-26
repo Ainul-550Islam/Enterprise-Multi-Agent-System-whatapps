@@ -11,7 +11,7 @@
 
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
-EV_DIR="../ci-evidence"
+EV_DIR="${TMPDIR:-/tmp}/enterprise-mas-route-evidence-${USER:-user}-$$"
 mkdir -p "$EV_DIR"
 
 FAILS=0
@@ -235,7 +235,7 @@ fi
 export CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0
 build_log="$EV_DIR/B_build.log"
 if ! cargo build -p mas-api --bin mas-api >"$build_log" 2>&1; then
-    note_fail "cargo build -p mas-api --bin mas-api (see ci-evidence/B_build.log)"
+    note_fail "cargo build -p mas-api --bin mas-api (see temporary route-evidence directory)"
     tail -20 "$build_log"
     echo "NOT_RUN_REASON=build failure"
     echo "EXIT_CODE=$FAILS"
@@ -261,7 +261,7 @@ if [ -f "$STUB_ROOT/tests/bridge/stub_server.py" ]; then
     done
 fi
 if [ -n "$STUB_PORT" ]; then
-    note_pass "Python AgentBridge stub listening on 127.0.0.1:$STUB_PORT (ci-evidence/B_stub.log)"
+    note_pass "Python AgentBridge stub listening on 127.0.0.1:$STUB_PORT (temporary route-evidence directory)"
 else
     note_fail "Python AgentBridge stub startup (tests/bridge/stub_server.py)"
     echo "NOT_RUN: route curls — AgentBridge stub did not start"
@@ -336,9 +336,9 @@ if [ "$READY" -ne 1 ]; then
     echo "-- boot log tail --"
     tail -40 "$EV_DIR/B_boot.log" 2>/dev/null || true
     if kill -0 "$SERVER_PID" 2>/dev/null; then
-        echo "NOT_RUN: route curls — server never became ready (log ci-evidence/B_boot.log)"
+        echo "NOT_RUN: route curls — server never became ready (log temporary route-evidence directory)"
     else
-        echo "NOT_RUN: route curls — server exited during boot (log ci-evidence/B_boot.log)"
+        echo "NOT_RUN: route curls — server exited during boot (log temporary route-evidence directory)"
     fi
     echo "EXIT_CODE=$FAILS"
     date -u +%Y-%m-%dT%H:%M:%SZ

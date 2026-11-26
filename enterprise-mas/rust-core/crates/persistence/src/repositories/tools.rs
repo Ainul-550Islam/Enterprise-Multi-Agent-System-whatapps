@@ -185,7 +185,7 @@ impl ToolStorePort for PostgresToolStore {
     ) -> Result<()> {
         ensure_permission_set(tenant, tool, permissions)?;
         let mut scoped = crate::scoped_request::connection().await?;
-        let connection = scoped.connection().as_mut();
+        let connection = scoped.connection();
         sqlx::query("SAVEPOINT tool_permission_replace")
             .execute(&mut *connection)
             .await
@@ -251,7 +251,7 @@ impl ToolStorePort for PostgresToolStore {
         }
         ensure_tenant(tenant)?;
         let mut scoped = crate::scoped_request::connection().await?;
-        let connection = scoped.connection().as_mut();
+        let connection = scoped.connection();
         sqlx::query("SAVEPOINT agent_tool_permission_replace")
             .execute(&mut *connection)
             .await

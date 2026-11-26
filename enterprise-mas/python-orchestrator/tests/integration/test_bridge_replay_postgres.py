@@ -30,7 +30,14 @@ from tests.bridge.conftest import (
     resolver,
 )
 
-pytestmark = [pytest.mark.integration, pytest.mark.asyncio(loop_scope="function")]
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.asyncio(loop_scope="function"),
+    pytest.mark.skipif(
+        not os.environ.get("MAS_TEST_REPLAY_DATABASE_URL"),
+        reason="MAS_TEST_REPLAY_DATABASE_URL is required",
+    ),
+]
 
 
 async def test_signed_request_executes_once_across_bridge_replicas() -> None:

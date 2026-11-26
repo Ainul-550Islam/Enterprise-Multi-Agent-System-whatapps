@@ -35,10 +35,21 @@ def build_data_hub_service(settings: Settings) -> DataHubService:
     from mas_orchestrator.security.credentials import resolve_secret
 
     data = settings.data_hub
-    db_url = resolve_secret(data.database_url_secret_ref).reveal()
-    api_key = resolve_secret(data.embedding_api_key_secret_ref)
-    index = PgVectorIndex.deferred(db_url, dimensions=1536, database_role="mas_rag")
-    embedder = OpenAIEmbedder(api_key=api_key, model=data.embedding_model, dimensions=1536)
+    database_ref = data.database_url_secret_ref
+    embedding_ref = settings.rag.embedding_api_key_secret_ref
+    if not database_ref or not embedding_ref:
+        raise ConfigurationError("Data Hub database and embedding secret references are required")
+    if data.database_role not in (None, "mas_rag"):
+        raise ConfigurationError("Data Hub requires the dedicated mas_rag database role")
+
+    database_url = resolve_secret(database_ref).reveal()
+    api_key = resolve_secret(embedding_ref)
+    index = PgVectorIndex.deferred(database_url, dimensions=1536, database_role="mas_rag")
+    embedder = OpenAIEmbedder(
+        api_key=api_key,
+        model=settings.rag.embedding_model,
+        dimensions=1536,
+    )
     pipeline = IngestionPipeline(
         index=index,
         embedder=embedder,
@@ -49,13 +60,15 @@ def build_data_hub_service(settings: Settings) -> DataHubService:
                 overlap_chars=settings.rag.chunk_overlap_chars,
             ),
             index_lexically=False,
-            atomic_document_replace=True,
+            parser_workers=data.parser_workers,
+            parser_timeout_seconds=data.parser_timeout_seconds,
+            parser_memory_bytes=data.parser_memory_bytes,
         ),
     )
     adapters: dict[DataSourceKind, SourceSyncAdapter] = {}
     if DataSourceKind.WEB in data.allowed_source_kinds:
         web = WebCrawlAdapter(
-            allowed_hosts=data.allowed_web_hosts,
+            allowed_hosts=data.crawl_egress_allowlist,
             max_depth=data.max_crawl_depth,
             max_pages=data.max_pages_per_sync,
             max_document_bytes=data.max_document_bytes,
@@ -64,13 +77,16 @@ def build_data_hub_service(settings: Settings) -> DataHubService:
         adapters[DataSourceKind.WEB] = web.sync
     if DataSourceKind.OBJECT_STORAGE in data.allowed_source_kinds:
         objects = S3CompatibleAdapter(
-            allowed_hosts=data.allowed_object_hosts,
+            allowed_hosts=data.object_storage_egress_allowlist,
             max_pages=data.max_pages_per_sync,
             max_document_bytes=data.max_document_bytes,
             max_sync_bytes=data.max_sync_bytes,
-            bindings=data.object_storage_bindings,
         )
         adapters[DataSourceKind.OBJECT_STORAGE] = objects.sync
     return DataHubService(
-        settings=settings, pipeline=pipeline, index=index, embedder=embedder, adapters=adapters
+        settings=settings,
+        pipeline=pipeline,
+        index=index,
+        embedder=embedder,
+        adapters=adapters,
     )

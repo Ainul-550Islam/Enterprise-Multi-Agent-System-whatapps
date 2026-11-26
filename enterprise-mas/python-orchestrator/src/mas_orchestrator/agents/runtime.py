@@ -36,6 +36,7 @@ from mas_orchestrator.contracts.errors import (
     CancellationRequestedError,
     ConfigurationError,
     ExecutionTimeoutError,
+    InvalidRequestError,
 )
 from mas_orchestrator.models.cost import CostLedger
 
@@ -175,6 +176,19 @@ class AgentRuntime:
         started = time.monotonic()
         ledger = CostLedger(self._pricing) if self._pricing is not None else None
 
+        if agent_spec is not None and (
+            agent_spec.tenant_id != context.tenant_id
+            or agent_spec.agent_id != agent_id
+            or (
+                context.agent_version_id is not None
+                and agent_spec.agent_version_id != context.agent_version_id
+            )
+        ):
+            raise InvalidRequestError(
+                "Rust-resolved agent snapshot does not match the execution scope",
+                details={"agent_id": agent_id, "tenant_id": context.tenant_id},
+            )
+
         spec = self._select_agent(context.tenant_id, routing, agent_id, agent_spec=agent_spec)
         agent = self._factory.build(spec, ledger=ledger)
 
@@ -239,7 +253,14 @@ class AgentRuntime:
                     "supervisor execution requires pinned delegated-agent snapshots",
                     details={"agent_id": agent_spec.agent_id},
                 )
-            if self._router.evaluate(agent_spec, routing or AgentRoutingRequest()) is not None:
+            request = routing or AgentRoutingRequest()
+            pinned_evaluator = getattr(self._router, "evaluate_pinned", None)
+            rejection = (
+                pinned_evaluator(agent_spec, request)
+                if callable(pinned_evaluator)
+                else self._router.evaluate(agent_spec, request)
+            )
+            if rejection is not None:
                 raise AgentNotFoundError(
                     "the requested agent does not satisfy the routing policy",
                     details={"agent_id": selected_id, "tenant_id": tenant_id},

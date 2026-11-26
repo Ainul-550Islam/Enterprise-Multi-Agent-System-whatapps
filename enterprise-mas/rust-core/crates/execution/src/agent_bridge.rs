@@ -74,7 +74,7 @@ impl AgentUsage {
 /// Sanitized runtime settings extracted from one immutable Rust-published
 /// version. Only fields consumed by the Python runtime cross the bridge; the
 /// arbitrary domain metadata map is intentionally never serialized.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentRuntimeConfiguration {
     #[serde(default)]
@@ -89,6 +89,15 @@ pub struct AgentRuntimeConfiguration {
     pub tags: Vec<String>,
     #[serde(default)]
     pub allowed_tools: Vec<String>,
+}
+
+impl fmt::Debug for AgentRuntimeConfiguration {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AgentRuntimeConfiguration")
+            .field("contents", &"[REDACTED]")
+            .finish()
+    }
 }
 
 /// Per-agent runtime ceilings. Python applies the same platform hard caps.
@@ -255,6 +264,12 @@ fn validate_runtime_configuration(configuration: &AgentRuntimeConfiguration) -> 
             .allowed_tools
             .iter()
             .any(|tool| tool.trim().is_empty() || tool.len() > 256)
+        || configuration
+            .allowed_tools
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            != configuration.allowed_tools.len()
     {
         return Err(AppError::invalid_field(
             "configuration_snapshot.allowed_tools",

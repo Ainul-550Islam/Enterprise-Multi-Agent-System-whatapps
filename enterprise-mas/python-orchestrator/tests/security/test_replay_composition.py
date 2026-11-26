@@ -17,11 +17,11 @@ def test_production_validation_requires_a_replay_store_secret_reference() -> Non
     absent = settings.model_copy(
         update={
             "security": settings.security.model_copy(
-                update={"internal_replay_database_url_ref": None}
+                update={"internal_replay_database_url_secret_ref": None}
             )
         }
     )
-    assert "security.internal_replay_database_url_ref" in {
+    assert "security.internal_replay_database_url_secret_ref" in {
         violation.field for violation in validate_settings(absent)
     }
     with pytest.raises(ConfigurationError):
@@ -41,7 +41,7 @@ def test_configured_secret_ref_produces_postgres_guard(monkeypatch: pytest.Monke
     monkeypatch.setenv("MAS_TEST_REPLAY_COMPOSITION_DSN", "postgresql://localhost/replay-test")
     settings = Settings(
         security=SecuritySettings(
-            internal_replay_database_url_ref="env:MAS_TEST_REPLAY_COMPOSITION_DSN"
+            internal_replay_database_url_secret_ref="env:MAS_TEST_REPLAY_COMPOSITION_DSN"
         )
     )
     assert isinstance(_internal_replay_guard(settings), PostgresReplayGuard)

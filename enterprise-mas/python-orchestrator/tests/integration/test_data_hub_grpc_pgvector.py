@@ -33,7 +33,13 @@ from mas_orchestrator.security.internal_service import (
     signed_internal_signature,
 )
 
-pytestmark = pytest.mark.integration
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.skipif(
+        not os.environ.get("MAS_TEST_RAG_DATABASE_URL"),
+        reason="MAS_TEST_RAG_DATABASE_URL is required",
+    ),
+]
 _TOKEN = "test-data-hub-token"
 _SECRET = "test-data-hub-signing-secret"
 

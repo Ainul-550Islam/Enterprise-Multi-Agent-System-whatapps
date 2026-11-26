@@ -366,11 +366,25 @@ class DataHubService:
             errors=tuple(errors),
         )
 
-    async def purge_document(self, *, tenant_id: str, document_id: str) -> int:
-        """Removes all vector and lexical records for one signed tenant/document."""
+    async def purge_document(
+        self,
+        *,
+        tenant_id: str,
+        organization_id: str,
+        project_id: str,
+        source_id: str,
+        document_id: str,
+    ) -> int:
+        """Removes indexed records for one signed tenant/project/source/document scope."""
         self._require_enabled()
-        _require_uuid(tenant_id, "tenant_id")
-        _require_uuid(document_id, "document_id")
+        for field, value in (
+            ("tenant_id", tenant_id),
+            ("organization_id", organization_id),
+            ("project_id", project_id),
+            ("source_id", source_id),
+            ("document_id", document_id),
+        ):
+            _require_uuid(value, field)
         if self._index is None:
             raise ConfigurationError("Data Hub vector index is not configured")
         removed = await self._index.delete_document(tenant_id, document_id)
@@ -438,16 +452,31 @@ def _safe_source_uri(value: str | None) -> str | None:
     """Removes fragments/query secrets and rejects unsafe citation URLs."""
     if value is None:
         return None
-    if len(value) > 2048 or any(character in value for character in "\r\n\x00"):
+    if (
+        len(value) > 2048
+        or value != value.strip()
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+        or "\\" in value
+    ):
         raise InvalidRequestError("Data Hub source URI is malformed")
-    parsed = urlsplit(value)
+    if value.startswith("//"):
+        raise InvalidRequestError("Data Hub source URI must not be protocol-relative")
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError as error:
+        raise InvalidRequestError("Data Hub source URI is malformed") from error
     if parsed.scheme and parsed.scheme.lower() not in {"http", "https"}:
         raise InvalidRequestError("Data Hub source URI uses an unsupported scheme")
+    if parsed.scheme and (not parsed.netloc or not parsed.hostname):
+        raise InvalidRequestError("Data Hub source URI must include a valid host")
+    if parsed.netloc and not parsed.scheme:
+        raise InvalidRequestError("Data Hub source URI must not be protocol-relative")
+    if port is not None and not 1 <= port <= 65535:
+        raise InvalidRequestError("Data Hub source URI port is outside the valid range")
     if parsed.username is not None or parsed.password is not None:
         raise InvalidRequestError("Data Hub source URI must not include user credentials")
-    return (
-        urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", "")) if parsed.scheme else value
-    )
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
 
 
 def _safe_metadata(value: Mapping[str, Any]) -> dict[str, Any]:

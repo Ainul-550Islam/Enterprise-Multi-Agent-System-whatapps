@@ -1,10 +1,12 @@
 """Data Hub startup fails closed on incomplete or unsafe configuration."""
 
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
 from mas_orchestrator.config.enums import DataSourceKind, VectorBackend
-from mas_orchestrator.config.settings import DataHubSettings, RagSettings, Settings
+from mas_orchestrator.config.settings import DataHubSettings, RagSettings, Settings, load_settings
 from mas_orchestrator.contracts.errors import ConfigurationError
 from mas_orchestrator.data_hub.composition import build_data_hub_service
 
@@ -23,123 +25,106 @@ def test_enabled_data_hub_requires_durable_pgvector() -> None:
 def test_enabled_data_hub_requires_secret_references() -> None:
     settings = Settings(
         rag=RagSettings(
-            enabled=True, vector_backend=VectorBackend.PGVECTOR, embedding_dimensions=1536
+            enabled=True,
+            vector_backend=VectorBackend.PGVECTOR,
+            embedding_dimensions=1536,
+            embedding_api_key_secret_ref=None,
         )
     )
-    with pytest.raises(ConfigurationError, match="secret reference"):
+    with pytest.raises(ConfigurationError, match="secret references"):
         build_data_hub_service(settings)
 
 
-def test_web_and_object_sources_require_explicit_egress_hosts() -> None:
-    for kind in (DataSourceKind.WEB, DataSourceKind.OBJECT_STORAGE):
-        with pytest.raises(ValidationError, match="allowlist"):
-            DataHubSettings(allowed_source_kinds=(kind,))
+def test_network_sources_require_explicit_egress_hosts() -> None:
+    from mas_orchestrator.data_hub.sources import S3CompatibleAdapter, WebCrawlAdapter
 
-
-def test_source_and_sync_byte_bounds_cannot_contradict() -> None:
-    with pytest.raises(ValidationError, match="byte bounds"):
-        DataHubSettings(max_upload_bytes=4096, max_document_bytes=2048)
-    with pytest.raises(ValidationError, match="byte bounds"):
-        DataHubSettings(max_document_bytes=4096, max_upload_bytes=2048, max_sync_bytes=2048)
-
-
-def test_data_hub_rejects_vector_index_that_exposes_unowned_rows() -> None:
-    from mas_orchestrator.data_hub.service import DataHubService
-    from mas_orchestrator.rag.pgvector_index import PgVectorIndex
-
-    settings = Settings(rag=RagSettings(enabled=True, vector_backend=VectorBackend.PGVECTOR))
-    unsafe_index = PgVectorIndex(object(), dimensions=1536, allow_unowned_documents=True)
-    with pytest.raises(ConfigurationError, match="cannot retrieve unowned"):
-        DataHubService(
-            settings=settings,
-            pipeline=object(),  # type: ignore[arg-type]
-            index=unsafe_index,
-            embedder=object(),  # type: ignore[arg-type]
+    with pytest.raises(ConfigurationError, match="non-empty egress allow-list"):
+        WebCrawlAdapter(
+            allowed_hosts=(),
+            max_depth=1,
+            max_pages=10,
+            max_document_bytes=4096,
+            max_sync_bytes=8192,
+        )
+    with pytest.raises(ConfigurationError, match="non-empty egress allow-list"):
+        S3CompatibleAdapter(
+            allowed_hosts=(),
+            max_pages=10,
+            max_document_bytes=4096,
+            max_sync_bytes=8192,
         )
 
 
-def test_operator_object_bindings_load_from_toml_and_reach_production_adapter(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: object
-) -> None:
-    from pathlib import Path
+def test_upload_and_document_byte_bounds_cannot_contradict() -> None:
+    with pytest.raises(
+        ValidationError, match="max_upload_bytes must not exceed max_document_bytes"
+    ):
+        DataHubSettings(max_upload_bytes=4096, max_document_bytes=2048)
 
-    from mas_orchestrator.config.settings import load_settings
+
+def test_data_hub_rejects_non_dedicated_pgvector_role() -> None:
+    settings = Settings(
+        rag=RagSettings(
+            enabled=True,
+            vector_backend=VectorBackend.PGVECTOR,
+            embedding_dimensions=1536,
+        ),
+        data_hub=DataHubSettings(
+            database_url_secret_ref="env:TEST_DATAHUB_DB",
+            database_role="application",
+        ),
+    )
+    with pytest.raises(ConfigurationError, match="dedicated mas_rag database role"):
+        build_data_hub_service(settings)
+
+
+def test_object_storage_adapter_uses_configured_egress_allowlist(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from mas_orchestrator.data_hub.sources import S3CompatibleAdapter
 
-    assert isinstance(tmp_path, Path)
-    (tmp_path / "default.toml").write_text("""
+    monkeypatch.setenv("TEST_DATAHUB_DB", "postgresql://unused:unused@localhost/unused")
+    monkeypatch.setenv("TEST_DATAHUB_EMBED", "dummy-not-a-real-provider-key")
+    settings = Settings(
+        rag=RagSettings(
+            enabled=True,
+            vector_backend=VectorBackend.PGVECTOR,
+            embedding_dimensions=1536,
+            embedding_api_key_secret_ref="env:TEST_DATAHUB_EMBED",
+        ),
+        data_hub=DataHubSettings(
+            allowed_source_kinds=(DataSourceKind.OBJECT_STORAGE,),
+            database_url_secret_ref="env:TEST_DATAHUB_DB",
+            object_storage_egress_allowlist=("storage.example.test",),
+        ),
+    )
+    service = build_data_hub_service(settings)
+    adapter = service._adapters[DataSourceKind.OBJECT_STORAGE].__self__  # type: ignore[attr-defined]
+    assert isinstance(adapter, S3CompatibleAdapter)
+    assert adapter._allowed_hosts == frozenset({"storage.example.test"})
+
+
+def test_operator_settings_load_egress_allowlist_from_toml(tmp_path: Path) -> None:
+    (tmp_path / "default.toml").write_text(
+        """
 [rag]
 enabled = true
 vector_backend = "pgvector"
 embedding_dimensions = 1536
+embedding_api_key_secret_ref = "env:TEST_DATAHUB_EMBED"
 [data_hub]
 database_url_secret_ref = "env:TEST_DATAHUB_DB"
-embedding_api_key_secret_ref = "env:TEST_DATAHUB_EMBED"
 allowed_source_kinds = ["object_storage"]
-allowed_object_hosts = ["storage.example.test"]
-[[data_hub.object_storage_bindings]]
-tenant_id = "00000000-0000-4000-8000-000000000012"
-organization_id = "00000000-0000-4000-8000-000000000013"
-project_id = "00000000-0000-4000-8000-000000000014"
-source_id = "00000000-0000-4000-8000-000000000011"
-endpoint_url = "https://storage.example.test"
-bucket = "test-bucket"
-prefix = "docs/"
-region = "us-east-1"
-access_key_secret_ref = "env:TEST_ACCESS_KEY"
-secret_key_secret_ref = "env:TEST_SECRET_KEY"
-""")
-    monkeypatch.setenv("TEST_DATAHUB_DB", "postgresql://unused:unused@localhost/unused")
-    monkeypatch.setenv("TEST_DATAHUB_EMBED", "dummy-not-a-real-provider-key")
+object_storage_egress_allowlist = ["storage.example.test"]
+""",
+        encoding="utf-8",
+    )
     settings = load_settings(config_dir=tmp_path)
-    service = build_data_hub_service(settings)
-    adapter = service._adapters[DataSourceKind.OBJECT_STORAGE].__self__  # type: ignore[attr-defined]
-    assert isinstance(adapter, S3CompatibleAdapter)
-    assert adapter._bindings == settings.data_hub.object_storage_bindings
-    assert len(adapter._bindings) == 1
+    assert settings.data_hub.object_storage_egress_allowlist == ("storage.example.test",)
 
 
-def test_object_bindings_reject_nil_ids_and_inline_secret_values() -> None:
-    from mas_orchestrator.config.settings import DataHubObjectStorageBinding
-
-    binding = {
-        "tenant_id": "00000000-0000-4000-8000-000000000012",
-        "organization_id": "00000000-0000-4000-8000-000000000013",
-        "project_id": "00000000-0000-4000-8000-000000000014",
-        "source_id": "00000000-0000-4000-8000-000000000011",
-        "endpoint_url": "https://storage.example.test",
-        "bucket": "test-bucket",
-        "prefix": "docs/",
-        "access_key_secret_ref": "env:TEST_ACCESS_KEY",
-        "secret_key_secret_ref": "env:TEST_SECRET_KEY",
-    }
-    with pytest.raises(ValidationError, match="non-nil canonical UUID"):
-        DataHubObjectStorageBinding(
-            **{**binding, "tenant_id": "00000000-0000-0000-0000-000000000000"}
+def test_duplicate_source_kinds_are_rejected() -> None:
+    with pytest.raises(ValidationError, match="must not contain duplicates"):
+        DataHubSettings(
+            allowed_source_kinds=(DataSourceKind.WEB, DataSourceKind.WEB),
         )
-    with pytest.raises(ValidationError, match="supported secret reference"):
-        DataHubObjectStorageBinding(**{**binding, "secret_key_secret_ref": "literal-raw-secret"})
-
-
-def test_object_bindings_load_from_operator_environment(monkeypatch: pytest.MonkeyPatch) -> None:
-    import json
-
-    from mas_orchestrator.config.settings import load_settings
-
-    binding = {
-        "tenant_id": "00000000-0000-4000-8000-000000000012",
-        "organization_id": "00000000-0000-4000-8000-000000000013",
-        "project_id": "00000000-0000-4000-8000-000000000014",
-        "source_id": "00000000-0000-4000-8000-000000000011",
-        "endpoint_url": "https://storage.example.test",
-        "bucket": "test-bucket",
-        "prefix": "docs/",
-        "access_key_secret_ref": "env:TEST_ACCESS_KEY",
-        "secret_key_secret_ref": "env:TEST_SECRET_KEY",
-    }
-    monkeypatch.setenv("MAS_ORCH_DATA_HUB__OBJECT_STORAGE_BINDINGS", json.dumps([binding]))
-    settings = load_settings()
-    assert settings.data_hub.object_storage_bindings[0].source_id == binding["source_id"]
-    monkeypatch.setenv("MAS_ORCH_DATA_HUB__OBJECT_STORAGE_BINDINGS", "not-json")
-    with pytest.raises(ValidationError, match="must be a JSON array"):
-        load_settings()

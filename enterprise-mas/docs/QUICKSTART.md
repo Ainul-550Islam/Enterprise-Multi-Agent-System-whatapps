@@ -58,7 +58,7 @@ SSE event → tear down. Exits non-zero on any failed assertion.
 Run it:
 
 ```bash
-bash enterprise-mas/scripts/e2e-smoke.sh
+bash scripts/e2e-smoke.sh
 ```
 
 ## 4. Python checks

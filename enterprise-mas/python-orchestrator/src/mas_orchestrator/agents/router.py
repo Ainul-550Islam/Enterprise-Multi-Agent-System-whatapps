@@ -89,9 +89,11 @@ class AgentRouter:
         self,
         spec: AgentSpec,
         request: AgentRoutingRequest,
+        *,
+        pinned: bool = False,
     ) -> AgentRejection | None:
         """Returns ``None`` if the agent is eligible, otherwise the reason."""
-        if not self._policy.is_allowed(spec.agent_id):
+        if not pinned and not self._policy.is_allowed(spec.agent_id):
             return AgentRejection(spec.agent_id, "not_allowlisted")
 
         if not spec.is_runnable:
@@ -118,6 +120,19 @@ class AgentRouter:
             return AgentRejection(spec.agent_id, "missing_tags")
 
         return None
+
+    def evaluate_pinned(
+        self,
+        spec: AgentSpec,
+        request: AgentRoutingRequest,
+    ) -> AgentRejection | None:
+        """Validates a Rust-pinned agent without consulting the local ID allowlist.
+
+        Rust is authoritative for catalog selection. The local router still
+        enforces lifecycle and request-capability constraints, but its catalog
+        allowlist cannot reject or substitute the exact pinned identity.
+        """
+        return self.evaluate(spec, request, pinned=True)
 
     def select(
         self,

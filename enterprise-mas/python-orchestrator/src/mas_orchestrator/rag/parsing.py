@@ -22,6 +22,8 @@ from mas_orchestrator.rag.models import DocumentFormat
 
 MAX_PARSED_CHARS: Final[int] = 8_000_000
 MAX_RAW_INPUT_BYTES: Final[int] = 8 * 1024 * 1024
+MAX_JSON_DEPTH: Final[int] = 128
+MAX_JSON_INTEGER_DIGITS: Final[int] = 1_000
 MAX_PDF_PAGES: Final[int] = 500
 MAX_CSV_ROWS: Final[int] = 100_000
 MAX_CSV_COLUMNS: Final[int] = 2_000
@@ -144,28 +146,71 @@ def _parse_markdown(content: str) -> str:
 
 
 def _parse_json(content: str) -> str:
-    """Flattens JSON into labelled lines, preserving object paths."""
+    """Flattens JSON into bounded labelled lines, preserving object paths."""
+    _check_json_nesting(content)
+
+    def parse_integer(raw: str) -> int:
+        if len(raw.lstrip("-")) > MAX_JSON_INTEGER_DIGITS:
+            raise ValueError("JSON integer exceeds the supported digit limit")
+        return int(raw)
+
     try:
-        payload = json.loads(content)
-    except json.JSONDecodeError as error:
+        payload = json.loads(content, parse_int=parse_integer)
+    except (json.JSONDecodeError, RecursionError, ValueError) as error:
         raise InvalidRequestError(
-            "document is not valid JSON", details={"position": error.pos}
+            "document is not valid or bounded JSON",
+            details={"reason": type(error).__name__},
         ) from error
 
     lines: list[str] = []
+    output_chars = 0
 
     def walk(value: object, path: str) -> None:
+        nonlocal output_chars
         if isinstance(value, dict):
             for key, item in value.items():
-                walk(item, f"{path}.{key}" if path else str(key))
+                next_path = f"{path}.{key}" if path else str(key)
+                if len(next_path) > MAX_PARSED_CHARS:
+                    raise InvalidRequestError(
+                        "parsed document exceeds the maximum size",
+                        details={"limit": MAX_PARSED_CHARS},
+                    )
+                walk(item, next_path)
         elif isinstance(value, list):
             for index, item in enumerate(value):
                 walk(item, f"{path}[{index}]")
         else:
-            lines.append(f"{path}: {value}")
+            output_chars = _append_limited(lines, f"{path}: {value}", output_chars)
 
     walk(payload, "")
     return _normalise("\n".join(lines))
+
+
+def _check_json_nesting(content: str) -> None:
+    """Rejects over-deep arrays and objects before invoking the JSON decoder."""
+    depth = 0
+    in_string = False
+    escaped = False
+    for character in content:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+        elif character in "[{":
+            depth += 1
+            if depth > MAX_JSON_DEPTH:
+                raise InvalidRequestError(
+                    "JSON nesting exceeds the maximum depth",
+                    details={"limit": MAX_JSON_DEPTH},
+                )
+        elif character in "]}":
+            depth -= 1
 
 
 def _parse_csv(content: str) -> str:

@@ -184,6 +184,11 @@ class ModelRegistry:
 
     def __contains__(self, model: object) -> bool:
         """Whether *model* is servable. Unknown objects yield ``False``."""
+        if isinstance(model, str):
+            provider, separator, model_name = model.partition("/")
+            if not separator or not provider.strip() or not model_name.strip():
+                return False
+            return self.find(_ref_from_key(model)) is not None
         if not hasattr(model, "key"):
             return False
         key = model.key

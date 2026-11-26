@@ -31,10 +31,11 @@ Loading order (later wins), matching the Rust Core convention:
 
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Final, get_origin
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
@@ -692,13 +693,30 @@ def _read_toml(path: Path) -> Mapping[str, Any]:
         return tomllib.load(handle)
 
 
+def _is_tuple_setting(parts: list[str]) -> bool:
+    """Returns whether a nested settings path declares a tuple field."""
+    model: type[BaseModel] = Settings
+    for index, part in enumerate(parts):
+        field = model.model_fields.get(part)
+        if field is None:
+            return False
+        annotation = field.annotation
+        if index == len(parts) - 1:
+            return get_origin(annotation) is tuple
+        if not isinstance(annotation, type) or not issubclass(annotation, BaseModel):
+            return False
+        model = annotation
+    return False
+
+
 def _env_overrides(prefix: str = ENV_PREFIX) -> Mapping[str, Any]:
     """Builds a nested override mapping from prefixed environment variables.
 
     ``MAS_ORCH_RUST_CORE__ENDPOINT=host:500`` becomes
     ``{"rust_core": {"endpoint": "host:500"}}`` using a double underscore as
-    the nesting separator. Values are strings; Pydantic coerces them to the
-    declared field types.
+    the nesting separator. Values for tuple fields accept JSON arrays, comma-
+    separated strings, or a single value; other values remain strings for
+    Pydantic to validate and coerce.
 
     Args:
         prefix: Environment variable prefix to scan for.
@@ -726,7 +744,19 @@ def _env_overrides(prefix: str = ENV_PREFIX) -> Mapping[str, Any]:
             cursor = nested
         leaf = parts[-1]
         if leaf:
-            cursor[leaf] = raw_value
+            value: Any = raw_value
+            if _is_tuple_setting([part for part in parts if part]):
+                stripped = raw_value.strip()
+                if stripped.startswith("["):
+                    try:
+                        decoded = json.loads(stripped)
+                    except json.JSONDecodeError:
+                        decoded = raw_value
+                    if isinstance(decoded, list):
+                        value = tuple(decoded)
+                if isinstance(value, str):
+                    value = tuple(item.strip() for item in raw_value.split(",") if item.strip())
+            cursor[leaf] = value
     return overrides
 
 

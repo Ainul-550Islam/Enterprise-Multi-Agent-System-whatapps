@@ -25,6 +25,7 @@ if TYPE_CHECKING:
 _LOGGER: Final[logging.Logger] = logging.getLogger(__name__)
 
 MAX_RECORDS_PER_TENANT: Final[int] = 10_000
+MAX_CLOSED_EXECUTIONS: Final[int] = 100_000
 
 
 @runtime_checkable
@@ -76,11 +77,22 @@ class InProcessMemoryStore:
             )
         self._environment = environment
         self._records: dict[tuple[str, str], MemoryRecord] = {}
+        self._closed_executions: set[tuple[str, str]] = set()
 
     async def put(self, record: MemoryRecord) -> None:
         """Stores a record."""
         key = (record.tenant_id, record.record_id)
-        if len(self._records) >= MAX_RECORDS_PER_TENANT and key not in self._records:
+        if (
+            record.scope.value == "task"
+            and record.execution_id is not None
+            and (record.tenant_id, record.execution_id) in self._closed_executions
+        ):
+            raise ConfigurationError("memory execution is already closed")
+        existing = self._records.get(key)
+        if existing is not None:
+            raise ConfigurationError("memory record id already exists")
+        tenant_count = sum(1 for owner, _record_id in self._records if owner == record.tenant_id)
+        if tenant_count >= MAX_RECORDS_PER_TENANT:
             raise ConfigurationError(
                 "in-process memory store is full",
                 details={"limit": MAX_RECORDS_PER_TENANT},
@@ -89,7 +101,10 @@ class InProcessMemoryStore:
 
     async def get(self, tenant_id: str, record_id: str) -> MemoryRecord | None:
         """Returns a record scoped to the tenant."""
-        return self._records.get((tenant_id, record_id))
+        record = self._records.get((tenant_id, record_id))
+        if record is not None and record.retention.is_expired():
+            return None
+        return record
 
     async def query(self, query: MemoryQuery) -> list[MemoryHit]:
         """Searches records for one tenant.
@@ -104,7 +119,7 @@ class InProcessMemoryStore:
         for (owner, _), record in self._records.items():
             if owner != query.tenant_id:
                 continue
-            if record.scope not in query.scopes:
+            if record.scope not in query.scopes or record.retention.is_expired():
                 continue
             if query.agent_id is not None and record.agent_id != query.agent_id:
                 continue
@@ -122,6 +137,24 @@ class InProcessMemoryStore:
                 break
 
         return results
+
+    async def close_execution(self, tenant_id: str, execution_id: str) -> int:
+        """Fences late task writes and deletes all task records for one execution."""
+        key = (tenant_id, execution_id)
+        if key not in self._closed_executions:
+            if len(self._closed_executions) >= MAX_CLOSED_EXECUTIONS:
+                raise ConfigurationError("closed execution cleanup capacity is full")
+            self._closed_executions.add(key)
+        doomed = [
+            record_key
+            for record_key, record in self._records.items()
+            if record.tenant_id == tenant_id
+            and record.scope.value == "task"
+            and record.execution_id == execution_id
+        ]
+        for record_key in doomed:
+            del self._records[record_key]
+        return len(doomed)
 
     async def delete(self, tenant_id: str, record_id: str) -> bool:
         """Deletes a record."""

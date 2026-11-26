@@ -80,5 +80,6 @@ mod tenant_isolation;
 pub mod tool_service;
 pub mod usage_service;
 pub mod webhook_service;
+pub mod whatsapp_policy;
 pub mod whatsapp_service;
 pub mod workflow_service;

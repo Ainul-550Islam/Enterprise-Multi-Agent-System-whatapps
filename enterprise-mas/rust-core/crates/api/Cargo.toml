@@ -23,7 +23,7 @@ version.workspace = true
 edition = "2021"
 rust-version = "1.85"
 description = "HTTP + gRPC api processes: thin transports over mas-application use-cases"
-license = "Proprietary"
+license = "LicenseRef-Proprietary"
 
 [lib]
 name = "mas_api"

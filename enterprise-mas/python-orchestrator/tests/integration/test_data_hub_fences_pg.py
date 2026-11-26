@@ -21,7 +21,13 @@ from mas_orchestrator.rag.models import (
 from mas_orchestrator.rag.parsing import Parser
 from mas_orchestrator.rag.pgvector_index import PgVectorIndex
 
-pytestmark = pytest.mark.integration
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.skipif(
+        not os.environ.get("MAS_TEST_RAG_DATABASE_URL"),
+        reason="MAS_TEST_RAG_DATABASE_URL is required",
+    ),
+]
 
 
 def owner() -> DataHubOwnership:

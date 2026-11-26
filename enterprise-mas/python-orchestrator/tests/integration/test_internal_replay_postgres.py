@@ -18,7 +18,14 @@ import pytest
 from mas_orchestrator.security.internal_replay import PostgresReplayGuard
 from mas_orchestrator.security.internal_service import InternalServiceIdentity
 
-pytestmark = [pytest.mark.integration, pytest.mark.asyncio(loop_scope="function")]
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.asyncio(loop_scope="function"),
+    pytest.mark.skipif(
+        not os.environ.get("MAS_TEST_REPLAY_DATABASE_URL"),
+        reason="MAS_TEST_REPLAY_DATABASE_URL is required",
+    ),
+]
 
 
 async def test_insert_only_role_consumes_nonce_once_across_instances() -> None:

@@ -158,7 +158,11 @@ pub async fn authenticated_layer(
     // any request carrying a tenant or project claim still goes through the
     // resolver below.
     let platform_capable = principal.is_usable() && principal.scopes.permits("platform:admin");
-    if platform_capable && claims.tenant.is_none() && claims.project.is_none() {
+    if platform_capable
+        && principal.tenant_id.is_none()
+        && claims.tenant.is_none()
+        && claims.project.is_none()
+    {
         request
             .extensions_mut()
             .insert(existing.with_authenticated(principal));

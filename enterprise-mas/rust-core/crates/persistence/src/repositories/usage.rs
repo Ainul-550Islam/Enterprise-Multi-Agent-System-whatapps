@@ -156,13 +156,13 @@ fn row_to_record(row: &sqlx::postgres::PgRow) -> Result<UsageRecord> {
 impl UsageStorePort for PostgresUsageStore {
     async fn append(&self, record: &UsageRecord) -> Result<()> {
         let mut executor = scoped_request::connection().await?;
-        Self::append_in(executor.connection().as_mut(), record).await
+        Self::append_in(executor.connection(), record).await
     }
 
     async fn get(&self, id: UsageRecordId) -> Result<Option<UsageRecord>> {
         let tenant = scoped_request::current_scope()?.tenant_id();
         let mut executor = scoped_request::connection().await?;
-        Self::get_in(executor.connection().as_mut(), tenant, id).await
+        Self::get_in(executor.connection(), tenant, id).await
     }
 
     async fn list(
@@ -176,7 +176,7 @@ impl UsageStorePort for PostgresUsageStore {
             return Err(AppError::not_found("usage", tenant.to_string()));
         }
         let mut executor = scoped_request::connection().await?;
-        Self::list_in(executor.connection().as_mut(), tenant, from, to, 1000).await
+        Self::list_in(executor.connection(), tenant, from, to, 1000).await
     }
 }
 
@@ -193,15 +193,7 @@ impl UsageReadPort for PostgresUsageStore {
             return Err(AppError::not_found("usage", tenant.to_string()));
         }
         let mut executor = scoped_request::connection().await?;
-        Self::list_page_in(
-            executor.connection().as_mut(),
-            tenant,
-            from,
-            to,
-            None,
-            limit,
-        )
-        .await
+        Self::list_page_in(executor.connection(), tenant, from, to, None, limit).await
     }
 
     async fn totals(
@@ -218,7 +210,7 @@ impl UsageReadPort for PostgresUsageStore {
         let mut executor = scoped_request::connection().await?;
         let rows = sqlx::query("SELECT resource, COALESCE(sum(quantity),0)::bigint AS total FROM usage_records WHERE tenant_id=$1 AND occurred_at >= $2 AND occurred_at < $3 AND ($4::text IS NULL OR resource=$4) AND ($5::uuid IS NULL OR project_id=$5) GROUP BY resource ORDER BY resource")
             .bind(tenant.into_uuid()).bind(from.into_datetime()).bind(to.into_datetime()).bind(dimension).bind(project.map(ProjectId::into_uuid))
-            .fetch_all(executor.connection().as_mut()).await.map_err(map_sqlx)?;
+            .fetch_all(executor.connection()).await.map_err(map_sqlx)?;
         rows.iter()
             .map(|row| {
                 let name: String = row.try_get("resource").map_err(map_sqlx)?;
@@ -238,7 +230,7 @@ impl UsageReadPort for PostgresUsageStore {
         }
         let mut executor = scoped_request::connection().await?;
         let rows = sqlx::query("SELECT id, dimension, period, max_value, enforcement, created_at, updated_at FROM quota_definitions WHERE tenant_id=$1 ORDER BY dimension, period")
-            .bind(tenant.into_uuid()).fetch_all(executor.connection().as_mut()).await.map_err(map_sqlx)?;
+            .bind(tenant.into_uuid()).fetch_all(executor.connection()).await.map_err(map_sqlx)?;
         let now = Timestamp::now();
         let mut snapshots = Vec::with_capacity(rows.len());
         for row in rows {
@@ -291,7 +283,7 @@ impl UsageReadPort for PostgresUsageStore {
                 updated_at,
             };
             let value: Option<i64> = sqlx::query_scalar("SELECT value FROM quota_counters WHERE tenant_id=$1 AND dimension=$2 AND bucket=$3")
-                .bind(tenant.into_uuid()).bind(dimension.as_str()).bind(bucket).fetch_optional(executor.connection().as_mut()).await.map_err(map_sqlx)?;
+                .bind(tenant.into_uuid()).bind(dimension.as_str()).bind(bucket).fetch_optional(executor.connection()).await.map_err(map_sqlx)?;
             let used = value.unwrap_or(0);
             snapshots.push((
                 quota,

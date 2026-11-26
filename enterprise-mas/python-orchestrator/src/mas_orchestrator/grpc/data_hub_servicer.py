@@ -14,6 +14,7 @@ import json
 import logging
 import time
 from typing import TYPE_CHECKING, Any
+from uuid import UUID
 
 from mas_orchestrator.config.enums import DataSourceKind
 from mas_orchestrator.contracts.errors import (
@@ -202,11 +203,18 @@ class DataHubBridgeServicer(mas_api_pb2_grpc.DataHubBridgeApiServicer):
         del metadata
         self._log_call("purge_document", request, identity.subject)
         try:
+            _require_scope_ids(
+                request,
+                ("tenant_id", "organization_id", "project_id", "source_id", "document_id"),
+            )
             removed = await self._run_with_deadline(
                 request,
                 context,
                 self._service.purge_document(
                     tenant_id=request.tenant_id,
+                    organization_id=request.organization_id,
+                    project_id=request.project_id,
+                    source_id=request.source_id,
                     document_id=request.document_id,
                 ),
             )
@@ -289,7 +297,20 @@ class DataHubBridgeServicer(mas_api_pb2_grpc.DataHubBridgeApiServicer):
         except ProtocolError as error:
             await abort_with_error(context, error)
             raise
-        deadline_ms = parse_deadline(request.deadline_rfc3339)
+        if not request.deadline_rfc3339.strip():
+            await abort_with_error(
+                context,
+                InvalidRequestError(
+                    "Data Hub request requires an absolute deadline",
+                    details={"field": "deadline_rfc3339"},
+                ),
+            )
+            raise AssertionError("abort_with_error never returns") from None
+        try:
+            deadline_ms = parse_deadline(request.deadline_rfc3339)
+        except InvalidRequestError as error:
+            await abort_with_error(context, error)
+            raise AssertionError("abort_with_error never returns") from None
         if deadline_ms is not None and deadline_ms <= int(time.time() * 1000):
             await abort_with_error(
                 context,
@@ -337,6 +358,24 @@ class DataHubBridgeServicer(mas_api_pb2_grpc.DataHubBridgeApiServicer):
                 "subject": subject,
             },
         )
+
+
+def _require_scope_ids(request: Any, fields: tuple[str, ...]) -> None:
+    """Rejects malformed or nil authoritative UUIDs before backend work."""
+    for field in fields:
+        value = getattr(request, field, "")
+        try:
+            parsed = UUID(value)
+        except (ValueError, TypeError, AttributeError) as error:
+            raise InvalidRequestError(
+                f"Data Hub {field} must be a canonical non-nil UUID",
+                details={"field": field},
+            ) from error
+        if str(parsed) != value or parsed.int == 0:
+            raise InvalidRequestError(
+                f"Data Hub {field} must be a canonical non-nil UUID",
+                details={"field": field},
+            )
 
 
 def _source_kind(value: str) -> DataSourceKind:

@@ -19,7 +19,7 @@ version.workspace = true
 edition = "2021"
 rust-version = "1.85"
 description = "Task consumer process: leases, retries, heartbeats, graceful shutdown"
-license = "Proprietary"
+license = "LicenseRef-Proprietary"
 
 [lib]
 name = "mas_worker"

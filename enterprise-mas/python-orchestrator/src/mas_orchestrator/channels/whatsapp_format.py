@@ -6,11 +6,10 @@ This module provides:
   • paragraph-aware splitting (respecting 4096-char per-message limit)
   • rejection of tables and HTML (safety)
 """
+
 from __future__ import annotations
 
 import re
-from typing import List, Tuple
-
 
 # WhatsApp-allowed markdown patterns
 _BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
@@ -20,7 +19,7 @@ _MONO_RE = re.compile(r"`(.+?)`")
 
 
 def format_for_whatsapp(markdown: str) -> str:
-    """Convert a markdown string to WhatsApp‑compatible formatting.
+    """Convert a markdown string to WhatsApp-compatible formatting.
 
     WhatsApp does not support raw HTML or complex markdown. This function
     converts the most common patterns and strips the rest.
@@ -58,16 +57,16 @@ def format_for_whatsapp(markdown: str) -> str:
     return text
 
 
-def split_by_limit(text: str, limit: int = 4096) -> List[str]:
+def split_by_limit(text: str, limit: int = 4096) -> list[str]:
     """Split text into chunks respecting WhatsApp's ~4096 char limit.
 
     Splitting rules:
-      • Never split mid‑a formatting marker (* _ ~ `)
+      • Never split mid-a formatting marker (* _ ~ `)
       • Respect paragraph boundaries (double newlines)
       • If a single segment exceeds the limit, truncate at the last safe point
         and append "…" (ellipsis), knowing WhatsApp will truncate anyway.
 
-    Returns a list ofWhatsApp‑ready message chunks.
+    Returns a list ofWhatsApp-ready message chunks.
     """
     if not text:
         return []
@@ -75,7 +74,7 @@ def split_by_limit(text: str, limit: int = 4096) -> List[str]:
     if len(text) <= limit:
         return [text]
 
-    chunks: List[str] = []
+    chunks: list[str] = []
     remaining = text
 
     while remaining:
@@ -87,15 +86,15 @@ def split_by_limit(text: str, limit: int = 4096) -> List[str]:
         # Try to find a paragraph break (\n\n) within the limit
         paragraph_cut = remaining[:limit].rfind("\n\n")
         if paragraph_cut >= 0:
-            chunks.append(remaining[:paragraph_cut + 2].strip())
-            remaining = remaining[paragraph_cut + 2:].strip()
+            chunks.append(remaining[: paragraph_cut + 2].strip())
+            remaining = remaining[paragraph_cut + 2 :].strip()
             continue
 
         # Try to find a sentence end (. ! ?) followed by space within the limit
         sentence_cut = _find_sentence_boundary(remaining[:limit])
         if sentence_cut >= 0:
-            chunks.append(remaining[:sentence_cut + 1].strip())
-            remaining = remaining[sentence_cut + 1:].strip()
+            chunks.append(remaining[: sentence_cut + 1].strip())
+            remaining = remaining[sentence_cut + 1 :].strip()
             continue
 
         # Fallback: just truncate at the limit with ellipsis
@@ -113,10 +112,7 @@ def _find_sentence_boundary(text: str) -> int:
     given text.
     """
     # Look for . ! ? followed by end-of-string or whitespace
-    matches = [
-        m.end() - 1
-        for m in re.finditer(r"[.!?](\s|$)", text)
-    ]
+    matches = [m.end() - 1 for m in re.finditer(r"[.!?](\s|$)", text)]
     return max(matches) if matches else -1
 
 
@@ -146,4 +142,4 @@ if __name__ == "__main__":
     print(f"Formatted ({len(formatted)} → {len(formatted)}): {formatted[:80]}…")
     print(f"Chunks ({len(chunks)}):")
     for i, c in enumerate(chunks):
-        print(f"  {i+1}. {c[:60]}{'…' if len(c) > 60 else ''}")
+        print(f"  {i + 1}. {c[:60]}{'…' if len(c) > 60 else ''}")

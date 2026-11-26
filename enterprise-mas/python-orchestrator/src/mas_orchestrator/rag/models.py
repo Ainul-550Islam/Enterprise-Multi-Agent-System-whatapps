@@ -38,6 +38,31 @@ class DocumentFormat(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class DataHubOwnership:
+    """Authoritative organization, project, and source owner for a Data Hub document."""
+
+    organization_id: str
+    project_id: str
+    source_id: str
+
+    def __post_init__(self) -> None:
+        for field_name in ("organization_id", "project_id", "source_id"):
+            value = getattr(self, field_name)
+            try:
+                parsed = uuid.UUID(value)
+            except (ValueError, AttributeError, TypeError) as error:
+                raise InvalidRequestError(
+                    f"{field_name} must be a canonical non-nil UUID",
+                    details={"field": field_name},
+                ) from error
+            if str(parsed) != value or parsed.int == 0:
+                raise InvalidRequestError(
+                    f"{field_name} must be a canonical non-nil UUID",
+                    details={"field": field_name},
+                )
+
+
+@dataclass(frozen=True, slots=True)
 class SecurityContext:
     """Who may see a document.
 
@@ -55,12 +80,36 @@ class SecurityContext:
     tenant_id: str
     allowed_roles: frozenset[str] = frozenset()
     allowed_principals: frozenset[str] = frozenset()
+    organization_id: str | None = None
+    project_id: str | None = None
 
     def __post_init__(self) -> None:
         if not self.tenant_id.strip():
             raise InvalidRequestError(
                 "security context must name a tenant", details={"field": "tenant_id"}
             )
+        if (self.organization_id is None) != (self.project_id is None):
+            raise InvalidRequestError(
+                "security context organization and project must be supplied together",
+                details={"field": "organization_id"},
+            )
+        if self.organization_id is not None and self.project_id is not None:
+            for field_name, value in (
+                ("organization_id", self.organization_id),
+                ("project_id", self.project_id),
+            ):
+                try:
+                    parsed = uuid.UUID(value)
+                except (ValueError, AttributeError, TypeError) as error:
+                    raise InvalidRequestError(
+                        f"{field_name} must be a canonical non-nil UUID",
+                        details={"field": field_name},
+                    ) from error
+                if str(parsed) != value or parsed.int == 0:
+                    raise InvalidRequestError(
+                        f"{field_name} must be a canonical non-nil UUID",
+                        details={"field": field_name},
+                    )
 
 
 @dataclass(frozen=True, slots=True)

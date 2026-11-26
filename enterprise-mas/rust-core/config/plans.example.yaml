@@ -1,0 +1,45 @@
+# Example commercial catalogue for `mas billing seed-plans`.
+# All `price_...` values are operator-supplied Stripe Price IDs, not valid
+# credentials or deployable IDs. Amounts are integer minor units (USD cents).
+plans:
+  - code: free
+    name: Free
+    description: Starter plan for evaluation and small workloads.
+    features:
+      max_agents: 3
+      monthly_executions: 1000
+    prices: []
+  - code: pro
+    name: Pro
+    description: Production plan for growing teams.
+    features:
+      max_agents: 25
+      monthly_executions: 25000
+    prices:
+      - provider: stripe
+        provider_price_id: price_REPLACE_WITH_PRO_MONTHLY
+        currency: usd
+        unit_amount: 2900
+        billing_interval: month
+      - provider: stripe
+        provider_price_id: price_REPLACE_WITH_PRO_YEARLY
+        currency: usd
+        unit_amount: 29000
+        billing_interval: year
+  - code: business
+    name: Business
+    description: Higher limits and annual billing for larger teams.
+    features:
+      max_agents: 100
+      monthly_executions: 100000
+    prices:
+      - provider: stripe
+        provider_price_id: price_REPLACE_WITH_BUSINESS_MONTHLY
+        currency: usd
+        unit_amount: 9900
+        billing_interval: month
+      - provider: stripe
+        provider_price_id: price_REPLACE_WITH_BUSINESS_YEARLY
+        currency: usd
+        unit_amount: 99000
+        billing_interval: year

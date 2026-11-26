@@ -72,7 +72,7 @@ class InMemoryVectorIndex:
                 details={"environment": environment.value},
             )
         self._environment = environment
-        self._items: dict[str, EmbeddedChunk] = {}
+        self._items: dict[tuple[str, str, str], EmbeddedChunk] = {}
         self._models: set[str] = set()
 
     async def upsert(self, items: Sequence[EmbeddedChunk]) -> None:
@@ -82,20 +82,35 @@ class InMemoryVectorIndex:
             ConfigurationError: If the batch mixes embedding models or the
                 index is full.
         """
-        for item in items:
-            self._models.add(item.model)
-            if len(self._models) > 1:
-                raise ConfigurationError(
-                    "index cannot hold vectors from more than one embedding model",
-                    details={"models": sorted(self._models)},
-                )
-            key = f"{item.chunk.access.tenant_id}:{item.chunk.chunk_id}"
-            if key not in self._items and len(self._items) >= MAX_INDEXED_CHUNKS:
-                raise ConfigurationError(
-                    "in-memory vector index is full",
-                    details={"limit": MAX_INDEXED_CHUNKS},
-                )
-            self._items[key] = item
+        batch = list(items)
+        incoming_models = {item.model for item in batch}
+        combined_models = self._models | incoming_models
+        if len(combined_models) > 1:
+            raise ConfigurationError(
+                "index cannot hold vectors from more than one embedding model",
+                details={"models": sorted(combined_models)},
+            )
+
+        keyed_items = [
+            (
+                (
+                    item.chunk.access.tenant_id,
+                    item.chunk.document_id,
+                    item.chunk.chunk_id,
+                ),
+                item,
+            )
+            for item in batch
+        ]
+        new_keys = {key for key, _ in keyed_items if key not in self._items}
+        if len(self._items) + len(new_keys) > MAX_INDEXED_CHUNKS:
+            raise ConfigurationError(
+                "in-memory vector index is full",
+                details={"limit": MAX_INDEXED_CHUNKS},
+            )
+
+        self._items.update(keyed_items)
+        self._models = combined_models
 
     async def search(
         self,

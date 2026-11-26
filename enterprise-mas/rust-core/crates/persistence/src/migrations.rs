@@ -357,6 +357,16 @@ pub static MIGRATIONS: &[Migration] = &[
         "whatsapp_inbox",
         "../../../migrations/0062_whatsapp_inbox/up.sql"
     ),
+    migration!(
+        63,
+        "oidc_identity_binding",
+        "../../../migrations/0063_oidc_identity_binding/up.sql"
+    ),
+    migration!(
+        64,
+        "billing_receipt_signature_check",
+        "../../../migrations/0064_billing_receipt_signature_check/up.sql"
+    ),
 ];
 
 /// A migration already recorded in the database.
@@ -690,9 +700,12 @@ mod tests {
     #[test]
     fn registry_is_contiguous_and_ordered() {
         validate_registry().expect("registry must be valid");
-        assert_eq!(MIGRATIONS.len(), 62);
+        assert_eq!(MIGRATIONS.len(), 64);
         assert_eq!(MIGRATIONS.first().map(|m| m.name), Some("extensions"));
-        assert_eq!(MIGRATIONS.last().map(|m| m.name), Some("whatsapp_inbox"));
+        assert_eq!(
+            MIGRATIONS.last().map(|m| m.name),
+            Some("billing_receipt_signature_check")
+        );
         let search_indexes = MIGRATIONS
             .iter()
             .find(|migration| migration.name == "bounded_search_indexes")

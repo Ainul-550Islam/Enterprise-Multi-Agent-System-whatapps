@@ -384,7 +384,7 @@ message SyncSourceReply {
   uint32 changed_count = 3;
   uint32 indexed_count = 4;
   uint32 failed_count = 5;
-  string next_cursor = 6;
+  optional string next_cursor = 6;
   repeated string errors = 7;  // safe document-id:error-code summaries only
 }
 

@@ -162,7 +162,12 @@ def _validate_uuid(value: str, field_name: str) -> None:
             f"Data Hub {field_name} must be a UUID",
             details={"field": field_name},
         ) from error
-    if str(parsed) != value.lower():
+    if parsed.int == 0:
+        raise InvalidRequestError(
+            f"Data Hub {field_name} must not use a nil UUID",
+            details={"field": field_name},
+        )
+    if str(parsed) != value:
         raise InvalidRequestError(
             f"Data Hub {field_name} must use canonical UUID form",
             details={"field": field_name},
@@ -185,3 +190,9 @@ def _validate_config_secrets(config: Mapping[str, Any]) -> None:
             )
         if isinstance(value, Mapping):
             _validate_config_secrets(value)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                if isinstance(item, Mapping):
+                    _validate_config_secrets(item)
+                elif isinstance(item, (list, tuple)):
+                    _validate_config_secrets({"nested": item})

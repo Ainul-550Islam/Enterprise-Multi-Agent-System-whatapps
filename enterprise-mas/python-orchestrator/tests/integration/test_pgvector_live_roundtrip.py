@@ -13,7 +13,13 @@ from mas_orchestrator.contracts.errors import RetrievalError
 from mas_orchestrator.rag.models import Chunk, DocumentAccess, EmbeddedChunk, SecurityContext
 from mas_orchestrator.rag.pgvector_index import PgVectorIndex
 
-pytestmark = pytest.mark.integration
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.skipif(
+        not os.environ.get("MAS_TEST_RAG_DATABASE_URL"),
+        reason="MAS_TEST_RAG_DATABASE_URL is required",
+    ),
+]
 
 
 @pytest.mark.asyncio
